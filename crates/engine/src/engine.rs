@@ -283,14 +283,22 @@ impl Engine {
                 rules,
                 members,
             } => {
-                let state = FolderState::new(
-                    folder,
-                    rules,
-                    members,
-                    self.config.node_id,
-                    self.config.author_host.clone(),
-                );
-                self.folders.insert(folder, state);
+                if self.folders.contains_key(&folder) {
+                    // Replacing the state would discard the index.
+                    out.push(Action::StatusChanged {
+                        folder,
+                        status: FolderStatus::AlreadyJoined,
+                    });
+                } else {
+                    let state = FolderState::new(
+                        folder,
+                        rules,
+                        members,
+                        self.config.node_id,
+                        self.config.author_host.clone(),
+                    );
+                    self.folders.insert(folder, state);
+                }
             }
             Event::RulesChanged { folder, rules } => match self.folders.get_mut(&folder) {
                 Some(f) => f.set_rules(rules),
@@ -907,6 +915,42 @@ mod tests {
                 folder: folder(),
                 status: FolderStatus::UnchangedUnknownPath { path: p("ghost") }
             }]
+        );
+    }
+
+    #[test]
+    fn joining_an_already_joined_folder_keeps_the_index() {
+        let mut e = engine(1, "a");
+        join(&mut e, &[1, 2]);
+        e.handle(
+            t(1.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("x"),
+                state: file(1, 1),
+            },
+        );
+        let out = e.handle(
+            t(2.0),
+            Event::FolderJoined {
+                folder: folder(),
+                rules: Rules::default(),
+                members: vec![node(1)],
+            },
+        );
+        assert_eq!(
+            out,
+            [Action::StatusChanged {
+                folder: folder(),
+                status: FolderStatus::AlreadyJoined
+            }]
+        );
+        let f = e.folder(folder()).unwrap();
+        assert_eq!(f.index().len(), 1, "index kept");
+        assert_eq!(
+            f.members().collect::<Vec<_>>(),
+            [node(1), node(2)],
+            "members kept"
         );
     }
 

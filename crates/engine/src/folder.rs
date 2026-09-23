@@ -69,6 +69,9 @@ pub struct Deferred {
 pub enum FolderStatus {
     /// A batch or command arrived for a folder this machine has not joined.
     UnknownFolder,
+    /// `FolderJoined` for a folder already joined; the existing state, index
+    /// included, was kept.
+    AlreadyJoined,
     /// The host reported `Unchanged` for a path with no live record: a host bug.
     UnchangedUnknownPath { path: RelPath },
     /// `ScanFinished` or `ScanAborted` without an open bracket: a host bug.
