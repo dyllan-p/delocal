@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 3 · 22 September 2026 · Status: **for review** · Changes from draft 2: NodeId representation and ordering defined (§4); `author_host` carried on entries and used for conflict names (§7.1, §7.4, §7.6, §11); engine takes time and randomness as inputs (§7); serde allowed in the engine (Appendix B); simulator gets its own CI job (§14.1).
+> Draft 4 · 23 September 2026 · Status: **for review** · Changes from draft 3: `seq` assignment rule (§7.1); merged-record fields on identical-content concurrency (§7.2); metadata-only applies (§7.5) and their brake treatment (§8.1); paused folders keep receiving and pending batches grow (§8.1); `deny` vector construction (§8.2); rename detection listed as out of scope (§3.2); simulator moved to its own crate (§14.1, Appendix B).
+>
+> Changes from draft 2: NodeId representation and ordering defined (§4); `author_host` carried on entries and used for conflict names (§7.1, §7.4, §7.6, §11); engine takes time and randomness as inputs (§7); serde allowed in the engine (Appendix B); simulator gets its own CI job (§14.1).
 >
 > This file is the source of truth for v1. Claude Code builds from it. When behaviour changes, this document changes first, then the code. Anything marked **[decision]** is a judgement call made while drafting that has not been discussed yet and should be confirmed or overruled. Anything marked **[verify]** is a claim about a third-party system that must be checked against reality during the relevant phase.
 
@@ -63,6 +65,7 @@ One day a script on the Pi goes wrong and deletes most of `~/Sync`. The Pi's own
 - Web portal or GUI
 - Extended attributes, ACLs, ownership, non-exec permission bits
 - Hard links (synced as separate files)
+- Rename detection: a rename is a delete plus an add, and the content is transferred again
 
 ### 3.3 Requirements on the user's machines
 
@@ -196,6 +199,8 @@ Per folder, one record per entry the machine knows about, including deleted ones
 
 Plus, per folder per remote member: the highest `seq` of theirs we have received, used for catch-up (§7.4).
 
+**When `seq` advances.** A record gets a new `seq` only when it describes committed local state: after a local change is observed, after a fetched file has been renamed into place, after a deletion or a metadata-only change has been applied. Accepting a batch never advances `seq`. This is what makes "a member's index announces version X" mean "that member can serve X" (§7.5).
+
 ### 7.2 Versions
 
 ```
@@ -208,7 +213,7 @@ Version = BTreeMap<NodeId, u64>
   - every `a[k] ≥ b[k]` and not equal → **a dominates**
   - every `b[k] ≥ a[k]` and not equal → **b dominates**
   - otherwise → **concurrent** (a conflict, unless the content hashes are equal — see §7.6)
-- **Merge** (used when concurrent versions have identical content): component-wise maximum, no increment. Two machines merging the same pair independently produce the same result, so they converge without talking.
+- **Merge** (used when concurrent versions have identical content): component-wise maximum, no increment. Two machines merging the same pair independently produce the same result, so they converge without talking. The merged record takes `mtime_ns`, `modified_by` and `author_host` from the side with the larger `mtime_ns`, and on a tie from the side with the larger `modified_by` (the §7.6 winner rule reused). If the file's mtime on disk then differs from the record, the host sets it (a metadata-only apply, §7.5).
 
 Wall-clock time never participates in ordering. See §7.8.
 
@@ -275,6 +280,8 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 8. `rename(tmp, target)`. Ensure parent directories exist (creating them as index entries if they arrived in the same batch).
 9. Update the index record and `fsync` the parent directory.
 
+**Metadata-only applies.** An incoming version that dominates the local one but has identical content (content equality as in §7.6: kind, hash, exec) needs no fetch, no trash and no write. The host sets the file's mtime to the record's `mtime_ns` and the index adopts the incoming version, `modified_by` and `author_host`. This is how `W′` (§7.6) and `deny` bumps (§8.2) land on machines that already hold the content. A version that differs only in the exec bit is applied the same way, by changing the bit, with no transfer.
+
 **Deletes.** Move the current file to trash, write the tombstone to the index. Directories are removed only when empty and only after all children in the batch have been processed. Order: creates process parents before children; deletes process children before parents.
 
 **Symlinks.** Written with `symlink(target, tmp)` then rename. Never followed.
@@ -337,9 +344,12 @@ A batch is **held** if either rule trips, evaluated over the batch's apply set (
 
 - Adds do not count toward H1. Adds are almost never destructive, and exempting them keeps first sync and bulk imports quiet.
 - H1 cannot trip on a folder with zero tracked entries.
+- Metadata-only applies (§7.5) count as neither `mods` nor `dels` for H1 and contribute no bytes to H2. Exec-bit-only changes count as `mods` and contribute no bytes.
 - Thresholds are per folder: `delocal rules ~/Sync --hold-count 50 --hold-pct 25 --hold-size 20G`. Setting `--hold-count 0` disables H1 for that folder.
 
 **Sender pre-check.** The same rules run on the machine where the changes happened, before anything is sent. If they trip, the folder is **paused** on that machine: nothing leaves, and `status` everywhere shows `paused on <machine>: 812 deletes pending — delocal review on <machine>`. This is cheap and it is what makes `revert` trivially safe: no other machine has seen the damage.
+
+A paused folder **keeps receiving**: remote batches are applied normally for paths not in the pending batch, and paths that are in the pending batch are left untouched until `approve` or `revert`. Further local changes made while paused join the pending batch, the brake is re-evaluated over the whole of it, and `revert` undoes all of it.
 
 **Receiver check.** Runs regardless of what the sender did. A machine running an old or broken delocal, or one whose user approved something hastily, still cannot push a mass change onto a machine that has not agreed.
 
@@ -356,7 +366,7 @@ When a receiver holds a batch, every version in its apply set is written to the 
 `delocal review` shows each held item: source, time, counts, size, sample paths, file-type breakdown. Then:
 
 - **`approve`** applies the apply set normally. Trash still protects every overwritten or deleted file.
-- **`deny`** makes this machine's current copies win: for every quarantined path, it bumps its own version (a local change with unchanged content), which dominates the quarantined version, and drops the quarantine. The mesh converges on this machine's copies. On the source machine this arrives as a mass modification and may itself trip that machine's brake; that is correct — the user is already in "something went wrong" mode and approving it there restores the source. **[decision]** This is the simplest correct semantics for `deny`; an alternative is for `deny` to only refuse and tell the user to run `revert` on the source.
+- **`deny`** makes this machine's current copies win. For every quarantined path it produces a new version equal to the component-wise maximum of its local version and every quarantined version for that path, with its own counter incremented (the same construction as `W′` in §7.6), so the result dominates all of them; then it drops the quarantine. Where this machine has no record for the path, the new version is a tombstone. Content is unchanged, so on machines that hold the same content this lands as a metadata-only apply (§7.5) and does not trip the brake. The mesh converges on this machine's copies. On the source machine this arrives as a mass modification and may itself trip that machine's brake; that is correct — the user is already in "something went wrong" mode and approving it there restores the source. **[decision]** This is the simplest correct semantics for `deny`; an alternative is for `deny` to only refuse and tell the user to run `revert` on the source.
 
 Approving on one machine does not approve on others in v1 (§3.2).
 
@@ -597,7 +607,7 @@ Protocol version is a single integer, bumped on any incompatible change. Two mac
 
 Sync tools earn trust with tests, not features. Testing is Phase 1, not Phase 5.
 
-### 14.1 The simulator (in `crates/engine`)
+### 14.1 The simulator (in `crates/sim`, depending on `delocal-engine`)
 
 The engine is pure, so it can be driven by an in-memory filesystem and an in-memory network with a seeded PRNG. Each run creates N nodes (2–8), one or more folders, and then applies thousands of random steps:
 
@@ -745,7 +755,8 @@ delocal/
   TESTING.md                acceptance checklist
   install.sh                served at delocal.sh/install
   crates/
-    engine/                 pure sync logic: index, versions, batches, conflicts, brake; the simulator
+    engine/                 pure sync logic: index, versions, batches, conflicts, brake
+    sim/                    deterministic simulator: in-memory host for N engines, seeded PRNG, invariants I1–I6; dev-only, runnable for the nightly
     delocal/                the binary: daemon, cli, fs, sqlite, net, tailscale, service install
   packaging/
     systemd/delocal.service
