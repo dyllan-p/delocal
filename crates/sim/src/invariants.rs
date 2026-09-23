@@ -225,10 +225,13 @@ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
 }
 
 /// I4: every conflict copy present is the copy of a version that lost at
-/// its path, with that version's content, and there is one copy path per
-/// losing version by construction of the name. A copy the simulated user
-/// edited afterwards (a mass modify picks any file) keeps the name check
-/// but not the content check: it is the user's file from then on.
+/// its path, with that version's content. The name carries the loser's
+/// mtime and author, so for files one copy path names one losing version;
+/// directories and symlinks carry no mtime (§7.1), and several losing
+/// versions by one author share a name, so the copy must match one of
+/// them. A copy the simulated user edited afterwards (a mass modify picks
+/// any file) keeps the name check but not the content check: it is the
+/// user's file from then on.
 fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
     let mut user_edited: BTreeSet<RelPath> = BTreeSet::new();
     for id in sim.node_ids() {
@@ -237,7 +240,7 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
     }
     // Losing versions per original path: ranked below a concurrent,
     // content-differing version by the winner rule.
-    let mut expected: BTreeMap<RelPath, Entry> = BTreeMap::new();
+    let mut expected: BTreeMap<RelPath, Vec<Entry>> = BTreeMap::new();
     for versions in sim.versions().values() {
         for (i, a) in versions.iter().enumerate() {
             for b in &versions[i + 1..] {
@@ -254,7 +257,10 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
                     continue; // a losing tombstone has no file to copy
                 }
                 if let Some(name) = conflict_copy_name(loser) {
-                    expected.entry(name).or_insert_with(|| loser.clone());
+                    let losers = expected.entry(name).or_default();
+                    if !losers.iter().any(|l| l.version == loser.version) {
+                        losers.push(loser.clone());
+                    }
                 }
             }
         }
@@ -267,7 +273,7 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
             if !path.file_name().contains(".conflict-") {
                 continue;
             }
-            let Some(loser) = expected.get(path) else {
+            let Some(losers) = expected.get(path) else {
                 return Err(sim.failure(
                     "I4 bounded conflicts",
                     format!(
@@ -279,15 +285,23 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
             if user_edited.contains(path) {
                 continue; // the user's own edit of the copy; the name still checks out
             }
-            let same = loser.kind == live.kind
-                && loser.hash == live.hash
-                && (loser.kind != Kind::File || loser.exec == live.exec);
+            let same = losers.iter().any(|loser| {
+                loser.kind == live.kind
+                    && loser.hash == live.hash
+                    && (loser.kind != Kind::File || loser.exec == live.exec)
+            });
             if !same {
+                let had: Vec<String> = losers
+                    .iter()
+                    .map(|l| format!("{:?} had {}", l.version, l.hash.short()))
+                    .collect();
                 return Err(sim.failure(
                     "I4 bounded conflicts",
                     format!(
-                        "{}: conflict copy {path} has content {} but the losing version {:?} had {}",
-                        id.short(), live.hash.short(), loser.version, loser.hash.short()
+                        "{}: conflict copy {path} has content {} but the losing version {}",
+                        id.short(),
+                        live.hash.short(),
+                        had.join("; ")
                     ),
                 ));
             }
