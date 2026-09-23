@@ -1,0 +1,17 @@
+[package]
+name = "delocal-engine"
+description = "Pure sync logic for delocal: index, versions, batches, conflicts, brake, simulator. No I/O."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+# This crate does no I/O. It must never depend on tokio, notify, rusqlite or
+# anything else that touches the world (DESIGN.md Appendix B). CI checks.
+[dependencies]
+
+[lints]
+workspace = true
