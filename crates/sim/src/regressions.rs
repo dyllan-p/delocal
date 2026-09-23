@@ -89,3 +89,65 @@ fn a_relayed_copy_of_a_wanted_version_is_not_quarantined() {
         ],
     );
 }
+
+/// A want created from the deferred set (an unfreeze, a superseded entry, a
+/// re-classification under an observable want) skipped quarantine matching
+/// and the brake, and could adopt a quarantined version.
+#[test]
+fn entries_readmitted_from_the_deferred_set_respect_the_quarantine() {
+    passes(
+        9000,
+        &[
+            Step::Online { node: 2 },
+            Step::Delete { node: 5, path: 11 },
+            Step::Everywhere {
+                path: 5,
+                contents: vec![None, None, None, Some(5), Some(2)],
+            },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::Revert,
+                delay_secs: 57,
+            },
+            Step::Partition { a: 6, b: 0 },
+            Step::Heal { a: 0, b: 6 },
+            Step::Modify {
+                node: 3,
+                path: 1,
+                content: 3,
+            },
+            Step::Create {
+                node: 2,
+                path: 6,
+                content: 4,
+            },
+            Step::Create {
+                node: 1,
+                path: 3,
+                content: 3,
+            },
+            Step::Modify {
+                node: 0,
+                path: 6,
+                content: 2,
+            },
+            Step::Create {
+                node: 3,
+                path: 10,
+                content: 3,
+            },
+            Step::Partition { a: 5, b: 1 },
+            Step::User {
+                node: 6,
+                action: crate::UserAction::Revert,
+                delay_secs: 11,
+            },
+            Step::Partition { a: 3, b: 5 },
+            Step::MassModify {
+                node: 7,
+                fraction: 68,
+                content: 3,
+            },
+        ],
+    );
+}

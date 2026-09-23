@@ -594,6 +594,12 @@ impl Engine {
                     want: want.map(Box::new),
                 });
             }
+            for status in folder.take_statuses() {
+                out.push(Action::StatusChanged {
+                    folder: folder_id,
+                    status,
+                });
+            }
         }
     }
 
