@@ -1041,6 +1041,16 @@ impl FolderState {
         self.wants.restore(want);
     }
 
+    /// The process restarted with this state (§11, §13): every want the
+    /// host was fetching or committing is wanted again, the open scan
+    /// bracket is gone, and peers will announce themselves afresh.
+    pub fn restarted(&mut self) {
+        self.wants.restarted();
+        self.scan = None;
+        self.catchup.clear();
+        self.window = None;
+    }
+
     /// Decide the next host steps for the want-list (§7.5) and adopt every
     /// index-only want. Returns the steps and the records adopted.
     pub fn dispatch(

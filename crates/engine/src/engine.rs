@@ -258,6 +258,22 @@ impl Engine {
         }
     }
 
+    /// Rebuild an engine from persisted folder state after a restart (§11
+    /// "persistence contract", §13). The folder state is the unit of
+    /// restart: index, pending set, watermarks, peer seqs and acks,
+    /// quarantine, wants, paused state and deferred entries all come back
+    /// as they were. Peers are not restored; they reconnect and exchange
+    /// `have_up_to`. Wants in transient states return to *wanted*, since
+    /// the host's in-flight operations died with the process.
+    pub fn restore(config: NodeConfig, folders: Vec<FolderState>) -> Self {
+        let mut engine = Self::new(config);
+        for mut folder in folders {
+            folder.restarted();
+            engine.folders.insert(folder.id(), folder);
+        }
+        engine
+    }
+
     pub fn config(&self) -> &NodeConfig {
         &self.config
     }
@@ -1965,6 +1981,56 @@ mod tests {
                 .any(|a| matches!(a, Action::Fetch { from, .. } if *from == node(1))),
             "retried, same source"
         );
+    }
+
+    #[test]
+    fn restore_rebuilds_folders_and_re_wants_in_flight_work() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        deliver(t(12.0), node(1), out, &mut engines);
+        let b = &engines[&node(2)];
+        let before = b.folder(folder()).unwrap().clone();
+        assert!(matches!(
+            before.wants().get(&p("n")).unwrap().state,
+            WantState::Fetching { .. }
+        ));
+        // The process dies and comes back with the persisted folder state.
+        let mut restored = Engine::restore(b.config().clone(), vec![before.clone()]);
+        let f = restored.folder(folder()).unwrap();
+        assert_eq!(f.index(), before.index());
+        assert_eq!(
+            f.wants().get(&p("n")).unwrap().state,
+            WantState::Wanted,
+            "the fetch died with the process"
+        );
+        assert_eq!(restored.peers().count(), 0, "peers reconnect");
+        assert_eq!(f.window(), None);
+        // On reconnect it exchanges have_up_to and the fetch starts again.
+        let out = restored.handle(
+            t(20.0),
+            Event::PeerConnected {
+                peer: node(1),
+                tier: Tier::Lan,
+            },
+        );
+        assert!(sends(&out).iter().any(|(to, o)| *to == node(1) && matches!(o, Outbound::HaveUpTo { seq, .. } if *seq == before.index().peer_seq(node(1)))));
+        assert!(out.iter().any(
+            |a| matches!(a, Action::Fetch { path, from, .. } if path == &p("n") && *from == node(1))
+        ));
     }
 
     #[test]
