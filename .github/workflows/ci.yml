@@ -1,9 +1,10 @@
 # CI for delocal (DESIGN.md §15 Phase 0).
 #
-# Three jobs:
-#   lint   fmt, clippy with warnings denied, and the engine boundary check
-#   test   cargo test on Linux and macOS
-#   build  release binaries for the four targets; Linux ones must be static
+# Four jobs:
+#   lint      fmt, clippy with warnings denied, and the engine boundary check
+#   test      cargo test on Linux and macOS
+#   build     release binaries for the four targets; Linux ones must be static
+#   simulate  the §14.1 simulator over 1,000 seeds (the nightly runs 100,000)
 #
 # The toolchain comes from rust-toolchain.toml. `rustup toolchain install`
 # with no arguments reads that file and installs the pinned version with its
@@ -162,3 +163,22 @@ jobs:
           name: delocal-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/delocal
           if-no-files-found: error
+
+  # DESIGN.md §14.1: 1,000 seeds per push in a dedicated job with its own
+  # timeout. The SEEDS variable is what the nightly workflow overrides.
+  simulate:
+    name: simulate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SEEDS: 1000
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: simulate
+
+      - name: Simulate
+        run: cargo run --release --locked -p delocal-sim -- --seeds "$SEEDS"
