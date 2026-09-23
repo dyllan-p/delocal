@@ -148,6 +148,13 @@ impl Index {
         self.records.get(path)
     }
 
+    /// True if this machine holds exactly `version` at `path` as a live
+    /// entry, so it can serve a `RequestFile` for it (§7.5 step 3). The
+    /// host answers `NotAvailable` otherwise.
+    pub fn has_exact(&self, path: &RelPath, version: &Version) -> bool {
+        self.live(path).is_some_and(|r| &r.entry.version == version)
+    }
+
     /// The live (non-deleted) entry at a path.
     pub fn live(&self, path: &RelPath) -> Option<&IndexRecord> {
         self.records.get(path).filter(|r| !r.entry.deleted)
@@ -192,6 +199,24 @@ impl Index {
     /// these to a peer that has acknowledged `after`.
     pub fn records_since(&self, after: u64) -> impl Iterator<Item = &IndexRecord> {
         self.records.values().filter(move |r| r.seq > after)
+    }
+
+    /// Every announced record with `seq` above `after`, in `seq` order: what
+    /// catch-up sends a peer (§7.4). For a path with a pending local change
+    /// the announced record is the one the pending set keeps, not the
+    /// current record, so a paused folder's pending set never leaks.
+    pub fn announced_since(&self, after: u64) -> Vec<&IndexRecord> {
+        let mut out: Vec<&IndexRecord> = self
+            .records
+            .iter()
+            .filter_map(|(path, record)| match self.pending.get(path) {
+                Some(announced) => announced.as_ref(),
+                None => (record.seq <= self.announced_seq).then_some(record),
+            })
+            .filter(|r| r.seq > after)
+            .collect();
+        out.sort_by_key(|r| r.seq);
+        out
     }
 
     /// Highest `seq` received from a peer, 0 if none.
@@ -954,6 +979,47 @@ mod tests {
             "restored records are not re-announced"
         );
         assert_eq!(idx.get(&p("keep")).unwrap().entry.hash, hash(1));
+    }
+
+    #[test]
+    fn announced_since_uses_the_pending_sets_announced_records() {
+        let mut idx = index();
+        idx.observe(p("a"), file(1, 1)).unwrap(); // seq 1
+        idx.observe(p("b"), file(2, 2)).unwrap(); // seq 2
+        idx.observe(p("c"), file(3, 3)).unwrap(); // seq 3
+        idx.mark_announced();
+        let b_announced = idx.get(&p("b")).unwrap().clone();
+        idx.observe_absent(&p("b"), 9).unwrap(); // seq 4, pending
+        idx.observe(p("d"), file(4, 4)).unwrap(); // seq 5, pending, never announced
+        let got: Vec<(&str, u64)> = idx
+            .announced_since(0)
+            .iter()
+            .map(|r| (r.entry.path.as_str(), r.seq))
+            .collect();
+        assert_eq!(
+            got,
+            [("a", 1), ("b", 2), ("c", 3)],
+            "b as announced, d not at all"
+        );
+        assert_eq!(idx.announced_since(0)[1], &b_announced);
+        assert_eq!(idx.announced_since(2).len(), 1);
+        assert!(idx.announced_since(3).is_empty());
+    }
+
+    #[test]
+    fn has_exact_means_live_and_equal() {
+        let mut idx = index();
+        let v = idx
+            .observe(p("a"), file(1, 1))
+            .unwrap()
+            .record
+            .entry
+            .version;
+        assert!(idx.has_exact(&p("a"), &v));
+        assert!(!idx.has_exact(&p("a"), &v.incremented(node(2))));
+        assert!(!idx.has_exact(&p("b"), &v));
+        let dead = idx.observe_absent(&p("a"), 2).unwrap().record.entry.version;
+        assert!(!idx.has_exact(&p("a"), &dead), "a tombstone serves nothing");
     }
 
     #[test]
