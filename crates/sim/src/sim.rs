@@ -739,7 +739,36 @@ impl Sim {
         ))
     }
 
+    /// I5 (§14.1): no batch that tripped the brake is applied without an
+    /// approve. Approve releases the item before admitting its entries, so
+    /// a commit whose want still names a held batch is a hole in the brake.
+    /// Versions are not the test: the merge of two sides is the same on
+    /// every machine, so a version a held batch carries can also be reached
+    /// through a batch that passed on its own apply set (§8.2 quarantines
+    /// the incoming version, not the merge, on purpose).
+    fn commits_held_item(&self, id: NodeId, action: &Action) -> Option<RelPath> {
+        let path = match action {
+            Action::Write { path, .. }
+            | Action::Remove { path, .. }
+            | Action::SetMeta { path, .. } => path,
+            _ => return None,
+        };
+        let folder = self.engine(id)?.folder(self.folder)?;
+        let want = folder.wants().get(path)?;
+        folder.quarantine().get(want.batch).map(|_| path.clone())
+    }
+
     fn act(&mut self, id: NodeId, action: Action) -> Result<(), Failure> {
+        if let Some(path) = self.commits_held_item(id, &action) {
+            return Err(self.fail(
+                "I5 brake",
+                format!(
+                    "{} committed {} from a batch that is still held",
+                    Self::short(id),
+                    path
+                ),
+            ));
+        }
         match action {
             Action::WakeAt(t) => {
                 // The engine speaks the node's skewed clock; the host keeps
@@ -887,40 +916,6 @@ impl Sim {
                 }
             },
             Action::IndexChanged { record, .. } => {
-                // I5: no held batch is applied before approve, which releases
-                // the item first. A conflict resolved against a batch that
-                // passed can produce the very version another, held batch
-                // carries (the merge of the same two sides is the same
-                // everywhere); that adoption applies nothing from the held
-                // batch, the content stays what this node had, so I5 asks
-                // whether the content changed, not only whether the version
-                // is quarantined.
-                let content_kept = self
-                    .nodes
-                    .get(&id)
-                    .and_then(|n| n.persisted.records.get(&record.entry.path))
-                    .is_some_and(|prev| prev.entry.same_content(&record.entry));
-                if record.entry.modified_by != id
-                    && !content_kept
-                    && self
-                        .engine(id)
-                        .and_then(|e| e.folder(self.folder))
-                        .is_some_and(|f| {
-                            f.quarantine()
-                                .versions_at(&record.entry.path)
-                                .contains(&record.entry.version)
-                        })
-                {
-                    return Err(self.fail(
-                        "I5 brake",
-                        format!(
-                            "{} adopted {} version {:?} while that version was quarantined",
-                            Self::short(id),
-                            record.entry.path,
-                            record.entry.version
-                        ),
-                    ));
-                }
                 if record.entry.path.file_name().contains(".conflict-")
                     && record.entry.modified_by == id
                     && !record.entry.deleted
