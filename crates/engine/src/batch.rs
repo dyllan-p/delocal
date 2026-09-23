@@ -169,8 +169,11 @@ pub enum ApplyMode {
     Fetch,
     /// No content: a directory to create or an entry to delete.
     Direct,
-    /// Same content as the local record: set mtime and exec, adopt the version.
+    /// Same content as the local file: set mtime and exec, adopt the version.
     MetadataOnly,
+    /// Same content and nothing to set on disk (a directory, a symlink or a
+    /// tombstone, none of which carry an mtime, §7.1): adopt the version only.
+    IndexOnly,
 }
 
 /// One candidate in an apply set.
@@ -225,9 +228,38 @@ impl ApplySet {
 /// How one dominating entry is applied over the local record (§7.5).
 fn mode_for(incoming: &Entry, local: Option<&Entry>) -> ApplyMode {
     match local {
-        Some(local) if local.same_content(incoming) => ApplyMode::MetadataOnly,
+        Some(local) if local.same_content(incoming) => {
+            if incoming.kind == Kind::File && !incoming.deleted {
+                ApplyMode::MetadataOnly
+            } else {
+                ApplyMode::IndexOnly
+            }
+        }
         _ if incoming.deleted || incoming.kind == Kind::Dir => ApplyMode::Direct,
         _ => ApplyMode::Fetch,
+    }
+}
+
+/// Classify one incoming entry against the index (§7.4 "receiving"):
+/// `Apply` if it dominates the local record, `Conflict` if concurrent,
+/// `None` if equal or dominated. Absent locally is the empty version.
+pub fn classify(index: &Index, incoming: &Entry) -> Option<ApplyItem> {
+    let local = index.get(&incoming.path).map(|r| &r.entry);
+    let relation = match local {
+        Some(l) => incoming.version.compare(&l.version),
+        None => Relation::Dominates,
+    };
+    match relation {
+        Relation::Dominates => Some(ApplyItem::Apply {
+            entry: incoming.clone(),
+            mode: mode_for(incoming, local),
+        }),
+        Relation::Equal | Relation::Dominated => None,
+        // `local` is Some here: the empty version is never concurrent.
+        Relation::Concurrent => local.map(|l| ApplyItem::Conflict {
+            incoming: incoming.clone(),
+            local: l.clone(),
+        }),
     }
 }
 
@@ -245,29 +277,10 @@ pub fn apply_set(index: &Index, batch: &Batch) -> ApplySet {
     }
     let mut items = Vec::new();
     let mut ignored = 0;
-    for (path, incoming) in last_by_path {
-        let local = index.get(path).map(|r| &r.entry);
-        let local_version = local.map(|e| &e.version);
-        let relation = match local_version {
-            Some(v) => incoming.version.compare(v),
-            None => Relation::Dominates,
-        };
-        match relation {
-            Relation::Dominates => items.push(ApplyItem::Apply {
-                entry: incoming.clone(),
-                mode: mode_for(incoming, local),
-            }),
-            Relation::Equal | Relation::Dominated => ignored += 1,
-            Relation::Concurrent => {
-                // `local` is Some here: an absent record is the empty version,
-                // which is never concurrent with anything.
-                if let Some(local) = local {
-                    items.push(ApplyItem::Conflict {
-                        incoming: incoming.clone(),
-                        local: local.clone(),
-                    });
-                }
-            }
+    for incoming in last_by_path.into_values() {
+        match classify(index, incoming) {
+            Some(item) => items.push(item),
+            None => ignored += 1,
         }
     }
     // BTreeMap iteration already gave path order; keep it explicit.
@@ -548,21 +561,26 @@ mod tests {
     }
 
     #[test]
-    fn two_tombstones_are_metadata_only() {
+    fn same_content_without_an_mtime_is_index_only() {
         let mut idx = index(1);
         idx.observe(p("a"), file(1, 1)).unwrap();
         let tomb = idx.observe_absent(&p("a"), 2).unwrap().record.entry;
         let mut incoming = tomb.clone();
         incoming.version = tomb.version.incremented(node(2));
         incoming.modified_by = node(2);
-        let set = apply_set(&idx, &batch_of(vec![incoming], 1));
-        assert!(matches!(
-            set.items[0],
-            ApplyItem::Apply {
-                mode: ApplyMode::MetadataOnly,
-                ..
-            }
-        ));
+        idx.observe(p("d"), dir()).unwrap();
+        let mut newer_dir = idx.get(&p("d")).unwrap().entry.clone();
+        newer_dir.version = newer_dir.version.incremented(node(2));
+        let set = apply_set(&idx, &batch_of(vec![incoming, newer_dir], 2));
+        let modes: Vec<_> = set
+            .items
+            .iter()
+            .map(|i| match i {
+                ApplyItem::Apply { mode, .. } => *mode,
+                ApplyItem::Conflict { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(modes, [ApplyMode::IndexOnly, ApplyMode::IndexOnly]);
     }
 
     #[test]
@@ -712,7 +730,11 @@ mod tests {
                                 match item {
                                     Some(ApplyItem::Apply { mode, .. }) => {
                                         let want = if r.entry.same_content(incoming) {
-                                            ApplyMode::MetadataOnly
+                                            if incoming.kind == Kind::File && !incoming.deleted {
+                                                ApplyMode::MetadataOnly
+                                            } else {
+                                                ApplyMode::IndexOnly
+                                            }
                                         } else if incoming.deleted || incoming.kind == Kind::Dir {
                                             ApplyMode::Direct
                                         } else {

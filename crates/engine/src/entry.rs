@@ -42,6 +42,7 @@ pub struct Observed {
     /// Bytes for files, target length for symlinks, 0 for directories.
     pub size: u64,
     /// Nanoseconds since the Unix epoch, as the filesystem reports it.
+    /// Files only; 0 for directories and symlinks (§7.1).
     pub mtime_ns: i64,
     /// The executable bit, files only.
     pub exec: bool,
@@ -51,16 +52,23 @@ pub struct Observed {
 
 impl Observed {
     /// Apply the §7.1 field rules for the kind: directories have no size,
-    /// hash or exec bit; symlinks have no exec bit. The host should already
-    /// report them this way; this makes it impossible to depend on it.
+    /// hash, exec bit or mtime; symlinks have no exec bit or mtime. A
+    /// directory's mtime changes whenever a child is created or removed, so
+    /// syncing it would turn every file change into a directory touch on
+    /// every machine, forever. The host should already report them this
+    /// way; this makes it impossible to depend on it.
     pub fn normalised(mut self) -> Self {
         match self.kind {
             Kind::Dir => {
                 self.size = 0;
                 self.hash = ContentHash::EMPTY;
                 self.exec = false;
+                self.mtime_ns = 0;
             }
-            Kind::Symlink => self.exec = false,
+            Kind::Symlink => {
+                self.exec = false;
+                self.mtime_ns = 0;
+            }
             Kind::File => {}
         }
         self
@@ -74,6 +82,8 @@ pub struct Entry {
     pub path: RelPath,
     pub kind: Kind,
     pub size: u64,
+    /// Files only; 0 for directories and symlinks (§7.1). For a tombstone,
+    /// when the deletion was observed.
     pub mtime_ns: i64,
     pub exec: bool,
     /// Content hash; [`ContentHash::EMPTY`] for directories and tombstones.
@@ -194,7 +204,8 @@ mod tests {
         .normalised();
         assert_eq!(
             (dir.size, dir.hash, dir.exec, dir.mtime_ns),
-            (0, ContentHash::EMPTY, false, 5)
+            (0, ContentHash::EMPTY, false, 0),
+            "directories carry no mtime"
         );
         let link = Observed {
             kind: Kind::Symlink,
@@ -204,7 +215,11 @@ mod tests {
             hash: hash(9),
         }
         .normalised();
-        assert_eq!((link.size, link.hash, link.exec), (7, hash(9), false));
+        assert_eq!(
+            (link.size, link.hash, link.exec, link.mtime_ns),
+            (7, hash(9), false, 0),
+            "symlinks carry no mtime"
+        );
         let file = Observed {
             kind: Kind::File,
             size: 7,
