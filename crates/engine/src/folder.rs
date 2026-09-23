@@ -302,9 +302,14 @@ pub enum HostStep {
         expected: Option<Expected>,
         displace: Displace,
     },
+    /// Delete as one operation: check `expected`, move the file aside,
+    /// report. `displace` says where it goes: the trash, or the conflict-copy
+    /// path when the removed file is the losing content of a conflict a
+    /// tombstone won (§7.6).
     Remove {
         path: RelPath,
         expected: Option<Expected>,
+        displace: Displace,
     },
     SetMeta {
         path: RelPath,
@@ -1318,7 +1323,14 @@ impl FolderState {
                             mtime_ns: want.entry.mtime_ns,
                             exec: want.entry.exec,
                         },
-                        _ if want.entry.deleted => HostStep::Remove { path, expected },
+                        _ if want.entry.deleted => HostStep::Remove {
+                            path,
+                            expected,
+                            displace: match &want.conflict {
+                                Some(copy) => Displace::ConflictCopy(copy.path.clone()),
+                                None => Displace::Trash,
+                            },
+                        },
                         _ => HostStep::Write {
                             path,
                             displace: match &want.conflict {
@@ -2775,7 +2787,7 @@ mod tests {
             matches!(&steps[3], HostStep::SetMeta { path, mtime_ns: 9, exec: false } if path == &p("f01"))
         );
         assert!(
-            matches!(&steps[4], HostStep::Remove { path, expected: Some(Expected { kind: Kind::File, size: 10, mtime_ns: 1 }) } if path == &p("f02"))
+            matches!(&steps[4], HostStep::Remove { path, expected: Some(Expected { kind: Kind::File, size: 10, mtime_ns: 1 }), displace: Displace::Trash } if path == &p("f02"))
         );
         assert_eq!(
             b.wants().get(&p("d/new")).unwrap().state,

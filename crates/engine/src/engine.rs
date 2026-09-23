@@ -209,6 +209,9 @@ pub enum Action {
         folder: FolderId,
         path: RelPath,
         expected: Option<Expected>,
+        /// Trash, or the conflict-copy path when the removed file is the
+        /// losing content of a conflict a tombstone won (§7.6).
+        displace: Displace,
     },
     /// Metadata-only apply (§7.5): set mtime and exec, no transfer.
     SetMeta {
@@ -589,10 +592,15 @@ impl Engine {
                         expected,
                         displace,
                     },
-                    HostStep::Remove { path, expected } => Action::Remove {
+                    HostStep::Remove {
+                        path,
+                        expected,
+                        displace,
+                    } => Action::Remove {
                         folder: folder_id,
                         path,
                         expected,
+                        displace,
                     },
                     HostStep::SetMeta {
                         path,
