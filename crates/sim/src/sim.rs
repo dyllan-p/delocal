@@ -1410,6 +1410,31 @@ impl Sim {
                     let gap = self.rng.random_range(NANOS..60 * NANOS);
                     return self.crash(node, gap);
                 }
+                // I8: a commit is reported only for a want whose version
+                // still dominates the record at its path. The engine adopts
+                // what the host committed; if the record moved on meanwhile
+                // (this node wrote its own conflict copy at the path while
+                // fetching a peer's, say), adopting would overwrite a local
+                // write the peers never saw. The engine asserts this in debug
+                // builds; the check here is what the release sweep and the
+                // shrinker see.
+                if outcome == ApplyOutcome::Ok
+                    && let Some(f) = self.engine(node).and_then(|e| e.folder(self.folder))
+                    && let Some(want) = f.wants().get(&path)
+                    && let Some(record) = f.index().get(&path)
+                    && !want.version().dominates_or_equals(&record.entry.version)
+                {
+                    return Err(self.fail(
+                        "I8 adopt dominance",
+                        format!(
+                            "{}: commit of {} at {:?} reported while the record there is {:?}",
+                            Self::short(node),
+                            path,
+                            want.version(),
+                            record.entry.version
+                        ),
+                    ));
+                }
                 self.feed(
                     node,
                     Event::Applied {

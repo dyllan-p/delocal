@@ -153,11 +153,21 @@ fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
     Ok(())
 }
 
-/// I2: sync never loses content. Every content a node adopted through
-/// sync is still in that node's folder or trash at the end, unless the
-/// node's own user edited or deleted the path afterwards, which §8.6 does
-/// not protect. (Announced content the author overwrote before anyone
-/// fetched it is likewise unprotected by design.)
+/// I2: sync never loses content (§14.1). As implemented:
+///
+/// - An **adoption** is an `IndexChanged` on node N whose record is live,
+///   not a directory, and authored by another node, except the records a
+///   `revert` puts back (§8.3), which are an index reset to what peers hold
+///   and land no content. The simulator records (hash, path, time) for each.
+/// - At the end of the run, for every adoption on N, the hash must be
+///   present in N's folder (any path, files and symlinks by content hash)
+///   or in N's trash (the hashes of everything sync moved aside).
+/// - **Exemption:** N's own user edited, deleted or created the path after
+///   the adoption (the simulator's `local_edit_at`), which §8.6 does not
+///   protect; a user's `rm` does not go through sync's trash.
+///
+/// Content a node announced but nobody fetched before the author replaced
+/// it is not an adoption anywhere and so is not covered, by design.
 fn i2_no_loss(sim: &Sim) -> Result<(), Failure> {
     let _ = sim.announced(); // kept for statistics
     for id in sim.node_ids() {
