@@ -38,8 +38,10 @@
 //! and the record in kind, size, mtime, exec or hash. An mtime-only change
 //! (`touch`) is a change with `hash == prev_hash` (§7.3): receivers apply it
 //! as metadata only (§7.5), the brake ignores it (§8.1), and it loses to
-//! any real edit in a conflict (§7.6). No tolerance is applied to the
-//! size-and-mtime fast path; the mtime precision shim is host work (§7.3).
+//! any real edit in a conflict (§7.6). The scanner's fast path (kind, size,
+//! mtime and exec bit, [`Entry::unchanged_by_stat`]) is the host's to apply
+//! before it reports; no tolerance is applied to mtime here, the precision
+//! shim being host work too (§7.3).
 
 use std::collections::BTreeMap;
 
