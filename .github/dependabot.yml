@@ -1,0 +1,13 @@
+# Weekly dependency update PRs for Cargo crates and the GitHub Actions the
+# workflows pin by commit SHA. Dependabot updates the SHA and the trailing
+# version comment together.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
