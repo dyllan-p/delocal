@@ -512,22 +512,29 @@ impl Index {
     /// Called only after the host reports the commit, never on accept.
     ///
     /// The adopted version must dominate or equal what the record holds;
-    /// the engine only applies versions that do. Checked in debug builds
-    /// so the simulator catches the first time it is not.
-    pub fn adopt(&mut self, entry: Entry) -> &IndexRecord {
+    /// the engine only applies versions that do. Asserted in debug builds so
+    /// the simulator catches the first time it is not; in release the adopt
+    /// is refused (`None`) rather than overwriting a record peers may never
+    /// have seen, and the caller keeps the entry for re-classification.
+    pub fn adopt(&mut self, entry: Entry) -> Option<&IndexRecord> {
+        let dominates = self
+            .records
+            .get(&entry.path)
+            .is_none_or(|r| entry.version.dominates_or_equals(&r.entry.version));
         debug_assert!(
-            self.records
-                .get(&entry.path)
-                .is_none_or(|r| entry.version.dominates_or_equals(&r.entry.version)),
+            dominates,
             "adopting a version that does not dominate the record at {}",
             entry.path
         );
+        if !dominates {
+            return None;
+        }
         let seq = self.next_seq();
         let path = entry.path.clone();
         self.pending.remove(&path);
         self.records
             .insert(path.clone(), IndexRecord { entry, seq });
-        &self.records[&path]
+        self.records.get(&path)
     }
 
     /// Record a local change. If the path has no pending change yet, the
@@ -865,7 +872,7 @@ mod tests {
         let mut idx = index();
         idx.observe(p("a.txt"), file(1, 100)).unwrap();
         let entry = remote("b.txt", 9, Version::empty().incremented(node(2)));
-        let record = idx.adopt(entry.clone()).clone();
+        let record = idx.adopt(entry.clone()).unwrap().clone();
         assert_eq!(record.entry, entry);
         assert_eq!(record.seq, 2);
         assert_eq!(idx.get(&p("b.txt")), Some(&record));

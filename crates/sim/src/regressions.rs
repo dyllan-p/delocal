@@ -2617,3 +2617,45 @@ fn a_deny_ranks_above_every_version_it_dominates() {
         ],
     );
 }
+
+/// Two holders of the same losing version each displaced it to the same
+/// conflict-copy path. One wanted the other's copy and was fetching it when
+/// its own commit wrote its copy record at that path; the fetch then landed
+/// over that record with a version that did not dominate it (I8). Every
+/// index write now re-classifies the wants at its path, so the want meets
+/// the node's own copy as an identical-content merge.
+#[test]
+fn a_want_for_a_peers_conflict_copy_meets_our_own_copy_as_a_merge() {
+    passes(
+        17,
+        &[
+            Step::Rename {
+                node: 5,
+                from: 3,
+                to: 6,
+            },
+            Step::Settle { secs: 13 },
+            Step::Create {
+                node: 4,
+                path: 0,
+                content: 5,
+            },
+            Step::MassDelete {
+                node: 1,
+                fraction: 52,
+            },
+            Step::Settle { secs: 18 },
+            Step::Touch { node: 7, path: 1 },
+            Step::Crash {
+                node: 3,
+                gap_secs: 13,
+            },
+            Step::Touch { node: 1, path: 9 },
+            Step::Heal { a: 4, b: 1 },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![Some(5), Some(4), Some(2), Some(2), Some(2)],
+            },
+        ],
+    );
+}
