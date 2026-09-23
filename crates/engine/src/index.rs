@@ -148,11 +148,33 @@ impl Index {
         self.records.get(path)
     }
 
-    /// True if this machine holds exactly `version` at `path` as a live
-    /// entry, so it can serve a `RequestFile` for it (§7.5 step 3). The
-    /// host answers `NotAvailable` otherwise.
-    pub fn has_exact(&self, path: &RelPath, version: &Version) -> bool {
-        self.live(path).is_some_and(|r| &r.entry.version == version)
+    /// Where this machine may serve `hash` from, for a `RequestFile` at
+    /// `path` (§7.5 steps 2 and 3): the record at `path` first if it is live
+    /// with that hash, then every other live file or symlink with that hash
+    /// in path order. Content is requested by hash, not by version, so a
+    /// holder of the winning side serves a merged version it has not seen,
+    /// and any concurrent holder of the same bytes serves them. Several
+    /// candidates rather than one because the disk must still match the
+    /// record (size and mtime), which only the host can check; it takes the
+    /// first that does and answers `NotAvailable` if none does. Directories
+    /// and tombstones carry [`ContentHash::EMPTY`] and serve nothing.
+    pub fn locate<'a>(
+        &'a self,
+        path: &'a RelPath,
+        hash: &'a ContentHash,
+    ) -> impl Iterator<Item = &'a RelPath> + 'a {
+        let holds = move |r: &&'a IndexRecord| {
+            !r.entry.deleted && r.entry.kind != Kind::Dir && r.entry.hash == *hash
+        };
+        let here = self.records.get(path).filter(holds).map(|r| &r.entry.path);
+        let elsewhere = self
+            .records
+            .values()
+            .filter(holds)
+            .filter(move |r| r.entry.path != *path)
+            .map(|r| &r.entry.path);
+        let any = *hash != ContentHash::EMPTY;
+        here.into_iter().chain(elsewhere).filter(move |_| any)
     }
 
     /// The live (non-deleted) entry at a path.
@@ -1007,19 +1029,34 @@ mod tests {
     }
 
     #[test]
-    fn has_exact_means_live_and_equal() {
+    fn locate_prefers_the_path_then_any_live_holder_of_the_hash() {
         let mut idx = index();
-        let v = idx
-            .observe(p("a"), file(1, 1))
-            .unwrap()
-            .record
-            .entry
-            .version;
-        assert!(idx.has_exact(&p("a"), &v));
-        assert!(!idx.has_exact(&p("a"), &v.incremented(node(2))));
-        assert!(!idx.has_exact(&p("b"), &v));
-        let dead = idx.observe_absent(&p("a"), 2).unwrap().record.entry.version;
-        assert!(!idx.has_exact(&p("a"), &dead), "a tombstone serves nothing");
+        idx.observe(p("a"), file(1, 1));
+        idx.observe(p("b"), file(1, 1));
+        idx.observe(p("c"), file(2, 1));
+        idx.observe(
+            p("d"),
+            Observed {
+                kind: Kind::Dir,
+                ..file(1, 1)
+            }
+            .normalised(),
+        );
+        fn at(idx: &Index, path: &str, h: u8) -> Vec<String> {
+            idx.locate(&p(path), &hash(h))
+                .map(|r| r.as_str().to_owned())
+                .collect()
+        }
+        assert_eq!(at(&idx, "b", 1), ["b", "a"], "the requested path first");
+        assert_eq!(at(&idx, "c", 1), ["a", "b"], "content elsewhere serves too");
+        assert_eq!(at(&idx, "a", 2), ["c"]);
+        assert_eq!(at(&idx, "a", 3), Vec::<String>::new(), "nobody has it");
+        assert!(
+            at(&idx, "d", 0).is_empty(),
+            "a directory's hash serves nothing"
+        );
+        idx.observe_absent(&p("a"), 2);
+        assert_eq!(at(&idx, "a", 1), ["b"], "a tombstone serves nothing");
     }
 
     #[test]
