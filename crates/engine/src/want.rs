@@ -316,6 +316,17 @@ impl WantList {
         self.note(&path);
     }
 
+    /// The process restarted: every transient state is *wanted* again, the
+    /// host's operations having died with it.
+    pub fn restarted(&mut self) {
+        let paths: Vec<RelPath> = self.wants.keys().cloned().collect();
+        for path in paths {
+            if let Some(w) = self.wants.remove(&path) {
+                self.restore(w);
+            }
+        }
+    }
+
     /// Drop the want at `path` (committed, superseded or cancelled).
     pub fn remove(&mut self, path: &RelPath) -> Option<Want> {
         let want = self.wants.remove(path);
