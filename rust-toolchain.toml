@@ -1,0 +1,12 @@
+# Pinned to an exact version, not a channel: CI denies clippy warnings, so a
+# floating "stable" would break CI on Rust release days for reasons unrelated
+# to our code. Bump deliberately, in its own commit, roughly every six weeks.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = [
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+]
