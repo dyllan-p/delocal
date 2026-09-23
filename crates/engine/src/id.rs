@@ -209,6 +209,19 @@ bytes_newtype! {
     BatchId, ID_LEN
 }
 
+impl BatchId {
+    /// The `n`th successor of this ID: the 16 bytes read as a big-endian
+    /// 128-bit integer plus `n`, wrapping.
+    ///
+    /// One `Tick` carries one fresh ID from the host, but a tick can form
+    /// several batches (several folders, or a split at 10,000 entries).
+    /// The base is random, so successors of it collide with nothing else
+    /// in practice, and randomness still enters the engine in one place.
+    pub const fn successor(self, n: u128) -> Self {
+        Self(u128::from_be_bytes(self.0).wrapping_add(n).to_be_bytes())
+    }
+}
+
 /// Why a string is not a valid [`HostName`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostNameError {
@@ -405,6 +418,24 @@ mod tests {
         assert!(serde_json::from_str::<NodeId>("\"0011\"").is_err());
         assert!(serde_json::from_str::<NodeId>("\"zz112233445566778899aabbccddeeff\"").is_err());
         assert!(serde_json::from_str::<NodeId>("[1, 2, 3]").is_err());
+    }
+
+    #[test]
+    fn batch_id_successors_are_distinct_and_ordered() {
+        let base = BatchId::from_bytes(sample());
+        assert_eq!(base.successor(0), base);
+        let s1 = base.successor(1);
+        let s2 = base.successor(2);
+        assert!(base < s1 && s1 < s2);
+        assert_eq!(
+            s1.as_bytes()[15],
+            0x00,
+            "0xff + 1 carries into the next byte"
+        );
+        assert_eq!(s1.as_bytes()[14], 0xef);
+        assert_eq!(s1.successor(1), s2);
+        let top = BatchId::from_bytes([0xff; ID_LEN]);
+        assert_eq!(top.successor(1), BatchId::from_bytes([0; ID_LEN]), "wraps");
     }
 
     #[test]
