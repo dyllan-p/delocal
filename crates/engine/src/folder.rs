@@ -283,10 +283,15 @@ impl FolderState {
             .map(|r| r.entry.path.clone())
             .filter(|p| !seen.contains(p))
             .collect();
-        let changes: Vec<LocalChange> = gone
-            .iter()
-            .filter_map(|p| self.index.observe_absent(p, now.as_unix_nanos()))
-            .collect();
+        let mut changes = Vec::new();
+        for path in &gone {
+            if let Some(change) = self.index.observe_absent(path, now.as_unix_nanos()) {
+                changes.push(change);
+            }
+            // A deferred entry whose file vanished underneath is only ever
+            // caught here: later scans never report a tombstoned path.
+            self.reconsider(path);
+        }
         if !changes.is_empty() {
             self.touched(now);
         }
@@ -639,6 +644,59 @@ mod tests {
             ApplyItem::Conflict { incoming, local } => {
                 assert_eq!(incoming, &entry);
                 assert_eq!(local.hash, hash(9));
+                assert_eq!(local.modified_by, node(2));
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deferred_entry_whose_path_vanishes_in_a_scan_bracket_becomes_a_conflict() {
+        // B creates x and announces it; A adopts it, edits it and announces
+        // the edit, which dominates B's version.
+        let mut b = FolderState::new(
+            FolderId::from_bytes([7; 16]),
+            Rules::default(),
+            [node(1), node(2)],
+            node(2),
+            HostName::new("desktop").unwrap(),
+        );
+        let b_entry = b
+            .scanned(t(0.5), p("x"), file(5, 5))
+            .change
+            .unwrap()
+            .record
+            .entry;
+        b.form_batches(t(2.5), batch_id().successor(1));
+        let mut a = folder();
+        a.adopt(t(3.0), b_entry);
+        a.scanned(t(3.5), p("x"), file(1, 1));
+        let batch = a.form_batches(t(5.5), batch_id()).remove(0);
+
+        let set = b.receive(&batch);
+        let entry = set.items[0].incoming().clone();
+        assert!(matches!(set.items[0], ApplyItem::Apply { .. }));
+        // The user edited x meanwhile, so the commit finds it changed.
+        b.applied(
+            t(6.0),
+            &entry.path,
+            &entry.version,
+            ApplyOutcome::ChangedUnderneath,
+        );
+        assert_eq!(b.deferred().count(), 1);
+
+        // Then the user deleted x. The watcher missed it; only the full scan
+        // notices, and a scan never reports a path that is gone.
+        b.scan_started();
+        let changes = b.scan_finished(t(7.0)).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(changes[0].record.entry.deleted);
+        assert!(b.deferred().next().is_none(), "not stuck");
+        assert_eq!(b.accepted().len(), 1);
+        match &b.accepted()[0].items[0] {
+            ApplyItem::Conflict { incoming, local } => {
+                assert_eq!(incoming, &entry);
+                assert!(local.deleted, "delete vs modify, for §7.6 to resolve");
                 assert_eq!(local.modified_by, node(2));
             }
             other => panic!("expected a conflict, got {other:?}"),
