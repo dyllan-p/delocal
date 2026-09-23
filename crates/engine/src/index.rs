@@ -3,25 +3,42 @@
 //!
 //! One [`Index`] per folder per machine. It holds one [`IndexRecord`] per
 //! path the machine knows about, deleted ones included, plus this machine's
-//! `seq` counter and the highest `seq` seen from each peer. Persistence is
-//! the host's job (Phase 2, SQLite); the engine reports every mutation.
+//! `seq` counter, the highest `seq` seen from each peer, and the set of
+//! local changes not yet announced. Persistence is the host's job (Phase 2,
+//! SQLite); the engine reports every mutation.
 //!
 //! Two ways a record changes:
 //!
 //! - **Local change** ([`Index::observe`], [`Index::observe_absent`]): the
 //!   scanner saw something different from the record. The new version is
 //!   `incremented(self)` on the entry's current vector (§7.2), `modified_by`
-//!   and `author_host` are this machine's, and `seq` advances.
+//!   and `author_host` are this machine's, `prev_hash` is the hash of the
+//!   last version peers could have seen (below), and `seq` advances. The
+//!   path joins the pending set until [`Index::mark_announced`].
 //! - **Adopt** ([`Index::adopt`]): a remote version has been committed to
 //!   disk, or a tombstone applied, and the record takes it over as is,
 //!   with a new `seq`. Never called on accept, only after the host reports
-//!   the commit (§7.1, "when `seq` advances").
+//!   the commit (§7.1, "when `seq` advances"). This is the only way a
+//!   received version enters the index: there is no slot for an
+//!   accepted-but-unapplied version.
+//!
+//! **`prev_hash` and coalescing.** `prev_hash` is the hash of the version
+//! this change replaced *as peers last saw it* (§7.1). For a path with no
+//! pending change that is the current record's hash. For a path that
+//! already has a pending (unannounced) change, it is the pending record's
+//! own `prev_hash`, so several changes inside one batch window collapse to
+//! one step from the last announced version. The change's kind is derived
+//! the same way, from whether peers last saw a live entry and whether one
+//! is there now: an add then a modify is still an add, a delete then a
+//! re-creation is a modify, an add then a delete is a delete of something
+//! peers never had (a tombstone with `hash == prev_hash == EMPTY`).
 //!
 //! What counts as a local change: any difference between the observation
 //! and the record in kind, size, mtime, exec or hash. An mtime-only change
-//! (`touch`) is a change with unchanged content; receivers apply it as
-//! metadata only (§7.5), so it is cheap, and it keeps every machine's mtime
-//! identical, which the conflict tie-break relies on (§7.6).
+//! (`touch`) is a change with `hash == prev_hash` (§7.3): receivers apply it
+//! as metadata only (§7.5), the brake ignores it (§8.1), and it loses to
+//! any real edit in a conflict (§7.6). No tolerance is applied to the
+//! size-and-mtime fast path; the mtime precision shim is host work (§7.3).
 
 use std::collections::BTreeMap;
 
@@ -41,8 +58,8 @@ pub struct IndexRecord {
     pub seq: u64,
 }
 
-/// How a local change relates to what the index held before (§7.4 summary
-/// counts, §8.1 brake).
+/// How a pending local change relates to the last version peers saw (§7.4
+/// summary counts, §8.1 brake).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ChangeKind {
     /// Nothing was there, or a tombstone was. Adds do not count toward H1.
@@ -53,9 +70,21 @@ pub enum ChangeKind {
     Delete,
 }
 
+impl ChangeKind {
+    /// The step from what peers last saw to what is there now.
+    fn between(announced_live: bool, now_live: bool) -> Self {
+        match (announced_live, now_live) {
+            (false, true) => Self::Add,
+            (true, true) => Self::Modify,
+            (_, false) => Self::Delete,
+        }
+    }
+}
+
 /// A local change the index has recorded and the engine will batch (§7.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalChange {
+    /// The step from what peers last saw to the new record (module docs).
     pub kind: ChangeKind,
     pub record: IndexRecord,
 }
@@ -70,6 +99,9 @@ pub struct Index {
     seq: u64,
     /// Highest `seq` received from each remote member (§7.1, §7.4 catch-up).
     peer_seq: BTreeMap<NodeId, u64>,
+    /// Local changes not yet announced. The value is whether peers last saw
+    /// a live entry at the path, which fixes the change's kind.
+    pending: BTreeMap<RelPath, bool>,
 }
 
 impl Index {
@@ -81,6 +113,7 @@ impl Index {
             records: BTreeMap::new(),
             seq: 0,
             peer_seq: BTreeMap::new(),
+            pending: BTreeMap::new(),
         }
     }
 
@@ -148,9 +181,41 @@ impl Index {
         *slot = (*slot).max(seq);
     }
 
+    /// Local changes not yet announced, in path order, with the coalesced
+    /// kind of each. Batch formation (§7.4) reads this.
+    pub fn pending(&self) -> impl Iterator<Item = (&IndexRecord, ChangeKind)> {
+        self.pending.iter().filter_map(|(path, announced_live)| {
+            self.records
+                .get(path)
+                .map(|r| (r, ChangeKind::between(*announced_live, !r.entry.deleted)))
+        })
+    }
+
+    /// Number of paths with an unannounced local change.
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Every pending change has been announced (the batch was sent). Later
+    /// changes to those paths start a new step from the announced version.
+    pub fn mark_announced(&mut self) {
+        self.pending.clear();
+    }
+
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
+    }
+
+    /// The hash of the last version of `path` that peers could have seen:
+    /// the pending change's `prev_hash` if there is one, else the current
+    /// record's hash, else `EMPTY`.
+    fn announced_hash(&self, path: &RelPath) -> ContentHash {
+        match self.records.get(path) {
+            None => ContentHash::EMPTY,
+            Some(r) if self.pending.contains_key(path) => r.entry.prev_hash,
+            Some(r) => r.entry.hash,
+        }
     }
 
     /// The scanner saw `observed` at `path` (§7.3). Returns the local change
@@ -162,14 +227,14 @@ impl Index {
     pub fn observe(&mut self, path: RelPath, observed: Observed) -> Option<LocalChange> {
         let observed = observed.normalised();
         let previous = self.records.get(&path);
-        let kind = match previous {
+        let previous_live = match previous {
             Some(r) if !r.entry.deleted => {
                 if r.entry.observed() == observed {
                     return None;
                 }
-                ChangeKind::Modify
+                true
             }
-            _ => ChangeKind::Add,
+            _ => false,
         };
         let version = previous
             .map(|r| r.entry.version.clone())
@@ -182,12 +247,13 @@ impl Index {
             mtime_ns: observed.mtime_ns,
             exec: observed.exec,
             hash: observed.hash,
+            prev_hash: self.announced_hash(&path),
             version,
             deleted: false,
             modified_by: self.own,
             author_host: self.host.clone(),
         };
-        Some(self.write(kind, entry))
+        Some(self.write(previous_live, entry))
     }
 
     /// The scanner found nothing at `path`. If a live entry was there, it
@@ -201,12 +267,13 @@ impl Index {
             mtime_ns: at_ns,
             exec: false,
             hash: ContentHash::EMPTY,
+            prev_hash: self.announced_hash(path),
             version: previous.entry.version.incremented(self.own),
             deleted: true,
             modified_by: self.own,
             author_host: self.host.clone(),
         };
-        Some(self.write(ChangeKind::Delete, entry))
+        Some(self.write(true, entry))
     }
 
     /// A remote entry has been committed to disk (or a remote tombstone
@@ -215,22 +282,25 @@ impl Index {
     pub fn adopt(&mut self, entry: Entry) -> &IndexRecord {
         let seq = self.next_seq();
         let path = entry.path.clone();
+        self.pending.remove(&path);
         self.records
             .insert(path.clone(), IndexRecord { entry, seq });
         &self.records[&path]
     }
 
-    fn write(&mut self, kind: ChangeKind, entry: Entry) -> LocalChange {
+    /// Record a local change. `previous_live` says whether a live entry was
+    /// at the path just before; if the path already has a pending change,
+    /// what peers last saw is kept from that instead.
+    fn write(&mut self, previous_live: bool, entry: Entry) -> LocalChange {
         let seq = self.next_seq();
+        let path = entry.path.clone();
+        let announced_live = *self.pending.entry(path.clone()).or_insert(previous_live);
+        let kind = ChangeKind::between(announced_live, !entry.deleted);
         let record = IndexRecord { entry, seq };
-        self.records
-            .insert(record.entry.path.clone(), record.clone());
+        self.records.insert(path, record.clone());
         LocalChange { kind, record }
     }
-}
 
-/// Convenience for building a [`Version`] that only this machine has touched.
-impl Index {
     /// The version a brand-new local entry gets: `{own: 1}`.
     pub fn first_version(&self) -> Version {
         Version::empty().incremented(self.own)
@@ -251,9 +321,11 @@ mod tests {
         NodeId::from_bytes(b)
     }
 
+    /// Never `EMPTY`, whatever `i` is: real content always has a real hash.
     fn hash(i: u8) -> ContentHash {
         let mut b = [0u8; 32];
         b[0] = i;
+        b[31] = 1;
         ContentHash::from_bytes(b)
     }
 
@@ -276,7 +348,7 @@ mod tests {
     }
 
     #[test]
-    fn first_observation_is_an_add_with_version_one() {
+    fn first_observation_is_an_add_with_version_one_and_empty_prev_hash() {
         let mut idx = index();
         let change = idx.observe(p("a.txt"), file(1, 100)).unwrap();
         assert_eq!(change.kind, ChangeKind::Add);
@@ -284,9 +356,12 @@ mod tests {
         assert_eq!(change.record.entry.version, idx.first_version());
         assert_eq!(change.record.entry.modified_by, node(1));
         assert_eq!(change.record.entry.author_host.as_str(), "laptop");
+        assert_eq!(change.record.entry.prev_hash, ContentHash::EMPTY);
+        assert!(!change.record.entry.is_metadata_only());
         assert!(!change.record.entry.deleted);
         assert_eq!(idx.tracked_count(), 1);
         assert_eq!(idx.seq(), 1);
+        assert_eq!(idx.pending_count(), 1);
     }
 
     #[test]
@@ -298,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn content_change_is_a_modify_that_dominates() {
+    fn content_change_is_a_modify_that_dominates_with_prev_hash() {
         let mut idx = index();
         let v1 = idx
             .observe(p("a.txt"), file(1, 100))
@@ -306,6 +381,7 @@ mod tests {
             .record
             .entry
             .version;
+        idx.mark_announced();
         let change = idx.observe(p("a.txt"), file(2, 200)).unwrap();
         assert_eq!(change.kind, ChangeKind::Modify);
         assert_eq!(change.record.seq, 2);
@@ -314,21 +390,89 @@ mod tests {
             Relation::Dominates
         );
         assert_eq!(change.record.entry.version.counter(node(1)), 2);
+        assert_eq!(change.record.entry.prev_hash, hash(1));
+        assert!(!change.record.entry.is_metadata_only());
     }
 
     #[test]
-    fn mtime_only_change_is_still_a_modify() {
+    fn touch_is_a_modify_with_hash_equal_to_prev_hash() {
         let mut idx = index();
         idx.observe(p("a.txt"), file(1, 100)).unwrap();
+        idx.mark_announced();
         let change = idx.observe(p("a.txt"), file(1, 101)).unwrap();
         assert_eq!(change.kind, ChangeKind::Modify);
         assert_eq!(change.record.entry.hash, hash(1));
+        assert_eq!(change.record.entry.prev_hash, hash(1));
+        assert!(change.record.entry.is_metadata_only());
+    }
+
+    #[test]
+    fn changes_within_one_window_coalesce_to_one_step() {
+        let mut idx = index();
+        idx.observe(p("a.txt"), file(1, 100)).unwrap();
+        idx.mark_announced();
+        // Three edits before the batch goes out.
+        let c2 = idx.observe(p("a.txt"), file(2, 200)).unwrap();
+        let c3 = idx.observe(p("a.txt"), file(3, 300)).unwrap();
+        let c4 = idx.observe(p("a.txt"), file(1, 400)).unwrap();
+        for c in [&c2, &c3, &c4] {
+            assert_eq!(
+                c.record.entry.prev_hash,
+                hash(1),
+                "always the announced hash"
+            );
+            assert_eq!(c.kind, ChangeKind::Modify);
+        }
+        assert!(
+            c4.record.entry.is_metadata_only(),
+            "edited back to the announced content: peers see a touch"
+        );
+        assert_eq!(idx.pending_count(), 1);
+        assert_eq!(idx.seq(), 4);
+    }
+
+    #[test]
+    fn add_then_modify_in_one_window_is_an_add() {
+        let mut idx = index();
+        idx.observe(p("n"), file(1, 1)).unwrap();
+        let c = idx.observe(p("n"), file(2, 2)).unwrap();
+        assert_eq!(c.kind, ChangeKind::Add);
+        assert_eq!(c.record.entry.prev_hash, ContentHash::EMPTY);
+        assert_eq!(
+            idx.pending().map(|(_, k)| k).collect::<Vec<_>>(),
+            [ChangeKind::Add]
+        );
+    }
+
+    #[test]
+    fn add_then_delete_in_one_window_is_an_invisible_tombstone() {
+        let mut idx = index();
+        idx.observe(p("n"), file(1, 1)).unwrap();
+        let c = idx.observe_absent(&p("n"), 2).unwrap();
+        assert_eq!(c.kind, ChangeKind::Delete);
+        assert!(c.record.entry.deleted);
+        assert_eq!(c.record.entry.prev_hash, ContentHash::EMPTY);
+        assert!(c.record.entry.is_metadata_only(), "§8.1 will not count it");
+    }
+
+    #[test]
+    fn delete_then_recreate_in_one_window_is_a_modify() {
+        let mut idx = index();
+        idx.observe(p("a"), file(1, 1)).unwrap();
+        idx.mark_announced();
+        idx.observe_absent(&p("a"), 2).unwrap();
+        let c = idx.observe(p("a"), file(2, 3)).unwrap();
+        assert_eq!(c.kind, ChangeKind::Modify);
+        assert_eq!(c.record.entry.prev_hash, hash(1));
+        assert!(!c.record.entry.is_metadata_only());
+        assert_eq!(c.record.entry.version.counter(node(1)), 3);
     }
 
     #[test]
     fn delete_makes_a_tombstone_that_dominates() {
         let mut idx = index();
         let live = idx.observe(p("a.txt"), file(1, 100)).unwrap().record.entry;
+        idx.mark_announced();
         let change = idx.observe_absent(&p("a.txt"), 500).unwrap();
         assert_eq!(change.kind, ChangeKind::Delete);
         let dead = &change.record.entry;
@@ -338,6 +482,8 @@ mod tests {
             (dead.size, dead.hash, dead.exec, dead.mtime_ns),
             (0, ContentHash::EMPTY, false, 500)
         );
+        assert_eq!(dead.prev_hash, hash(1));
+        assert!(!dead.is_metadata_only(), "a deletion is a content change");
         assert!(dead.version.dominates(&live.version));
         assert_eq!(idx.tracked_count(), 0);
         assert_eq!(idx.len(), 1, "tombstones are kept (§7.7)");
@@ -356,43 +502,75 @@ mod tests {
     }
 
     #[test]
-    fn recreation_after_delete_is_an_add_that_dominates_the_tombstone() {
+    fn recreation_after_announced_delete_is_an_add_that_dominates_the_tombstone() {
         let mut idx = index();
         idx.observe(p("a.txt"), file(1, 100)).unwrap();
         let tomb = idx.observe_absent(&p("a.txt"), 200).unwrap().record.entry;
+        idx.mark_announced();
         let change = idx.observe(p("a.txt"), file(3, 300)).unwrap();
         assert_eq!(change.kind, ChangeKind::Add, "adds do not count toward H1");
+        assert_eq!(change.record.entry.prev_hash, ContentHash::EMPTY);
+        assert!(!change.record.entry.is_metadata_only());
         assert!(change.record.entry.version.dominates(&tomb.version));
         assert_eq!(change.record.entry.version.counter(node(1)), 3);
         assert_eq!(idx.tracked_count(), 1);
+    }
+
+    fn remote(path: &str, h: u8, version: Version) -> Entry {
+        Entry {
+            path: p(path),
+            kind: Kind::File,
+            size: 3,
+            mtime_ns: 7,
+            exec: true,
+            hash: hash(h),
+            prev_hash: ContentHash::EMPTY,
+            version,
+            deleted: false,
+            modified_by: node(2),
+            author_host: HostName::new("desktop").unwrap(),
+        }
     }
 
     #[test]
     fn adopt_takes_a_remote_entry_as_is_with_a_new_seq() {
         let mut idx = index();
         idx.observe(p("a.txt"), file(1, 100)).unwrap();
-        let remote = Entry {
-            path: p("b.txt"),
-            kind: Kind::File,
-            size: 3,
-            mtime_ns: 7,
-            exec: true,
-            hash: hash(9),
-            version: Version::empty().incremented(node(2)),
-            deleted: false,
-            modified_by: node(2),
-            author_host: HostName::new("desktop").unwrap(),
-        };
-        let record = idx.adopt(remote.clone()).clone();
-        assert_eq!(record.entry, remote);
+        let entry = remote("b.txt", 9, Version::empty().incremented(node(2)));
+        let record = idx.adopt(entry.clone()).clone();
+        assert_eq!(record.entry, entry);
         assert_eq!(record.seq, 2);
         assert_eq!(idx.get(&p("b.txt")), Some(&record));
-        // A later local change to the adopted entry continues its vector.
+        assert_eq!(idx.pending_count(), 1, "adopting is not a local change");
+        // A later local change to the adopted entry continues its vector and
+        // replaces the remote hash, which peers have seen.
         let change = idx.observe(p("b.txt"), file(4, 8)).unwrap();
         assert_eq!(change.kind, ChangeKind::Modify);
+        assert_eq!(change.record.entry.prev_hash, hash(9));
         assert_eq!(change.record.entry.version.counter(node(2)), 1);
         assert_eq!(change.record.entry.version.counter(node(1)), 1);
-        assert!(change.record.entry.version.dominates(&remote.version));
+        assert!(change.record.entry.version.dominates(&entry.version));
+    }
+
+    #[test]
+    fn adopt_over_an_existing_record_needs_a_dominating_version() {
+        let mut idx = index();
+        let mine = idx
+            .observe(p("a"), file(1, 1))
+            .unwrap()
+            .record
+            .entry
+            .version;
+        let newer = remote("a", 5, mine.incremented(node(2)));
+        idx.adopt(newer.clone());
+        assert_eq!(idx.get(&p("a")).unwrap().entry, newer);
+        assert_eq!(
+            idx.pending_count(),
+            0,
+            "the pending local change was superseded"
+        );
+        // Equal is allowed too (a re-commit of the same version).
+        idx.adopt(newer);
     }
 
     #[test]
@@ -438,6 +616,7 @@ mod tests {
         let mut idx = index();
         idx.observe(p("a"), file(1, 1)).unwrap();
         idx.observe_absent(&p("a"), 2).unwrap();
+        idx.observe(p("b"), file(1, 1)).unwrap();
         idx.set_peer_seq(node(2), 4);
         let json = serde_json::to_string(&idx).unwrap();
         assert_eq!(serde_json::from_str::<Index>(&json).unwrap(), idx);
@@ -451,16 +630,15 @@ mod tests {
     enum Step {
         See { path: u8, hash: u8, mtime: i64 },
         Gone { path: u8, at: i64 },
+        Announce,
     }
 
     fn step() -> impl Strategy<Value = Step> {
         prop_oneof![
-            (0u8..4, 0u8..3, 0i64..4).prop_map(|(path, hash, mtime)| Step::See {
-                path,
-                hash,
-                mtime
-            }),
-            (0u8..4, 0i64..4).prop_map(|(path, at)| Step::Gone { path, at }),
+            4 => (0u8..4, 0u8..3, 0i64..4)
+                .prop_map(|(path, hash, mtime)| Step::See { path, hash, mtime }),
+            2 => (0u8..4, 0i64..4).prop_map(|(path, at)| Step::Gone { path, at }),
+            1 => Just(Step::Announce),
         ]
     }
 
@@ -470,22 +648,40 @@ mod tests {
 
     proptest! {
         /// Every change dominates the record it replaced, is authored by this
-        /// machine, and advances seq by exactly one; no-ops leave seq alone.
+        /// machine, advances seq by exactly one, and carries as prev_hash the
+        /// hash of the last version peers could have seen (EMPTY if none).
+        /// No-ops leave seq alone.
         #[test]
-        fn local_changes_are_monotone(steps in prop::collection::vec(step(), 1..40)) {
+        fn local_changes_are_monotone_and_prev_hash_tracks_announced(
+            steps in prop::collection::vec(step(), 1..50)
+        ) {
             let mut idx = index();
+            // What peers have seen: hash and liveness of the last announced
+            // record per path.
+            let mut announced: BTreeMap<RelPath, (ContentHash, bool)> = BTreeMap::new();
             let mut changes = 0u64;
             for s in steps {
-                let (path, before) = match &s {
-                    Step::See { path, .. } | Step::Gone { path, .. } => {
-                        let path = path_of(*path);
-                        (path.clone(), idx.get(&path).cloned())
+                let path = match &s {
+                    Step::See { path, .. } | Step::Gone { path, .. } => path_of(*path),
+                    Step::Announce => {
+                        for (record, _) in idx.pending() {
+                            announced.insert(
+                                record.entry.path.clone(),
+                                (record.entry.hash, !record.entry.deleted),
+                            );
+                        }
+                        idx.mark_announced();
+                        prop_assert_eq!(idx.pending_count(), 0);
+                        continue;
                     }
                 };
+                let before = idx.get(&path).cloned();
+                let was_pending = idx.pending().any(|(r, _)| r.entry.path == path);
                 let seq_before = idx.seq();
                 let change = match s {
                     Step::See { hash, mtime, .. } => idx.observe(path.clone(), file(hash, mtime)),
                     Step::Gone { at, .. } => idx.observe_absent(&path, at),
+                    Step::Announce => unreachable!(),
                 };
                 match change {
                     None => prop_assert_eq!(idx.seq(), seq_before),
@@ -495,23 +691,47 @@ mod tests {
                         prop_assert_eq!(c.record.seq, idx.seq());
                         prop_assert_eq!(c.record.entry.modified_by, node(1));
                         prop_assert_eq!(&c.record.entry.path, &path);
-                        if let Some(b) = before {
-                            prop_assert!(c.record.entry.version.dominates(&b.entry.version));
-                            prop_assert_eq!(
-                                c.record.entry.version.counter(node(1)),
-                                b.entry.version.counter(node(1)) + 1
-                            );
-                        } else {
-                            prop_assert_eq!(c.kind, ChangeKind::Add);
-                            prop_assert_eq!(c.record.entry.version, idx.first_version());
+                        prop_assert_eq!(
+                            c.record.entry.prev_hash,
+                            announced.get(&path).map_or(ContentHash::EMPTY, |(h, _)| *h)
+                        );
+                        match &before {
+                            Some(b) => {
+                                prop_assert!(c.record.entry.version.dominates(&b.entry.version));
+                                prop_assert_eq!(
+                                    c.record.entry.version.counter(node(1)),
+                                    b.entry.version.counter(node(1)) + 1
+                                );
+                                if !was_pending {
+                                    prop_assert_eq!(c.record.entry.prev_hash, b.entry.hash);
+                                }
+                            }
+                            None => {
+                                prop_assert_eq!(c.kind, ChangeKind::Add);
+                                prop_assert_eq!(c.record.entry.version, idx.first_version());
+                                prop_assert_eq!(c.record.entry.prev_hash, ContentHash::EMPTY);
+                            }
                         }
-                        prop_assert_eq!(c.kind == ChangeKind::Delete, c.record.entry.deleted);
+                        prop_assert_eq!(c.record.entry.deleted, c.kind == ChangeKind::Delete);
+                        if c.record.entry.deleted {
+                            prop_assert_eq!(c.record.entry.hash, ContentHash::EMPTY);
+                        }
+                        // The pending kind is the step from the announced state.
+                        let announced_live = announced.get(&path).is_some_and(|(_, live)| *live);
+                        let now_live = !c.record.entry.deleted;
+                        let expected = match (announced_live, now_live) {
+                            (false, true) => ChangeKind::Add,
+                            (true, true) => ChangeKind::Modify,
+                            (_, false) => ChangeKind::Delete,
+                        };
+                        prop_assert_eq!(c.kind, expected);
                     }
                 }
             }
             prop_assert_eq!(idx.seq(), changes);
             prop_assert_eq!(idx.records_since(0).count(), idx.len());
             prop_assert!(idx.tracked_count() <= idx.len());
+            prop_assert!(idx.pending_count() <= idx.len());
         }
 
         /// Replaying the same observations onto the resulting index changes nothing.
@@ -531,6 +751,7 @@ mod tests {
                         idx.observe_absent(&path, at);
                         last.insert(path, None);
                     }
+                    Step::Announce => idx.mark_announced(),
                 }
             }
             let seq = idx.seq();
