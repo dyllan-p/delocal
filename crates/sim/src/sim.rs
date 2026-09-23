@@ -257,6 +257,10 @@ pub struct Sim {
     links: BTreeMap<(NodeId, NodeId), Link>,
     messages: Vec<Message>,
     msg_seq: u64,
+    /// Batches each node's user approved (I5): their entries may be applied
+    /// however late they reach the want-list, even if leftovers of the same
+    /// batch are held again under its id.
+    approved: BTreeSet<(NodeId, BatchId)>,
     ops: Vec<Op>,
     users: Vec<UserDue>,
     corruption_on: bool,
@@ -336,6 +340,7 @@ impl Sim {
             links,
             messages: Vec::new(),
             msg_seq: 0,
+            approved: BTreeSet::new(),
             ops: Vec::new(),
             users: Vec::new(),
             corruption_on: true,
@@ -755,6 +760,9 @@ impl Sim {
         };
         let folder = self.engine(id)?.folder(self.folder)?;
         let want = folder.wants().get(path)?;
+        if self.approved.contains(&(id, want.batch)) {
+            return None;
+        }
         folder.quarantine().get(want.batch).map(|_| path.clone())
     }
 
@@ -1840,10 +1848,12 @@ impl Sim {
             UserAction::ApproveAll => {
                 for batch in held {
                     self.stats.approvals += 1;
+                    self.approved.insert((id, batch));
                     self.feed(id, Event::Approve { folder, batch })?;
                 }
                 if let Some(batch) = paused {
                     self.stats.approvals += 1;
+                    self.approved.insert((id, batch));
                     self.feed(id, Event::Approve { folder, batch })?;
                 }
             }
