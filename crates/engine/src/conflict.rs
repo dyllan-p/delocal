@@ -125,32 +125,10 @@ fn total_fallback(a: &Entry, b: &Entry) -> Winner {
     }
 }
 
-/// Which side's content fields the §7.2 identical-content merge keeps:
-/// larger `mtime_ns`, then larger `modified_by`, then the total fallback.
-/// Rules 1 and 2 do not apply, because identical content means both are
-/// tombstones or neither is, and a touch is not demoted by anything when
-/// the content is the same anyway.
-pub fn prefer_fields(a: &Entry, b: &Entry) -> Winner {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    let pick = |ord: std::cmp::Ordering, fallback: bool| match ord {
-        Greater => Some(Winner {
-            side: Side::First,
-            fallback,
-        }),
-        Less => Some(Winner {
-            side: Side::Second,
-            fallback,
-        }),
-        Equal => None,
-    };
-    pick(a.mtime_ns.cmp(&b.mtime_ns), false)
-        .or_else(|| pick(a.modified_by.cmp(&b.modified_by), false))
-        .unwrap_or_else(|| total_fallback(a, b))
-}
-
 /// `M = merge(W, L)` (§7.6): `w`'s content fields under the component-wise
 /// maximum of both vectors, no increment. Also the §7.2 identical-content
-/// merge when `w` is the side [`prefer_fields`] picked.
+/// merge, where `w` is the side [`winner`] picks: one order for every
+/// concurrent pair, so that a merged record is a function of its vector.
 pub fn merged(w: &Entry, l: &Entry) -> Entry {
     Entry {
         version: w.version.merge(&l.version),
