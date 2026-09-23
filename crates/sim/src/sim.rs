@@ -887,9 +887,21 @@ impl Sim {
                 }
             },
             Action::IndexChanged { record, .. } => {
-                // I5: a version still in quarantine is never adopted. Approve
-                // releases the item first, so after an approval this is clear.
+                // I5: no held batch is applied before approve, which releases
+                // the item first. A conflict resolved against a batch that
+                // passed can produce the very version another, held batch
+                // carries (the merge of the same two sides is the same
+                // everywhere); that adoption applies nothing from the held
+                // batch, the content stays what this node had, so I5 asks
+                // whether the content changed, not only whether the version
+                // is quarantined.
+                let content_kept = self
+                    .nodes
+                    .get(&id)
+                    .and_then(|n| n.persisted.records.get(&record.entry.path))
+                    .is_some_and(|prev| prev.entry.same_content(&record.entry));
                 if record.entry.modified_by != id
+                    && !content_kept
                     && self
                         .engine(id)
                         .and_then(|e| e.folder(self.folder))
