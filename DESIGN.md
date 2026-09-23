@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 7 · 23 September 2026 · Status: **for review** · Changes from draft 6: batch entries ordered by `seq`, `seq_high` on every batch, the decision doubles as the acknowledgement, and the connect-time watermark exchange (§7.4, §12); the sender's summary counts local changes only (§7.4).
+> Draft 8 · 23 September 2026 · Status: **for review** · Changes from draft 7: directories and symlinks carry no mtime (§7.1, §7.5); a commit that finds the file changed underneath is re-evaluated after the next observation rather than dropped (§7.5); H1 excludes directories on both sides of the ratio, and the sender cannot see exec-only changes (§8.1).
+>
+> Changes from draft 6: batch entries ordered by `seq`, `seq_high` on every batch, the decision doubles as the acknowledgement, and the connect-time watermark exchange (§7.4, §12); the sender's summary counts local changes only (§7.4).
 >
 > Changes from draft 5: conflicts resolve to the merged version `M = merge(W, L)` with no increment, replacing `W′` (§7.6); the displacing commit (§7.5); adopted records are announced, so live batches and catch-up are the same mechanism (§7.4).
 >
@@ -194,7 +196,7 @@ Per folder, one record per entry the machine knows about, including deleted ones
 | `path` | Relative, forward slashes, no leading `./`. NFC-normalised **by the host** before it reaches the engine; the engine treats paths as opaque UTF-8 |
 | `kind` | `file` / `dir` / `symlink` |
 | `size` | bytes (0 for dir; target length for symlink) |
-| `mtime_ns` | as observed or received; for a tombstone, the time the deletion was observed on the machine that made it |
+| `mtime_ns` | Files only, as observed or received. **0 for directories and symlinks**: a directory's mtime changes whenever a child is created or removed, so syncing it would make every file change ripple into a directory "touch" on every machine, forever; symlink timestamps are not worth the platform differences. For a tombstone, the time the deletion was observed on the machine that made it |
 | `exec` | bool; the only permission bit synced |
 | `hash` | BLAKE3 of content (files), of the target string (symlinks); the all-zero sentinel `EMPTY` for directories and tombstones. `EMPTY` is never the hash of a file (BLAKE3 of empty input is not all zeros) |
 | `prev_hash` | The `hash` of the version this one replaced, as it was when the change was made; `EMPTY` if the path did not exist. Set by the author, carried with the entry. A version whose `hash == prev_hash` is a **metadata-only change** (a touch). Used by the conflict rule (§7.6) and the brake (§8.1) |
@@ -288,12 +290,12 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 
 **Committing.**
 
-6. Check the target path is still what the index said it was when the decision was made (same `size` and `mtime_ns`, or absent). If not, the local file changed underneath us: abort the commit and treat the situation as a conflict on the next scan (§7.6).
+6. Check the target path is still what the index said it was when the decision was made (same `size` and `mtime_ns` for a file; same kind for a directory or symlink; or absent). If not, the local file changed underneath us: abort the commit and report `ChangedUnderneath`. The engine keeps the incoming entry and re-evaluates it against the index after the next observation of that path arrives, which will find a new local version and classify the pair as a conflict (§7.6) or as dominated. The incoming version is never dropped: the sender has already been acknowledged for it and would not send it again.
 7. If a file exists at the target, **move it to trash** (§8.4), or, when the commit resolves a conflict and the existing file is the losing content, to the conflict-copy path (§7.6). Same filesystem, so this is a rename either way. The engine says which in the commit action; the host never chooses.
 8. `rename(tmp, target)`. Ensure parent directories exist (creating them as index entries if they arrived in the same batch).
 9. Update the index record and `fsync` the parent directory.
 
-**Metadata-only applies.** An incoming version that dominates the local one but has identical content (content equality as in §7.6: kind, hash, exec) needs no fetch, no trash and no write. The host sets the file's mtime to the record's `mtime_ns` and the index adopts the incoming version, `modified_by` and `author_host`. This is how a conflict's merged version `M` (§7.6) lands on a machine that already holds the winning content, and how `deny` bumps (§8.2) land on machines that hold the same copy. A version that differs only in the exec bit is applied the same way, by changing the bit, with no transfer.
+**Metadata-only applies.** An incoming version that dominates the local one but has identical content (content equality as in §7.6: kind, hash, exec) needs no fetch, no trash and no write. The host sets the file's mtime to the record's `mtime_ns` (files only; directories and symlinks carry no mtime, §7.1, so for them this is an index-only update with no disk action) and the index adopts the incoming version, `modified_by` and `author_host`. This is how a conflict's merged version `M` (§7.6) lands on a machine that already holds the winning content, and how `deny` bumps (§8.2) land on machines that hold the same copy. A version that differs only in the exec bit is applied the same way, by changing the bit, with no transfer.
 
 **Deletes.** Move the current file to trash, write the tombstone to the index. Directories are removed only when empty and only after all children in the batch have been processed. Order: creates process parents before children; deletes process children before parents.
 
@@ -355,12 +357,12 @@ A batch is **held** if either rule trips, evaluated over the batch's apply set (
 
 | Rule | Default |
 |---|---|
-| **H1 · count** | `dels + mods ≥ 50` **and** `dels + mods ≥ 25%` of the folder's tracked (non-deleted) entries before the batch |
+| **H1 · count** | `dels + mods ≥ 50` **and** `dels + mods ≥ 25%` of the folder's tracked entries before the batch. Tracked means live and not a directory; directories are excluded from both sides of the ratio, since a directory and its tombstone have the same (empty) content |
 | **H2 · size** | total bytes of adds + mods `> 20 GiB` **[decision]** |
 
 - Adds do not count toward H1. Adds are almost never destructive, and exempting them keeps first sync and bulk imports quiet.
 - H1 cannot trip on a folder with zero tracked entries.
-- A batch entry counts as a `mod` only if it changes content: its `hash` differs from its `prev_hash`, or its kind or exec bit differs from the record it replaces. Metadata-only changes (touches, §7.3) and metadata-only applies (§7.5) count as neither `mods` nor `dels` for H1 and contribute no bytes to H2, on the sender pre-check and the receiver alike. Exec-bit-only changes count as `mods` and contribute no bytes.
+- A batch entry counts as a `mod` only if it changes content: its `hash` differs from its `prev_hash`, or its kind or exec bit differs from the record it replaces. Metadata-only changes (touches, §7.3) and metadata-only applies (§7.5) count as neither `mods` nor `dels` for H1 and contribute no bytes to H2, on the sender pre-check and the receiver alike. Exec-bit-only changes count as `mods` and contribute no bytes on the receiver, which can see the record being replaced. The sender pre-check cannot (after coalescing it no longer holds the replaced record, and `hash == prev_hash`), so it classifies them as metadata-only; a mass `chmod` is not destructive, and the receiver check still counts it.
 - Thresholds are per folder: `delocal rules ~/Sync --hold-count 50 --hold-pct 25 --hold-size 20G`. Setting `--hold-count 0` disables H1 for that folder.
 
 **Sender pre-check.** The same rules run on the machine where the changes happened, before anything is sent. If they trip, the folder is **paused** on that machine: nothing leaves, and `status` everywhere shows `paused on <machine>: 812 deletes pending — delocal review on <machine>`. This is cheap and it is what makes `revert` trivially safe: no other machine has seen the damage.
