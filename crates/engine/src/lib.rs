@@ -9,14 +9,17 @@
 //!
 //! - [`id`]: node, folder and batch identifiers (§4), hostnames (§7.1)
 //! - [`version`]: version vectors, comparison, merge, the local-change rule (§7.2)
+//! - [`path`]: validated relative paths (§7.1)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod id;
+pub mod path;
 pub mod version;
 
 pub use id::{BatchId, FolderId, HostName, NodeId};
+pub use path::RelPath;
 pub use version::{Relation, Version};
 
 /// The version of delocal, taken from the workspace at compile time.
