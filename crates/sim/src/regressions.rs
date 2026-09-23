@@ -3259,3 +3259,169 @@ fn a_retargeted_symlink_the_watcher_missed_is_found_by_the_next_scan() {
         ],
     );
 }
+
+/// A file announced, fetched by nobody, deleted by its user and then
+/// reverted: the restored record described content that existed nowhere,
+/// the restoring want never found a source, and the index said live while
+/// the disk said absent forever. Once every member has answered
+/// NotAvailable the deletion stands (§8.3 step 4).
+#[test]
+fn a_reverted_deletion_nobody_can_serve_stands() {
+    passes(
+        106,
+        &[
+            Step::Delete { node: 1, path: 5 },
+            Step::Modify {
+                node: 2,
+                path: 2,
+                content: 4,
+            },
+            Step::Mkdir { node: 5, dir: 1 },
+            Step::Crash {
+                node: 2,
+                gap_secs: 61,
+            },
+            Step::Delete { node: 0, path: 8 },
+            Step::Partition { a: 0, b: 1 },
+            Step::Modify {
+                node: 5,
+                path: 10,
+                content: 3,
+            },
+            Step::MassDelete {
+                node: 2,
+                fraction: 57,
+            },
+            Step::Create {
+                node: 2,
+                path: 4,
+                content: 2,
+            },
+            Step::Delete { node: 0, path: 8 },
+            Step::Everywhere {
+                path: 7,
+                contents: vec![Some(5), Some(1), Some(2), Some(5), Some(5), None, Some(5)],
+            },
+            Step::Create {
+                node: 0,
+                path: 8,
+                content: 3,
+            },
+            Step::Modify {
+                node: 0,
+                path: 5,
+                content: 4,
+            },
+            Step::Partition { a: 4, b: 0 },
+            Step::Symlink {
+                node: 3,
+                path: 3,
+                target: 5,
+            },
+            Step::Offline { node: 5 },
+            Step::Modify {
+                node: 4,
+                path: 4,
+                content: 1,
+            },
+            Step::Modify {
+                node: 4,
+                path: 1,
+                content: 3,
+            },
+            Step::Mkdir { node: 2, dir: 1 },
+            Step::Heal { a: 5, b: 0 },
+            Step::Settle { secs: 30 },
+            Step::Partition { a: 0, b: 0 },
+            Step::Delete { node: 7, path: 11 },
+            Step::User {
+                node: 6,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 40,
+            },
+            Step::Crash {
+                node: 4,
+                gap_secs: 99,
+            },
+            Step::Modify {
+                node: 1,
+                path: 1,
+                content: 3,
+            },
+            Step::Create {
+                node: 2,
+                path: 2,
+                content: 3,
+            },
+            Step::Chmod { node: 0, path: 6 },
+            Step::Modify {
+                node: 5,
+                path: 4,
+                content: 3,
+            },
+            Step::MassDelete {
+                node: 4,
+                fraction: 85,
+            },
+            Step::Delete { node: 5, path: 2 },
+            Step::Delete { node: 6, path: 3 },
+            Step::Create {
+                node: 1,
+                path: 7,
+                content: 1,
+            },
+            Step::Offline { node: 0 },
+            Step::Offline { node: 2 },
+            Step::Partition { a: 5, b: 2 },
+            Step::Heal { a: 2, b: 0 },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![None, Some(1), None],
+            },
+            Step::Online { node: 7 },
+            Step::Touch { node: 6, path: 8 },
+            Step::Partition { a: 1, b: 5 },
+            Step::Everywhere {
+                path: 3,
+                contents: vec![None, None, Some(5)],
+            },
+            Step::Everywhere {
+                path: 4,
+                contents: vec![Some(2), None, Some(3), Some(5), Some(2), Some(2)],
+            },
+            Step::Mkdir { node: 0, dir: 1 },
+            Step::Settle { secs: 28 },
+            Step::Rename {
+                node: 0,
+                from: 0,
+                to: 11,
+            },
+            Step::Delete { node: 0, path: 4 },
+            Step::Delete { node: 0, path: 1 },
+            Step::Modify {
+                node: 5,
+                path: 2,
+                content: 2,
+            },
+            Step::Rename {
+                node: 7,
+                from: 1,
+                to: 4,
+            },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 15,
+            },
+            Step::User {
+                node: 6,
+                action: crate::UserAction::Revert,
+                delay_secs: 42,
+            },
+            Step::Everywhere {
+                path: 10,
+                contents: vec![None, None, Some(1), None, Some(4), Some(2), None],
+            },
+        ],
+    );
+}

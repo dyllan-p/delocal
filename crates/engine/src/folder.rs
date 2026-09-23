@@ -196,6 +196,10 @@ pub enum FolderStatus {
     RulesRecheck { batch: BatchId, would_pass: bool },
     /// A want gave up after two hash mismatches (§7.5 step 4).
     GaveUp { path: RelPath },
+    /// A reverted path's content exists on no member: every member answered
+    /// `NotAvailable`, so the deletion stands and the record is a tombstone
+    /// again (§8.3 step 4).
+    Unrecoverable { path: RelPath },
     /// A fetch or commit deadline passed; the want is wanted again (§7.5).
     Stalled { path: RelPath },
 }
@@ -259,6 +263,16 @@ pub struct Received {
     pub already_wanted: usize,
     /// The hold reason, if held.
     pub held: Option<HoldReason>,
+}
+
+/// What a fetch report did (§7.5, §8.3 step 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fetched {
+    /// The want's state after the report, if one matched and remains.
+    pub state: Option<WantState>,
+    /// The tombstone written because a restoring want ran out of members
+    /// to ask; announced like any local change.
+    pub unrecoverable: Option<LocalChange>,
 }
 
 /// What `approve` did.
@@ -1185,6 +1199,7 @@ impl FolderState {
                     mismatches: 0,
                     fetched: false,
                     restoring: true,
+                    answered: BTreeSet::new(),
                     state: WantState::Wanted,
                 });
             }
@@ -1261,14 +1276,46 @@ impl FolderState {
     }
 
     /// The host reported on a fetch (§7.5 steps 3 and 4). Returns the
-    /// want's new state, if the report matched one.
+    /// want's new state, if the report matched one, and the tombstone
+    /// written if the report settled a restoring want as unrecoverable
+    /// (§8.3 step 4): every other member has now answered `NotAvailable`,
+    /// the restored record describes content that exists nowhere, so the
+    /// deletion stands as a local change, announced like any other.
     pub fn fetched(
         &mut self,
+        now: Timestamp,
         path: &RelPath,
         version: &Version,
         report: FetchReport,
-    ) -> Option<WantState> {
-        self.wants.fetched(path, version, report).map(|w| w.state)
+    ) -> Fetched {
+        let own = self.index.own();
+        let unrecoverable = {
+            let want = self.wants.fetched(path, version, report);
+            want.is_some_and(|w| {
+                w.restoring
+                    && report == FetchReport::NotAvailable
+                    && self
+                        .members
+                        .iter()
+                        .all(|m| *m == own || w.answered.contains(m))
+            })
+        };
+        let state = self.wants.get(path).map(|w| w.state);
+        if !unrecoverable {
+            return Fetched {
+                state,
+                unrecoverable: None,
+            };
+        }
+        self.wants.remove(path);
+        let change = self.index.observe_absent(path, now.as_unix_nanos());
+        if change.is_some() {
+            self.touched(now);
+        }
+        Fetched {
+            state: None,
+            unrecoverable: change,
+        }
     }
 
     /// The host reported bytes arriving for a fetch (§7.5).
@@ -1917,7 +1964,7 @@ mod tests {
             for (path, version, state) in in_flight {
                 match state {
                     WantState::Fetching { .. } => {
-                        f.fetched(&path, &version, FetchReport::Ok);
+                        f.fetched(now, &path, &version, FetchReport::Ok);
                     }
                     WantState::Committing { .. } => {
                         out.extend(f.applied(now, &path, &version, ApplyOutcome::Ok));
@@ -1930,7 +1977,7 @@ mod tests {
             for step in &steps {
                 match step {
                     HostStep::Fetch { path, version, .. } => {
-                        f.fetched(path, version, FetchReport::Ok);
+                        f.fetched(now, path, version, FetchReport::Ok);
                     }
                     HostStep::Write { path, entry, .. } => {
                         out.extend(f.applied(now, path, &entry.version, ApplyOutcome::Ok));
@@ -2312,7 +2359,7 @@ mod tests {
         assert!(want.sources.contains(&node(3)), "C named as a source");
         assert!(b.in_flight(&p("new")), "the fetch goes on");
         // The commit lands without touching the quarantine.
-        b.fetched(&p("new"), &wanted, FetchReport::Ok);
+        b.fetched(t(20.0), &p("new"), &wanted, FetchReport::Ok);
         b.dispatch(t(18.0), &lan(&[1]));
         assert_eq!(
             b.applied(t(19.0), &p("new"), &wanted, ApplyOutcome::Ok)
@@ -2460,7 +2507,7 @@ mod tests {
         let v = b.wants().get(&p("z")).unwrap().version().clone();
         let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Fetch { .. }));
-        b.fetched(&p("z"), &v, FetchReport::Ok);
+        b.fetched(t(20.0), &p("z"), &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { .. }));
         assert!(
@@ -2533,7 +2580,7 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s, HostStep::Fetch { path, .. } if path == &p("f00")))
         );
-        b.fetched(&p("f00"), &w_version, FetchReport::Ok);
+        b.fetched(t(20.0), &p("f00"), &w_version, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(16.0), &lan(&[1, 3]));
         assert!(steps.iter().any(|s| matches!(s, HostStep::Write { path, displace: Displace::ConflictCopy(c), .. } if path == &p("f00") && c == &copy_path)));
         let written = b.applied(t(17.0), &p("f00"), &w_version, ApplyOutcome::Ok);
@@ -3012,7 +3059,7 @@ mod tests {
         let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Fetch { from, .. } if *from == node(1)));
         assert!(b.in_flight(&p("f00")));
-        b.fetched(&p("f00"), &v, FetchReport::Ok);
+        b.fetched(t(20.0), &p("f00"), &v, FetchReport::Ok);
         assert!(b.in_flight(&p("f00")));
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(
@@ -3092,7 +3139,7 @@ mod tests {
                 match step {
                     HostStep::Fetch { path, version, .. } => {
                         let outcome = script.next();
-                        f.fetched(path, version, outcome);
+                        f.fetched(now, path, version, outcome);
                     }
                     HostStep::Write { path, entry, .. } => {
                         f.applied(now, path, &entry.version, ApplyOutcome::Ok);
