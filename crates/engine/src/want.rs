@@ -123,6 +123,11 @@ pub struct Want {
     pub fetched: bool,
     /// Made by `revert` (§8.3): `Absent` observations are the trash move.
     pub restoring: bool,
+    /// Members that answered `NotAvailable`. For a restoring want, whose
+    /// sources are every other member, the members not in here are the ones
+    /// `status` names as not yet asked; once every member is in here the
+    /// content exists nowhere and the deletion stands (§8.3 step 4).
+    pub answered: BTreeSet<NodeId>,
     pub state: WantState,
 }
 
@@ -174,6 +179,7 @@ impl Want {
             mismatches: 0,
             fetched: false,
             restoring: false,
+            answered: BTreeSet::new(),
             state: WantState::Wanted,
         }
     }
@@ -379,6 +385,7 @@ impl WantList {
             FetchReport::NotAvailable => {
                 if let Some(from) = from {
                     want.sources.remove(&from);
+                    want.answered.insert(from);
                 }
                 want.state = WantState::Wanted;
             }

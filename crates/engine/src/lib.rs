@@ -48,7 +48,7 @@ pub use conflict::{ConflictCopy, Resolution, Side, Winner};
 pub use engine::{Action, Engine, Event, NodeConfig, Outbound};
 pub use entry::{ContentHash, Entry, Kind, Observed};
 pub use folder::{
-    ApplyOutcome, Approved, Deferred, DeferredReason, Displace, Expected, FolderState,
+    ApplyOutcome, Approved, Deferred, DeferredReason, Displace, Expected, Fetched, FolderState,
     FolderStatus, HostStep, Paused, Received, RevertOutcome, ScanState, Ticked, Window,
 };
 pub use id::{BatchId, FolderId, HostName, NodeId};

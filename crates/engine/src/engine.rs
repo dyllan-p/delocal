@@ -452,10 +452,21 @@ impl Engine {
                 ..
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
-                    if f.fetched(&path, &version, outcome) == Some(crate::want::WantState::GaveUp) {
+                    let fetched = f.fetched(now, &path, &version, outcome);
+                    if fetched.state == Some(crate::want::WantState::GaveUp) {
                         out.push(Action::StatusChanged {
                             folder,
-                            status: FolderStatus::GaveUp { path },
+                            status: FolderStatus::GaveUp { path: path.clone() },
+                        });
+                    }
+                    if let Some(change) = fetched.unrecoverable {
+                        out.push(Action::IndexChanged {
+                            folder,
+                            record: change.record,
+                        });
+                        out.push(Action::StatusChanged {
+                            folder,
+                            status: FolderStatus::Unrecoverable { path },
                         });
                     }
                 }
@@ -825,7 +836,7 @@ mod tests {
     use proptest::prelude::*;
 
     use crate::batch::Summary;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
     use crate::batch::ApplyMode;
@@ -1413,6 +1424,203 @@ mod tests {
     }
 
     /// A and B connected, both with tight rules, both holding ten files A made.
+    /// §8.3 step 4: a reverted path whose content no member can serve.
+    #[test]
+    fn an_unrecoverable_revert_ends_in_a_tombstone_once_every_member_answered() {
+        // Three members; C starts offline. B creates three files and
+        // announces them; A wants them but never fetches (its fetches go
+        // unanswered). B's user deletes all three (the folder pauses on the
+        // deletes), then reverts. The restored records describe content only
+        // B ever had, and B's user removed it.
+        let mut a = engine(1, "alpha");
+        let mut b = engine(2, "bravo");
+        let mut c = engine(3, "charlie");
+        for e in [&mut a, &mut b, &mut c] {
+            join_with(e, tight(), &[1, 2, 3]);
+        }
+        connect(&mut a, &mut b);
+        for i in 0..3 {
+            b.handle(
+                t(1.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i}")),
+                    state: file(1, 1),
+                },
+            );
+        }
+        let out = b.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        let mut engines = BTreeMap::from([(node(1), a), (node(2), b), (node(3), c)]);
+        deliver(t(3.0), node(2), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        for i in 0..3 {
+            b.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        let out = b.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(2),
+            },
+        );
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::StatusChanged {
+                status: FolderStatus::Paused { .. },
+                ..
+            }
+        )));
+        let out = b.handle(t(13.0), Event::Revert { folder: folder() });
+        let fetches: Vec<(RelPath, Version)> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Fetch {
+                    path,
+                    version,
+                    from,
+                    ..
+                } if *from == node(1) => Some((path.clone(), version.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fetches.len(), 3, "restoring wants ask the connected member");
+        // A never had the bytes.
+        for (path, version) in &fetches {
+            let out = b.handle(
+                t(14.0),
+                Event::Fetched {
+                    folder: folder(),
+                    path: path.clone(),
+                    hash: hash(1),
+                    version: version.clone(),
+                    outcome: FetchReport::NotAvailable,
+                },
+            );
+            assert!(
+                !out.iter().any(|a| matches!(
+                    a,
+                    Action::IndexChanged { .. }
+                        | Action::StatusChanged {
+                            status: FolderStatus::Unrecoverable { .. },
+                            ..
+                        }
+                )),
+                "C has not been asked yet"
+            );
+        }
+        let f = b.folder(folder()).unwrap();
+        assert_eq!(f.wants().len(), 3, "the wants wait for C");
+        for w in f.wants().iter() {
+            assert!(w.restoring);
+            assert_eq!(w.answered, BTreeSet::from([node(1)]));
+            assert!(
+                !w.answered.contains(&node(3)),
+                "C is the member not yet asked"
+            );
+        }
+        // C connects and is asked; it never had the files either.
+        let out = b.handle(
+            t(20.0),
+            Event::PeerConnected {
+                peer: node(3),
+                tier: Tier::Lan,
+            },
+        );
+        let mut all = out;
+        all.extend(b.handle(
+            t(21.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        ));
+        let fetches: Vec<(RelPath, Version)> = all
+            .iter()
+            .filter_map(|a| match a {
+                Action::Fetch {
+                    path,
+                    version,
+                    from,
+                    ..
+                } if *from == node(3) => Some((path.clone(), version.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fetches.len(),
+            3,
+            "the late member is asked when it connects"
+        );
+        let mut tombstones = 0;
+        let mut statuses = 0;
+        for (path, version) in &fetches {
+            let out = b.handle(
+                t(22.0),
+                Event::Fetched {
+                    folder: folder(),
+                    path: path.clone(),
+                    hash: hash(1),
+                    version: version.clone(),
+                    outcome: FetchReport::NotAvailable,
+                },
+            );
+            tombstones += out.iter().filter(|a| matches!(a, Action::IndexChanged { record, .. } if record.entry.deleted && record.entry.path == *path)).count();
+            statuses += out.iter().filter(|a| matches!(a, Action::StatusChanged { status: FolderStatus::Unrecoverable { path: sp }, .. } if sp == path)).count();
+        }
+        assert_eq!((tombstones, statuses), (3, 3));
+        let f = b.folder(folder()).unwrap();
+        assert!(f.wants().is_empty(), "the wants are dropped");
+        for i in 0..3 {
+            let e = &f.index().get(&p(&format!("f{i}"))).unwrap().entry;
+            assert!(e.deleted, "the deletion stands");
+            assert_eq!(
+                e.prev_hash,
+                hash(1),
+                "prev_hash is the restored record's hash"
+            );
+            assert_eq!(e.modified_by, node(2), "a local change");
+        }
+        // The tombstones are local changes (§8.3 step 4), so the next tick
+        // runs the sender pre-check over them (§8.1): three deletions of
+        // three tracked files, the very counts that paused the folder the
+        // first time, and the folder pauses again instead of announcing
+        // them. That is the design as written; whether these tombstones
+        // should be exempt from the pre-check is an open question.
+        let out = b.handle(
+            t(30.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::StatusChanged {
+                    status: FolderStatus::Paused { .. },
+                    ..
+                }
+            )),
+            "paused on its own tombstones: {out:?}"
+        );
+        assert!(!out.iter().any(|a| matches!(
+            a,
+            Action::Send {
+                payload: Outbound::Batch(_),
+                ..
+            }
+        )));
+    }
+
     fn two_with_ten_files() -> BTreeMap<NodeId, Engine> {
         let mut a = engine(1, "alpha");
         let mut b = engine(2, "bravo");
