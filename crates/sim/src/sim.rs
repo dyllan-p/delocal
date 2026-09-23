@@ -562,6 +562,16 @@ impl Sim {
                 self.clock = end;
                 return Ok(());
             }
+            if next < self.clock {
+                return Err(self.fail(
+                    "clock",
+                    format!(
+                        "an event at {next:?} was queued after the clock reached {:?}; {}",
+                        self.clock,
+                        self.describe_unquiet()
+                    ),
+                ));
+            }
             self.clock = next;
             budget -= 1;
             if budget == 0 {
