@@ -2,8 +2,8 @@
 //!
 //! Defaults are the **\[decision\]** values in the design; `delocal rules`
 //! changes them per folder (Phase 4). The engine only reads them: the brake
-//! (PR 5) uses the `hold_*` fields and the want-list (PR 6) the `*_limit`
-//! fields. Nothing here is enforced yet.
+//! uses the `hold_*` fields, the want-list the `*_limit` and `max_fetches_*`
+//! fields.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,10 +25,15 @@ pub struct Rules {
     pub direct_limit: u64,
     /// Files over this are deferred on a `relay` tier (§6.5).
     pub relay_limit: u64,
+    /// Most fetches in progress from one peer at once (§7.5).
+    pub max_fetches_per_peer: u32,
+    /// Most fetches in progress for this folder at once (§7.5).
+    pub max_fetches_per_folder: u32,
 }
 
 impl Default for Rules {
     /// §8.1: 50 entries and 25 %, 20 GiB. §6.5: 1 GiB direct, 50 MiB relay.
+    /// §7.5: 4 fetches per peer, 16 per folder.
     fn default() -> Self {
         Self {
             hold_count: 50,
@@ -36,6 +41,8 @@ impl Default for Rules {
             hold_size: 20 * GIB,
             direct_limit: GIB,
             relay_limit: 50 * MIB,
+            max_fetches_per_peer: 4,
+            max_fetches_per_folder: 16,
         }
     }
 }
@@ -52,6 +59,8 @@ mod tests {
         assert_eq!(r.hold_size, 21_474_836_480);
         assert_eq!(r.direct_limit, 1_073_741_824);
         assert_eq!(r.relay_limit, 52_428_800);
+        assert_eq!(r.max_fetches_per_peer, 4);
+        assert_eq!(r.max_fetches_per_folder, 16);
     }
 
     #[test]

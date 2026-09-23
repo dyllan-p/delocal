@@ -17,6 +17,13 @@ pub const DEBOUNCE_NANOS: i64 = 2 * NANOS_PER_SECOND;
 /// Longest a batch window stays open after its first change (§7.4).
 pub const WINDOW_NANOS: i64 = 10 * NANOS_PER_SECOND;
 
+/// A fetch with no progress reported for this long is stalled and the want
+/// returns to *wanted* (§7.5).
+pub const FETCH_STALL_NANOS: i64 = 60 * NANOS_PER_SECOND;
+
+/// A commit not reported within this long is overdue (§7.5).
+pub const COMMIT_DEADLINE_NANOS: i64 = 30 * NANOS_PER_SECOND;
+
 /// A point in time as nanoseconds since the Unix epoch, supplied by the host.
 ///
 /// The same representation as `mtime_ns` on entries, so the two compare
@@ -174,6 +181,8 @@ mod tests {
     fn constants_are_what_the_design_says() {
         assert_eq!(DEBOUNCE_NANOS, 2_000_000_000);
         assert_eq!(WINDOW_NANOS, 10_000_000_000);
+        assert_eq!(FETCH_STALL_NANOS, 60_000_000_000);
+        assert_eq!(COMMIT_DEADLINE_NANOS, 30_000_000_000);
     }
 
     #[test]
