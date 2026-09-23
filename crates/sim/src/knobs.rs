@@ -1,0 +1,53 @@
+//! Tunables the binary exposes as flags, so a failing seed can be replayed
+//! with the same world and a class of failure isolated.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// Everything about the world that is not the seed or the steps.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Knobs {
+    /// Probability that a fetch's bytes arrive corrupted (`HashMismatch`).
+    pub corruption: f64,
+    /// Probability that a filesystem change produces no watcher event and
+    /// is left for the next full scan.
+    pub drop_watcher: f64,
+    /// Message delay range in milliseconds, inclusive.
+    pub delay_ms: (u64, u64),
+    /// Probability that a completed commit's report is lost to a crash
+    /// landing between the rename and `Applied` (§13).
+    pub crash_after_rename: f64,
+    /// Number of nodes, or `None` to draw 2 to 8 from the seed.
+    pub nodes: Option<u8>,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Self {
+            corruption: 0.0,
+            drop_watcher: 0.3,
+            delay_ms: (5, 800),
+            crash_after_rename: 0.1,
+            nodes: None,
+        }
+    }
+}
+
+impl fmt::Display for Knobs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {}",
+            self.corruption,
+            self.drop_watcher,
+            self.delay_ms.0,
+            self.delay_ms.1,
+            self.crash_after_rename
+        )?;
+        if let Some(n) = self.nodes {
+            write!(f, " --nodes {n}")?;
+        }
+        Ok(())
+    }
+}
