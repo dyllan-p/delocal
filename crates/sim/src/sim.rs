@@ -257,6 +257,14 @@ pub struct Sim {
     /// The node whose `revert` is being processed, while it is: the records
     /// it restores are what peers hold, not content that landed (I2).
     reverting: Option<NodeId>,
+    /// When (in events) each node last reverted each path (§8.3). A revert
+    /// discards every version the node wrote at the path since its last
+    /// announcement, and the node's next change re-issues those counters;
+    /// nobody else ever saw the discarded records (I7).
+    reverted_at: BTreeMap<(NodeId, RelPath), u64>,
+    /// When (in events) each version at each path was first seen, for the
+    /// revert exemption above.
+    seen_at: BTreeMap<RelPath, Vec<(Version, u64)>>,
     links: BTreeMap<(NodeId, NodeId), Link>,
     messages: Vec<Message>,
     msg_seq: u64,
@@ -344,6 +352,8 @@ impl Sim {
             messages: Vec::new(),
             msg_seq: 0,
             reverting: None,
+            reverted_at: BTreeMap::new(),
+            seen_at: BTreeMap::new(),
             approved: BTreeSet::new(),
             ops: Vec::new(),
             users: Vec::new(),
@@ -941,19 +951,69 @@ impl Sim {
                 {
                     self.stats.conflict_copies += 1;
                 }
-                // One entry per version. A node that reverts a pending change
-                // (§8.3) restores the announced record, and its next local
-                // change counts up from there, re-issuing a version its
-                // reverted record had used; nobody else ever saw the reverted
-                // one, so the node's newer own write replaces it here.
-                let list = self.versions.entry(record.entry.path.clone()).or_default();
-                match list.iter_mut().find(|e| e.version == record.entry.version) {
-                    Some(existing) => {
-                        if record.entry.modified_by == id && *existing != record.entry {
-                            *existing = record.entry.clone();
+                // I7 (§14.1): equal vectors at a path mean equal content and
+                // deletion state, on every node, after every index write. The
+                // one exemption is a node's own re-issue after `revert`
+                // (§8.3): the reverted record's vector was never announced,
+                // and the newer own write replaces it.
+                let path = record.entry.path.clone();
+                let list = self.versions.entry(path.clone()).or_default();
+                match list.iter().position(|e| e.version == record.entry.version) {
+                    Some(at) => {
+                        let existing = list[at].clone();
+                        let same = existing.kind == record.entry.kind
+                            && existing.hash == record.entry.hash
+                            && existing.exec == record.entry.exec
+                            && existing.deleted == record.entry.deleted;
+                        if !same {
+                            let seen = self
+                                .seen_at
+                                .get(&path)
+                                .and_then(|v| v.iter().find(|(ver, _)| *ver == existing.version))
+                                .map_or(0, |(_, at)| *at);
+                            let reissue = record.entry.modified_by == id
+                                && existing.modified_by == id
+                                && self
+                                    .reverted_at
+                                    .get(&(id, path.clone()))
+                                    .is_some_and(|&reverted| reverted >= seen);
+                            if !reissue {
+                                return Err(self.fail(
+                                    "I7 version identity",
+                                    format!(
+                                        "{}: {} at version {:?} has {:?} {} exec={} deleted={} but the same vector was seen with {:?} {} exec={} deleted={}",
+                                        Self::short(id),
+                                        path,
+                                        record.entry.version,
+                                        record.entry.kind,
+                                        record.entry.hash.short(),
+                                        record.entry.exec,
+                                        record.entry.deleted,
+                                        existing.kind,
+                                        existing.hash.short(),
+                                        existing.exec,
+                                        existing.deleted
+                                    ),
+                                ));
+                            }
+                            if let Some(list) = self.versions.get_mut(&path) {
+                                list[at] = record.entry.clone();
+                            }
+                            let now_ev = self.stats.events;
+                            self.seen_at
+                                .entry(path.clone())
+                                .or_default()
+                                .push((record.entry.version.clone(), now_ev));
                         }
                     }
-                    None => list.push(record.entry.clone()),
+                    None => {
+                        list.push(record.entry.clone());
+                        let now_ev = self.stats.events;
+                        self.seen_at
+                            .entry(path.clone())
+                            .or_default()
+                            .push((record.entry.version.clone(), now_ev));
+                    }
                 }
                 let now = self.clock;
                 if let Some(n) = self.nodes.get_mut(&id) {
@@ -1916,6 +1976,11 @@ impl Sim {
             UserAction::Revert => {
                 if paused.is_some() {
                     self.stats.reverts += 1;
+                    let pending: Vec<RelPath> = f.index().pending_paths().cloned().collect();
+                    let at = self.stats.events;
+                    for path in pending {
+                        self.reverted_at.insert((id, path), at);
+                    }
                     // §8.3 puts the announced records back and re-fetches
                     // them; no content lands, so these writes are not
                     // adoptions for I2.

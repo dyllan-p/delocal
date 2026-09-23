@@ -292,7 +292,8 @@ pub struct Classified {
 /// - dominates the local record: apply it as is;
 /// - equal or dominated: nothing;
 /// - concurrent, identical content: the §7.2 merge, fields from the side
-///   [`conflict::prefer_fields`] picks, adopted as metadata or index only;
+///   [`conflict::winner`] picks (§7.6 "one order for everything"), adopted
+///   as metadata or index only;
 /// - concurrent, different content: `M` from [`conflict::resolve`]. If the
 ///   local record is the loser and live, the item carries the conflict copy
 ///   unless the conflict path already has a live record, in which case the
@@ -329,13 +330,15 @@ pub fn classify(index: &Index, incoming: &Entry) -> Classified {
                 };
             };
             if local.same_content(incoming) {
-                // The §7.2 identical-content merge. Two records that tie all
-                // the way down are the same content under two vectors (two
-                // machines resolved the same conflict, or created the same
-                // directory); whichever side gives the fields, M is the same.
-                // That tie is not a rule-5 conflict decision (§7.6) and is
-                // not counted as one.
-                let pick = conflict::prefer_fields(incoming, local);
+                // The §7.2 identical-content merge, decided by the same total
+                // order as a conflict (§7.6 "one order for everything") so
+                // that every merged record is a function of its vector. Two
+                // records that tie all the way down are the same content
+                // under two vectors (two machines resolved the same conflict,
+                // or created the same directory); whichever side gives the
+                // fields, M is the same. Reaching rule 5 here is that tie,
+                // not a conflict decision, and is not counted as one.
+                let pick = conflict::winner(incoming, local);
                 let (fields, other) = match pick.side {
                     Side::First => (incoming, local),
                     Side::Second => (local, incoming),
