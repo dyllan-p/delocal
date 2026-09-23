@@ -254,6 +254,9 @@ pub struct Sim {
     nodes: BTreeMap<NodeId, Node>,
     /// Node ids in creation order, for `Step` indices.
     order: Vec<NodeId>,
+    /// The node whose `revert` is being processed, while it is: the records
+    /// it restores are what peers hold, not content that landed (I2).
+    reverting: Option<NodeId>,
     links: BTreeMap<(NodeId, NodeId), Link>,
     messages: Vec<Message>,
     msg_seq: u64,
@@ -340,6 +343,7 @@ impl Sim {
             links,
             messages: Vec::new(),
             msg_seq: 0,
+            reverting: None,
             approved: BTreeSet::new(),
             ops: Vec::new(),
             users: Vec::new(),
@@ -956,6 +960,7 @@ impl Sim {
                     if record.entry.modified_by != id
                         && !record.entry.deleted
                         && record.entry.kind != Kind::Dir
+                        && self.reverting != Some(id)
                     {
                         n.synced
                             .push((record.entry.hash, record.entry.path.clone(), now));
@@ -1911,7 +1916,13 @@ impl Sim {
             UserAction::Revert => {
                 if paused.is_some() {
                     self.stats.reverts += 1;
-                    self.feed(id, Event::Revert { folder })?;
+                    // §8.3 puts the announced records back and re-fetches
+                    // them; no content lands, so these writes are not
+                    // adoptions for I2.
+                    self.reverting = Some(id);
+                    let fed = self.feed(id, Event::Revert { folder });
+                    self.reverting = None;
+                    fed?;
                 }
             }
             UserAction::Rules {
