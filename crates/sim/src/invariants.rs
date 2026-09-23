@@ -226,8 +226,15 @@ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
 
 /// I4: every conflict copy present is the copy of a version that lost at
 /// its path, with that version's content, and there is one copy path per
-/// losing version by construction of the name.
+/// losing version by construction of the name. A copy the simulated user
+/// edited afterwards (a mass modify picks any file) keeps the name check
+/// but not the content check: it is the user's file from then on.
 fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
+    let mut user_edited: BTreeSet<RelPath> = BTreeSet::new();
+    for id in sim.node_ids() {
+        let (_, local_edit_at) = sim.synced(*id);
+        user_edited.extend(local_edit_at.keys().cloned());
+    }
     // Losing versions per original path: ranked below a concurrent,
     // content-differing version by the winner rule.
     let mut expected: BTreeMap<RelPath, Entry> = BTreeMap::new();
@@ -269,6 +276,9 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
                     ),
                 ));
             };
+            if user_edited.contains(path) {
+                continue; // the user's own edit of the copy; the name still checks out
+            }
             let same = loser.kind == live.kind
                 && loser.hash == live.hash
                 && (loser.kind != Kind::File || loser.exec == live.exec);
