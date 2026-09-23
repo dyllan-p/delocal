@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 10 · 23 September 2026 · Status: **for review** · Changes from draft 9: rule 5 of the winner rule orders on kind as well (§7.6); the conflict copy's `prev_hash` follows §7.1 rather than being fixed at `EMPTY` (§7.6); the conflict-name split and truncation rules are spelled out (§7.6).
+> Draft 11 · 23 September 2026 · Status: **for review** · Changes from draft 10: the sender's H1 denominator is the tracked count at the last announcement; a paused folder stays paused until `approve` or `revert`; frozen paths keep every incoming version; rule changes never release anything by themselves; the paused batch has a reserved id (§8.1). Quarantine stores raw incoming entries and `approve` re-classifies (§8.2). `revert` restores records with their original `seq`, removes never-announced adds, and puts reverted paths in flight (§8.3).
+>
+> Changes from draft 9: rule 5 of the winner rule orders on kind as well (§7.6); the conflict copy's `prev_hash` follows §7.1 rather than being fixed at `EMPTY` (§7.6); the conflict-name split and truncation rules are spelled out (§7.6).
 >
 > Changes from draft 8: the winner rule is a total order in five steps (§7.6); the conflict copy is this machine's change (§7.6); an occupied conflict path displaces to trash (§7.6); a displacement target that appears late is `ChangedUnderneath` (§7.5); non-empty directory losers noted as known behaviour (§7.6).
 >
@@ -369,11 +371,11 @@ A batch is **held** if either rule trips, evaluated over the batch's apply set (
 - Adds do not count toward H1. Adds are almost never destructive, and exempting them keeps first sync and bulk imports quiet.
 - H1 cannot trip on a folder with zero tracked entries.
 - A batch entry counts as a `mod` only if it changes content: its `hash` differs from its `prev_hash`, or its kind or exec bit differs from the record it replaces. Metadata-only changes (touches, §7.3) and metadata-only applies (§7.5) count as neither `mods` nor `dels` for H1 and contribute no bytes to H2, on the sender pre-check and the receiver alike. Exec-bit-only changes count as `mods` and contribute no bytes on the receiver, which can see the record being replaced. The sender pre-check cannot (after coalescing it no longer holds the replaced record, and `hash == prev_hash`), so it classifies them as metadata-only; a mass `chmod` is not destructive, and the receiver check still counts it.
-- Thresholds are per folder: `delocal rules ~/Sync --hold-count 50 --hold-pct 25 --hold-size 20G`. Setting `--hold-count 0` disables H1 for that folder.
+- Thresholds are per folder: `delocal rules ~/Sync --hold-count 50 --hold-pct 25 --hold-size 20G`. Setting `--hold-count 0` disables H1 for that folder. Changing the rules never releases a held batch or unpauses a folder by itself: `status` says what would now pass, and `approve` releases it. Every release is an explicit act, wherever the rule change came from (rules travel with folder metadata, §9.1).
 
-**Sender pre-check.** The same rules run on the machine where the changes happened, before anything is sent. If they trip, the folder is **paused** on that machine: nothing leaves, and `status` everywhere shows `paused on <machine>: 812 deletes pending — delocal review on <machine>`. This is cheap and it is what makes `revert` trivially safe: no other machine has seen the damage.
+**Sender pre-check.** The same rules run on the machine where the changes happened, before anything is sent. If they trip, the folder is **paused** on that machine: nothing leaves, and `status` everywhere shows `paused on <machine>: 812 deletes pending — delocal review on <machine>`. This is cheap and it is what makes `revert` trivially safe: no other machine has seen the damage. The sender's H1 denominator is the tracked count **as of its last announcement**, not the current one: after `rm -rf` of 800 of 1,000 files the current count is 200, which is exactly the wrong number. Once paused, a folder stays paused until `approve` or `revert`, even if later local changes bring the pending set back under the thresholds; `status` says so. The batch that would have been sent gets a batch id at the moment of pausing, shown by `status` and `review`, and `approve <id>` sends it.
 
-A paused folder **keeps receiving**: remote batches are applied normally for paths not in the pending batch, and paths that are in the pending batch are left untouched until `approve` or `revert`. Further local changes made while paused join the pending batch, the brake is re-evaluated over the whole of it, and `revert` undoes all of it.
+A paused folder **keeps receiving**: remote batches are applied normally for paths not in the pending batch, and paths that are in the pending batch are left untouched until `approve` or `revert`: every incoming version for such a path is kept, in arrival order, and re-classified when the folder unpauses (dropping one would lose it, since the sender has been acknowledged for it). Further local changes made while paused join the pending batch, the brake is re-evaluated over the whole of it, and `revert` undoes all of it.
 
 **Receiver check.** Runs regardless of what the sender did. A machine running an old or broken delocal, or one whose user approved something hastily, still cannot push a mass change onto a machine that has not agreed.
 
@@ -381,7 +383,7 @@ Counting only. No content analysis, no entropy heuristics, no attempt to recogni
 
 ### 8.2 Quarantine
 
-When a receiver holds a batch, every version in its apply set is written to the `quarantine` table. Quarantine is by **version**, not by sender:
+When a receiver holds a batch, every incoming entry that produced an apply-set item is written to the `quarantine` table **as received**, not as classified: a conflict's `M` (§7.6) never appears on the wire, and quarantining it instead of the incoming version would let that version through from another peer. Quarantine is by **version**, not by sender:
 
 - The same version offered later by any other member is still held.
 - Any version that **dominates** a quarantined version (the source kept editing after the event) is also quarantined, and joins the same review item.
@@ -389,7 +391,7 @@ When a receiver holds a batch, every version in its apply set is written to the 
 
 `delocal review` shows each held item: source, time, counts, size, sample paths, file-type breakdown. Then:
 
-- **`approve`** applies the apply set normally. Trash still protects every overwritten or deleted file.
+- **`approve`** re-classifies the quarantined entries against the index as it stands and applies the result normally. Trash still protects every overwritten or deleted file.
 - **`deny`** makes this machine's current copies win. For every quarantined path it produces a new version equal to the component-wise maximum of its local version and every quarantined version for that path, with its own counter incremented, so the result dominates all of them; then it drops the quarantine. Where this machine has no record for the path, the new version is a tombstone. Content is unchanged, so on machines that hold the same content this lands as a metadata-only apply (§7.5) and does not trip the brake. The mesh converges on this machine's copies. On the source machine this arrives as a mass modification and may itself trip that machine's brake; that is correct — the user is already in "something went wrong" mode and approving it there restores the source. **[decision]** This is the simplest correct semantics for `deny`; an alternative is for `deny` to only refuse and tell the user to run `revert` on the source.
 
 Approving on one machine does not approve on others in v1 (§3.2).
@@ -399,9 +401,9 @@ Approving on one machine does not approve on others in v1 (§3.2).
 `delocal revert ~/Sync` on the machine that paused itself means "make this folder look like the rest of the mesh again":
 
 1. Discard the pending batch.
-2. For every path in it: move the current local file (if any) to trash, and reset the index record to the last version that was actually announced.
+2. For every path in it: move the current local file (if any) to trash, and reset the index record to the last version that was actually announced, restoring that record exactly, `seq` included, so it is not re-announced. A path peers never saw has no announced version; its record is removed.
 3. Adds that were part of the pending batch are also moved to trash **[decision]** — in the destructive scenarios (encryption, a script writing junk) they are the debris.
-4. The normal want-list logic re-fetches every reverted path from peers, which still have them because nothing was sent.
+4. The normal want-list logic re-fetches every reverted path from peers, which still have them because nothing was sent. Until each fetch commits the path is **in flight**: observations of it are ignored and the scan bracket's deletion pass skips it, otherwise the trash move in step 2 would be seen as a deletion and announced, which is the one thing `revert` exists to prevent. (In flight is the general rule for any path with an accepted apply item; §7.5.)
 
 `revert` is only meaningful on a paused sender. On other machines it is a no-op with an explanatory message.
 
