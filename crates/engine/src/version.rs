@@ -43,7 +43,7 @@ impl Relation {
     }
 
     /// True for `Dominates` and `Equal`: "we already have at least this".
-    pub const fn dominates_or_equal(self) -> bool {
+    pub const fn dominates_or_equals(self) -> bool {
         matches!(self, Self::Dominates | Self::Equal)
     }
 }
@@ -111,7 +111,7 @@ impl Version {
 
     /// `self` dominates or equals `other`.
     pub fn dominates_or_equals(&self, other: &Self) -> bool {
-        self.compare(other).dominates_or_equal()
+        self.compare(other).dominates_or_equals()
     }
 
     /// Component-wise maximum, no increment (§7.2).
@@ -130,8 +130,10 @@ impl Version {
     /// The local-change rule (§7.2): this vector with `node`'s counter one
     /// higher. Missing key reads as 0, so a first change yields 1.
     ///
-    /// Saturates at `u64::MAX` rather than panic. Reaching it would take
-    /// more changes to one path than any machine will ever make.
+    /// Saturates rather than panics: if `node`'s counter is already
+    /// `u64::MAX` the result equals the input. That is the single exception
+    /// to the law that the increment dominates its input. Reaching it would
+    /// take more changes to one path than any machine will ever make.
     pub fn incremented(&self, node: NodeId) -> Self {
         let mut out = self.0.clone();
         let slot = out.entry(node).or_insert(0);
@@ -178,8 +180,10 @@ mod tests {
 
     /// A small pool of node IDs so generated versions share keys often.
     fn node(i: u8) -> NodeId {
+        // The first byte so that short forms differ and Debug output is
+        // readable in failures: node(1) shows as 01000000.
         let mut bytes = [0u8; 16];
-        bytes[15] = i;
+        bytes[0] = i;
         NodeId::from_bytes(bytes)
     }
 
@@ -256,9 +260,34 @@ mod tests {
     }
 
     #[test]
+    fn json_round_trip_and_form() {
+        let v = version(&[(1, 2), (3, 7)]);
+        let json = serde_json::to_string(&v).unwrap();
+        // A map keyed by hex node IDs; zero counters never appear.
+        assert_eq!(
+            json,
+            "{\"01000000000000000000000000000000\":2,\"03000000000000000000000000000000\":7}"
+        );
+        let back: Version = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, v);
+        // Zeros arriving from outside are dropped on the way in.
+        let with_zero: Version =
+            serde_json::from_str("{\"01000000000000000000000000000000\":0}").unwrap();
+        assert_eq!(with_zero, Version::empty());
+    }
+
+    #[test]
+    fn postcard_round_trip() {
+        let v = version(&[(1, 2), (3, 7)]);
+        let bytes = postcard::to_stdvec(&v).unwrap();
+        let back: Version = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, v);
+    }
+
+    #[test]
     fn debug_uses_short_ids() {
-        let v = version(&[(1, 2)]);
-        assert_eq!(format!("{v:?}"), "{00000000: 2}");
+        let v = version(&[(1, 2), (3, 1)]);
+        assert_eq!(format!("{v:?}"), "{01000000: 2, 03000000: 1}");
     }
 
     // ---- laws ----------------------------------------------------------------
@@ -345,6 +374,14 @@ mod tests {
             if n != m {
                 prop_assert_eq!(v.incremented(n).compare(&v.incremented(m)), Relation::Concurrent);
             }
+        }
+
+        #[test]
+        fn serde_round_trips_preserve_version(a in any_version()) {
+            let json = serde_json::to_string(&a).unwrap();
+            prop_assert_eq!(serde_json::from_str::<Version>(&json).unwrap(), a.clone());
+            let bytes = postcard::to_stdvec(&a).unwrap();
+            prop_assert_eq!(postcard::from_bytes::<Version>(&bytes).unwrap(), a);
         }
 
         #[test]
