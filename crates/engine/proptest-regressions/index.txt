@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c8697ce6607df857c1a02438ce0bfe5192fa31499b7baae8f1ca67ecd77f5361 # shrinks to steps = [See { path: 3, hash: 0, mtime: 0 }, Gone { path: 3, at: 0 }, See { path: 3, hash: 0, mtime: 0 }]
+cc 751f15dafa64b94d95e092bc2d92b5a72fa17ccdfd4c96bcdfed2175307d06e0 # shrinks to steps = [See { path: 3, hash: 0, mtime: 0 }, Announce, Gone { path: 3, at: 0 }, Copy { path: 3, hash: 0 }]
