@@ -249,6 +249,38 @@ mod tests {
     }
 
     #[test]
+    fn json_form_is_the_hex_string() {
+        let id = NodeId::from_bytes(sample());
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(json, "\"00112233445566778899aabbccddeeff\"");
+        let back: NodeId = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn postcard_form_is_the_raw_bytes() {
+        let id = NodeId::from_bytes(sample());
+        let bytes = postcard::to_stdvec(&id).unwrap();
+        // A varint length prefix (one byte for 16) plus the 16 bytes; the hex
+        // string would be 33.
+        assert!(
+            bytes.len() <= 17,
+            "postcard NodeId is {} bytes",
+            bytes.len()
+        );
+        assert_eq!(&bytes[bytes.len() - ID_LEN..], &sample());
+        let back: NodeId = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back, id);
+    }
+
+    #[test]
+    fn json_rejects_wrong_length_and_bad_hex() {
+        assert!(serde_json::from_str::<NodeId>("\"0011\"").is_err());
+        assert!(serde_json::from_str::<NodeId>("\"zz112233445566778899aabbccddeeff\"").is_err());
+        assert!(serde_json::from_str::<NodeId>("[1, 2, 3]").is_err());
+    }
+
+    #[test]
     fn ids_of_different_kinds_are_different_types() {
         // Compile-time check: a NodeId is not a FolderId even with equal bytes.
         fn takes_node(_: NodeId) {}
