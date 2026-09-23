@@ -1084,6 +1084,7 @@ impl Sim {
     }
 
     fn set_online(&mut self, id: NodeId, online: bool) -> Result<(), Failure> {
+        let clock = self.clock;
         let Some(node) = self.nodes.get(&id) else {
             return Ok(());
         };
@@ -1094,6 +1095,10 @@ impl Sim {
         if online {
             if let Some(n) = self.nodes.get_mut(&id) {
                 n.online = true;
+                // Offline stands for a suspended machine: its timers did not
+                // run, and whatever fell due while it slept fires now.
+                n.wake_at = n.wake_at.map(|t| t.max(clock));
+                n.next_scan_at = n.next_scan_at.max(clock);
             }
             for p in peers {
                 self.connect(id, p)?;
