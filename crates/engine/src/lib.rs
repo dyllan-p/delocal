@@ -17,6 +17,7 @@
 //! - [`batch`]: batch formation, the summary, decisions, the apply set (§7.4)
 //! - [`brake`]: the H1 and H2 rules, one function for sender and receiver (§8.1)
 //! - [`quarantine`]: held batches and the versions they hold (§8.2)
+//! - [`want`]: the want-list, source selection, deadlines, ordering (§7.5, §6.5)
 //! - [`conflict`]: the winner rule, the merged version `M`, conflict-copy names (§7.6)
 //! - [`folder`]: per-folder state: window, scan bracket, accepted work (§7.3, §7.4)
 //! - [`engine`]: the `Engine`, its `Event`s and `Action`s (§7)
@@ -37,6 +38,7 @@ pub mod quarantine;
 pub mod rules;
 pub mod time;
 pub mod version;
+pub mod want;
 
 pub use batch::{
     ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Classified, Decision, Summary,
@@ -58,6 +60,7 @@ pub use quarantine::{HeldItem, Quarantine};
 pub use rules::Rules;
 pub use time::Timestamp;
 pub use version::{Relation, Version};
+pub use want::{FetchReport, Want, WantList, WantState};
 
 /// The version of delocal, taken from the workspace at compile time.
 ///
