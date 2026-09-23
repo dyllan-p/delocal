@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 6 · 23 September 2026 · Status: **for review** · Changes from draft 5: conflicts resolve to the merged version `M = merge(W, L)` with no increment, replacing `W′` (§7.6); the displacing commit (§7.5); adopted records are announced, so live batches and catch-up are the same mechanism (§7.4).
+> Draft 7 · 23 September 2026 · Status: **for review** · Changes from draft 6: batch entries ordered by `seq`, `seq_high` on every batch, the decision doubles as the acknowledgement, and the connect-time watermark exchange (§7.4, §12); the sender's summary counts local changes only (§7.4).
+>
+> Changes from draft 5: conflicts resolve to the merged version `M = merge(W, L)` with no increment, replacing `W′` (§7.6); the displacing commit (§7.5); adopted records are announced, so live batches and catch-up are the same mechanism (§7.4).
 >
 > Changes from draft 4: `prev_hash` on every entry and the metadata-only rule in conflicts (§7.1, §7.6); mtime-only changes and the mtime-precision shim (§7.3); tombstone `hash` and `mtime_ns` defined (§7.1); NFC normalisation is the host's job (§7.1, Appendix A); brake classification of mods via `prev_hash` (§8.1).
 >
@@ -264,9 +266,11 @@ Otherwise the batch is sent to every connected member of the folder and recorded
 - incoming **dominated** or **equal** → ignore (we already have it or newer)
 - **concurrent** → conflict handling (§7.6) produces zero or more candidate actions
 
-The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluated over the apply set. Result: `accepted` (apply set goes into the want-list) or `held` (versions quarantined, §8.2). The receiver replies `BatchDecision { id, decision }`, and records the batch in history either way.
+The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluated over the apply set. Result: `accepted` (apply set goes into the want-list) or `held` (versions quarantined, §8.2). The receiver replies `BatchDecision { id, decision, seq_high }`, and records the batch in history either way.
 
-**Catch-up.** When two members connect, each sends every index record with `seq` greater than the last `seq` the other has acknowledged, packaged as one or more synthetic batches (max 10,000 entries each). These go through exactly the same brake. A brand-new member receiving the whole folder sees a batch of pure adds, which the count rule ignores (§8.1), so first sync is never held by count; it can still be held by size.
+**Ordering and acknowledgement.** Entries in a batch are ordered by the sender's `seq`, not by path, and a batch that would exceed 10,000 entries is split on `seq` boundaries, so every batch covers a contiguous range of the sender's `seq` and its `seq_high` is a true watermark. The receiver's `BatchDecision` is the acknowledgement: `Accepted` and `Held` both mean "I have your records up to `seq_high`" (held versions sit in quarantine and are not re-sent). There is no separate ack message. Receivers sort their apply set by path before applying, which is where §7.5's parents-before-children order comes from. The sender's `summary` counts only this machine's own local changes, classified as in §8.1; adopted records it relays are not counted, since they already passed this machine's receiver brake, and every receiver computes its own counts over its own apply set anyway.
+
+**Catch-up.** When two members connect, each tells the other the highest `seq` of theirs it holds, per folder (`have_up_to` in `FolderMeta`, §12), and each sends every index record with `seq` greater than that, packaged as one or more batches (max 10,000 entries each, split on `seq`). These go through exactly the same brake. A brand-new member receiving the whole folder sees a batch of pure adds, which the count rule ignores (§8.1), so first sync is never held by count; it can still be held by size.
 
 **Why batches and not a live index stream:** every batch is a natural unit for approval, for `history`, for `review` and for `revert`. Syncthing streams index updates continuously and has no such unit, which is why its safety story is weaker. The cost is up to 10 s of latency on a change, which is acceptable.
 
@@ -583,9 +587,9 @@ machines       (node, hostname, ts_stable_id, ts_user, trusted, last_seen, deloc
 ```
 Hello         { proto: u32, node: NodeId, hostname, version: String, now: i64 }
 Goodbye       { reason }
-FolderMeta    { folder, name, members, rules, meta_version }
+FolderMeta    { folder, name, members, rules, meta_version, have_up_to: u64 }   // have_up_to: highest seq of the recipient's records the sender holds
 Batch         { …§7.4 }
-BatchDecision { batch: BatchId, decision: Accepted | Held { reason } }
+BatchDecision { batch: BatchId, decision: Accepted | Held { reason }, seq_high: u64 }   // doubles as the ack (§7.4)
 RequestFile   { folder, path, version, offset: u64 }
 FileData      { req: RequestId, offset: u64, bytes: Vec<u8> }     // 1 MiB chunks
 FileDone      { req: RequestId }
