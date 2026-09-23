@@ -11,17 +11,20 @@
 //! - [`version`]: version vectors, comparison, merge, the local-change rule (§7.2)
 //! - [`path`]: validated relative paths (§7.1)
 //! - [`entry`]: index entries and content equality (§7.1, §7.6)
+//! - [`index`]: the per-folder index, local changes, tombstones (§7.1, §7.2, §7.7)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod entry;
 pub mod id;
+pub mod index;
 pub mod path;
 pub mod version;
 
 pub use entry::{Entry, Hash, Kind, Observed};
 pub use id::{BatchId, FolderId, HostName, NodeId};
+pub use index::{ChangeKind, Index, IndexRecord, LocalChange};
 pub use path::RelPath;
 pub use version::{Relation, Version};
 
