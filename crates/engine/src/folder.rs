@@ -331,6 +331,19 @@ pub struct FolderState {
     winner_fallbacks: u64,
     quarantine: Quarantine,
     paused: Option<Paused>,
+    /// Statuses raised outside a direct call's return value (a hold made
+    /// while admitting re-classified entries); the engine drains them.
+    #[serde(skip)]
+    statuses: Vec<FolderStatus>,
+}
+
+/// A re-classified item on its way into the want-list, with the batch it
+/// came from.
+struct Candidate {
+    item: ApplyItem,
+    batch: BatchId,
+    source: NodeId,
+    seq_high: u64,
 }
 
 impl FolderState {
@@ -356,7 +369,13 @@ impl FolderState {
             winner_fallbacks: 0,
             quarantine: Quarantine::default(),
             paused: None,
+            statuses: Vec::new(),
         }
+    }
+
+    /// Statuses raised since the last call (see `statuses`).
+    pub fn take_statuses(&mut self) -> Vec<FolderStatus> {
+        std::mem::take(&mut self.statuses)
     }
 
     pub fn id(&self) -> FolderId {
@@ -498,9 +517,9 @@ impl FolderState {
         };
         if change.is_some() {
             self.touched(now);
-            self.reclassify_want(&path);
+            self.reclassify_want(now, &path);
         }
-        self.reconsider(&path, None);
+        self.reconsider(now, &path, None);
         Scanned {
             change,
             status: None,
@@ -511,7 +530,7 @@ impl FolderState {
     /// entry against the new record. A dominating result replaces the want
     /// (keeping its sources when the version is unchanged); anything else
     /// ends it.
-    fn reclassify_want(&mut self, path: &RelPath) {
+    fn reclassify_want(&mut self, now: Timestamp, path: &RelPath) {
         let Some(old) = self.wants.remove(path) else {
             return;
         };
@@ -521,14 +540,110 @@ impl FolderState {
         }
         if let Some(item) = classified.item {
             let same = item.incoming().version == old.entry.version;
-            if self
-                .wants
-                .insert(item, old.batch, old.source, old.seq_high)
-                .is_none()
-                && same
-            {
+            self.admit(
+                now,
+                vec![Candidate {
+                    item,
+                    batch: old.batch,
+                    source: old.source,
+                    seq_high: old.seq_high,
+                }],
+                true,
+            );
+            if same {
                 for src in old.sources {
                     self.wants.note_announced(path, &old.entry.version, src);
+                }
+            }
+        }
+    }
+
+    /// Admit re-classified items the way `receive` admits new ones (§7.4,
+    /// §8.1, §8.2): an item whose version this machine already wants only
+    /// names a source; one whose version is quarantined, or dominates a
+    /// quarantined version, joins that held item; the rest go through the
+    /// brake as one apply set per originating batch, and are held under
+    /// that batch's id or wanted. `brake` is false for an explicit
+    /// `approve`, which is the release itself.
+    fn admit(&mut self, now: Timestamp, candidates: Vec<Candidate>, brake: bool) {
+        let mut groups: BTreeMap<(BatchId, NodeId, u64), Vec<ApplyItem>> = BTreeMap::new();
+        for c in candidates {
+            let entry = c.item.incoming();
+            if let Some(want) = self.wants.get(c.item.path())
+                && (entry.version == *want.version() || want.version().dominates(&entry.version))
+            {
+                self.wants
+                    .note_announced(c.item.path(), &entry.version, c.source);
+                continue;
+            }
+            if let Some(held) = self.quarantine.matching(entry) {
+                self.quarantine.join(held, entry.clone());
+                self.statuses.push(FolderStatus::JoinedHeld {
+                    batch: held,
+                    count: 1,
+                });
+                continue;
+            }
+            groups
+                .entry((c.batch, c.source, c.seq_high))
+                .or_default()
+                .push(c.item);
+        }
+        for ((batch, source, seq_high), mut items) in groups {
+            items.sort_by(|a, b| a.path().cmp(b.path()));
+            let set = ApplySet {
+                folder: self.id,
+                batch,
+                source,
+                seq_high,
+                items,
+                ignored: 0,
+                duplicates: 0,
+                fallbacks: 0,
+            };
+            let summary = brake::receiver_summary(&self.index, &set);
+            let verdict = if brake {
+                brake::evaluate(&self.rules, &summary, self.index.tracked_count())
+            } else {
+                Verdict::Pass
+            };
+            match verdict {
+                Verdict::Hold(reason) => {
+                    let paths = set.items.len();
+                    if self.quarantine.get(batch).is_some() {
+                        for item in set.items {
+                            self.quarantine.join(batch, item.incoming().clone());
+                        }
+                        self.statuses.push(FolderStatus::JoinedHeld {
+                            batch,
+                            count: paths,
+                        });
+                    } else {
+                        self.quarantine.hold(HeldItem {
+                            batch,
+                            source,
+                            seq_high,
+                            held_at: now,
+                            reason,
+                            entries: set
+                                .items
+                                .into_iter()
+                                .map(|i| (i.path().clone(), i.incoming().clone()))
+                                .collect(),
+                        });
+                        self.statuses.push(FolderStatus::Held {
+                            batch,
+                            source,
+                            reason,
+                            summary,
+                            paths,
+                        });
+                    }
+                }
+                Verdict::Pass => {
+                    for item in set.items {
+                        self.want(item, batch, source, seq_high);
+                    }
                 }
             }
         }
@@ -538,7 +653,7 @@ impl FolderState {
     /// now stands, in arrival order; only those with `reason` if given.
     /// Each becomes a want (an `Apply`, possibly a conflict's `M`) or is
     /// dropped if the index has caught up with it.
-    fn reconsider(&mut self, path: &RelPath, reason: Option<DeferredReason>) {
+    fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: Option<DeferredReason>) {
         let Some(list) = self.deferred.remove(path) else {
             return;
         };
@@ -548,15 +663,29 @@ impl FolderState {
         if !keep.is_empty() {
             self.deferred.insert(path.clone(), keep);
         }
-        for deferred in take {
-            let classified = batch::classify(&self.index, &deferred.entry);
+        let candidates = self.classify_deferred(take);
+        self.admit(now, candidates, true);
+    }
+
+    /// Classify deferred entries against the index as it now stands, in
+    /// arrival order, dropping those the index has caught up with.
+    fn classify_deferred(&mut self, deferred: Vec<Deferred>) -> Vec<Candidate> {
+        let mut out = Vec::new();
+        for d in deferred {
+            let classified = batch::classify(&self.index, &d.entry);
             if classified.fallback {
                 self.winner_fallbacks += 1;
             }
             if let Some(item) = classified.item {
-                self.want(item, deferred.batch, deferred.source, deferred.seq_high);
+                out.push(Candidate {
+                    item,
+                    batch: d.batch,
+                    source: d.source,
+                    seq_high: d.seq_high,
+                });
             }
         }
+        out
     }
 
     /// Put an accepted item in the want-list, or defer it if it is
@@ -576,12 +705,26 @@ impl FolderState {
         }
     }
 
-    /// The folder unpaused: every frozen entry is classified again.
-    fn unfreeze(&mut self) {
+    /// The folder unpaused: every frozen entry is classified again and
+    /// admitted together, so a mass change that arrived while paused meets
+    /// the brake as the batch it was (§8.1).
+    fn unfreeze(&mut self, now: Timestamp) {
         let paths: Vec<RelPath> = self.deferred.keys().cloned().collect();
+        let mut frozen = Vec::new();
         for path in paths {
-            self.reconsider(&path, Some(DeferredReason::Frozen));
+            let Some(list) = self.deferred.remove(&path) else {
+                continue;
+            };
+            let (take, keep): (Vec<Deferred>, Vec<Deferred>) = list
+                .into_iter()
+                .partition(|d| d.reason == DeferredReason::Frozen);
+            if !keep.is_empty() {
+                self.deferred.insert(path, keep);
+            }
+            frozen.extend(take);
         }
+        let candidates = self.classify_deferred(frozen);
+        self.admit(now, candidates, true);
     }
 
     /// A full scan begins: start collecting the paths it reports.
@@ -604,11 +747,11 @@ impl FolderState {
         for path in &gone {
             if let Some(change) = self.index.observe_absent(path, now.as_unix_nanos()) {
                 changes.push(change);
-                self.reclassify_want(path);
+                self.reclassify_want(now, path);
             }
             // A deferred entry whose file vanished underneath is only ever
             // caught here: later scans never report a tombstoned path.
-            self.reconsider(path, None);
+            self.reconsider(now, path, None);
         }
         if !changes.is_empty() {
             self.touched(now);
@@ -896,16 +1039,25 @@ impl FolderState {
                 duplicates: 0,
                 fallbacks,
             };
-            for it in set.items.clone() {
-                self.want(it, item.batch, item.source, item.seq_high);
-            }
+            let candidates = set
+                .items
+                .iter()
+                .cloned()
+                .map(|it| Candidate {
+                    item: it,
+                    batch: item.batch,
+                    source: item.source,
+                    seq_high: item.seq_high,
+                })
+                .collect();
+            self.admit(now, candidates, false);
             return Approved::Released(Some(set));
         }
         match &self.paused {
             Some(paused) if paused.batch == batch => {
                 let batches = self.form_batches(now, batch);
                 self.paused = None;
-                self.unfreeze();
+                self.unfreeze(now);
                 Approved::Sent(batches)
             }
             _ => Approved::Unknown,
@@ -939,7 +1091,7 @@ impl FolderState {
     /// restore every path's announced record, move the current files to
     /// trash, and want the restored live entries again as `restoring`.
     /// `None` if the folder is not paused.
-    pub fn revert(&mut self, _now: Timestamp) -> Option<RevertOutcome> {
+    pub fn revert(&mut self, now: Timestamp) -> Option<RevertOutcome> {
         let paused = self.paused.take()?;
         let own = self.index.own();
         let others: BTreeSet<NodeId> = self.members.iter().copied().filter(|m| *m != own).collect();
@@ -975,7 +1127,7 @@ impl FolderState {
             }
         }
         self.window = None;
-        self.unfreeze();
+        self.unfreeze(now);
         Some(RevertOutcome {
             batch: paused.batch,
             trash,
@@ -1123,7 +1275,7 @@ impl FolderState {
                 WantStep::Adopt(entry) => {
                     let path = entry.path.clone();
                     adopted.push(self.adopt(now, entry));
-                    self.reconsider(&path, None);
+                    self.reconsider(now, &path, None);
                 }
             }
         }
@@ -1164,7 +1316,7 @@ impl FolderState {
                     self.touched(now);
                     written.push(change.record);
                 }
-                self.reconsider(path, None);
+                self.reconsider(now, path, None);
                 written
             }
             ApplyOutcome::ChangedUnderneath => {
@@ -2023,6 +2175,51 @@ mod tests {
             1
         );
         assert_eq!(b.quarantine().len(), 1, "the deletes stay held");
+    }
+
+    #[test]
+    fn frozen_edits_meet_the_brake_when_the_folder_unpauses() {
+        // B edits eight files and pauses (8 mods of 10). A edits the same
+        // eight while B is paused: frozen. At approve they resolve as eight
+        // conflicts, eight mods against B's live copies: held, not applied.
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..8 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), file(2, 20));
+        }
+        assert!(matches!(
+            b.tick(t(12.0), bid(5)),
+            Ticked::Paused { first: true, .. }
+        ));
+        for i in 0..8 {
+            a.scanned(t(13.0), p(&format!("f{i:02}")), file(3, 30));
+        }
+        let batch = a.form_batches(t(15.0), bid(6)).remove(0);
+        let r = b.receive(t(15.0), &batch);
+        assert_eq!(r.frozen, 8);
+        assert!(b.wants().is_empty());
+        assert!(matches!(b.approve(t(20.0), bid(5)), Approved::Sent(_)));
+        assert!(b.deferred().next().is_none(), "unfrozen");
+        assert!(b.wants().is_empty(), "held, not wanted");
+        let held = b.quarantine().get(bid(6)).unwrap();
+        assert_eq!(held.entries.len(), 8);
+        assert_eq!(held.source, node(1));
+        assert!(matches!(
+            held.reason,
+            HoldReason::Count {
+                destructive: 8,
+                tracked: 10
+            }
+        ));
+        let statuses = b.take_statuses();
+        assert!(
+            matches!(statuses.as_slice(), [FolderStatus::Held { batch, paths: 8, .. }] if *batch == bid(6))
+        );
+        // Approving the held item applies the eight conflicts.
+        match b.approve(t(21.0), bid(6)) {
+            Approved::Released(Some(set)) => assert_eq!(set.items.len(), 8),
+            other => panic!("expected a release, got {other:?}"),
+        }
+        assert_eq!(b.wants().len(), 8);
     }
 
     #[test]
