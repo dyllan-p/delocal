@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 4 · 23 September 2026 · Status: **for review** · Changes from draft 3: `seq` assignment rule (§7.1); merged-record fields on identical-content concurrency (§7.2); metadata-only applies (§7.5) and their brake treatment (§8.1); paused folders keep receiving and pending batches grow (§8.1); `deny` vector construction (§8.2); rename detection listed as out of scope (§3.2); simulator moved to its own crate (§14.1, Appendix B).
+> Draft 5 · 23 September 2026 · Status: **for review** · Changes from draft 4: `prev_hash` on every entry and the metadata-only rule in conflicts (§7.1, §7.6); mtime-only changes and the mtime-precision shim (§7.3); tombstone `hash` and `mtime_ns` defined (§7.1); NFC normalisation is the host's job (§7.1, Appendix A); brake classification of mods via `prev_hash` (§8.1).
+>
+> Changes from draft 3: `seq` assignment rule (§7.1); merged-record fields on identical-content concurrency (§7.2); metadata-only applies (§7.5) and their brake treatment (§8.1); paused folders keep receiving and pending batches grow (§8.1); `deny` vector construction (§8.2); rename detection listed as out of scope (§3.2); simulator moved to its own crate (§14.1, Appendix B).
 >
 > Changes from draft 2: NodeId representation and ordering defined (§4); `author_host` carried on entries and used for conflict names (§7.1, §7.4, §7.6, §11); engine takes time and randomness as inputs (§7); serde allowed in the engine (Appendix B); simulator gets its own CI job (§14.1).
 >
@@ -185,12 +187,13 @@ Per folder, one record per entry the machine knows about, including deleted ones
 
 | Field | Notes |
 |---|---|
-| `path` | Relative, forward slashes, NFC-normalised, no leading `./` |
+| `path` | Relative, forward slashes, no leading `./`. NFC-normalised **by the host** before it reaches the engine; the engine treats paths as opaque UTF-8 |
 | `kind` | `file` / `dir` / `symlink` |
 | `size` | bytes (0 for dir; target length for symlink) |
-| `mtime_ns` | as observed or received |
+| `mtime_ns` | as observed or received; for a tombstone, the time the deletion was observed on the machine that made it |
 | `exec` | bool; the only permission bit synced |
-| `hash` | BLAKE3 of content (files), of the target string (symlinks), empty (dirs) |
+| `hash` | BLAKE3 of content (files), of the target string (symlinks); the all-zero sentinel `EMPTY` for directories and tombstones. `EMPTY` is never the hash of a file (BLAKE3 of empty input is not all zeros) |
+| `prev_hash` | The `hash` of the version this one replaced, as it was when the change was made; `EMPTY` if the path did not exist. Set by the author, carried with the entry. A version whose `hash == prev_hash` is a **metadata-only change** (a touch). Used by the conflict rule (§7.6) and the brake (§8.1) |
 | `version` | version vector (§7.2) |
 | `deleted` | bool — this record is a tombstone |
 | `modified_by` | node ID that produced this version |
@@ -222,6 +225,8 @@ Wall-clock time never participates in ordering. See §7.8.
 - `notify` watches every folder root recursively. Events are debounced (2 s of quiet per path).
 - A **full scan** runs at daemon start, every hour **[decision]**, and on `delocal scan`. Watchers drop events under load; the scan is the ground truth.
 - Fast path: an entry whose `size` and `mtime_ns` match the index is unchanged. Anything else is hashed.
+- **A change in mtime alone** (size and hash unchanged) is still a change: it produces a new version with `hash == prev_hash` and propagates, so that every machine holds the same `mtime_ns` for the same version and the conflict tie-break stays deterministic. Receivers apply it as a metadata-only apply (§7.5); it is invisible to the brake (§8.1); and it loses to any real content change in a conflict (§7.6).
+- **mtime precision shim [Phase 2].** Filesystems with coarse timestamps (FAT, exFAT, some network mounts) cannot store the record's `mtime_ns` exactly, so a received file would look touched on the next scan, gain a new version, propagate, and loop forever. After every `Write` or `SetMeta` the host reads back the mtime the filesystem kept; if it differs from the one requested, the host records the pair and reports the requested value to the engine on later scans while the stored value is unchanged. The engine never sees the discrepancy.
 - **Stability check:** a file is not hashed until its mtime has been unchanged for 2 s, and if it changes during hashing the hash is discarded and retried. This avoids announcing half-written files.
 - Hashing is BLAKE3, parallel across files, streamed for large ones.
 - Always ignored: `.delocal/` at the folder root. User rules: `.delocalignore` at the folder root, gitignore syntax via the `ignore` crate. Default rules shipped for every folder: `.DS_Store`, `._*`, `*.swp`, `*~`, `.#*`, `.Trash*`.
@@ -294,8 +299,9 @@ Two versions of the same path are in conflict when they are **concurrent** (§7.
 
 **Deterministic winner.** Every machine must pick the same winner without communicating:
 
-1. The version with the larger `mtime_ns` wins.
-2. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
+1. If exactly one side is a metadata-only change (`hash == prev_hash`, §7.1), the other side wins. A real edit is never demoted to a conflict copy by a touch.
+2. Otherwise the version with the larger `mtime_ns` wins.
+3. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
 
 **Actions.** Let `W` be the winning version and `L` the losing one.
 
@@ -344,7 +350,7 @@ A batch is **held** if either rule trips, evaluated over the batch's apply set (
 
 - Adds do not count toward H1. Adds are almost never destructive, and exempting them keeps first sync and bulk imports quiet.
 - H1 cannot trip on a folder with zero tracked entries.
-- Metadata-only applies (§7.5) count as neither `mods` nor `dels` for H1 and contribute no bytes to H2. Exec-bit-only changes count as `mods` and contribute no bytes.
+- A batch entry counts as a `mod` only if it changes content: its `hash` differs from its `prev_hash`, or its kind or exec bit differs from the record it replaces. Metadata-only changes (touches, §7.3) and metadata-only applies (§7.5) count as neither `mods` nor `dels` for H1 and contribute no bytes to H2, on the sender pre-check and the receiver alike. Exec-bit-only changes count as `mods` and contribute no bytes.
 - Thresholds are per folder: `delocal rules ~/Sync --hold-count 50 --hold-pct 25 --hold-size 20G`. Setting `--hold-count 0` disables H1 for that folder.
 
 **Sender pre-check.** The same rules run on the machine where the changes happened, before anything is sent. If they trip, the folder is **paused** on that machine: nothing leaves, and `status` everywhere shows `paused on <machine>: 812 deletes pending — delocal review on <machine>`. This is cheap and it is what makes `revert` trivially safe: no other machine has seen the damage.
@@ -742,6 +748,7 @@ For the record, so they are not reopened by accident:
 | paths | `directories` |
 | errors & logging | `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`, `tracing-appender` |
 | file metadata | `filetime`, `tempfile` |
+| NFC normalisation of paths (binary crate only) | `unicode-normalization` |
 | ids & randomness | `rand` |
 | testing | `proptest`, `insta`, `cargo-fuzz` |
 
