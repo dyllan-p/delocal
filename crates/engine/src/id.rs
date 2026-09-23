@@ -8,7 +8,7 @@
 //! means this. Displayed as 32 lowercase hex characters; the short form is
 //! the first 8.
 //!
-//! The byte-newtype machinery is shared with [`struct@crate::entry::Hash`] through
+//! The byte-newtype machinery is shared with [`crate::entry::ContentHash`] through
 //! the `bytes_newtype!` macro.
 
 use std::fmt;

@@ -22,7 +22,7 @@ pub mod index;
 pub mod path;
 pub mod version;
 
-pub use entry::{Entry, Hash, Kind, Observed};
+pub use entry::{ContentHash, Entry, Kind, Observed};
 pub use id::{BatchId, FolderId, HostName, NodeId};
 pub use index::{ChangeKind, Index, IndexRecord, LocalChange};
 pub use path::RelPath;

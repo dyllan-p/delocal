@@ -2,7 +2,7 @@
 //!
 //! [`Entry`] is the §7.1 record without `seq`: what travels in a batch
 //! (§7.4) and what a scanner observation becomes once the engine has
-//! versioned it. [`struct@Hash`] is opaque here: the host computes BLAKE3, the
+//! versioned it. [`ContentHash`] is opaque here: the host computes BLAKE3, the
 //! engine only compares.
 
 use serde::{Deserialize, Serialize};
@@ -13,12 +13,12 @@ use crate::version::Version;
 
 bytes_newtype! {
     /// A BLAKE3 hash (§7.1): of the content for files, of the target string
-    /// for symlinks. Directories carry [`Hash::EMPTY`]. The engine never
+    /// for symlinks. Directories carry [`ContentHash::EMPTY`]. The engine never
     /// computes one.
-    Hash, 32
+    ContentHash, 32
 }
 
-impl Hash {
+impl ContentHash {
     /// The "empty" hash directories carry. All zeros; no real BLAKE3 output
     /// will ever equal it in practice.
     pub const EMPTY: Self = Self([0u8; 32]);
@@ -45,8 +45,8 @@ pub struct Observed {
     pub mtime_ns: i64,
     /// The executable bit, files only.
     pub exec: bool,
-    /// Content hash; [`Hash::EMPTY`] for directories.
-    pub hash: Hash,
+    /// Content hash; [`ContentHash::EMPTY`] for directories.
+    pub hash: ContentHash,
 }
 
 impl Observed {
@@ -57,7 +57,7 @@ impl Observed {
         match self.kind {
             Kind::Dir => {
                 self.size = 0;
-                self.hash = Hash::EMPTY;
+                self.hash = ContentHash::EMPTY;
                 self.exec = false;
             }
             Kind::Symlink => self.exec = false,
@@ -76,7 +76,7 @@ pub struct Entry {
     pub size: u64,
     pub mtime_ns: i64,
     pub exec: bool,
-    pub hash: Hash,
+    pub hash: ContentHash,
     pub version: Version,
     /// This record is a tombstone (§7.7).
     pub deleted: bool,
@@ -122,10 +122,10 @@ mod tests {
         NodeId::from_bytes(b)
     }
 
-    fn hash(i: u8) -> Hash {
+    fn hash(i: u8) -> ContentHash {
         let mut b = [0u8; 32];
         b[0] = i;
-        Hash::from_bytes(b)
+        ContentHash::from_bytes(b)
     }
 
     fn file(h: u8, exec: bool) -> Entry {
@@ -145,9 +145,9 @@ mod tests {
 
     #[test]
     fn hash_is_64_hex_and_has_an_empty_value() {
-        assert_eq!(Hash::EMPTY.to_string(), "0".repeat(64));
-        assert_eq!(Hash::LEN, 32);
-        let h: Hash = "ff".repeat(32).parse().unwrap();
+        assert_eq!(ContentHash::EMPTY.to_string(), "0".repeat(64));
+        assert_eq!(ContentHash::LEN, 32);
+        let h: ContentHash = "ff".repeat(32).parse().unwrap();
         assert_eq!(*h.as_bytes(), [0xff; 32]);
         assert_eq!(h.short().to_string(), "ffffffff");
         assert_eq!(
@@ -156,7 +156,7 @@ mod tests {
         );
         let bytes = postcard::to_stdvec(&h).unwrap();
         assert!(bytes.len() <= 33);
-        assert_eq!(postcard::from_bytes::<Hash>(&bytes).unwrap(), h);
+        assert_eq!(postcard::from_bytes::<ContentHash>(&bytes).unwrap(), h);
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
         .normalised();
         assert_eq!(
             (dir.size, dir.hash, dir.exec, dir.mtime_ns),
-            (0, Hash::EMPTY, false, 5)
+            (0, ContentHash::EMPTY, false, 5)
         );
         let link = Observed {
             kind: Kind::Symlink,
@@ -216,7 +216,7 @@ mod tests {
 
         let mut dir_a = a.clone();
         dir_a.kind = Kind::Dir;
-        dir_a.hash = Hash::EMPTY;
+        dir_a.hash = ContentHash::EMPTY;
         let mut dir_b = dir_a.clone();
         dir_b.exec = true; // not meaningful for dirs, must not matter
         assert!(dir_a.same_content(&dir_b));

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entry::{Entry, Hash, Observed};
+use crate::entry::{ContentHash, Entry, Observed};
 use crate::id::{HostName, NodeId};
 use crate::path::RelPath;
 use crate::version::Version;
@@ -200,7 +200,7 @@ impl Index {
             size: 0,
             mtime_ns: at_ns,
             exec: false,
-            hash: Hash::EMPTY,
+            hash: ContentHash::EMPTY,
             version: previous.entry.version.incremented(self.own),
             deleted: true,
             modified_by: self.own,
@@ -251,10 +251,10 @@ mod tests {
         NodeId::from_bytes(b)
     }
 
-    fn hash(i: u8) -> Hash {
+    fn hash(i: u8) -> ContentHash {
         let mut b = [0u8; 32];
         b[0] = i;
-        Hash::from_bytes(b)
+        ContentHash::from_bytes(b)
     }
 
     fn p(s: &str) -> RelPath {
@@ -336,7 +336,7 @@ mod tests {
         assert_eq!(dead.kind, Kind::File, "tombstone remembers the kind");
         assert_eq!(
             (dead.size, dead.hash, dead.exec, dead.mtime_ns),
-            (0, Hash::EMPTY, false, 500)
+            (0, ContentHash::EMPTY, false, 500)
         );
         assert!(dead.version.dominates(&live.version));
         assert_eq!(idx.tracked_count(), 0);
@@ -406,7 +406,7 @@ mod tests {
             hash: hash(1),
         };
         let e = idx.observe(p("d"), dir.clone()).unwrap().record.entry;
-        assert_eq!((e.size, e.hash, e.exec), (0, Hash::EMPTY, false));
+        assert_eq!((e.size, e.hash, e.exec), (0, ContentHash::EMPTY, false));
         // Reporting the un-normalised form again is still "unchanged".
         assert_eq!(idx.observe(p("d"), dir), None);
     }
