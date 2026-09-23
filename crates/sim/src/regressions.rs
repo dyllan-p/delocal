@@ -706,3 +706,110 @@ fn an_entry_of_a_held_batch_is_not_committed_before_approve() {
         ],
     );
 }
+
+/// A crash between a fetch and its commit kept the want's fetched flag
+/// while the temp file died with the process; the restarted node asked the
+/// host to commit content it did not have, the commit failed, and the entry
+/// was deferred at a path with no record and no file, which no scan ever
+/// reports.
+#[test]
+fn a_want_fetched_before_a_crash_is_fetched_again() {
+    passes(
+        5,
+        &[
+            Step::Chmod { node: 6, path: 7 },
+            Step::Offline { node: 0 },
+            Step::MassDelete {
+                node: 2,
+                fraction: 65,
+            },
+            Step::Modify {
+                node: 0,
+                path: 2,
+                content: 4,
+            },
+            Step::Settle { secs: 20 },
+            Step::Delete { node: 6, path: 3 },
+            Step::Tier {
+                a: 4,
+                b: 6,
+                tier: 2,
+            },
+            Step::Modify {
+                node: 7,
+                path: 1,
+                content: 5,
+            },
+            Step::User {
+                node: 1,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 58,
+            },
+            Step::Rmdir { node: 1, dir: 0 },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![Some(4), Some(4), Some(2), None, Some(4), None],
+            },
+            Step::Delete { node: 3, path: 7 },
+            Step::Settle { secs: 36 },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 56,
+            },
+            Step::Modify {
+                node: 0,
+                path: 6,
+                content: 2,
+            },
+            Step::Create {
+                node: 1,
+                path: 11,
+                content: 5,
+            },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![None, Some(4), None, None, Some(5), Some(1), None],
+            },
+            Step::Tier {
+                a: 4,
+                b: 7,
+                tier: 2,
+            },
+            Step::Chmod { node: 1, path: 7 },
+            Step::Modify {
+                node: 5,
+                path: 1,
+                content: 3,
+            },
+            Step::Crash {
+                node: 3,
+                gap_secs: 7,
+            },
+            Step::Partition { a: 0, b: 0 },
+            Step::Settle { secs: 28 },
+            Step::Online { node: 5 },
+            Step::Symlink {
+                node: 2,
+                path: 6,
+                target: 1,
+            },
+            Step::Tier {
+                a: 6,
+                b: 4,
+                tier: 2,
+            },
+            Step::Heal { a: 5, b: 1 },
+            Step::Create {
+                node: 2,
+                path: 4,
+                content: 2,
+            },
+            Step::Create {
+                node: 2,
+                path: 1,
+                content: 1,
+            },
+        ],
+    );
+}

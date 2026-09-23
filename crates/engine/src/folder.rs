@@ -778,6 +778,20 @@ impl FolderState {
             // caught here: later scans never report a tombstoned path.
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
         }
+        // A deferred entry at a path with no record and no file is in the
+        // same position: nothing will ever report that path, and the bracket
+        // has just observed it absent (§7.3).
+        let unseen: Vec<RelPath> = self
+            .deferred
+            .keys()
+            .filter(|p| {
+                !seen.contains(*p) && self.index.live(p).is_none() && !self.wants.in_flight(p)
+            })
+            .cloned()
+            .collect();
+        for path in &unseen {
+            self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+        }
         if !changes.is_empty() {
             self.touched(now);
         }
@@ -2332,6 +2346,46 @@ mod tests {
             other => panic!("expected a release, got {other:?}"),
         }
         assert_eq!(b.wants().len(), 10);
+    }
+
+    #[test]
+    fn a_scan_bracket_reconsiders_a_deferred_entry_at_an_unrecorded_path() {
+        // A adds z; B's commit of it fails ChangedUnderneath (say the host
+        // lost the temp file). B has no record of z and no file at z, so no
+        // scan will ever report z; the bracket's end must stand in for the
+        // observation, or the entry waits forever.
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("z"), file(3, 30));
+        let batch = a.form_batches(t(12.0), bid(6)).remove(0);
+        assert_eq!(b.receive(t(12.0), &batch).decision, Decision::Accepted);
+        let v = b.wants().get(&p("z")).unwrap().version().clone();
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Fetch { .. }));
+        b.fetched(&p("z"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { .. }));
+        assert!(
+            b.applied(t(15.0), &p("z"), &v, ApplyOutcome::ChangedUnderneath)
+                .is_empty()
+        );
+        assert_eq!(b.deferred().count(), 1);
+        assert!(b.wants().is_empty());
+
+        b.scan_started();
+        for i in 0..10 {
+            b.scanned(t(16.0), p(&format!("f{i:02}")), ScanState::Unchanged);
+        }
+        assert!(
+            b.scan_finished(t(17.0)).unwrap().is_empty(),
+            "nothing tombstoned"
+        );
+        assert!(
+            b.deferred().next().is_none(),
+            "reconsidered at the bracket's end"
+        );
+        let want = b.wants().get(&p("z")).unwrap();
+        assert_eq!(want.version(), &v, "wanted again");
+        assert!(!want.fetched, "a fresh want fetches again");
     }
 
     #[test]
