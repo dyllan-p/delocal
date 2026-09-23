@@ -1,6 +1,6 @@
 # delocal — v1 Design
 
-> Draft 1 · 22 September 2026 · Status: **for review**
+> Draft 2 · 22 September 2026 · Status: **for review** · Changes from draft 1: §7.2 local-change rule made precise (no separate counter).
 >
 > This file is the source of truth for v1. Claude Code builds from it. When behaviour changes, this document changes first, then the code. Anything marked **[decision]** is a judgement call made while drafting that has not been discussed yet and should be confirmed or overruled. Anything marked **[verify]** is a claim about a third-party system that must be checked against reality during the relevant phase.
 
@@ -201,7 +201,7 @@ Plus, per folder per remote member: the highest `seq` of theirs we have received
 Version = BTreeMap<NodeId, u64>
 ```
 
-- **Local change to an entry:** take the entry's current version, set `v[self] = max(v[self], self_counter) + 1`. Deletion is a local change like any other; it produces a tombstone with a new version.
+- **Local change to an entry:** take the entry's current version (an absent entry has the empty version), and set `v[self] = v[self] + 1`, with a missing key read as 0. There is no counter outside the entry's own vector. The per-folder `seq` in §7.1 is for index catch-up only and never participates in version comparison. Deletion is a local change like any other; it produces a tombstone with a new version.
 - **Comparison** of `a` and `b`, treating missing keys as 0:
   - `a == b` → **equal**
   - every `a[k] ≥ b[k]` and not equal → **a dominates**
