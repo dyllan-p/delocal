@@ -16,8 +16,12 @@ path = "src/lib.rs"
 [dependencies]
 serde.workspace = true
 
+# Dev-only, from Appendix A: serde_json and postcard prove the two serde
+# branches (hex string for human-readable formats, raw bytes for the wire).
 [dev-dependencies]
 proptest.workspace = true
+serde_json.workspace = true
+postcard.workspace = true
 
 [lints]
 workspace = true
