@@ -71,6 +71,17 @@ impl Quarantine {
             .map(|(_, id)| *id)
     }
 
+    /// The largest stamp among the quarantined entries at `path`, `None` if
+    /// none is held there. A `deny` bump (§8.2) dominates every one of them
+    /// and must rank above them all (§7.6), so its stamp starts here.
+    pub fn max_stamp_at(&self, path: &RelPath) -> Option<i64> {
+        self.items
+            .values()
+            .filter_map(|item| item.entries.get(path))
+            .map(|e| e.stamp)
+            .max()
+    }
+
     /// Every quarantined version at `path`, across all items.
     pub fn versions_at(&self, path: &RelPath) -> Vec<Version> {
         self.versions

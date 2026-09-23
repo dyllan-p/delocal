@@ -1132,7 +1132,11 @@ impl FolderState {
         let mut changes = Vec::with_capacity(paths.len());
         for path in &paths {
             let over = self.quarantine.versions_at(path);
-            changes.push(self.index.bump_over(path, &over, now.as_unix_nanos()));
+            let over_stamp = self.quarantine.max_stamp_at(path);
+            changes.push(
+                self.index
+                    .bump_over(path, &over, over_stamp, now.as_unix_nanos()),
+            );
         }
         self.quarantine.release(batch);
         if !changes.is_empty() {
@@ -2465,12 +2469,17 @@ mod tests {
         let dels = a.form_batches(t(12.0), bid(3)).remove(0);
         b.receive(t(12.0), &dels);
         let quarantined: Vec<Version> = b.quarantine().versions_at(&p("f03"));
+        let held_stamp = b.quarantine().max_stamp_at(&p("f03")).unwrap();
         assert_eq!(b.deny(t(13.0), bid(9)), None);
         let changes = b.deny(t(13.0), bid(3)).unwrap();
         assert_eq!(changes.len(), 8);
         for c in &changes {
             let e = &c.record.entry;
             assert!(!e.deleted, "B's copies win");
+            assert!(
+                e.stamp > held_stamp,
+                "the bump ranks above the tombstones it dominates (§7.6)"
+            );
             assert!(e.is_metadata_only(), "content unchanged");
             assert_eq!(e.modified_by, node(2));
             assert_eq!(c.kind, ChangeKind::Modify);
