@@ -497,6 +497,7 @@ mod tests {
             kind: Kind::File,
             size: 10,
             mtime_ns: 5,
+            stamp: 5,
             exec: false,
             hash: hash(h),
             prev_hash: ContentHash::EMPTY,
@@ -691,6 +692,45 @@ mod tests {
         assert_eq!(copy.loser.hash, hash(3));
         assert_eq!(copy.path.as_str(), "conflict.conflict-19700101-000000-h");
         assert_eq!(set.fallbacks, 0);
+    }
+
+    #[test]
+    fn a_tombstone_with_the_larger_stamp_wins_and_displaces_the_edit() {
+        // The local edit is older than the deleted file's last edit: the
+        // deletion wins by stamp (§7.6), applies without a fetch, and the
+        // edit goes to its conflict copy rather than the trash.
+        let mut idx = Index::new(node(1), HostName::new("h").unwrap());
+        let mut local = entry("f", 3, Version::empty().incremented(node(1)), 1);
+        local.stamp = 10;
+        idx.adopt(local.clone());
+        let mut dead = entry("f", 0, Version::empty().incremented(node(2)), 2);
+        dead.deleted = true;
+        dead.hash = ContentHash::EMPTY;
+        dead.stamp = 20;
+        let c = classify(&idx, &dead);
+        let ApplyItem::Apply {
+            entry,
+            mode,
+            conflict,
+        } = c.item.unwrap();
+        assert!(entry.deleted, "the tombstone wins");
+        assert_eq!(mode, ApplyMode::Direct, "nothing to fetch");
+        let copy = conflict.expect("the live loser is displaced to its copy");
+        assert_eq!(copy.loser, local);
+        assert!(copy.path.as_str().contains(".conflict-"));
+        // The reverse: an edit newer than the deleted file's last edit wins.
+        let mut fresh = local.clone();
+        fresh.stamp = 30;
+        let mut idx = Index::new(node(1), HostName::new("h").unwrap());
+        idx.adopt(fresh);
+        let ApplyItem::Apply {
+            entry,
+            mode,
+            conflict,
+        } = classify(&idx, &dead).item.unwrap();
+        assert!(!entry.deleted, "the edit wins and the deletion is dropped");
+        assert_eq!(mode, ApplyMode::IndexOnly);
+        assert!(conflict.is_none());
     }
 
     #[test]

@@ -85,6 +85,16 @@ pub struct Entry {
     /// Files only; 0 for directories and symlinks (§7.1). For a tombstone,
     /// when the deletion was observed.
     pub mtime_ns: i64,
+    /// A Lamport timestamp seeded by the modification time (§7.1): a content
+    /// change stamps `max(mtime_ns, replaced record's stamp + 1)`; a
+    /// metadata-only change, a tombstone, a directory or a symlink stamps
+    /// `replaced record's stamp + 1`; a path with no record stamps
+    /// `mtime_ns`, or 1 for a kind without one. Set by the author, carried
+    /// with the entry, inherited by a merged record from the winner. It
+    /// strictly increases along every machine's chain of versions for a
+    /// path, so as the first key of the winner rule (§7.6) it makes the
+    /// merged content a function of the vector. Never compared to a clock.
+    pub stamp: i64,
     pub exec: bool,
     /// Content hash; [`ContentHash::EMPTY`] for directories and tombstones.
     pub hash: ContentHash,
@@ -175,6 +185,7 @@ mod tests {
             kind: Kind::File,
             size: 10,
             mtime_ns: 1_000,
+            stamp: 1_000,
             exec,
             hash: hash(h),
             prev_hash: ContentHash::EMPTY,

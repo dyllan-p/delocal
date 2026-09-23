@@ -80,22 +80,27 @@ pub fn winner(a: &Entry, b: &Entry) -> Winner {
         }),
         Equal => None,
     };
-    // 1. live beats tombstone
+    // 1. the larger stamp: strictly increasing along every chain, so an
+    //    increment ranks above everything in its causal past (§7.6)
+    if let Some(w) = pick(a.stamp.cmp(&b.stamp), false) {
+        return w;
+    }
+    // 2. live beats tombstone
     if let Some(w) = pick(b.deleted.cmp(&a.deleted), false) {
         return w;
     }
-    // 2. content change beats touch
+    // 3. content change beats touch
     if let Some(w) = pick(b.is_metadata_only().cmp(&a.is_metadata_only()), false) {
         return w;
     }
-    // 3, 4.
+    // 4, 5.
     if let Some(w) = pick(a.mtime_ns.cmp(&b.mtime_ns), false) {
         return w;
     }
     if let Some(w) = pick(a.modified_by.cmp(&b.modified_by), false) {
         return w;
     }
-    // 5. the total fallback
+    // 6. the total fallback
     total_fallback(a, b)
 }
 
@@ -278,6 +283,7 @@ mod tests {
             kind: Kind::File,
             size: 10,
             mtime_ns,
+            stamp: mtime_ns,
             exec: false,
             hash: hash(h),
             prev_hash: hash(100),
@@ -377,31 +383,46 @@ mod tests {
     fn winner_rule_in_order() {
         let a = entry("f", 1, 100, 1);
         let b = entry("f", 2, 200, 2);
-        // 3: larger mtime
-        assert_eq!(winner(&a, &b).side, Side::Second);
-        assert_eq!(winner(&b, &a).side, Side::First);
-        // 1: live beats tombstone regardless of mtime
+        // 1: the larger stamp, whatever the rest says
+        let mut old_tombstone = b.clone();
+        old_tombstone.deleted = true;
+        old_tombstone.hash = ContentHash::EMPTY;
+        old_tombstone.stamp = 300;
+        assert_eq!(
+            winner(&a, &old_tombstone).side,
+            Side::Second,
+            "a tombstone whose chain ran further ranks above an older edit"
+        );
+        assert_eq!(winner(&old_tombstone, &a).side, Side::First);
+        // 4: equal stamps, larger mtime
+        let mut a_same_stamp = a.clone();
+        a_same_stamp.stamp = b.stamp;
+        assert_eq!(winner(&a_same_stamp, &b).side, Side::Second);
+        assert_eq!(winner(&b, &a_same_stamp).side, Side::First);
+        // 2: equal stamps, live beats tombstone regardless of mtime
         let mut dead = b.clone();
         dead.deleted = true;
         dead.hash = ContentHash::EMPTY;
+        dead.stamp = a.stamp;
         assert_eq!(winner(&a, &dead).side, Side::First);
         assert_eq!(winner(&dead, &a).side, Side::Second);
-        // 2: a real edit beats a touch regardless of mtime
+        // 3: equal stamps, a real edit beats a touch regardless of mtime
         let mut touch = b.clone();
         touch.prev_hash = touch.hash;
+        touch.stamp = a.stamp;
         assert!(touch.is_metadata_only());
         assert_eq!(winner(&a, &touch).side, Side::First);
         assert_eq!(winner(&touch, &a).side, Side::Second);
-        // 4: equal mtime, larger node id
+        // 5: equal stamp and mtime, larger node id
         let c = entry("f", 3, 200, 3);
         let w = winner(&b, &c);
         assert_eq!((w.side, w.fallback), (Side::Second, false));
-        // 5: same author and mtime, fallback on hash
+        // 6: same author, stamp and mtime, fallback on hash
         let d = entry("f", 2, 200, 9);
         let w = winner(&b, &d);
         assert_eq!((w.side, w.fallback), (Side::Second, true));
         assert_eq!(winner(&d, &b).side, Side::First);
-        // 5: a symlink and a file with the same bytes, author and time
+        // 6: a symlink and a file with the same bytes, author and time
         let mut link = b.clone();
         link.kind = Kind::Symlink;
         let w = winner(&b, &link);
@@ -447,29 +468,41 @@ mod tests {
             any::<bool>(), // deleted
             0u8..3,        // kind
             0u8..3,        // extra version key
+            0i64..4,       // stamp
         )
-            .prop_map(|(path, by, mtime, h, ph, exec, deleted, kind, other)| {
-                let kind = match kind {
-                    0 => Kind::File,
-                    1 => Kind::Dir,
-                    _ => Kind::Symlink,
-                };
-                let mut e = entry(
-                    ["d/a.txt", "b", ".rc"][path as usize],
-                    by,
-                    if kind == Kind::File { mtime } else { 0 },
-                    h,
-                );
-                e.kind = kind;
-                e.exec = exec && kind == Kind::File;
-                e.deleted = deleted;
-                e.prev_hash = hash(ph);
-                if deleted || kind == Kind::Dir {
-                    e.hash = ContentHash::EMPTY;
-                }
-                e.version = e.version.incremented(node(other));
-                e
-            })
+            .prop_map(
+                |(path, by, mtime, h, ph, exec, deleted, kind, other, stamp)| {
+                    let kind = match kind {
+                        0 => Kind::File,
+                        1 => Kind::Dir,
+                        _ => Kind::Symlink,
+                    };
+                    let mut e = entry(
+                        ["d/a.txt", "b", ".rc"][path as usize],
+                        by,
+                        if kind == Kind::File { mtime } else { 0 },
+                        h,
+                    );
+                    e.kind = kind;
+                    e.exec = exec && kind == Kind::File;
+                    e.deleted = deleted;
+                    e.prev_hash = hash(ph);
+                    if deleted || kind == Kind::Dir {
+                        e.hash = ContentHash::EMPTY;
+                    }
+                    e.version = e.version.incremented(node(other));
+                    e.stamp = stamp;
+                    e
+                },
+            )
+    }
+
+    /// Two entries at one path, any content.
+    fn concurrent_pair() -> impl Strategy<Value = (Entry, Entry)> {
+        (any_entry(), any_entry()).prop_map(|(a, mut b)| {
+            b.path = a.path.clone();
+            (a, b)
+        })
     }
 
     /// Two entries at one path with different content: a conflict.
@@ -502,17 +535,39 @@ mod tests {
             prop_assert!(m.same_content(w));
             prop_assert_eq!((m.mtime_ns, m.modified_by, &m.author_host, m.prev_hash, m.size),
                             (w.mtime_ns, w.modified_by, &w.author_host, w.prev_hash, w.size));
-            // Rule 1 and 2, when they apply.
-            if a.deleted != b.deleted {
-                prop_assert_eq!(w.deleted, false);
-            } else if a.is_metadata_only() != b.is_metadata_only() {
-                prop_assert!(!w.is_metadata_only());
+            // Rules 2 and 3 apply among equal stamps only.
+            if a.stamp == b.stamp {
+                if a.deleted != b.deleted {
+                    prop_assert_eq!(w.deleted, false);
+                } else if a.is_metadata_only() != b.is_metadata_only() {
+                    prop_assert!(!w.is_metadata_only());
+                }
             }
-            // Rule 5 only fires when 3 and 4 tie.
+            // Rule 6 only fires when 1, 4 and 5 tie.
             if ab.fallback {
+                prop_assert_eq!(a.stamp, b.stamp);
                 prop_assert_eq!(a.mtime_ns, b.mtime_ns);
                 prop_assert_eq!(a.modified_by, b.modified_by);
             }
+        }
+
+        /// The stamp is the first key: for any concurrent pair, identical
+        /// content included, the winner's stamp is the larger or the two are
+        /// equal (§7.6).
+        #[test]
+        fn the_winner_has_the_larger_stamp_or_an_equal_one((a, b) in concurrent_pair()) {
+            let w = winner(&a, &b);
+            let (win, lose) = match w.side {
+                Side::First => (&a, &b),
+                Side::Second => (&b, &a),
+            };
+            prop_assert!(win.stamp >= lose.stamp, "{:?} vs {:?}", win.stamp, lose.stamp);
+            // Symmetric, except for the full tie, which gives First from
+            // either side by design (the two are the same content under two
+            // vectors, so M is the same whichever is picked).
+            let ba = winner(&b, &a);
+            let full_tie = w.fallback && ba.fallback && w.side == Side::First && ba.side == Side::First;
+            prop_assert!(ba.side == w.side.flip() || full_tie);
         }
 
         /// The conflict-copy name is a valid path with a legal component
