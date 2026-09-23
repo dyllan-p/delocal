@@ -1249,7 +1249,12 @@ impl Sim {
                 if !self.nodes.get(&node).is_some_and(Node::alive) {
                     return Ok(());
                 }
-                let outcome = self.commit(node, &path, &version, &action);
+                let (outcome, created) = self.commit(node, &path, &version, &action);
+                // The host's mkdir of missing parents is a filesystem event
+                // like any other: the watcher may report it, the scan will.
+                for dir in created {
+                    self.watch(node, dir)?;
+                }
                 if outcome == ApplyOutcome::ChangedUnderneath {
                     self.stats.changed_underneath += 1;
                 }
@@ -1273,16 +1278,17 @@ impl Sim {
         }
     }
 
-    /// §7.5 steps 6 to 9 against the simulated filesystem.
+    /// §7.5 steps 6 to 9 against the simulated filesystem. Also returns the
+    /// parent directories the host had to create for a write.
     fn commit(
         &mut self,
         id: NodeId,
         path: &RelPath,
         version: &Version,
         action: &Action,
-    ) -> ApplyOutcome {
+    ) -> (ApplyOutcome, Vec<RelPath>) {
         let Some(node) = self.nodes.get_mut(&id) else {
-            return ApplyOutcome::ChangedUnderneath;
+            return (ApplyOutcome::ChangedUnderneath, Vec::new());
         };
         let expected = match action {
             Action::Write { expected, .. } | Action::Remove { expected, .. } => *expected,
@@ -1291,16 +1297,43 @@ impl Sim {
         if !matches!(action, Action::SetMeta { .. })
             && !expected_matches(node.fs.get(path), expected)
         {
-            return ApplyOutcome::ChangedUnderneath;
+            return (ApplyOutcome::ChangedUnderneath, Vec::new());
         }
-        match action {
+        let mut created = Vec::new();
+        if let Action::Write { .. } = action {
+            // A rename into a directory that does not exist fails, so a real
+            // host creates the missing ancestors first (the entry's own
+            // parent may be tombstoned here while a peer kept a child alive).
+            // A file where a directory must be cannot be renamed into.
+            let mut ancestor = path.parent();
+            while let Some(dir) = ancestor {
+                match node.fs.get(&dir) {
+                    Some(f) if f.kind == Kind::Dir => break,
+                    Some(_) => return (ApplyOutcome::ChangedUnderneath, Vec::new()),
+                    None => created.push(dir.clone()),
+                }
+                ancestor = dir.parent();
+            }
+            for dir in &created {
+                node.fs.insert(
+                    dir.clone(),
+                    File {
+                        kind: Kind::Dir,
+                        content: Vec::new(),
+                        mtime_ns: 0,
+                        exec: false,
+                    },
+                );
+            }
+        }
+        let outcome = match action {
             Action::Write {
                 entry, displace, ..
             } => {
                 if let Displace::ConflictCopy(target) = displace
                     && node.fs.contains_key(target)
                 {
-                    return ApplyOutcome::ChangedUnderneath;
+                    return (ApplyOutcome::ChangedUnderneath, created);
                 }
                 let content = match entry.kind {
                     Kind::Dir => Some(Vec::new()),
@@ -1313,7 +1346,7 @@ impl Sim {
                 };
                 let Some(content) = content else {
                     // No verified temp file: the host cannot commit this.
-                    return ApplyOutcome::ChangedUnderneath;
+                    return (ApplyOutcome::ChangedUnderneath, created);
                 };
                 if let Some(existing) = node.fs.remove(path) {
                     match displace {
@@ -1339,7 +1372,7 @@ impl Sim {
                     && existing.kind == Kind::Dir
                     && node.fs.keys().any(|p| path.is_ancestor_of(p))
                 {
-                    return ApplyOutcome::ChangedUnderneath; // not empty
+                    return (ApplyOutcome::ChangedUnderneath, created); // not empty
                 }
                 if let Some(existing) = node.fs.remove(path) {
                     trash_file(node, existing);
@@ -1355,7 +1388,8 @@ impl Sim {
                 _ => ApplyOutcome::ChangedUnderneath,
             },
             _ => ApplyOutcome::ChangedUnderneath,
-        }
+        };
+        (outcome, created)
     }
 
     // ---------------------------------------------------------------- scanning
