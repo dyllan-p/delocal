@@ -521,13 +521,28 @@ impl Sim {
                 || f.paused().is_some()
                 || f.deferred().next().is_some()
             {
+                let deferred: Vec<String> = f
+                    .deferred()
+                    .map(|d| {
+                        format!(
+                            "{}@{:?} {:?}{} (index: {:?})",
+                            d.entry.path,
+                            d.entry.version,
+                            d.reason,
+                            if d.entry.deleted { " tombstone" } else { "" },
+                            f.index()
+                                .get(&d.entry.path)
+                                .map(|r| (r.entry.version.clone(), r.entry.deleted))
+                        )
+                    })
+                    .collect();
                 out.push_str(&format!(
-                    " {}: window={:?} held={} paused={} deferred={} wants=[{}];",
+                    " {}: window={:?} held={} paused={} deferred=[{}] wants=[{}];",
                     Self::short(n.id),
                     f.window().map(|w| w.due()),
                     f.quarantine().len(),
                     f.paused().is_some(),
-                    f.deferred().count(),
+                    deferred.join(", "),
                     wants.join(", ")
                 ));
             }
