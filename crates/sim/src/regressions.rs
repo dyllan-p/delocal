@@ -46,3 +46,46 @@ fn the_same_directory_created_twice_is_not_a_winner_fallback() {
         ],
     );
 }
+
+/// A version already accepted and being fetched arrived again relayed in a
+/// batch that tripped the brake, was quarantined, and its own fetch then
+/// adopted it from quarantine.
+#[test]
+fn a_relayed_copy_of_a_wanted_version_is_not_quarantined() {
+    passes(
+        5000,
+        &[
+            Step::Modify {
+                node: 0,
+                path: 8,
+                content: 4,
+            },
+            Step::Create {
+                node: 7,
+                path: 11,
+                content: 4,
+            },
+            Step::Settle { secs: 36 },
+            Step::Everywhere {
+                path: 10,
+                contents: vec![Some(2), None, Some(3)],
+            },
+            Step::Everywhere {
+                path: 5,
+                contents: vec![Some(5), Some(3), None],
+            },
+            Step::Offline { node: 5 },
+            Step::MassModify {
+                node: 3,
+                fraction: 59,
+                content: 1,
+            },
+            Step::Tier {
+                a: 2,
+                b: 4,
+                tier: 0,
+            },
+            Step::Chmod { node: 6, path: 4 },
+        ],
+    );
+}
