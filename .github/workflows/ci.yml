@@ -50,13 +50,24 @@ jobs:
       # that does. `cargo tree -e normal` lists only normal (non-dev,
       # non-build) dependencies, which is what ships in the binary. If any
       # of these crates appear, the boundary is in the wrong place.
-      - name: Engine boundary
+      - name: Engine boundary (dependencies)
         run: |
           set -euo pipefail
           tree="$(cargo tree -p delocal-engine -e normal --locked)"
           echo "$tree"
-          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio'; then
-            echo "::error::delocal-engine depends on an I/O crate (see CLAUDE.md, crate boundary)"
+          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio|rand'; then
+            echo "::error::delocal-engine depends on an I/O or randomness crate (see CLAUDE.md, crate boundary)"
+            exit 1
+          fi
+
+      # The engine also never reads the filesystem, the network or a clock
+      # directly. Comments count too: the rule is simple on purpose, so pick
+      # other words. `\b` keeps "Instant" from matching "instantly".
+      - name: Engine boundary (source)
+        run: |
+          set -euo pipefail
+          if grep -rnE 'std::fs\b|std::net\b|\bSystemTime\b|\bInstant\b' crates/engine/src; then
+            echo "::error::delocal-engine source touches the world (see CLAUDE.md, crate boundary)"
             exit 1
           fi
 
