@@ -3,12 +3,14 @@
 //! [`RelPath`] is the key of the index and the `path` of every entry and
 //! batch entry. Construction validates shape: non-empty, no empty component
 //! (so no leading, trailing or doubled slash), no `.` or `..` component, no
-//! NUL, and not under `.delocal/` at the folder root, which §7.3 reserves
-//! and always ignores. Rejecting reserved paths here means a batch from a
-//! misbehaving peer cannot write into `.delocal/`.
+//! NUL, no component over 255 bytes (`NAME_MAX` on ext4 and APFS, so such a
+//! file cannot exist on a supported filesystem), and not under `.delocal/`
+//! at the folder root, which §7.3 reserves and always ignores. Rejecting
+//! reserved paths here means a batch from a misbehaving peer cannot write
+//! into `.delocal/`.
 //!
-//! NFC normalisation is the host's job before a path reaches the engine:
-//! the engine has no Unicode tables and does not check it.
+//! NFC normalisation is the host's job before a path reaches the engine
+//! (§7.1): the engine treats paths as opaque UTF-8.
 //!
 //! `Ord` is the byte order of the string. Because a parent is a strict
 //! prefix of its children, sorting puts every directory before its contents,
@@ -21,6 +23,9 @@ use serde::{Deserialize, Serialize};
 
 /// The directory at every folder root that delocal owns (§7.3, §11).
 pub const RESERVED_DIR: &str = ".delocal";
+
+/// Longest path component, in bytes: `NAME_MAX` on ext4 and APFS.
+pub const MAX_COMPONENT_LEN: usize = 255;
 
 /// Why a string is not a valid [`RelPath`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,6 +44,8 @@ pub enum RelPathError {
     DotDotComponent,
     /// A NUL byte, which no filesystem accepts.
     Nul,
+    /// A component longer than [`MAX_COMPONENT_LEN`] bytes.
+    ComponentTooLong(usize),
     /// `.delocal` or something under it at the folder root.
     Reserved,
 }
@@ -53,6 +60,7 @@ impl fmt::Display for RelPathError {
             Self::DotComponent => "path contains a . component",
             Self::DotDotComponent => "path contains a .. component",
             Self::Nul => "path contains a NUL byte",
+            Self::ComponentTooLong(_) => "path has a component longer than 255 bytes",
             Self::Reserved => "path is under the reserved .delocal directory",
         })
     }
@@ -86,6 +94,9 @@ impl RelPath {
                 "" => return Err(RelPathError::EmptyComponent),
                 "." => return Err(RelPathError::DotComponent),
                 ".." => return Err(RelPathError::DotDotComponent),
+                c if c.len() > MAX_COMPONENT_LEN => {
+                    return Err(RelPathError::ComponentTooLong(c.len()));
+                }
                 _ => {}
             }
         }
@@ -188,6 +199,8 @@ mod tests {
 
     #[test]
     fn accepts_ordinary_paths() {
+        let long = "x".repeat(255);
+        let two_long = format!("{}/{}", "y".repeat(255), "z".repeat(255));
         for ok in [
             "a",
             "a/b",
@@ -200,6 +213,8 @@ mod tests {
             "...",
             "delocal",
             "x/.delocal/inner",
+            long.as_str(),
+            two_long.as_str(),
         ] {
             assert!(RelPath::new(ok).is_ok(), "{ok:?} should be valid");
         }
@@ -207,6 +222,9 @@ mod tests {
 
     #[test]
     fn rejects_by_rule() {
+        let too_long = "x".repeat(256);
+        // Bytes, not chars: 128 two-byte characters are 256 bytes.
+        let too_long_utf8 = "ü".repeat(128);
         let cases = [
             ("", RelPathError::Empty),
             ("/abs", RelPathError::Absolute),
@@ -218,6 +236,8 @@ mod tests {
             ("../a", RelPathError::DotDotComponent),
             ("a/..", RelPathError::DotDotComponent),
             ("a\0b", RelPathError::Nul),
+            (too_long.as_str(), RelPathError::ComponentTooLong(256)),
+            (too_long_utf8.as_str(), RelPathError::ComponentTooLong(256)),
             (".delocal", RelPathError::Reserved),
             (".delocal/trash/x", RelPathError::Reserved),
         ];
@@ -241,6 +261,10 @@ mod tests {
         assert_eq!(p("docs").join("a.txt"), Ok(p("docs/a.txt")));
         assert_eq!(p("docs").join("a/b"), Err(RelPathError::EmptyComponent));
         assert_eq!(p("docs").join(".."), Err(RelPathError::DotDotComponent));
+        assert_eq!(
+            p("docs").join(&"n".repeat(256)),
+            Err(RelPathError::ComponentTooLong(256))
+        );
     }
 
     #[test]
