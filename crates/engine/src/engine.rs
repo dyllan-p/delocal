@@ -373,7 +373,12 @@ impl Engine {
     }
 
     /// Form and send batches for every folder whose window is due (§7.4).
+    ///
+    /// The host's timer has fired, so nothing is scheduled any more: forget
+    /// what was asked for, and `schedule` re-announces the due time of any
+    /// folder that is not due yet (a tick that came early).
     fn tick(&mut self, now: Timestamp, fresh: BatchId, out: &mut Vec<Action>) {
+        self.woke.clear();
         let mut used: u128 = 0;
         for folder in self.folders.values_mut() {
             if !folder.is_due(now) {
@@ -613,14 +618,26 @@ mod tests {
         );
         assert_eq!(out[1], Action::WakeAt(t(13.0)));
 
-        // An early tick does nothing and does not repeat the wake.
+        // An early tick forms nothing and asks for the wake again, since the
+        // host's timer has fired and is no longer pending.
         let out = a.handle(
             t(12.0),
             Event::Tick {
                 fresh_batch_id: fresh(1),
             },
         );
-        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(out, [Action::WakeAt(t(13.0))]);
+        let out = a.handle(
+            t(13.0).plus_nanos(-1),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        assert_eq!(
+            out,
+            [Action::WakeAt(t(13.0))],
+            "1 ns early still re-announces"
+        );
 
         let out = a.handle(
             t(13.0),
