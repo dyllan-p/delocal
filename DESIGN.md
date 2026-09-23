@@ -332,7 +332,7 @@ Every machine announces `M` once it has adopted it (§7.4); receivers already ho
 report.conflict-20260922-143005-laptop.xlsx
 ```
 
-If `author_host` is empty (should not happen, but the format must be total), the short form of `L.modified_by` is used instead.
+If `author_host` is empty (should not happen, but the format must be total), the short form of `L.modified_by` is used instead. The split is on the last extension only: `archive.tar.gz` becomes `archive.tar.conflict-…gz`; a name with no extension, a dotfile such as `.bashrc`, and a directory take the suffix on the whole name. The result is cut to fit 255 bytes, stem first.
 
 **Special cases.**
 
