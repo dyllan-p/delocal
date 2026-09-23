@@ -15,6 +15,7 @@
 //! - [`time`]: timestamps as inputs and the batch window constants (§7.4)
 //! - [`rules`]: per-folder thresholds and limits (§8.1, §6.5)
 //! - [`batch`]: batch formation, the summary, decisions, the apply set (§7.4)
+//! - [`brake`]: the H1 and H2 rules, one function for sender and receiver (§8.1)
 //! - [`conflict`]: the winner rule, the merged version `M`, conflict-copy names (§7.6)
 //! - [`folder`]: per-folder state: window, scan bracket, accepted work (§7.3, §7.4)
 //! - [`engine`]: the `Engine`, its `Event`s and `Action`s (§7)
@@ -23,6 +24,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod batch;
+pub mod brake;
 pub mod conflict;
 pub mod engine;
 pub mod entry;
@@ -37,6 +39,7 @@ pub mod version;
 pub use batch::{
     ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Classified, Decision, Summary,
 };
+pub use brake::{HoldReason, Verdict};
 pub use conflict::{ConflictCopy, Resolution, Side, Winner};
 pub use engine::{
     Action, Displace, Engine, Event, Expected, FetchOutcome, NodeConfig, Outbound, Tier,
