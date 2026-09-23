@@ -2,8 +2,8 @@
 //!
 //! [`Entry`] is the §7.1 record without `seq`: what travels in a batch
 //! (§7.4) and what a scanner observation becomes once the engine has
-//! versioned it. [`ContentHash`] is opaque here: the host computes BLAKE3, the
-//! engine only compares.
+//! versioned it. [`ContentHash`] is opaque here: the host computes BLAKE3,
+//! the engine only compares.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,14 +13,14 @@ use crate::version::Version;
 
 bytes_newtype! {
     /// A BLAKE3 hash (§7.1): of the content for files, of the target string
-    /// for symlinks. Directories carry [`ContentHash::EMPTY`]. The engine never
-    /// computes one.
+    /// for symlinks. Directories and tombstones carry [`ContentHash::EMPTY`].
+    /// The engine never computes one.
     ContentHash, 32
 }
 
 impl ContentHash {
-    /// The "empty" hash directories carry. All zeros; no real BLAKE3 output
-    /// will ever equal it in practice.
+    /// The all-zero sentinel for directories and tombstones (§7.1). Never
+    /// the hash of a file: BLAKE3 of empty input is not all zeros.
     pub const EMPTY: Self = Self([0u8; 32]);
 }
 
@@ -76,7 +76,14 @@ pub struct Entry {
     pub size: u64,
     pub mtime_ns: i64,
     pub exec: bool,
+    /// Content hash; [`ContentHash::EMPTY`] for directories and tombstones.
     pub hash: ContentHash,
+    /// The `hash` of the version this one replaced, as it was when the
+    /// change was made; [`ContentHash::EMPTY`] if the path did not exist.
+    /// Set by the author and carried with the entry. `hash == prev_hash`
+    /// means a metadata-only change (§7.1), which loses conflicts to real
+    /// edits (§7.6) and is invisible to the brake (§8.1).
+    pub prev_hash: ContentHash,
     pub version: Version,
     /// This record is a tombstone (§7.7).
     pub deleted: bool,
@@ -97,6 +104,12 @@ impl Entry {
             exec: self.exec,
             hash: self.hash,
         }
+    }
+
+    /// A metadata-only change (§7.1): the content is what it was before.
+    /// Touches, and tombstones for paths peers never saw.
+    pub fn is_metadata_only(&self) -> bool {
+        self.hash == self.prev_hash
     }
 
     /// Content equality per §7.6: kind, hash, and for files the exec bit.
@@ -136,6 +149,7 @@ mod tests {
             mtime_ns: 1_000,
             exec,
             hash: hash(h),
+            prev_hash: ContentHash::EMPTY,
             version: Version::empty().incremented(node(1)),
             deleted: false,
             modified_by: node(1),
@@ -237,11 +251,22 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_means_hash_equals_prev_hash() {
+        let mut e = file(1, false);
+        assert!(!e.is_metadata_only(), "a first add replaces nothing");
+        e.prev_hash = hash(1);
+        assert!(e.is_metadata_only(), "a touch");
+        e.prev_hash = hash(2);
+        assert!(!e.is_metadata_only(), "a real edit");
+    }
+
+    #[test]
     fn entry_round_trips_through_both_formats() {
         let e = file(3, true);
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"kind\":\"file\""));
         assert!(json.contains("\"author_host\":\"laptop\""));
+        assert!(json.contains(&format!("\"prev_hash\":\"{}\"", "0".repeat(64))));
         assert_eq!(serde_json::from_str::<Entry>(&json).unwrap(), e);
         let bytes = postcard::to_stdvec(&e).unwrap();
         assert_eq!(postcard::from_bytes::<Entry>(&bytes).unwrap(), e);
