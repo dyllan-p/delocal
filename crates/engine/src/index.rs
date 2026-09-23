@@ -645,6 +645,27 @@ mod tests {
     }
 
     #[test]
+    fn a_child_under_an_announced_directory_does_not_touch_the_directory() {
+        let mut idx = index();
+        let dir = |mtime_ns| Observed {
+            kind: Kind::Dir,
+            size: 0,
+            mtime_ns,
+            exec: false,
+            hash: ContentHash::EMPTY,
+        };
+        idx.observe(p("d"), dir(100)).unwrap();
+        idx.mark_announced();
+        // Creating d/child bumps the directory's mtime on disk; the host
+        // reports the directory again with the new mtime.
+        idx.observe(p("d/child"), file(1, 200)).unwrap();
+        assert_eq!(idx.observe(p("d"), dir(200)), None);
+        assert_eq!(idx.pending_kind(&p("d")), None);
+        assert_eq!(idx.pending_count(), 1, "only the child is pending");
+        assert_eq!(idx.get(&p("d")).unwrap().entry.mtime_ns, 0);
+    }
+
+    #[test]
     fn tracked_count_excludes_directories_and_tombstones() {
         let mut idx = index();
         idx.observe(
