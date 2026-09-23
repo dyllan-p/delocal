@@ -549,7 +549,20 @@ impl Index {
     /// dominates all of them, with content unchanged. With no local record
     /// the result is a tombstone dated `at_ns`. `hash == prev_hash`, so on
     /// peers that hold the same content this lands as a metadata-only apply.
-    pub fn bump_over(&mut self, path: &RelPath, over: &[Version], at_ns: i64) -> LocalChange {
+    ///
+    /// `over_stamp` is the largest stamp among the versions bumped over. The
+    /// bump dominates them all, and an increment must rank above everything
+    /// in its causal past (§7.6), so its stamp is one past the larger of the
+    /// local record's and theirs; the replaced record alone is not enough
+    /// here, since the quarantined versions were never in this machine's
+    /// chain.
+    pub fn bump_over(
+        &mut self,
+        path: &RelPath,
+        over: &[Version],
+        over_stamp: Option<i64>,
+        at_ns: i64,
+    ) -> LocalChange {
         let local = self.records.get(path).map(|r| r.entry.clone());
         let base = local
             .as_ref()
@@ -560,11 +573,19 @@ impl Index {
             .fold(base, |acc, v| acc.merge(v))
             .incremented(self.own);
         let prev_hash = self.announced_hash(path);
+        let stamp = local
+            .as_ref()
+            .map(|e| e.stamp)
+            .into_iter()
+            .chain(over_stamp)
+            .max()
+            .unwrap_or(0)
+            + 1;
         let entry = match local {
             Some(e) => Entry {
                 version,
                 prev_hash,
-                stamp: e.stamp + 1,
+                stamp,
                 modified_by: self.own,
                 author_host: self.host.clone(),
                 ..e
@@ -574,7 +595,7 @@ impl Index {
                 kind: Kind::File,
                 size: 0,
                 mtime_ns: at_ns,
-                stamp: 1,
+                stamp,
                 exec: false,
                 hash: ContentHash::EMPTY,
                 prev_hash,
@@ -1007,8 +1028,9 @@ mod tests {
         idx.mark_announced();
         let mine = idx.get(&p("a")).unwrap().entry.clone();
         let q1 = Version::empty().incremented(node(2)).incremented(node(2));
+        let q1_stamp = 500;
         let q2: Version = [(node(3), 4)].into_iter().collect();
-        let c = idx.bump_over(&p("a"), &[q1.clone(), q2.clone()], 9);
+        let c = idx.bump_over(&p("a"), &[q1.clone(), q2.clone()], None, 9);
         let e = &c.record.entry;
         assert!(e.version.dominates(&q1));
         assert!(e.version.dominates(&q2));
@@ -1022,7 +1044,11 @@ mod tests {
         assert_eq!(e.modified_by, node(1));
         assert_eq!(c.kind, ChangeKind::Modify);
         // No record: a tombstone that still dominates.
-        let c = idx.bump_over(&p("never"), std::slice::from_ref(&q1), 77);
+        let c = idx.bump_over(&p("never"), std::slice::from_ref(&q1), Some(q1_stamp), 77);
+        assert!(
+            c.record.entry.stamp > q1_stamp,
+            "a bump ranks above what it dominates"
+        );
         let e = &c.record.entry;
         assert!(e.deleted);
         assert!(e.version.dominates(&q1));

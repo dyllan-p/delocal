@@ -2418,3 +2418,202 @@ fn equal_vectors_mean_equal_content_when_deletes_race_an_edit() {
         ],
     );
 }
+
+/// A `deny` with no local record made a tombstone stamped 1 that dominated
+/// a version stamped by its mtime; a node that met the tombstone alone
+/// ranked its own edit above it while a node holding the dominated version
+/// ranked that above everything, and the same vector carried two contents
+/// (I7). A deny's bump now stamps one past every version it dominates.
+#[test]
+fn a_deny_ranks_above_every_version_it_dominates() {
+    passes(
+        0,
+        &[
+            Step::Tier {
+                a: 7,
+                b: 7,
+                tier: 0,
+            },
+            Step::Create {
+                node: 7,
+                path: 10,
+                content: 5,
+            },
+            Step::Modify {
+                node: 0,
+                path: 7,
+                content: 4,
+            },
+            Step::Modify {
+                node: 1,
+                path: 8,
+                content: 1,
+            },
+            Step::Create {
+                node: 1,
+                path: 4,
+                content: 3,
+            },
+            Step::Heal { a: 4, b: 0 },
+            Step::Create {
+                node: 6,
+                path: 5,
+                content: 2,
+            },
+            Step::Offline { node: 4 },
+            Step::Mkdir { node: 2, dir: 1 },
+            Step::Create {
+                node: 7,
+                path: 6,
+                content: 2,
+            },
+            Step::Create {
+                node: 6,
+                path: 7,
+                content: 4,
+            },
+            Step::Create {
+                node: 3,
+                path: 8,
+                content: 3,
+            },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::Revert,
+                delay_secs: 8,
+            },
+            Step::Everywhere {
+                path: 9,
+                contents: vec![Some(3), Some(5), Some(1)],
+            },
+            Step::Modify {
+                node: 0,
+                path: 1,
+                content: 4,
+            },
+            Step::Partition { a: 3, b: 3 },
+            Step::Settle { secs: 30 },
+            Step::Create {
+                node: 6,
+                path: 8,
+                content: 5,
+            },
+            Step::Crash {
+                node: 1,
+                gap_secs: 16,
+            },
+            Step::MassModify {
+                node: 7,
+                fraction: 98,
+                content: 1,
+            },
+            Step::Partition { a: 7, b: 4 },
+            Step::Heal { a: 3, b: 5 },
+            Step::Delete { node: 0, path: 11 },
+            Step::Online { node: 0 },
+            Step::Create {
+                node: 7,
+                path: 6,
+                content: 1,
+            },
+            Step::Delete { node: 2, path: 6 },
+            Step::Online { node: 2 },
+            Step::Rename {
+                node: 1,
+                from: 2,
+                to: 9,
+            },
+            Step::Create {
+                node: 5,
+                path: 7,
+                content: 1,
+            },
+            Step::Delete { node: 2, path: 1 },
+            Step::Offline { node: 3 },
+            Step::Offline { node: 2 },
+            Step::Settle { secs: 20 },
+            Step::Mkdir { node: 2, dir: 2 },
+            Step::Create {
+                node: 6,
+                path: 10,
+                content: 3,
+            },
+            Step::Create {
+                node: 1,
+                path: 7,
+                content: 3,
+            },
+            Step::Settle { secs: 22 },
+            Step::Online { node: 6 },
+            Step::Everywhere {
+                path: 5,
+                contents: vec![Some(5), Some(4), Some(3)],
+            },
+            Step::Crash {
+                node: 7,
+                gap_secs: 19,
+            },
+            Step::Create {
+                node: 1,
+                path: 9,
+                content: 3,
+            },
+            Step::Tier {
+                a: 6,
+                b: 7,
+                tier: 1,
+            },
+            Step::Modify {
+                node: 3,
+                path: 9,
+                content: 1,
+            },
+            Step::Everywhere {
+                path: 8,
+                contents: vec![Some(2), Some(5)],
+            },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![Some(4), None, Some(4)],
+            },
+            Step::Delete { node: 7, path: 1 },
+            Step::Modify {
+                node: 3,
+                path: 9,
+                content: 3,
+            },
+            Step::Modify {
+                node: 1,
+                path: 3,
+                content: 5,
+            },
+            Step::User {
+                node: 4,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 43,
+            },
+            Step::Chmod { node: 1, path: 11 },
+            Step::Online { node: 4 },
+            Step::Rmdir { node: 0, dir: 0 },
+            Step::Modify {
+                node: 5,
+                path: 2,
+                content: 1,
+            },
+            Step::Rename {
+                node: 1,
+                from: 7,
+                to: 7,
+            },
+            Step::Settle { secs: 15 },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::Rules {
+                    hold_count: 2,
+                    hold_pct: 29,
+                },
+                delay_secs: 9,
+            },
+        ],
+    );
+}
