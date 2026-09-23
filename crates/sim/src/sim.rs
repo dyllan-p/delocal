@@ -1244,6 +1244,7 @@ impl Sim {
                         Event::FetchProgress {
                             folder: self.folder,
                             path,
+                            hash,
                             version,
                         },
                     );
@@ -1252,14 +1253,22 @@ impl Sim {
                 if !self.connected(node, from) {
                     return Ok(());
                 }
+                // §7.5 step 2: the source serves the requested content from
+                // `path` if its live record there has that hash and the disk
+                // still matches the record, failing that from any live file
+                // with that hash, failing that not at all.
                 let served = self.nodes.get(&from).and_then(|src| {
                     let engine = src.engine.as_ref()?;
-                    let f = engine.folder(self.folder)?;
-                    if !f.index().has_exact(&path, &version) {
-                        return None;
-                    }
-                    let file = src.fs.get(&path)?;
-                    (file.kind != Kind::Dir).then(|| file.content.clone())
+                    let index = engine.folder(self.folder)?.index();
+                    index.locate(&path, &hash).find_map(|at| {
+                        let record = index.live(at)?;
+                        let file = src.fs.get(at)?;
+                        let matches = file.kind == record.entry.kind
+                            && (file.kind != Kind::File
+                                || (file.content.len() as u64 == record.entry.size
+                                    && file.mtime_ns == record.entry.mtime_ns));
+                        matches.then(|| file.content.clone())
+                    })
                 });
                 let report = match served {
                     None => {
@@ -1286,6 +1295,7 @@ impl Sim {
                     Event::Fetched {
                         folder: self.folder,
                         path,
+                        hash,
                         version,
                         outcome: report,
                     },

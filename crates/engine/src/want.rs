@@ -31,7 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{ApplyItem, ApplyMode};
 use crate::conflict::ConflictCopy;
-use crate::entry::{Entry, Kind};
+use crate::entry::{ContentHash, Entry, Kind};
 use crate::id::{BatchId, NodeId};
 use crate::path::RelPath;
 use crate::rules::Rules;
@@ -107,13 +107,13 @@ pub struct Want {
     pub batch: BatchId,
     pub source: NodeId,
     pub seq_high: u64,
-    /// Members that announced exactly this version: the batch's source, the
-    /// version's author, and later batches carrying the same version. One
-    /// that answers `NotAvailable` has moved on and is removed (§7.5 step
-    /// 3); announcing the version again puts it back, since it now says it
-    /// holds it. A conflict's `M` exists nowhere until someone merges, so
-    /// its first announcer is often the winner's holder, which can answer
-    /// `NotAvailable` until it has seen the loser too.
+    /// Members that announced a version **with the wanted content** at this
+    /// path (§7.5): the batch's source, the version's author, and later
+    /// batches carrying a version at the path with the same hash. Fetches
+    /// are by hash, so whoever announced `W` is a source for a conflict's
+    /// `M`, which has `W`'s content. One that answers `NotAvailable` has
+    /// moved on and is removed (step 3); announcing the content again puts
+    /// it back, since it now says it holds it.
     pub sources: BTreeSet<NodeId>,
     /// Sources that served a hash mismatch: never asked again for this
     /// want, whatever they announce (§7.5 step 4 retries from another).
@@ -289,12 +289,14 @@ impl WantList {
         None
     }
 
-    /// A batch carried `(path, version)`, whether or not it produced an
-    /// item: if that is exactly what a want is after, the batch's source
-    /// has it (§7.5).
-    pub fn note_announced(&mut self, path: &RelPath, version: &Version, by: NodeId) {
-        if let Some(want) = self.wants.get_mut(path)
-            && want.version() == version
+    /// A batch carried a version at `path` with content `hash`, whether or
+    /// not it produced an item: if that is the content a want is after, the
+    /// batch's source has it (§7.5). Directories and tombstones carry the
+    /// empty hash and are never fetched, so they name no source.
+    pub fn note_announced(&mut self, path: &RelPath, hash: &ContentHash, by: NodeId) {
+        if *hash != ContentHash::EMPTY
+            && let Some(want) = self.wants.get_mut(path)
+            && want.entry.hash == *hash
             && want.sources.insert(by)
         {
             self.note(path);
@@ -706,6 +708,12 @@ mod tests {
         }
     }
 
+    /// The content every test file carries (see `entry`); the version is
+    /// irrelevant to a fetch, which is by hash.
+    fn hash_of(_version: &Version) -> ContentHash {
+        entry("f", Kind::File, 10, 2, false).hash
+    }
+
     fn item(e: Entry, mode: ApplyMode) -> ApplyItem {
         ApplyItem::Apply {
             entry: e,
@@ -760,8 +768,8 @@ mod tests {
             l.get(&p("f")).unwrap().excluded.is_empty(),
             "not available is not a mismatch"
         );
-        // Node 2 announces the version again (it has merged to it): asked again.
-        l.note_announced(&p("f"), &version, node(2));
+        // Node 2 announces the content again (it has merged to it): asked again.
+        l.note_announced(&p("f"), &hash_of(&version), node(2));
         let steps = l.dispatch(t(2), &Rules::default(), &peers);
         assert!(
             matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)),
@@ -769,24 +777,39 @@ mod tests {
         );
         // A mismatch, by contrast, sticks.
         l.fetched(&p("f"), &version, FetchReport::HashMismatch);
-        l.note_announced(&p("f"), &version, node(2));
+        l.note_announced(&p("f"), &hash_of(&version), node(2));
         assert!(l.dispatch(t(3), &Rules::default(), &peers).is_empty());
         assert_eq!(l.get(&p("f")).unwrap().state, WantState::NoSource);
     }
 
     #[test]
+    fn sources_are_keyed_by_content_not_version() {
+        // A concurrent version of the same bytes from node 5 makes node 5 a
+        // source; a different hash, or a tombstone, does not.
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        let want = l.get(&p("f")).unwrap().clone();
+        let same_bytes = entry("f", Kind::File, 10, 5, false);
+        assert_ne!(same_bytes.version, want.entry.version);
+        assert_eq!(same_bytes.hash, want.entry.hash);
+        l.note_announced(&p("f"), &same_bytes.hash, node(5));
+        assert!(l.get(&p("f")).unwrap().sources.contains(&node(5)));
+        let mut other = [0u8; 32];
+        other[0] = 9;
+        l.note_announced(&p("f"), &ContentHash::from_bytes(other), node(6));
+        l.note_announced(&p("f"), &ContentHash::EMPTY, node(7));
+        let sources = &l.get(&p("f")).unwrap().sources;
+        assert!(!sources.contains(&node(6)), "other content");
+        assert!(
+            !sources.contains(&node(7)),
+            "a tombstone announces no content"
+        );
+    }
+
+    #[test]
     fn selection_prefers_tier_then_node_and_skips_excluded() {
         let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
-        l.note_announced(
-            &p("f"),
-            &entry("f", Kind::File, 10, 2, false).version,
-            node(3),
-        );
-        l.note_announced(
-            &p("f"),
-            &entry("f", Kind::File, 10, 2, false).version,
-            node(4),
-        );
+        l.note_announced(&p("f"), &entry("f", Kind::File, 10, 2, false).hash, node(3));
+        l.note_announced(&p("f"), &entry("f", Kind::File, 10, 2, false).hash, node(4));
         let steps = l.dispatch(
             t(0),
             &Rules::default(),
@@ -882,7 +905,7 @@ mod tests {
         for path in ["a", "b", "c", "d", "e"] {
             l.note_announced(
                 &p(path),
-                &entry(path, Kind::File, 1, 2, false).version,
+                &entry(path, Kind::File, 1, 2, false).hash,
                 node(3),
             );
         }

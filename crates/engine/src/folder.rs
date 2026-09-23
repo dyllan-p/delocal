@@ -563,7 +563,7 @@ impl FolderState {
             );
             if same {
                 for src in old.sources {
-                    self.wants.note_announced(path, &old.entry.version, src);
+                    self.wants.note_announced(path, &old.entry.hash, src);
                 }
             }
         }
@@ -588,7 +588,7 @@ impl FolderState {
                 && (entry.version == *want.version() || want.version().dominates(&entry.version))
             {
                 self.wants
-                    .note_announced(c.item.path(), &entry.version, c.source);
+                    .note_announced(c.item.path(), &entry.hash, c.source);
                 continue;
             }
             if let Some(held) = self.quarantine.matching(&c.raw) {
@@ -957,8 +957,7 @@ impl FolderState {
             raw.insert(&entry.path, entry);
         }
         for (path, entry) in &raw {
-            self.wants
-                .note_announced(path, &entry.version, batch.source);
+            self.wants.note_announced(path, &entry.hash, batch.source);
         }
 
         let mut joined = 0;

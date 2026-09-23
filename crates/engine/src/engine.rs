@@ -125,18 +125,24 @@ pub enum Event {
         seq: u64,
     },
 
-    /// The host finished a fetch the engine asked for (§7.5).
+    /// The host finished a fetch the engine asked for (§7.5). `hash` is
+    /// what was requested from the source (a `RequestFile` names content,
+    /// not a version); `version` is the want the report belongs to, so a
+    /// late report for a want since replaced is told apart.
     Fetched {
         folder: FolderId,
         path: RelPath,
+        hash: ContentHash,
         version: Version,
         outcome: FetchReport,
     },
     /// Bytes are arriving for a fetch; the host sends this at most every
-    /// few seconds. Pushes the stall deadline out (§7.5).
+    /// few seconds. Pushes the stall deadline out (§7.5). Fields as in
+    /// [`Event::Fetched`].
     FetchProgress {
         folder: FolderId,
         path: RelPath,
+        hash: ContentHash,
         version: Version,
     },
     /// A want the host persisted comes back after a restart (Phase 2).
@@ -175,7 +181,10 @@ pub enum Action {
     /// Send a message to a connected peer.
     Send { to: NodeId, payload: Outbound },
 
-    /// Pull one file from one source (§7.5 steps 1 to 5).
+    /// Pull one file from one source (§7.5 steps 1 to 5): send
+    /// `RequestFile { folder, path, hash, offset }`. The request names the
+    /// content, so the source may serve it from `path` or from any live
+    /// file with that hash. `version` is for the report back, not the wire.
     Fetch {
         folder: FolderId,
         path: RelPath,
@@ -437,6 +446,7 @@ impl Engine {
                 path,
                 version,
                 outcome,
+                ..
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
                     if f.fetched(&path, &version, outcome) == Some(crate::want::WantState::GaveUp) {
@@ -452,6 +462,7 @@ impl Engine {
                 folder,
                 path,
                 version,
+                ..
             } => match self.folders.get_mut(&folder) {
                 Some(f) => f.progress(now, &path, &version),
                 None => out.push(unknown_folder(folder)),
@@ -1936,6 +1947,7 @@ mod tests {
             Event::FetchProgress {
                 folder: folder(),
                 path: p("n"),
+                hash: fetch.2,
                 version: fetch.1.clone(),
             },
         );
@@ -1945,6 +1957,7 @@ mod tests {
             Event::Fetched {
                 folder: folder(),
                 path: p("n"),
+                hash: fetch.2,
                 version: fetch.1.clone(),
                 outcome: FetchReport::Ok,
             },
@@ -2532,7 +2545,7 @@ mod tests {
                     now = now.plus_nanos(gap * NANOS_PER_SECOND);
                     let b = engines.get_mut(&node(2)).unwrap();
                     if let Some(v) = &v {
-                        all.extend(b.handle(now, Event::FetchProgress { folder: folder(), path: p("n"), version: v.clone() }).into_iter().map(|a| (node(2), a)));
+                        all.extend(b.handle(now, Event::FetchProgress { folder: folder(), path: p("n"), hash: hash(seed), version: v.clone() }).into_iter().map(|a| (node(2), a)));
                     }
                     all.extend(b.handle(now.plus_nanos(1), Event::Tick { fresh_batch_id: fresh(9) }).into_iter().map(|a| (node(2), a)));
                 }
