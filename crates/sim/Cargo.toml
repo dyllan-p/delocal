@@ -1,0 +1,29 @@
+[package]
+name = "delocal-sim"
+description = "Deterministic simulator for the delocal engine: in-memory host, seeded PRNG, invariants I1-I6."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "delocal-sim"
+path = "src/main.rs"
+
+# Dev-only (DESIGN.md Appendix B): depends on the engine, nothing depends
+# on it. rand_chacha is the seeded PRNG; blake3 makes the host's hashes real.
+# proptest is a normal dependency because the step Strategy lives in the
+# library, shared by the shrinking test and the binary's generator.
+[dependencies]
+delocal-engine.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+blake3.workspace = true
+serde.workspace = true
+postcard.workspace = true
+proptest.workspace = true
+
+[lints]
+workspace = true
