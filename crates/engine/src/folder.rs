@@ -254,6 +254,9 @@ pub struct Received {
     pub joined: usize,
     /// Items frozen because their path is pending on a paused folder.
     pub frozen: usize,
+    /// Items whose version this machine already wants (or has superseded in
+    /// its want-list); they only named another source (§7.5).
+    pub already_wanted: usize,
     /// The hold reason, if held.
     pub held: Option<HoldReason>,
 }
@@ -778,12 +781,24 @@ impl FolderState {
 
         let mut joined = 0;
         let mut frozen = 0;
+        let mut already_wanted = 0;
         let mut kept = Vec::with_capacity(set.items.len());
         for item in std::mem::take(&mut set.items) {
             let Some(incoming) = raw.get(item.path()).copied() else {
                 kept.push(item);
                 continue;
             };
+            // A version this machine already accepted went through the brake
+            // when it was accepted; another member offering it (or something
+            // older) only adds a source, and must not be held or quarantined
+            // while its fetch is under way (§7.5).
+            if let Some(want) = self.wants.get(item.path())
+                && (item.incoming().version == *want.version()
+                    || want.version().dominates(&item.incoming().version))
+            {
+                already_wanted += 1;
+                continue;
+            }
             if let Some(held) = self.quarantine.matching(incoming) {
                 self.quarantine.join(held, incoming.clone());
                 joined += 1;
@@ -832,6 +847,7 @@ impl FolderState {
                     summary,
                     joined,
                     frozen,
+                    already_wanted,
                     held: Some(reason),
                 }
             }
@@ -845,6 +861,7 @@ impl FolderState {
                     summary,
                     joined,
                     frozen,
+                    already_wanted,
                     held: None,
                 }
             }
@@ -1945,6 +1962,67 @@ mod tests {
         assert!(b.quarantine().is_empty());
         assert_eq!(b.wants().len(), 8, "one want per released path");
         assert_eq!(b.approve(t(22.0), bid(3)), Approved::Unknown);
+    }
+
+    #[test]
+    fn a_version_already_wanted_is_not_rebraked_when_relayed() {
+        // A announces a file; B accepts it and starts fetching. C relays the
+        // same version inside a batch that trips B's brake: the relayed copy
+        // must only add C as a source, not be quarantined under B's own fetch.
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("new"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        let r = b.receive(t(12.0), &batch);
+        assert_eq!(r.decision, Decision::Accepted);
+        let wanted = b.wants().get(&p("new")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        assert!(b.in_flight(&p("new")));
+
+        // C's batch: the same version of "new" plus eight deletes.
+        let mut c = folder_with(Rules::default(), 3, "charlie");
+        for i in 0..10 {
+            let e = b
+                .index()
+                .get(&p(&format!("f{i:02}")))
+                .unwrap()
+                .entry
+                .clone();
+            c.adopt(t(13.0), e);
+        }
+        c.adopt(t(13.0), batch.entries[0].clone());
+        c.form_batches(t(14.0), bid(4));
+        for i in 0..8 {
+            c.scanned(t(15.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let mut relay = c.form_batches(t(17.0), bid(5)).remove(0);
+        relay.entries.push(batch.entries[0].clone()); // the relayed "new"
+        relay.seq_high += 1;
+        let r = b.receive(t(17.0), &relay);
+        assert_eq!(r.already_wanted, 1);
+        assert_eq!(
+            r.held,
+            Some(HoldReason::Count {
+                destructive: 8,
+                tracked: 10
+            })
+        );
+        assert!(
+            b.quarantine().versions_at(&p("new")).is_empty(),
+            "the wanted version is not quarantined"
+        );
+        let want = b.wants().get(&p("new")).unwrap();
+        assert_eq!(want.version(), &wanted);
+        assert!(want.sources.contains(&node(3)), "C named as a source");
+        assert!(b.in_flight(&p("new")), "the fetch goes on");
+        // The commit lands without touching the quarantine.
+        b.fetched(&p("new"), &wanted, FetchReport::Ok);
+        b.dispatch(t(18.0), &lan(&[1]));
+        assert_eq!(
+            b.applied(t(19.0), &p("new"), &wanted, ApplyOutcome::Ok)
+                .len(),
+            1
+        );
+        assert_eq!(b.quarantine().len(), 1, "the deletes stay held");
     }
 
     #[test]
