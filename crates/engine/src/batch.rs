@@ -313,6 +313,12 @@ pub fn classify(index: &Index, incoming: &Entry) -> Classified {
                 };
             };
             if local.same_content(incoming) {
+                // The §7.2 identical-content merge. Two records that tie all
+                // the way down are the same content under two vectors (two
+                // machines resolved the same conflict, or created the same
+                // directory); whichever side gives the fields, M is the same.
+                // That tie is not a rule-5 conflict decision (§7.6) and is
+                // not counted as one.
                 let pick = conflict::prefer_fields(incoming, local);
                 let (fields, other) = match pick.side {
                     Side::First => (incoming, local),
@@ -327,7 +333,7 @@ pub fn classify(index: &Index, incoming: &Entry) -> Classified {
                 } else {
                     ApplyMode::IndexOnly
                 };
-                return apply(merged, mode, None, pick.fallback);
+                return apply(merged, mode, None, false);
             }
             let resolution = conflict::resolve(incoming, local);
             match resolution.winner {
@@ -659,6 +665,29 @@ mod tests {
         assert_eq!(copy.loser.hash, hash(3));
         assert_eq!(copy.path.as_str(), "conflict.conflict-19700101-000000-h");
         assert_eq!(set.fallbacks, 0);
+    }
+
+    #[test]
+    fn an_identical_content_merge_that_ties_everywhere_is_not_a_fallback() {
+        // Two nodes create the same directory: same content, same (zero)
+        // mtime, and after adoption elsewhere the same author too.
+        let mut idx = index(1);
+        idx.observe(p("d"), dir()).unwrap();
+        let mine = idx.get(&p("d")).unwrap().entry.clone();
+        let mut theirs = mine.clone();
+        theirs.version = Version::empty().incremented(node(2));
+        theirs.modified_by = mine.modified_by; // as it would be after relaying M
+        let set = apply_set(&idx, &batch_of(vec![theirs.clone()], 1));
+        assert_eq!(set.items.len(), 1);
+        assert_eq!(set.items[0].mode(), ApplyMode::IndexOnly);
+        assert_eq!(
+            set.items[0].incoming().version,
+            mine.version.merge(&theirs.version)
+        );
+        assert_eq!(
+            set.fallbacks, 0,
+            "a full tie on identical content is not a rule-5 decision"
+        );
     }
 
     #[test]
