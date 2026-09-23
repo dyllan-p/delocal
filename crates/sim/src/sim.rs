@@ -733,9 +733,12 @@ impl Sim {
         match action {
             Action::WakeAt(t) => {
                 // The engine speaks the node's skewed clock; the host keeps
-                // global time.
+                // global time. "No later than" a time already past means
+                // now: a restored folder can carry a window that fell due
+                // while the process was down.
+                let clock = self.clock;
                 if let Some(n) = self.nodes.get_mut(&id) {
-                    let global = t.plus_nanos(-n.skew_ns);
+                    let global = t.plus_nanos(-n.skew_ns).max(clock);
                     n.wake_at = Some(n.wake_at.map_or(global, |w| w.min(global)));
                 }
             }
