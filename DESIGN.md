@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 15 · 23 September 2026 · Status: **for review** · Changes from draft 14: the scan fast path compares the exec bit (§7.3); one total order for every concurrent pair, identical content included, with the argument for why the merged version is then a function of its vector (§7.2, §7.6).
+> Draft 16 · 23 September 2026 · Status: **for review** · Changes from draft 15: the `stamp`, a Lamport timestamp seeded by mtime, is the first key of the winner rule, because the simulator disproved draft 15's claim that one total order was enough (§7.1, §7.6, §7.8); delete-vs-modify restated under the stamp (§7.6); I7 added (§14.1).
+>
+> Changes from draft 15: the scan fast path compares the exec bit (§7.3); one total order for every concurrent pair, identical content included, with the argument for why the merged version is then a function of its vector (§7.2, §7.6).
 >
 > Changes from draft 14: content is requested by hash, not by version, and want-list sources are keyed by content (§7.5, §12); batches carry `seq_low` and acknowledgements are the contiguous watermark, so the protocol is correct over a lossy, reordering transport (§7.4, §12); `IndexRemoved` hook (§11); CI policy for the random sweep (§14.1).
 >
@@ -214,6 +216,7 @@ Per folder, one record per entry the machine knows about, including deleted ones
 | `exec` | bool; the only permission bit synced |
 | `hash` | BLAKE3 of content (files), of the target string (symlinks); the all-zero sentinel `EMPTY` for directories and tombstones. `EMPTY` is never the hash of a file (BLAKE3 of empty input is not all zeros) |
 | `prev_hash` | The `hash` of the version this one replaced, as it was when the change was made; `EMPTY` if the path did not exist. Set by the author, carried with the entry. A version whose `hash == prev_hash` is a **metadata-only change** (a touch). Used by the conflict rule (§7.6) and the brake (§8.1) |
+| `stamp` | A Lamport timestamp seeded by the modification time, in nanoseconds. For a content change: `max(mtime_ns, stamp of the record being replaced + 1)`; for a metadata-only change, a tombstone, a directory or a symlink: `stamp of the record being replaced + 1`; for a path with no record: `mtime_ns` (or 1 when the kind has none). Set by the author, carried with the entry; a merged record inherits the winner's. Strictly increasing along every machine's chain of versions for a path, which is what makes the winner rule (§7.6) converge. Never compared to a clock |
 | `version` | version vector (§7.2) |
 | `deleted` | bool — this record is a tombstone |
 | `modified_by` | node ID that produced this version |
@@ -323,15 +326,20 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 
 Two versions of the same path are in conflict when they are **concurrent** (§7.2) **and** their hashes differ (kind, hash, and for files exec bit; mtime is not compared). Concurrent versions with identical content are not a conflict: both sides merge vectors and move on. This rule matters because it is how independently-made identical changes, and the conflict-copy mechanism itself, converge without producing duplicates.
 
-**One order for everything.** The winner rule below is a total order on entries (it compares fields lexicographically and never looks at the vector), and it is applied to **every** concurrent pair, whether or not their content differs; for identical content it only decides which side's metadata the merged record carries. This is what makes a merged version a function of its vector. Every vector in the system is either an increment (a node's versions of a path form a chain, each containing the previous) or a union of existing vectors, so a version whose vector lies componentwise within a merged vector is in that merge's causal past, and the merged record's fields are the maximum, under the order, of the increment-created versions in that past. Two machines holding the same vector therefore hold the same content, which is what lets a receiver drop an `Equal` version unread. Using two different comparisons, one for conflicts and another for identical content, breaks this: pairwise merges in different orders can then reach the same vector with different content, and each side drops the other's as equal, forever. The simulator checks the consequence directly: on every node, equal vectors at a path imply equal content and deletion state.
+**One order for everything, and it must be monotone.** The winner rule below is a total order on entries and it is applied to **every** concurrent pair, whether or not their content differs; for identical content it only decides which side's metadata the merged record carries. One order is necessary but not sufficient. Draft 15 argued that a merged record's content is then the maximum, under the order, of the increment-created versions in its causal past, and so a function of its vector. The simulator showed that argument was wrong (seed 2, seed 111): it only holds if every increment ranks **above** the version it replaces, and rules that look at content do not have that property. A delete ranks below the live file it replaces, a touch below the edit, a symlink or directory (no mtime) below the file. A machine that meets the newer increment alone and a machine that meets the older one first then compare different frontiers, and pairwise maximum over different sets gives different content under the same vector; each side then drops the other's as `Equal`, forever.
+
+The fix is a first key that is strictly increasing along every chain: the **stamp** (§7.1), a Lamport timestamp seeded by the modification time. A content change stamps `max(mtime_ns, previous stamp + 1)`; a metadata-only change, a tombstone, a directory or a symlink stamps `previous stamp + 1`; a merged record inherits the winner's stamp. Because an increment's stamp exceeds the stamp of the record it was made from, and that record's content is by induction the maximum over its own past, every increment ranks above everything in its causal past. With that, the merged record's content **is** the maximum over the increment-created versions in its vector's past, pairwise maximum computes it exactly (the past of a union is the union of the pasts, since a node's versions form a chain), and two machines holding the same vector hold the same content. That is what lets a receiver drop an `Equal` version unread. The remaining rules are tie-breaks among versions with equal stamps, which is where they were always meant to apply: two branches that diverged from the same ancestor at the same moment.
+
+What this means for the user: the most recent edit wins, by a clock that can only move forward along each machine's history; a deletion or a touch never leaps ahead of the file it replaced, so a concurrent edit that is newer than the deleted file's last edit wins, and an older one loses and survives as a conflict copy rather than undoing the deletion. The simulator checks the consequence directly (I7): on every node, equal vectors at a path imply equal content and deletion state.
 
 **Deterministic winner.** Every machine must pick the same winner without communicating:
 
-1. If exactly one side is a tombstone, the live side wins (delete vs modify: a file someone is still editing should not vanish).
-2. If exactly one side is a metadata-only change (`hash == prev_hash`, §7.1), the other side wins. A real edit is never demoted to a conflict copy by a touch.
-3. Otherwise the version with the larger `mtime_ns` wins.
-4. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
-5. Tie: larger `hash`, then `kind` (a symlink and a file with the same bytes tie on hash), then `exec` set, then `size`, `prev_hash`, `author_host`, so the rule is total. Two concurrent versions from one author should be impossible (a node's versions of a path form a chain), so this step exists only to make the rule total; the simulator counts how often it fires, and any count above zero is a bug to find.
+1. The version with the larger `stamp` wins.
+2. Tie: if exactly one side is a tombstone, the live side wins.
+3. Tie: if exactly one side is a metadata-only change (`hash == prev_hash`, §7.1), the other side wins. A real edit is never demoted to a conflict copy by a touch made at the same moment.
+4. Tie: the version with the larger `mtime_ns` wins.
+5. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
+6. Tie: larger `hash`, then `kind` (a symlink and a file with the same bytes tie on hash), then `exec` set, then `size`, `prev_hash`, `author_host`, so the rule is total. Two concurrent versions from one author should be impossible (a node's versions of a path form a chain), so this step exists only to make the rule total; the simulator counts how often it fires, and any count above zero is a bug to find.
 
 **Actions.** Let `W` be the winning version and `L` the losing one, and let `M = merge(W, L)` (§7.2): `W`'s content fields (kind, size, mtime_ns, exec, hash, modified_by, author_host, prev_hash) under the component-wise maximum of the two vectors. `M` dominates both `W` and `L`, and every machine computes the same `M` from the same two inputs, so no increment is needed and no machine has to be told what the others decided. (This is the identical-content merge of §7.2 with a rule for whose content to keep. `deny` in §8.2 does increment, because the choice it encodes is the user's and two machines could choose differently.)
 
@@ -352,7 +360,7 @@ If `author_host` is empty (should not happen, but the format must be total), the
 
 **Special cases.**
 
-- **Delete vs modify:** the modification wins regardless of mtime. The deletion is dropped. A file that someone is still editing should not vanish.
+- **Delete vs modify:** decided by the stamp like everything else. A tombstone's stamp is its predecessor's plus one, so a concurrent edit made after the file's last edit wins and the deletion is dropped; an edit older than that loses, and because the machine holding it displaces it to a conflict copy before applying the tombstone, the edit survives in the folder under the conflict name. A file that someone is editing never vanishes; at worst it is renamed.
 - **Modify vs modify on a directory** cannot happen; directories carry no content.
 - **File vs directory at the same path:** the winner rule decides; the loser is renamed with the conflict suffix. Expected to be vanishingly rare. If the loser is a non-empty directory, displacing it moves its children too: their old records are tombstoned and the moved children appear as adds on the next scan, which may trip the brake on that machine. Known behaviour, accepted; the brake is the safety net.
 - **Case-insensitive filesystems (macOS default):** two index paths that differ only by case cannot both exist. Neither is applied; `status` reports the pair and the user resolves it on a case-sensitive machine. **[decision]** This is the Syncthing approach and is good enough for v1.
@@ -365,7 +373,7 @@ A deleted entry keeps its index record with `deleted = true` and the deletion's 
 
 ### 7.8 Clocks
 
-Wall-clock time is used for exactly three things: local change detection (mtime vs index), the conflict tie-break, and preserving mtimes on received files. It never orders events; version vectors do. If a peer's `Hello` timestamp differs from local time by more than 5 minutes, `status` shows a warning, because the tie-break is less trustworthy.
+Wall-clock time is used for exactly four things: local change detection (mtime vs index), seeding the `stamp` of a content change (§7.1), the conflict tie-breaks below the stamp, and preserving mtimes on received files. It never orders events; version vectors do. If a peer's `Hello` timestamp differs from local time by more than 5 minutes, `status` shows a warning, because the tie-break is less trustworthy.
 
 ---
 
@@ -672,6 +680,7 @@ Invariants checked at the end of every run and at random quiescent points:
 | I4 | **Bounded conflicts.** A losing version is a version that `winner` (§7.6) ranks below a concurrent version with different content at the same path. Every conflict copy present at the end has the deterministic name of some losing version at that path and that version's content, and there is exactly one copy path per losing version, never one per node. Two different losing versions may legitimately have identical content. |
 | I5 | **Brake.** No batch that trips H1/H2 is ever applied without an explicit approve step in the simulation. |
 | I6 | **Determinism.** Same seed → byte-identical outcome. |
+| I7 | **Vector determines content.** On every node, after every index write: two records ever seen at a path with equal vectors have equal kind, hash, exec and deletion state. The one exemption is a machine's own re-issue after `revert`, which reuses a never-announced vector (§8.3). |
 
 Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `simulate` job with its own timeout; a scheduled nightly workflow runs 100,000. A `SEEDS` environment variable controls the count. The pinned regression seeds (§14.4) are always required to pass. The random sweep is advisory (`continue-on-error`) until the first time it passes clean at 1,000 seeds, and a required check from then on; a required check that is red for weeks teaches everyone to ignore it.
 
