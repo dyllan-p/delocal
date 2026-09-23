@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.98"
+
+# Every dependency version is declared here once and inherited by member
+# crates with `crate.workspace = true`. Only crates from DESIGN.md Appendix A
+# may appear here. Phase 0 needs none.
+[workspace.dependencies]
+delocal-engine = { path = "crates/engine" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+# Release binaries are what users download, so trade compile time for a
+# smaller, faster binary. `strip` removes debug symbols, `lto = "fat"` lets
+# the optimiser see across crate boundaries, and one codegen unit gives it
+# the whole crate at once.
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
