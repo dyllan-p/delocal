@@ -222,6 +222,11 @@ pub enum Action {
         folder: FolderId,
         record: IndexRecord,
     },
+    /// A record left the index; persistence hook for Phase 2. Only `revert`
+    /// removes records (§8.3: a pending add peers never saw has no announced
+    /// version to fall back to). Every other end of a path is a tombstone,
+    /// reported as [`Action::IndexChanged`].
+    IndexRemoved { folder: FolderId, path: RelPath },
     /// A want changed or ended; persistence hook for Phase 2 (§7.5).
     WantChanged {
         folder: FolderId,
@@ -501,6 +506,15 @@ impl Engine {
             Event::Revert { folder } => match self.folders.get_mut(&folder) {
                 Some(f) => match f.revert(now) {
                     Some(reverted) => {
+                        for write in reverted.reverted {
+                            out.push(match write.restored {
+                                Some(record) => Action::IndexChanged { folder, record },
+                                None => Action::IndexRemoved {
+                                    folder,
+                                    path: write.path,
+                                },
+                            });
+                        }
                         for path in &reverted.trash {
                             out.push(Action::MoveToTrash {
                                 folder,
@@ -1610,6 +1624,28 @@ mod tests {
             "eight restored wants, four fetch slots per peer"
         );
         let out = core(&out);
+        // The index writes come first, one per pending path (§11: every
+        // write is reported before the host acts on it).
+        let restored = out
+            .iter()
+            .filter(|a| matches!(a, Action::IndexChanged { .. }))
+            .count();
+        assert_eq!(
+            restored, 8,
+            "one announced record put back per reverted path"
+        );
+        assert_eq!(
+            out[8],
+            Action::IndexRemoved {
+                folder: folder(),
+                path: p("junk")
+            },
+            "a pending add peers never saw is removed, not restored"
+        );
+        let out: Vec<Action> = out
+            .into_iter()
+            .filter(|a| !matches!(a, Action::IndexChanged { .. } | Action::IndexRemoved { .. }))
+            .collect();
         assert_eq!(
             out[0],
             Action::MoveToTrash {

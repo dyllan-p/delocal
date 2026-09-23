@@ -948,6 +948,11 @@ impl Sim {
                         .insert(record.entry.path.clone(), record);
                 }
             }
+            Action::IndexRemoved { path, .. } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.persisted.records.remove(&path);
+                }
+            }
             Action::WantChanged { path, want, .. } => {
                 if let Some(n) = self.nodes.get_mut(&id) {
                     match want {

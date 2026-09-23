@@ -52,7 +52,7 @@ pub use folder::{
     FolderStatus, HostStep, Paused, Received, RevertOutcome, ScanState, Ticked, Window,
 };
 pub use id::{BatchId, FolderId, HostName, NodeId};
-pub use index::{ChangeKind, Index, IndexRecord, LocalChange};
+pub use index::{ChangeKind, Index, IndexRecord, LocalChange, Reverted};
 pub use path::RelPath;
 pub use quarantine::{HeldItem, Quarantine};
 pub use rules::Rules;
