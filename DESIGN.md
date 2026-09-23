@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 5 · 23 September 2026 · Status: **for review** · Changes from draft 4: `prev_hash` on every entry and the metadata-only rule in conflicts (§7.1, §7.6); mtime-only changes and the mtime-precision shim (§7.3); tombstone `hash` and `mtime_ns` defined (§7.1); NFC normalisation is the host's job (§7.1, Appendix A); brake classification of mods via `prev_hash` (§8.1).
+> Draft 6 · 23 September 2026 · Status: **for review** · Changes from draft 5: conflicts resolve to the merged version `M = merge(W, L)` with no increment, replacing `W′` (§7.6); the displacing commit (§7.5); adopted records are announced, so live batches and catch-up are the same mechanism (§7.4).
+>
+> Changes from draft 4: `prev_hash` on every entry and the metadata-only rule in conflicts (§7.1, §7.6); mtime-only changes and the mtime-precision shim (§7.3); tombstone `hash` and `mtime_ns` defined (§7.1); NFC normalisation is the host's job (§7.1, Appendix A); brake classification of mods via `prev_hash` (§8.1).
 >
 > Changes from draft 3: `seq` assignment rule (§7.1); merged-record fields on identical-content concurrency (§7.2); metadata-only applies (§7.5) and their brake treatment (§8.1); paused folders keep receiving and pending batches grow (§8.1); `deny` vector construction (§8.2); rename detection listed as out of scope (§3.2); simulator moved to its own crate (§14.1, Appendix B).
 >
@@ -254,6 +256,8 @@ Before sending, the sender runs the **brake pre-check** (§8.1) against its own 
 
 Otherwise the batch is sent to every connected member of the folder and recorded in history.
 
+**Adopted records are announced too.** A batch carries every record written since the last batch: local changes with their coalesced kind (§7.1), and records adopted from peers (§7.5) as they stand. Announcing adoptions is what lets a change reach a machine that is not connected to its source (A → B → C while A and C cannot see each other), and it is what carries a conflict's merged version `M` (§7.6). Receivers drop equal and dominated versions, so the redundancy costs one comparison per entry. This makes a live batch and catch-up the same mechanism: both are "records with `seq` above what this peer has acknowledged".
+
 **Receiving a batch.** For each entry, compare its version with the local record (absent = empty version, dominated by everything):
 
 - incoming **dominates** → candidate to apply
@@ -281,11 +285,11 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 **Committing.**
 
 6. Check the target path is still what the index said it was when the decision was made (same `size` and `mtime_ns`, or absent). If not, the local file changed underneath us: abort the commit and treat the situation as a conflict on the next scan (§7.6).
-7. If a file exists at the target, **move it to trash** (§8.4). Same filesystem, so this is a rename.
+7. If a file exists at the target, **move it to trash** (§8.4), or, when the commit resolves a conflict and the existing file is the losing content, to the conflict-copy path (§7.6). Same filesystem, so this is a rename either way. The engine says which in the commit action; the host never chooses.
 8. `rename(tmp, target)`. Ensure parent directories exist (creating them as index entries if they arrived in the same batch).
 9. Update the index record and `fsync` the parent directory.
 
-**Metadata-only applies.** An incoming version that dominates the local one but has identical content (content equality as in §7.6: kind, hash, exec) needs no fetch, no trash and no write. The host sets the file's mtime to the record's `mtime_ns` and the index adopts the incoming version, `modified_by` and `author_host`. This is how `W′` (§7.6) and `deny` bumps (§8.2) land on machines that already hold the content. A version that differs only in the exec bit is applied the same way, by changing the bit, with no transfer.
+**Metadata-only applies.** An incoming version that dominates the local one but has identical content (content equality as in §7.6: kind, hash, exec) needs no fetch, no trash and no write. The host sets the file's mtime to the record's `mtime_ns` and the index adopts the incoming version, `modified_by` and `author_host`. This is how a conflict's merged version `M` (§7.6) lands on a machine that already holds the winning content, and how `deny` bumps (§8.2) land on machines that hold the same copy. A version that differs only in the exec bit is applied the same way, by changing the bit, with no transfer.
 
 **Deletes.** Move the current file to trash, write the tombstone to the index. Directories are removed only when empty and only after all children in the batch have been processed. Order: creates process parents before children; deletes process children before parents.
 
@@ -303,11 +307,13 @@ Two versions of the same path are in conflict when they are **concurrent** (§7.
 2. Otherwise the version with the larger `mtime_ns` wins.
 3. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
 
-**Actions.** Let `W` be the winning version and `L` the losing one.
+**Actions.** Let `W` be the winning version and `L` the losing one, and let `M = merge(W, L)` (§7.2): `W`'s content fields (kind, size, mtime_ns, exec, hash, modified_by, author_host, prev_hash) under the component-wise maximum of the two vectors. `M` dominates both `W` and `L`, and every machine computes the same `M` from the same two inputs, so no increment is needed and no machine has to be told what the others decided. (This is the identical-content merge of §7.2 with a rule for whose content to keep. `deny` in §8.2 does increment, because the choice it encodes is the user's and two machines could choose differently.)
 
-- A machine that currently **holds L** locally renames its file to the conflict name (below) as a normal local change (producing a fresh version for the new path), then accepts `W` for the original path.
-- A machine that currently **holds W** locally produces `W' = merge(W, L)` with its own counter incremented. `W'` dominates both `W` and `L`, so every machine converges on `W`'s content once `W'` propagates. If several machines hold `W` and each does this, their `W'` versions are concurrent with identical content and merge under the identical-content rule.
-- A machine that holds **neither** (it has an older version or nothing) does nothing special: it will receive `W'` and the conflict copy as ordinary changes.
+- A machine that currently **holds L** locally fetches `W`'s content, then commits in one host operation: the existing file is moved to the conflict-copy path instead of the trash, and `W`'s content is renamed in (§7.5 step 7). The index adopts `M` at the original path and records the conflict copy as a local add at the conflict path with `L`'s content fields, `prev_hash = EMPTY` and a fresh version. The path is never absent in between, so no scan can mistake the displacement for a deletion.
+- A machine that currently **holds W** locally adopts `M` as a metadata-only apply (§7.5): nothing changes on disk.
+- A machine that holds **neither** (an older version, or nothing) applies `M` as an ordinary change and never creates a conflict copy.
+
+Every machine announces `M` once it has adopted it (§7.4); receivers already hold it and ignore the equal version. Conflict copies made by several `L`-holders have the same path and the same content, so their versions merge under §7.2.
 
 **Conflict copy name** is deterministic so that several machines renaming `L` independently produce the same path and the same content, which then merge. It is built only from data carried with `L` itself, never from anything looked up locally:
 
@@ -372,7 +378,7 @@ When a receiver holds a batch, every version in its apply set is written to the 
 `delocal review` shows each held item: source, time, counts, size, sample paths, file-type breakdown. Then:
 
 - **`approve`** applies the apply set normally. Trash still protects every overwritten or deleted file.
-- **`deny`** makes this machine's current copies win. For every quarantined path it produces a new version equal to the component-wise maximum of its local version and every quarantined version for that path, with its own counter incremented (the same construction as `W′` in §7.6), so the result dominates all of them; then it drops the quarantine. Where this machine has no record for the path, the new version is a tombstone. Content is unchanged, so on machines that hold the same content this lands as a metadata-only apply (§7.5) and does not trip the brake. The mesh converges on this machine's copies. On the source machine this arrives as a mass modification and may itself trip that machine's brake; that is correct — the user is already in "something went wrong" mode and approving it there restores the source. **[decision]** This is the simplest correct semantics for `deny`; an alternative is for `deny` to only refuse and tell the user to run `revert` on the source.
+- **`deny`** makes this machine's current copies win. For every quarantined path it produces a new version equal to the component-wise maximum of its local version and every quarantined version for that path, with its own counter incremented, so the result dominates all of them; then it drops the quarantine. Where this machine has no record for the path, the new version is a tombstone. Content is unchanged, so on machines that hold the same content this lands as a metadata-only apply (§7.5) and does not trip the brake. The mesh converges on this machine's copies. On the source machine this arrives as a mass modification and may itself trip that machine's brake; that is correct — the user is already in "something went wrong" mode and approving it there restores the source. **[decision]** This is the simplest correct semantics for `deny`; an alternative is for `deny` to only refuse and tell the user to run `revert` on the source.
 
 Approving on one machine does not approve on others in v1 (§3.2).
 
