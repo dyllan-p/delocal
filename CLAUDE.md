@@ -21,21 +21,32 @@ reality in the phase that needs them, not before.
 
 ## Crate boundary (DESIGN.md Appendix B)
 
-Two crates:
+Three crates:
 
 - `crates/engine` (package `delocal-engine`): pure sync logic. Index, versions,
-  batches, conflicts, brake, quarantine, revert semantics, and the simulator. It takes
-  events and returns actions. It does no I/O.
+  batches, conflicts, brake, quarantine, revert semantics. One `Engine` per node that
+  consumes `Event`s and returns `Action`s. It does no I/O and never reads a clock or a
+  random number generator: timestamps and fresh identifiers arrive in events.
+- `crates/sim` (package `delocal-sim`): the deterministic simulator. An in-memory host
+  for N engines with a seeded PRNG, the invariants I1 to I6, a proptest test for
+  shrinking, and a binary for the nightly run. Dev-only; it depends on the engine and
+  nothing depends on it.
 - `crates/delocal` (package `delocal`): the binary. Daemon, CLI, filesystem, SQLite,
-  networking, Tailscale, service install.
+  networking, Tailscale, service install. Wire messages (`Hello`, the `Batch` envelope,
+  `RequestFile`, and so on) live here and contain engine value types.
 
-`crates/engine` must never depend on `tokio`, `notify`, `rusqlite` or anything else
-that does I/O or touches the world. If it needs to, the boundary is in the wrong place:
-move the code, do not add the dependency.
+`crates/engine` must never depend on `tokio`, `notify`, `rusqlite`, `rand` or anything
+else that does I/O or touches the world, and its source never uses `std::fs`,
+`std::net`, `SystemTime` or `Instant`. It may depend on `serde` with `derive` so that
+its value types serialise directly, and on `proptest` for tests. The boundary is about
+I/O and runtimes, not about traits over data. If the engine needs anything else, the
+boundary is in the wrong place: move the code, do not add the dependency.
 
-CI enforces this. A step runs `cargo tree -p delocal-engine -e normal` and fails if the
-output matches `tokio|notify|rusqlite|reqwest|hyper|mio`. Do not weaken or skip that
-step; extend the pattern if a new I/O crate appears in Appendix A.
+CI enforces this with two steps. One runs `cargo tree -p delocal-engine -e normal` and
+fails if the output matches `tokio|notify|rusqlite|reqwest|hyper|mio|rand`. The other
+greps `crates/engine/src` for `std::fs`, `std::net`, `SystemTime` and `Instant` and fails
+on any hit, comments included. Do not weaken or skip either step; extend the patterns
+if a new I/O crate appears in Appendix A.
 
 ## Working conventions
 
@@ -48,6 +59,9 @@ step; extend the pattern if a new I/O crate appears in Appendix A.
 - Tests live next to the code they test. Property tests use proptest.
 - At the end of each phase, stop and write a summary: what was built, what you are unsure
   about, what the next phase needs from me. Do not start the next phase.
+- From Phase 1 on, every step is a branch and a pull request against `main`, never a
+  direct commit. I review and rebase-merge on GitHub. Open one PR at a time and stop
+  after opening it; do not start the next step until I say the PR is merged.
 
 ## Toolchain
 
