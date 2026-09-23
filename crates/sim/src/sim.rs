@@ -937,9 +937,19 @@ impl Sim {
                 {
                     self.stats.conflict_copies += 1;
                 }
+                // One entry per version. A node that reverts a pending change
+                // (§8.3) restores the announced record, and its next local
+                // change counts up from there, re-issuing a version its
+                // reverted record had used; nobody else ever saw the reverted
+                // one, so the node's newer own write replaces it here.
                 let list = self.versions.entry(record.entry.path.clone()).or_default();
-                if !list.iter().any(|e| e.version == record.entry.version) {
-                    list.push(record.entry.clone());
+                match list.iter_mut().find(|e| e.version == record.entry.version) {
+                    Some(existing) => {
+                        if record.entry.modified_by == id && *existing != record.entry {
+                            *existing = record.entry.clone();
+                        }
+                    }
+                    None => list.push(record.entry.clone()),
                 }
                 let now = self.clock;
                 if let Some(n) = self.nodes.get_mut(&id) {
