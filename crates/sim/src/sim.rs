@@ -259,8 +259,9 @@ pub struct Sim {
     reverting: Option<NodeId>,
     /// When (in events) each node last reverted each path (§8.3). A revert
     /// discards every version the node wrote at the path since its last
-    /// announcement, and the node's next change re-issues those counters;
-    /// nobody else ever saw the discarded records (I7).
+    /// announcement; nobody else ever saw those records, and their vectors
+    /// can be reached again, by the node's next change or by a merge that
+    /// includes its re-issued counter (I7).
     reverted_at: BTreeMap<(NodeId, RelPath), u64>,
     /// When (in events) each version at each path was first seen, for the
     /// revert exemption above.
@@ -971,12 +972,12 @@ impl Sim {
                                 .get(&path)
                                 .and_then(|v| v.iter().find(|(ver, _)| *ver == existing.version))
                                 .map_or(0, |(_, at)| *at);
-                            let reissue = record.entry.modified_by == id
-                                && existing.modified_by == id
-                                && self
-                                    .reverted_at
-                                    .get(&(id, path.clone()))
-                                    .is_some_and(|&reverted| reverted >= seen);
+                            // The earlier record was discarded by its author's
+                            // revert after it was written: nobody else ever saw
+                            // it, and the vector is free to be reached again,
+                            // by that author's next change or by any merge
+                            // that includes it.
+                            let reissue = self.discarded_since(&existing, seen);
                             if !reissue {
                                 return Err(self.fail(
                                     "I7 version identity",
@@ -2054,6 +2055,27 @@ impl Sim {
 
     pub(crate) fn announced(&self) -> &BTreeSet<ContentHash> {
         &self.announced
+    }
+
+    /// True if `entry`'s author reverted its path (§8.3) after `entry` was
+    /// first seen at event `seen`: the record was pending and never
+    /// announced, so no other node ever held it. Such records are not
+    /// evidence of anything the mesh saw (I3, I7).
+    fn discarded_since(&self, entry: &Entry, seen: u64) -> bool {
+        self.reverted_at
+            .get(&(entry.modified_by, entry.path.clone()))
+            .is_some_and(|&reverted| reverted >= seen)
+    }
+
+    /// True if `entry`, as recorded in the version table, was discarded by
+    /// its author's revert before anyone else could see it.
+    pub(crate) fn discarded_by_revert(&self, entry: &Entry) -> bool {
+        let seen = self
+            .seen_at
+            .get(&entry.path)
+            .and_then(|v| v.iter().find(|(ver, _)| *ver == entry.version))
+            .map_or(u64::MAX, |(_, at)| *at);
+        self.discarded_since(entry, seen)
     }
 
     /// Content `id` adopted through sync, with when, and when its user last

@@ -201,11 +201,19 @@ fn i2_no_loss(sim: &Sim) -> Result<(), Failure> {
 }
 
 /// I3: a tombstone that nothing concurrent or newer ever contradicted means
-/// the path is gone everywhere.
+/// the path is gone everywhere. Records discarded by their author's revert
+/// never reached anyone and take no part, on either side.
 fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
     for (path, versions) in sim.versions() {
-        for tomb in versions.iter().filter(|e| e.deleted) {
-            let contradicted = versions.iter().any(|v| {
+        // A tombstone its author discarded with `revert` (§8.3) was pending
+        // and never announced: no deletion happened as far as the mesh is
+        // concerned, and it contradicts nothing either.
+        let seen: Vec<&Entry> = versions
+            .iter()
+            .filter(|e| !sim.discarded_by_revert(e))
+            .collect();
+        for tomb in seen.iter().filter(|e| e.deleted) {
+            let contradicted = seen.iter().any(|v| {
                 v.version != tomb.version
                     && (v.version.dominates(&tomb.version)
                         || v.version.compare(&tomb.version) == delocal_engine::Relation::Concurrent)
