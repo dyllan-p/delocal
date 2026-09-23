@@ -135,6 +135,25 @@ pub struct Watermark {
     ranges: BTreeMap<u64, u64>,
 }
 
+/// The §7.1 stamp of a change that replaces `previous` (the current record
+/// at the path, tombstone included): a content change to a file moves at
+/// least one past the replaced stamp and otherwise takes the modification
+/// time; everything else moves exactly one past it; a first record takes
+/// the modification time, or 1 for a kind that has none.
+fn stamp_for(
+    previous: Option<&IndexRecord>,
+    kind: Kind,
+    mtime_ns: i64,
+    content_changed: bool,
+) -> i64 {
+    match previous {
+        Some(r) if content_changed && kind == Kind::File => mtime_ns.max(r.entry.stamp + 1),
+        Some(r) => r.entry.stamp + 1,
+        None if kind == Kind::File => mtime_ns,
+        None => 1,
+    }
+}
+
 impl Index {
     /// An empty index for this machine.
     pub fn new(own: NodeId, host: HostName) -> Self {
@@ -405,14 +424,22 @@ impl Index {
             .map(|r| r.entry.version.clone())
             .unwrap_or_default()
             .incremented(self.own);
+        let prev_hash = self.announced_hash(&path);
+        let stamp = stamp_for(
+            previous,
+            observed.kind,
+            observed.mtime_ns,
+            observed.hash != prev_hash,
+        );
         let entry = Entry {
             path: path.clone(),
             kind: observed.kind,
             size: observed.size,
             mtime_ns: observed.mtime_ns,
+            stamp,
             exec: observed.exec,
             hash: observed.hash,
-            prev_hash: self.announced_hash(&path),
+            prev_hash,
             version,
             deleted: false,
             modified_by: self.own,
@@ -430,6 +457,7 @@ impl Index {
             kind: previous.entry.kind,
             size: 0,
             mtime_ns: at_ns,
+            stamp: previous.entry.stamp + 1,
             exec: false,
             hash: ContentHash::EMPTY,
             prev_hash: self.announced_hash(path),
@@ -461,11 +489,13 @@ impl Index {
             .unwrap_or_default()
             .incremented(self.own);
         let prev_hash = self.announced_hash(&path);
+        let stamp = stamp_for(self.records.get(&path), loser.kind, loser.mtime_ns, true);
         let entry = Entry {
             path,
             kind: loser.kind,
             size: loser.size,
             mtime_ns: loser.mtime_ns,
+            stamp,
             exec: loser.exec,
             hash: loser.hash,
             prev_hash,
@@ -534,6 +564,7 @@ impl Index {
             Some(e) => Entry {
                 version,
                 prev_hash,
+                stamp: e.stamp + 1,
                 modified_by: self.own,
                 author_host: self.host.clone(),
                 ..e
@@ -543,6 +574,7 @@ impl Index {
                 kind: Kind::File,
                 size: 0,
                 mtime_ns: at_ns,
+                stamp: 1,
                 exec: false,
                 hash: ContentHash::EMPTY,
                 prev_hash,
@@ -796,6 +828,7 @@ mod tests {
             kind: Kind::File,
             size: 3,
             mtime_ns: 7,
+            stamp: 7,
             exec: true,
             hash: hash(h),
             prev_hash: ContentHash::EMPTY,
@@ -1220,7 +1253,8 @@ mod tests {
     }
 
     proptest! {
-        /// Every change dominates the record it replaced, is authored by this
+        /// Every change dominates the record it replaced, carries a stamp
+        /// strictly above the replaced record's (§7.1), is authored by this
         /// machine, advances seq by exactly one, and carries as prev_hash the
         /// hash of the last version peers could have seen (EMPTY if none).
         /// No-ops leave seq alone.
@@ -1287,6 +1321,13 @@ mod tests {
                         match &before {
                             Some(b) => {
                                 prop_assert!(c.record.entry.version.dominates(&b.entry.version));
+                                // §7.1: the stamp strictly increases along the chain.
+                                prop_assert!(
+                                    c.record.entry.stamp > b.entry.stamp,
+                                    "stamp {} after {}",
+                                    c.record.entry.stamp,
+                                    b.entry.stamp
+                                );
                                 prop_assert_eq!(
                                     c.record.entry.version.counter(node(1)),
                                     b.entry.version.counter(node(1)) + 1

@@ -694,6 +694,7 @@ mod tests {
             kind,
             size,
             mtime_ns: 0,
+            stamp: 1,
             exec: false,
             hash: if kind == Kind::Dir || deleted {
                 ContentHash::EMPTY

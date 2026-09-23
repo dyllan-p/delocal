@@ -157,6 +157,7 @@ mod tests {
             kind: Kind::File,
             size: 1,
             mtime_ns: 1,
+            stamp: 1,
             exec: false,
             hash: ContentHash::EMPTY,
             prev_hash: ContentHash::EMPTY,

@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 0fe3d3aedc0c6f9884239c522fd2192625c79702a196feed78898006e577bd6c # shrinks to a = Entry { path: ".rc", kind: Symlink, size: 10, mtime_ns: 0, exec: false, hash: ContentHash(0100000000000000000000000000000000000000000000000000000000000001), prev_hash: ContentHash(0000000000000000000000000000000000000000000000000000000000000001), version: {00000000: 2}, deleted: false, modified_by: NodeId(00000000000000000000000000000000), author_host: HostName("host0") }, b = Entry { path: ".rc", kind: File, size: 10, mtime_ns: 0, exec: false, hash: ContentHash(0100000000000000000000000000000000000000000000000000000000000001), prev_hash: ContentHash(0000000000000000000000000000000000000000000000000000000000000001), version: {00000000: 2}, deleted: false, modified_by: NodeId(00000000000000000000000000000000), author_host: HostName("host0") }
