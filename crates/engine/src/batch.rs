@@ -11,8 +11,11 @@
 //!
 //! **Receiving.** Each entry is compared with the local record (absent is
 //! the empty version, dominated by everything): dominates gives a candidate
-//! to apply, dominated or equal is dropped, concurrent is a conflict for
-//! §7.6 (PR 4). The candidates, sorted by path, are the apply set.
+//! to apply, dominated or equal is dropped, concurrent with identical
+//! content is the §7.2 merge, concurrent with different content is a
+//! conflict resolved on the spot to `M` (§7.6). Every candidate is an entry
+//! that dominates the local record. The candidates, sorted by path, are the
+//! apply set.
 //!
 //! Both operations are pure functions of their inputs and deterministic:
 //! entries by `seq`, apply set by path.
@@ -21,6 +24,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::conflict::{self, ConflictCopy, Side};
 use crate::entry::{Entry, Kind};
 use crate::id::{BatchId, FolderId, NodeId};
 use crate::index::{ChangeKind, Index, IndexRecord};
@@ -176,29 +180,45 @@ pub enum ApplyMode {
     IndexOnly,
 }
 
-/// One candidate in an apply set.
+/// One candidate in an apply set: an entry that dominates the local record.
+/// For a conflict (§7.6) that entry is `M`, and `conflict` says where the
+/// host moves the losing local file instead of the trash.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApplyItem {
-    /// The incoming version dominates the local record.
-    Apply { entry: Entry, mode: ApplyMode },
-    /// Concurrent with the local record and different content: §7.6 (PR 4).
-    Conflict { incoming: Entry, local: Entry },
+    Apply {
+        entry: Entry,
+        mode: ApplyMode,
+        /// `Some` when this machine holds the losing side of a conflict and
+        /// the conflict path is free; the commit displaces the file there.
+        /// `None` means displace to trash (or nothing to displace).
+        conflict: Option<ConflictCopy>,
+    },
 }
 
 impl ApplyItem {
     /// The path this item is about.
     pub fn path(&self) -> &RelPath {
-        match self {
-            Self::Apply { entry, .. } => &entry.path,
-            Self::Conflict { incoming, .. } => &incoming.path,
-        }
+        &self.incoming().path
     }
 
-    /// The incoming entry.
+    /// The entry to apply: the incoming entry, or `M` for a conflict.
     pub fn incoming(&self) -> &Entry {
         match self {
             Self::Apply { entry, .. } => entry,
-            Self::Conflict { incoming, .. } => incoming,
+        }
+    }
+
+    /// How to apply it.
+    pub fn mode(&self) -> ApplyMode {
+        match self {
+            Self::Apply { mode, .. } => *mode,
+        }
+    }
+
+    /// The conflict copy, if the commit displaces a losing file to one.
+    pub fn conflict(&self) -> Option<&ConflictCopy> {
+        match self {
+            Self::Apply { conflict, .. } => conflict.as_ref(),
         }
     }
 }
@@ -216,6 +236,8 @@ pub struct ApplySet {
     pub ignored: usize,
     /// Paths that appeared more than once; the last by `seq` was kept.
     pub duplicates: usize,
+    /// Conflicts that rule 5 of §7.6 decided. Should stay at zero.
+    pub fallbacks: usize,
 }
 
 impl ApplySet {
@@ -240,26 +262,103 @@ fn mode_for(incoming: &Entry, local: Option<&Entry>) -> ApplyMode {
     }
 }
 
-/// Classify one incoming entry against the index (§7.4 "receiving"):
-/// `Apply` if it dominates the local record, `Conflict` if concurrent,
-/// `None` if equal or dominated. Absent locally is the empty version.
-pub fn classify(index: &Index, incoming: &Entry) -> Option<ApplyItem> {
+/// The result of classifying one incoming entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Classified {
+    /// `None` if the entry is equal to or dominated by the local record.
+    pub item: Option<ApplyItem>,
+    /// Rule 5 of the winner rule decided a merge (§7.6).
+    pub fallback: bool,
+}
+
+/// Classify one incoming entry against the index (§7.4 "receiving").
+///
+/// - dominates the local record: apply it as is;
+/// - equal or dominated: nothing;
+/// - concurrent, identical content: the §7.2 merge, fields from the side
+///   [`conflict::prefer_fields`] picks, adopted as metadata or index only;
+/// - concurrent, different content: `M` from [`conflict::resolve`]. If the
+///   local record is the loser and live, the item carries the conflict copy
+///   unless the conflict path already has a live record, in which case the
+///   displaced file goes to trash (§7.6). If the local record is the winner,
+///   `M` is adopted index-only: nothing changes on disk.
+pub fn classify(index: &Index, incoming: &Entry) -> Classified {
     let local = index.get(&incoming.path).map(|r| &r.entry);
     let relation = match local {
         Some(l) => incoming.version.compare(&l.version),
         None => Relation::Dominates,
     };
+    let apply = |entry: Entry, mode: ApplyMode, conflict: Option<ConflictCopy>, fallback: bool| {
+        Classified {
+            item: Some(ApplyItem::Apply {
+                entry,
+                mode,
+                conflict,
+            }),
+            fallback,
+        }
+    };
     match relation {
-        Relation::Dominates => Some(ApplyItem::Apply {
-            entry: incoming.clone(),
-            mode: mode_for(incoming, local),
-        }),
-        Relation::Equal | Relation::Dominated => None,
-        // `local` is Some here: the empty version is never concurrent.
-        Relation::Concurrent => local.map(|l| ApplyItem::Conflict {
-            incoming: incoming.clone(),
-            local: l.clone(),
-        }),
+        Relation::Dominates => apply(incoming.clone(), mode_for(incoming, local), None, false),
+        Relation::Equal | Relation::Dominated => Classified {
+            item: None,
+            fallback: false,
+        },
+        Relation::Concurrent => {
+            // The empty version is never concurrent, so `local` is present.
+            let Some(local) = local else {
+                return Classified {
+                    item: None,
+                    fallback: false,
+                };
+            };
+            if local.same_content(incoming) {
+                let pick = conflict::prefer_fields(incoming, local);
+                let (fields, other) = match pick.side {
+                    Side::First => (incoming, local),
+                    Side::Second => (local, incoming),
+                };
+                let merged = conflict::merged(fields, other);
+                let mode = if merged.kind == Kind::File
+                    && !merged.deleted
+                    && merged.mtime_ns != local.mtime_ns
+                {
+                    ApplyMode::MetadataOnly
+                } else {
+                    ApplyMode::IndexOnly
+                };
+                return apply(merged, mode, None, pick.fallback);
+            }
+            let resolution = conflict::resolve(incoming, local);
+            match resolution.winner {
+                // Local holds W: M has the local content, nothing to do on disk.
+                Side::Second => apply(
+                    resolution.merged,
+                    ApplyMode::IndexOnly,
+                    None,
+                    resolution.fallback,
+                ),
+                // Local holds L: fetch W's content, displace the local file.
+                Side::First => {
+                    let mode = if resolution.merged.kind == Kind::Dir {
+                        ApplyMode::Direct
+                    } else {
+                        ApplyMode::Fetch
+                    };
+                    let copy = if local.deleted {
+                        None
+                    } else {
+                        conflict::conflict_copy_name(local)
+                            .filter(|path| index.live(path).is_none())
+                            .map(|path| ConflictCopy {
+                                path,
+                                loser: local.clone(),
+                            })
+                    };
+                    apply(resolution.merged, mode, copy, resolution.fallback)
+                }
+            }
+        }
     }
 }
 
@@ -277,8 +376,13 @@ pub fn apply_set(index: &Index, batch: &Batch) -> ApplySet {
     }
     let mut items = Vec::new();
     let mut ignored = 0;
+    let mut fallbacks = 0;
     for incoming in last_by_path.into_values() {
-        match classify(index, incoming) {
+        let c = classify(index, incoming);
+        if c.fallback {
+            fallbacks += 1;
+        }
+        match c.item {
             Some(item) => items.push(item),
             None => ignored += 1,
         }
@@ -293,6 +397,7 @@ pub fn apply_set(index: &Index, batch: &Batch) -> ApplySet {
         items,
         ignored,
         duplicates,
+        fallbacks,
     }
 }
 
@@ -524,17 +629,17 @@ mod tests {
             .items
             .iter()
             .map(|i| {
-                let what = match i {
-                    ApplyItem::Apply { mode, .. } => format!("{mode:?}"),
-                    ApplyItem::Conflict { .. } => "Conflict".to_owned(),
-                };
+                let mut what = format!("{:?}", i.mode());
+                if i.conflict().is_some() {
+                    what.push_str("+copy");
+                }
                 (i.path().as_str().to_owned(), what)
             })
             .collect();
         assert_eq!(
             got,
             [
-                ("conflict".to_owned(), "Conflict".to_owned()),
+                ("conflict".to_owned(), "Fetch+copy".to_owned()),
                 ("gone".to_owned(), "Direct".to_owned()),
                 ("newdir".to_owned(), "Direct".to_owned()),
                 ("newfile".to_owned(), "Fetch".to_owned()),
@@ -542,9 +647,18 @@ mod tests {
             ],
             "sorted by path"
         );
-        if let ApplyItem::Conflict { local, .. } = &set.items[0] {
-            assert_eq!(local.hash, hash(3));
-        }
+        // The incoming edit (mtime 5) beat the local one (mtime 1): the item
+        // is M with the incoming content, and the local file becomes the copy.
+        let m = set.items[0].incoming();
+        assert_eq!(m.hash, hash(7));
+        assert!(
+            m.version
+                .dominates(&idx.get(&p("conflict")).unwrap().entry.version)
+        );
+        let copy = set.items[0].conflict().unwrap();
+        assert_eq!(copy.loser.hash, hash(3));
+        assert_eq!(copy.path.as_str(), "conflict.conflict-19700101-000000-h");
+        assert_eq!(set.fallbacks, 0);
     }
 
     #[test]
@@ -572,14 +686,7 @@ mod tests {
         let mut newer_dir = idx.get(&p("d")).unwrap().entry.clone();
         newer_dir.version = newer_dir.version.incremented(node(2));
         let set = apply_set(&idx, &batch_of(vec![incoming, newer_dir], 2));
-        let modes: Vec<_> = set
-            .items
-            .iter()
-            .map(|i| match i {
-                ApplyItem::Apply { mode, .. } => *mode,
-                ApplyItem::Conflict { .. } => unreachable!(),
-            })
-            .collect();
+        let modes: Vec<_> = set.items.iter().map(ApplyItem::mode).collect();
         assert_eq!(modes, [ApplyMode::IndexOnly, ApplyMode::IndexOnly]);
     }
 
@@ -747,8 +854,30 @@ mod tests {
                             }
                             Relation::Concurrent => {
                                 expected_items += 1;
-                                let is_conflict = matches!(item, Some(ApplyItem::Conflict { .. }));
-                                prop_assert!(is_conflict, "concurrent must be Conflict, got {item:?}");
+                                let Some(item) = item else {
+                                    prop_assert!(false, "concurrent must produce an item");
+                                    return Ok(());
+                                };
+                                let m = item.incoming();
+                                prop_assert_eq!(&m.version, &incoming.version.merge(&r.entry.version));
+                                prop_assert!(m.version.dominates(&r.entry.version));
+                                if r.entry.same_content(incoming) {
+                                    prop_assert!(item.conflict().is_none());
+                                    prop_assert!(matches!(item.mode(), ApplyMode::IndexOnly | ApplyMode::MetadataOnly));
+                                } else {
+                                    let res = crate::conflict::resolve(incoming, &r.entry);
+                                    prop_assert_eq!(m, &res.merged);
+                                    match res.winner {
+                                        crate::conflict::Side::Second => {
+                                            prop_assert_eq!(item.mode(), ApplyMode::IndexOnly);
+                                            prop_assert!(item.conflict().is_none());
+                                        }
+                                        crate::conflict::Side::First => {
+                                            prop_assert!(matches!(item.mode(), ApplyMode::Fetch | ApplyMode::Direct));
+                                            prop_assert_eq!(item.conflict().is_some(), !r.entry.deleted);
+                                        }
+                                    }
+                                }
                             }
                             Relation::Equal | Relation::Dominated => {
                                 expected_ignored += 1;

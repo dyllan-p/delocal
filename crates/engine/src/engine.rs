@@ -310,6 +310,7 @@ impl Engine {
                 state,
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
+                    let before = f.winner_fallbacks();
                     let scanned = f.scanned(now, path, state);
                     if let Some(change) = scanned.change {
                         out.push(Action::IndexChanged {
@@ -319,6 +320,14 @@ impl Engine {
                     }
                     if let Some(status) = scanned.status {
                         out.push(Action::StatusChanged { folder, status });
+                    }
+                    if f.winner_fallbacks() > before {
+                        out.push(Action::StatusChanged {
+                            folder,
+                            status: FolderStatus::WinnerFallback {
+                                count: f.winner_fallbacks(),
+                            },
+                        });
                     }
                 }
                 None => out.push(unknown_folder(folder)),
@@ -365,7 +374,7 @@ impl Engine {
                 outcome,
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
-                    if let Some(record) = f.applied(now, &path, &version, outcome) {
+                    for record in f.applied(now, &path, &version, outcome) {
                         out.push(Action::IndexChanged { folder, record });
                     }
                 }
@@ -422,6 +431,14 @@ impl Engine {
             return;
         };
         let set: ApplySet = folder.receive(&batch);
+        if set.fallbacks > 0 {
+            out.push(Action::StatusChanged {
+                folder: batch.folder,
+                status: FolderStatus::WinnerFallback {
+                    count: folder.winner_fallbacks(),
+                },
+            });
+        }
         if set.duplicates > 0 {
             out.push(Action::StatusChanged {
                 folder: batch.folder,
@@ -480,6 +497,7 @@ mod tests {
     use super::*;
     use crate::batch::{ApplyItem, ApplyMode};
     use crate::entry::{Kind, Observed};
+    use crate::index::IndexRecord;
     use crate::time::NANOS_PER_SECOND;
 
     fn node(i: u8) -> NodeId {
@@ -832,6 +850,176 @@ mod tests {
         let a = &engines[&node(1)];
         assert!(a.folder(folder()).unwrap().accepted().is_empty());
         assert_eq!(engines[&node(2)].folder(folder()).unwrap().due(), None);
+    }
+
+    #[test]
+    fn a_conflict_resolves_to_m_on_both_sides_and_the_copy_is_announced() {
+        let mut engines = BTreeMap::new();
+        let mut a = engine(1, "alpha");
+        let mut b = engine(2, "bravo");
+        join(&mut a, &[1, 2]);
+        join(&mut b, &[1, 2]);
+        connect(&mut a, &mut b);
+        // B creates the base and A commits it.
+        b.handle(
+            t(1.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("x"),
+                state: file(1, 1),
+            },
+        );
+        let out = b.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        engines.insert(node(1), a);
+        engines.insert(node(2), b);
+        deliver(t(3.0), node(2), out, &mut engines);
+        let base = engines[&node(1)].folder(folder()).unwrap().accepted()[0].items[0]
+            .incoming()
+            .clone();
+        engines.get_mut(&node(1)).unwrap().handle(
+            t(4.0),
+            Event::Applied {
+                folder: folder(),
+                path: p("x"),
+                version: base.version.clone(),
+                outcome: ApplyOutcome::Ok,
+            },
+        );
+        engines.get_mut(&node(1)).unwrap().handle(
+            t(6.0),
+            Event::Tick {
+                fresh_batch_id: fresh(2),
+            },
+        );
+
+        // Concurrent edits: A at mtime 100 (loses), B at mtime 200 (wins).
+        let out_a = engines.get_mut(&node(1)).unwrap().handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("x"),
+                state: file(5, 100),
+            },
+        );
+        assert!(matches!(out_a[0], Action::IndexChanged { .. }));
+        engines.get_mut(&node(2)).unwrap().handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("x"),
+                state: file(6, 200),
+            },
+        );
+        let out_a = engines.get_mut(&node(1)).unwrap().handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        let out_b = engines.get_mut(&node(2)).unwrap().handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        deliver(t(12.0), node(1), out_a, &mut engines);
+        deliver(t(12.0), node(2), out_b, &mut engines);
+
+        // A holds L: fetch W's content, displace to the conflict copy.
+        let a_item = engines[&node(1)].folder(folder()).unwrap().accepted()[0].items[0].clone();
+        assert_eq!(a_item.mode(), ApplyMode::Fetch);
+        let copy = a_item.conflict().unwrap().clone();
+        assert_eq!(copy.path.as_str(), "x.conflict-19700101-000000-alpha");
+        assert_eq!(copy.loser.hash, hash(5));
+        let m = a_item.incoming().clone();
+        assert_eq!(m.hash, hash(6));
+        assert_eq!(m.modified_by, node(2));
+        // B holds W: index-only, no copy, the same M.
+        let b_item = engines[&node(2)].folder(folder()).unwrap().accepted()[0].items[0].clone();
+        assert_eq!(b_item.mode(), ApplyMode::IndexOnly);
+        assert!(b_item.conflict().is_none());
+        assert_eq!(b_item.incoming(), &m);
+
+        // Both hosts commit. A writes two records: M and the copy.
+        let out = engines.get_mut(&node(1)).unwrap().handle(
+            t(13.0),
+            Event::Applied {
+                folder: folder(),
+                path: p("x"),
+                version: m.version.clone(),
+                outcome: ApplyOutcome::Ok,
+            },
+        );
+        let changed: Vec<&IndexRecord> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::IndexChanged { record, .. } => Some(record),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed[0].entry, m);
+        assert_eq!(changed[1].entry.path, copy.path);
+        assert_eq!(changed[1].entry.hash, hash(5));
+        assert_eq!(
+            changed[1].entry.modified_by,
+            node(1),
+            "the copy is A's change"
+        );
+        assert_eq!(changed[1].entry.author_host.as_str(), "alpha");
+        assert_eq!(changed[1].entry.prev_hash, ContentHash::EMPTY);
+        let out = engines.get_mut(&node(2)).unwrap().handle(
+            t(13.0),
+            Event::Applied {
+                folder: folder(),
+                path: p("x"),
+                version: m.version.clone(),
+                outcome: ApplyOutcome::Ok,
+            },
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|a| matches!(a, Action::IndexChanged { .. }))
+                .count(),
+            1
+        );
+
+        // A's next batch carries M and the copy; B ignores M and takes the copy.
+        let out = engines.get_mut(&node(1)).unwrap().handle(
+            t(15.0),
+            Event::Tick {
+                fresh_batch_id: fresh(5),
+            },
+        );
+        let Outbound::Batch(batch) = sends(&out)[0].1.clone() else {
+            panic!()
+        };
+        assert_eq!(batch.entries.len(), 2);
+        assert_eq!(
+            batch.summary.adds, 1,
+            "the copy is A's local add; M is relayed"
+        );
+        deliver(t(15.0), node(1), out, &mut engines);
+        let b_folder = engines[&node(2)].folder(folder()).unwrap();
+        assert_eq!(b_folder.index().get(&p("x")).unwrap().entry, m);
+        let set = &b_folder.accepted()[0];
+        assert_eq!(set.ignored, 1, "M is equal on B");
+        assert_eq!(set.items[0].path(), &copy.path);
+        assert_eq!(set.items[0].mode(), ApplyMode::Fetch);
+        assert!(set.items[0].conflict().is_none());
+        assert_eq!(b_folder.winner_fallbacks(), 0);
+        assert_eq!(
+            engines[&node(1)]
+                .folder(folder())
+                .unwrap()
+                .winner_fallbacks(),
+            0
+        );
     }
 
     #[test]

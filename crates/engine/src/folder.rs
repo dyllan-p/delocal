@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{self, ApplyItem, ApplySet, Batch};
+use crate::conflict::ConflictCopy;
 use crate::entry::{Entry, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange};
@@ -57,6 +58,7 @@ pub enum ApplyOutcome {
 /// step 6), waiting for the next observation of its path.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Deferred {
+    /// The entry to re-classify: the incoming entry, or `M` for a conflict.
     pub entry: Entry,
     /// The batch it arrived in, so the re-evaluated item keeps its origin.
     pub batch: BatchId,
@@ -78,6 +80,9 @@ pub enum FolderStatus {
     ScanNotOpen,
     /// A received batch repeated a path; the last by `seq` was kept (§7.4).
     DuplicatePaths { batch: BatchId, count: usize },
+    /// Rule 5 of the winner rule (§7.6) decided this many conflicts. It
+    /// should never fire; any count is a bug to find.
+    WinnerFallback { count: u64 },
 }
 
 /// An open batch window (§7.4).
@@ -124,6 +129,8 @@ pub struct FolderState {
     /// Entries whose commit found the file changed underneath, by path,
     /// waiting for the next observation (§7.5 step 6).
     deferred: BTreeMap<RelPath, Deferred>,
+    /// How many conflicts rule 5 of §7.6 has decided here. Should stay 0.
+    winner_fallbacks: u64,
 }
 
 impl FolderState {
@@ -145,6 +152,7 @@ impl FolderState {
             accepted: Vec::new(),
             acked: BTreeMap::new(),
             deferred: BTreeMap::new(),
+            winner_fallbacks: 0,
         }
     }
 
@@ -204,6 +212,12 @@ impl FolderState {
         self.deferred.values()
     }
 
+    /// Conflicts decided by rule 5 of §7.6 so far. Any value above 0 is a
+    /// bug the simulator should find.
+    pub fn winner_fallbacks(&self) -> u64 {
+        self.winner_fallbacks
+    }
+
     /// A record was written at `now`: open or extend the window.
     fn touched(&mut self, now: Timestamp) {
         self.window = Some(match self.window {
@@ -255,7 +269,11 @@ impl FolderState {
         let Some(deferred) = self.deferred.remove(path) else {
             return;
         };
-        if let Some(item) = batch::classify(&self.index, &deferred.entry) {
+        let classified = batch::classify(&self.index, &deferred.entry);
+        if classified.fallback {
+            self.winner_fallbacks += 1;
+        }
+        if let Some(item) = classified.item {
             self.accepted.push(ApplySet {
                 folder: self.id,
                 batch: deferred.batch,
@@ -264,6 +282,7 @@ impl FolderState {
                 items: vec![item],
                 ignored: 0,
                 duplicates: 0,
+                fallbacks: usize::from(classified.fallback),
             });
         }
     }
@@ -330,6 +349,7 @@ impl FolderState {
     pub fn receive(&mut self, batch: &Batch) -> ApplySet {
         self.index.set_peer_seq(batch.source, batch.seq_high);
         let set = batch::apply_set(&self.index, batch);
+        self.winner_fallbacks += set.fallbacks as u64;
         if !set.is_empty() {
             self.accepted.push(set.clone());
         }
@@ -345,42 +365,59 @@ impl FolderState {
 
     /// The host finished committing (or failed to commit) an accepted item
     /// (§7.5 steps 6 to 9). On `Ok` the index adopts the entry and the
-    /// window opens so the adoption is announced (§7.4). On
-    /// `ChangedUnderneath` the entry is kept in the deferred set until the
-    /// path is observed again; the sender has been acknowledged for it and
-    /// will not send it twice. Either way the item leaves the accepted sets.
-    /// Returns the adopted record, or `None` if nothing matched or the
-    /// commit did not happen.
+    /// window opens so the adoption is announced (§7.4); if the item
+    /// carried a conflict copy, the displaced file is recorded at the
+    /// conflict path as this machine's local add (§7.6), without waiting for
+    /// a scan. On `ChangedUnderneath` the entry is kept in the deferred set
+    /// until the path is observed again; the sender has been acknowledged
+    /// for it and will not send it twice. Either way the item leaves the
+    /// accepted sets. Returns every record written, in order; empty if
+    /// nothing matched or the commit did not happen.
     pub fn applied(
         &mut self,
         now: Timestamp,
         path: &RelPath,
         version: &Version,
         outcome: ApplyOutcome,
-    ) -> Option<IndexRecord> {
-        let mut found: Option<Deferred> = None;
+    ) -> Vec<IndexRecord> {
+        let mut found: Option<(Deferred, Option<ConflictCopy>)> = None;
         for set in &mut self.accepted {
             if let Some(pos) = set.items.iter().position(|item| {
-                matches!(item, ApplyItem::Apply { entry, .. } if &entry.path == path && &entry.version == version)
+                let e = item.incoming();
+                &e.path == path && &e.version == version
             }) {
-                if let ApplyItem::Apply { entry, .. } = set.items.remove(pos) {
-                    found = Some(Deferred {
+                let ApplyItem::Apply {
+                    entry, conflict, ..
+                } = set.items.remove(pos);
+                found = Some((
+                    Deferred {
                         entry,
                         batch: set.batch,
                         source: set.source,
                         seq_high: set.seq_high,
-                    });
-                }
+                    },
+                    conflict,
+                ));
                 break;
             }
         }
         self.accepted.retain(|set| !set.is_empty());
-        let deferred = found?;
+        let Some((deferred, conflict)) = found else {
+            return Vec::new();
+        };
         match outcome {
-            ApplyOutcome::Ok => Some(self.adopt(now, deferred.entry)),
+            ApplyOutcome::Ok => {
+                let mut written = vec![self.adopt(now, deferred.entry)];
+                if let Some(copy) = conflict {
+                    let change = self.index.record_conflict_copy(copy.path, &copy.loser);
+                    self.touched(now);
+                    written.push(change.record);
+                }
+                written
+            }
             ApplyOutcome::ChangedUnderneath => {
                 self.deferred.insert(path.clone(), deferred);
-                None
+                Vec::new()
             }
         }
     }
@@ -400,7 +437,9 @@ mod tests {
 
     use super::*;
     use crate::batch::ApplyMode;
+    use crate::conflict::{Side, resolve};
     use crate::entry::{ContentHash, Kind};
+    use crate::index::ChangeKind;
     use crate::time::NANOS_PER_SECOND;
 
     fn node(i: u8) -> NodeId {
@@ -579,10 +618,10 @@ mod tests {
 
         let entry = set.items[0].incoming().clone();
         let none = b.applied(t(5.0), &p("nope"), &entry.version, ApplyOutcome::Ok);
-        assert_eq!(none, None);
+        assert!(none.is_empty());
         let record = b
             .applied(t(5.0), &entry.path, &entry.version, ApplyOutcome::Ok)
-            .unwrap();
+            .remove(0);
         assert_eq!(record.entry, entry);
         assert_eq!(record.seq, 1);
         assert!(b.accepted().is_empty(), "the set emptied and was dropped");
@@ -618,7 +657,7 @@ mod tests {
             &entry.version,
             ApplyOutcome::ChangedUnderneath,
         );
-        assert_eq!(out, None);
+        assert!(out.is_empty());
         assert!(b.accepted().is_empty());
         assert_eq!(b.index().get(&p("x")), None);
         assert_eq!(b.due(), None);
@@ -631,8 +670,9 @@ mod tests {
         );
 
         // The scan finds the file the user created underneath: a new local
-        // version, concurrent with A's, so the entry comes back as a conflict.
-        b.scanned(t(6.0), p("x"), file(9, 9));
+        // version, concurrent with A's and with different content. A's has
+        // the larger mtime, so A wins and the local file becomes the copy.
+        b.scanned(t(6.0), p("x"), file(9, 0));
         assert!(b.deferred().next().is_none());
         assert_eq!(b.accepted().len(), 1);
         let set = &b.accepted()[0];
@@ -640,14 +680,19 @@ mod tests {
             (set.batch, set.source, set.seq_high),
             (batch.id, node(1), 1)
         );
-        match &set.items[0] {
-            ApplyItem::Conflict { incoming, local } => {
-                assert_eq!(incoming, &entry);
-                assert_eq!(local.hash, hash(9));
-                assert_eq!(local.modified_by, node(2));
-            }
-            other => panic!("expected a conflict, got {other:?}"),
-        }
+        let item = &set.items[0];
+        assert_eq!(item.mode(), ApplyMode::Fetch);
+        let m = item.incoming();
+        assert_eq!(m.hash, hash(1), "M carries the winner's content");
+        assert!(m.version.dominates(&entry.version));
+        assert!(
+            m.version
+                .dominates(&b.index().get(&p("x")).unwrap().entry.version)
+        );
+        let copy = item.conflict().unwrap();
+        assert_eq!(copy.loser.hash, hash(9));
+        assert_eq!(copy.loser.modified_by, node(2));
+        assert_eq!(copy.path.as_str(), "x.conflict-19700101-000000-desktop");
     }
 
     #[test]
@@ -693,14 +738,19 @@ mod tests {
         assert!(changes[0].record.entry.deleted);
         assert!(b.deferred().next().is_none(), "not stuck");
         assert_eq!(b.accepted().len(), 1);
-        match &b.accepted()[0].items[0] {
-            ApplyItem::Conflict { incoming, local } => {
-                assert_eq!(incoming, &entry);
-                assert!(local.deleted, "delete vs modify, for §7.6 to resolve");
-                assert_eq!(local.modified_by, node(2));
-            }
-            other => panic!("expected a conflict, got {other:?}"),
-        }
+        // Delete vs modify: the live incoming side wins (§7.6 rule 1). There is
+        // no local file to displace, so no conflict copy; M carries A's
+        // content under the merged vector.
+        let item = &b.accepted()[0].items[0];
+        assert_eq!(item.mode(), ApplyMode::Fetch);
+        assert!(item.conflict().is_none());
+        let m = item.incoming();
+        assert!(m.same_content(&entry));
+        assert!(!m.deleted);
+        let tomb = &b.index().get(&p("x")).unwrap().entry;
+        assert!(tomb.deleted);
+        assert!(m.version.dominates(&tomb.version));
+        assert!(m.version.dominates(&entry.version));
     }
 
     #[test]
@@ -721,7 +771,7 @@ mod tests {
         assert_eq!(b.accepted().len(), 1);
         assert!(matches!(
             &b.accepted()[0].items[0],
-            ApplyItem::Apply { entry: e, mode: ApplyMode::Fetch } if *e == entry
+            ApplyItem::Apply { entry: e, mode: ApplyMode::Fetch, conflict: None } if *e == entry
         ));
         assert!(b.deferred().next().is_none());
     }
@@ -761,6 +811,137 @@ mod tests {
         assert_eq!(serde_json::from_str::<FolderState>(&json).unwrap(), f);
     }
 
+    fn desktop() -> FolderState {
+        FolderState::new(
+            FolderId::from_bytes([7; 16]),
+            Rules::default(),
+            [node(1), node(2), node(3)],
+            node(2),
+            HostName::new("desktop").unwrap(),
+        )
+    }
+
+    fn observed(kind: Kind, h: u8, mtime_ns: i64, exec: bool) -> ScanState {
+        ScanState::Observed(Observed {
+            kind,
+            size: if kind == Kind::Dir { 0 } else { 10 },
+            mtime_ns,
+            exec,
+            hash: if kind == Kind::Dir {
+                ContentHash::EMPTY
+            } else {
+                hash(h)
+            },
+        })
+    }
+
+    /// Host shorthand: commit every accepted item as `Ok`.
+    fn commit_all(f: &mut FolderState, now: Timestamp) -> Vec<IndexRecord> {
+        let items: Vec<(RelPath, Version)> = f
+            .accepted()
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .map(|i| (i.path().clone(), i.incoming().version.clone()))
+            .collect();
+        let mut out = Vec::new();
+        for (path, version) in items {
+            out.extend(f.applied(now, &path, &version, ApplyOutcome::Ok));
+        }
+        out
+    }
+
+    #[test]
+    fn w_holder_adopts_m_index_only_and_nothing_pends_for_the_copy() {
+        // B creates the base; A adopts it. Both edit: B later (wins), A earlier.
+        let mut b = desktop();
+        let base = b
+            .scanned(t(1.0), p("x"), file(1, 1))
+            .change
+            .unwrap()
+            .record
+            .entry;
+        b.form_batches(t(3.0), batch_id());
+        let mut a = folder();
+        a.adopt(t(3.0), base);
+        a.scanned(t(4.0), p("x"), file(2, 100)); // L
+        let batch = a.form_batches(t(6.0), batch_id().successor(1)).remove(0);
+        b.scanned(t(4.5), p("x"), file(3, 200)); // W
+        let set = b.receive(&batch);
+        let item = &set.items[0];
+        assert_eq!(item.mode(), ApplyMode::IndexOnly);
+        assert!(item.conflict().is_none());
+        let m = item.incoming();
+        assert_eq!(m.hash, hash(3), "M has the local (winning) content");
+        assert_eq!(m.modified_by, node(2));
+        let written = commit_all(&mut b, t(7.0));
+        assert_eq!(written.len(), 1, "no conflict copy on the winner's side");
+        assert_eq!(b.index().get(&p("x")).unwrap().entry, *m);
+        assert_eq!(b.index().pending_count(), 0, "B's edit is announced as M");
+        let out = b.form_batches(t(9.0), batch_id().successor(2)).remove(0);
+        assert_eq!(out.entries, vec![m.clone()]);
+    }
+
+    #[test]
+    fn a_non_empty_directory_that_loses_is_displaced_with_its_children() {
+        let mut b = desktop();
+        b.scanned(t(1.0), p("d"), observed(Kind::Dir, 0, 0, false));
+        b.scanned(t(1.0), p("d/a"), file(1, 1));
+        b.scanned(t(1.0), p("d/b"), file(2, 1));
+        b.form_batches(t(3.0), batch_id());
+        // A never saw the directory and created a file named d.
+        let mut a = folder();
+        a.scanned(t(2.0), p("d"), file(7, 5));
+        let batch = a.form_batches(t(4.0), batch_id().successor(1)).remove(0);
+        let set = b.receive(&batch);
+        let item = &set.items[0];
+        assert_eq!(
+            item.mode(),
+            ApplyMode::Fetch,
+            "the file wins: mtime 5 beats a directory's 0"
+        );
+        let copy = item.conflict().unwrap().clone();
+        assert_eq!(copy.path.as_str(), "d.conflict-19700101-000000-desktop");
+        assert_eq!(copy.loser.kind, Kind::Dir);
+        // The host moves the whole directory aside and writes the file.
+        let written = commit_all(&mut b, t(5.0));
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].entry.kind, Kind::File);
+        assert_eq!(written[1].entry.kind, Kind::Dir);
+        assert_eq!(written[1].entry.path, copy.path);
+        // The next full scan sees the moved children and not the old ones.
+        b.scan_started();
+        b.scanned(t(6.0), p("d"), ScanState::Unchanged);
+        b.scanned(t(6.0), copy.path.clone(), ScanState::Unchanged);
+        b.scanned(t(6.0), copy.path.join("a").unwrap(), file(1, 1));
+        b.scanned(t(6.0), copy.path.join("b").unwrap(), file(2, 1));
+        b.scan_finished(t(7.0)).unwrap();
+        let pending: Vec<(String, ChangeKind)> = b
+            .index()
+            .pending()
+            .map(|(r, k)| (r.entry.path.as_str().to_owned(), k))
+            .collect();
+        assert_eq!(
+            pending,
+            [
+                (
+                    "d.conflict-19700101-000000-desktop".to_owned(),
+                    ChangeKind::Add
+                ),
+                (
+                    "d.conflict-19700101-000000-desktop/a".to_owned(),
+                    ChangeKind::Add
+                ),
+                (
+                    "d.conflict-19700101-000000-desktop/b".to_owned(),
+                    ChangeKind::Add
+                ),
+                ("d/a".to_owned(), ChangeKind::Delete),
+                ("d/b".to_owned(), ChangeKind::Delete),
+            ],
+            "the copy and two adds, two tombstones; known behaviour per §7.6"
+        );
+    }
+
     proptest! {
         /// Under random write times the window is due at exactly
         /// min(first + 10 s, last + 2 s), never earlier, and a batch formed
@@ -791,6 +972,84 @@ mod tests {
             prop_assert_eq!(total, gaps.len());
             prop_assert_eq!(f.due(), None);
             prop_assert!(f.index().unannounced().is_empty());
+        }
+
+        /// §7.6: two L-holders make conflict copies with the same path and the
+        /// same content, which then merge under §7.2 once they exchange
+        /// batches; every machine ends with the same M at the original path.
+        #[test]
+        fn two_losers_make_identical_copies_that_merge(
+            l_hash in 0u8..3, hash_gap in 1u8..3, l_mtime in 0i64..3, mtime_gap in 1i64..3,
+            l_exec: bool, w_exec: bool,
+        ) {
+            // W always has different content (hash) and a later mtime than L,
+            // so W wins by rule 3 without any assumption to reject on.
+            let w_hash = (l_hash + hash_gap) % 3;
+            let w_mtime = l_mtime + mtime_gap;
+            // B makes the base; A and C adopt it. B edits it (L), A edits it (W):
+            // concurrent. C takes B's edit first and so also holds L.
+            let mut b = desktop();
+            // hash 9 and mtime 9 are outside the ranges the edits draw from.
+            let base = b.scanned(t(1.0), p("x"), file(9, 9)).change.unwrap().record.entry;
+            b.form_batches(t(3.0), batch_id());
+            let mut a = folder();
+            a.adopt(t(3.0), base.clone());
+            let mut c = FolderState::new(b.id(), Rules::default(), [node(1), node(2), node(3)], node(3), HostName::new("charlie").unwrap());
+            c.adopt(t(3.0), base);
+
+            let l = b.scanned(t(4.0), p("x"), observed(Kind::File, l_hash, l_mtime, l_exec)).change.unwrap().record.entry;
+            let batch_l = b.form_batches(t(6.0), batch_id().successor(1)).remove(0);
+            let w = a.scanned(t(4.0), p("x"), observed(Kind::File, w_hash, w_mtime, w_exec)).change.unwrap().record.entry;
+            let batch_w = a.form_batches(t(6.0), batch_id().successor(2)).remove(0);
+            prop_assert!(!l.same_content(&w));
+            prop_assert_eq!(resolve(&w, &l).winner, Side::First, "W must win for B and C to be L-holders");
+
+            c.receive(&batch_l);
+            commit_all(&mut c, t(7.0));
+            prop_assert_eq!(&c.index().get(&p("x")).unwrap().entry, &l);
+
+            let sb = b.receive(&batch_w);
+            let sc = c.receive(&batch_w);
+            let copy_b = sb.items[0].conflict().unwrap().clone();
+            let copy_c = sc.items[0].conflict().unwrap().clone();
+            prop_assert_eq!(&copy_b.path, &copy_c.path);
+            prop_assert!(copy_b.loser.same_content(&copy_c.loser));
+            let m = sb.items[0].incoming().clone();
+            prop_assert_eq!(&m, sc.items[0].incoming());
+            prop_assert_eq!(&m.version, &w.version.merge(&l.version));
+
+            let wb = commit_all(&mut b, t(8.0));
+            let wc = commit_all(&mut c, t(8.0));
+            prop_assert_eq!(wb.len(), 2);
+            prop_assert_eq!(wc.len(), 2);
+            prop_assert!(wb[1].entry.same_content(&wc[1].entry));
+            prop_assert_eq!(wb[1].entry.modified_by, node(2));
+            prop_assert_eq!(wc[1].entry.modified_by, node(3));
+            prop_assert_eq!(&wb[1].entry.path, &copy_b.path);
+
+            // Exchange: each announces M and its copy; the copies are concurrent
+            // with identical content and merge under §7.2.
+            let from_b = b.form_batches(t(10.0), batch_id().successor(3)).remove(0);
+            let from_c = c.form_batches(t(10.0), batch_id().successor(4)).remove(0);
+            let sc2 = c.receive(&from_b);
+            let sb2 = b.receive(&from_c);
+            prop_assert_eq!(sc2.ignored, 1, "M is equal on both sides");
+            prop_assert_eq!(sb2.ignored, 1);
+            prop_assert_eq!(sc2.items.len(), 1);
+            prop_assert!(matches!(sc2.items[0].mode(), ApplyMode::IndexOnly | ApplyMode::MetadataOnly));
+            commit_all(&mut c, t(11.0));
+            commit_all(&mut b, t(11.0));
+            prop_assert_eq!(b.index().get(&copy_b.path), c.index().get(&copy_b.path));
+            prop_assert_eq!(&b.index().get(&p("x")).unwrap().entry, &m);
+            prop_assert_eq!(&c.index().get(&p("x")).unwrap().entry, &m);
+
+            // A, the W-holder, takes M as a metadata-only apply and the copy as an add.
+            let sa = a.receive(&from_b);
+            prop_assert_eq!(sa.items.len(), 2);
+            commit_all(&mut a, t(12.0));
+            prop_assert_eq!(&a.index().get(&p("x")).unwrap().entry, &m);
+            prop_assert!(a.index().get(&copy_b.path).unwrap().entry.same_content(&copy_b.loser));
+            prop_assert_eq!(b.winner_fallbacks() + c.winner_fallbacks() + a.winner_fallbacks(), 0);
         }
     }
 }
