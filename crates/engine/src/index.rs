@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entry::{ContentHash, Entry, Observed};
+use crate::entry::{ContentHash, Entry, Kind, Observed};
 use crate::id::{HostName, NodeId};
 use crate::path::RelPath;
 use crate::version::Version;
@@ -146,9 +146,13 @@ impl Index {
         self.records.values().filter(|r| !r.entry.deleted)
     }
 
-    /// Number of tracked (non-deleted) entries: the denominator of H1 (§8.1).
+    /// Number of tracked entries, the denominator of H1 (§8.1): live and
+    /// not a directory. Directories are excluded from both sides of the
+    /// ratio because a directory and its tombstone have the same content.
     pub fn tracked_count(&self) -> usize {
-        self.live_records().count()
+        self.live_records()
+            .filter(|r| r.entry.kind != Kind::Dir)
+            .count()
     }
 
     /// Total number of records, tombstones included.
@@ -356,7 +360,6 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::entry::Kind;
     use crate::version::Relation;
 
     fn node(i: u8) -> NodeId {
@@ -639,6 +642,28 @@ mod tests {
         assert_eq!((e.size, e.hash, e.exec), (0, ContentHash::EMPTY, false));
         // Reporting the un-normalised form again is still "unchanged".
         assert_eq!(idx.observe(p("d"), dir), None);
+    }
+
+    #[test]
+    fn tracked_count_excludes_directories_and_tombstones() {
+        let mut idx = index();
+        idx.observe(
+            p("d"),
+            Observed {
+                kind: Kind::Dir,
+                size: 0,
+                mtime_ns: 0,
+                exec: false,
+                hash: ContentHash::EMPTY,
+            },
+        )
+        .unwrap();
+        idx.observe(p("d/a"), file(1, 1)).unwrap();
+        idx.observe(p("d/b"), file(2, 1)).unwrap();
+        assert_eq!(idx.tracked_count(), 2);
+        idx.observe_absent(&p("d/b"), 5).unwrap();
+        assert_eq!(idx.tracked_count(), 1);
+        assert_eq!(idx.len(), 3);
     }
 
     #[test]
