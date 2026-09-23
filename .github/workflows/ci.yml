@@ -1,0 +1,153 @@
+# CI for delocal (DESIGN.md §15 Phase 0).
+#
+# Three jobs:
+#   lint   fmt, clippy with warnings denied, and the engine boundary check
+#   test   cargo test on Linux and macOS
+#   build  release binaries for the four targets; Linux ones must be static
+#
+# The toolchain comes from rust-toolchain.toml. `rustup toolchain install`
+# with no arguments reads that file and installs the pinned version with its
+# components and targets, so CI and a developer's machine use the same one.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# A new push to the same branch cancels the run for the previous push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental compilation only helps repeated local builds; in CI it
+  # costs time and cache space.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      # DESIGN.md Appendix B: the engine does no I/O and depends on nothing
+      # that does. `cargo tree -e normal` lists only normal (non-dev,
+      # non-build) dependencies, which is what ships in the binary. If any
+      # of these crates appear, the boundary is in the wrong place.
+      - name: Engine boundary
+        run: |
+          set -euo pipefail
+          tree="$(cargo tree -p delocal-engine -e normal --locked)"
+          echo "$tree"
+          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio'; then
+            echo "::error::delocal-engine depends on an I/O crate (see CLAUDE.md, crate boundary)"
+            exit 1
+          fi
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux musl builds use `cross`, which runs cargo inside a
+          # container that has the right linker and musl toolchain for the
+          # target. The host toolchain (from rust-toolchain.toml) is used;
+          # only the linker comes from the image.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+            static: true
+            run: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: true
+            static: true
+            run: false
+          # macOS builds are native on the Apple silicon runner. The x86_64
+          # target cross-compiles with the same SDK; it is not run here.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            cross: false
+            static: false
+            run: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cross: false
+            static: false
+            run: false
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
+
+      - name: Build release
+        run: ${{ matrix.cross && 'cross' || 'cargo' }} build --release --locked --target ${{ matrix.target }} -p delocal
+
+      # DESIGN.md §16: Linux binaries are fully static. Rust's musl targets
+      # produce a static-pie executable by default; `file` reports that as
+      # "static-pie linked" (newer) or "statically linked" (older). Anything
+      # else, in particular "dynamically linked", fails the build.
+      - name: Assert static
+        if: matrix.static
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/delocal"
+          desc="$(file "$bin")"
+          echo "$desc"
+          if ! echo "$desc" | grep -Eq 'statically linked|static-pie linked'; then
+            echo "::error::$bin is not statically linked"
+            exit 1
+          fi
+
+      - name: Run
+        if: matrix.run
+        run: target/${{ matrix.target }}/release/delocal
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: delocal-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/delocal
+          if-no-files-found: error
