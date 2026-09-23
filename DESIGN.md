@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 12 · 23 September 2026 · Status: **for review** · Changes from draft 11: catch-up carries announced records only and `have_up_to` replaces the ack (§7.4); want-list sources, selection, concurrency limits, progress-based deadlines, and the in-flight rule with its `revert` exception (§7.5, §8.3).
+> Draft 13 · 23 September 2026 · Status: **for review** · Changes from draft 12: given-up wants retry on a new source or connection (§7.5); the folder state is the unit of persistence and restart, index writes are durable and `seq` never rewinds (§11, §13); simulator crash model, I2 scoped to announced content, I4 defined by losing versions (§14.1).
+>
+> Changes from draft 11: catch-up carries announced records only and `have_up_to` replaces the ack (§7.4); want-list sources, selection, concurrency limits, progress-based deadlines, and the in-flight rule with its `revert` exception (§7.5, §8.3).
 >
 > Changes from draft 10: the sender's H1 denominator is the tracked count at the last announcement; a paused folder stays paused until `approve` or `revert`; frozen paths keep every incoming version; rule changes never release anything by themselves; the paused batch has a reserved id (§8.1). Quarantine stores raw incoming entries and `approve` re-classifies (§8.2). `revert` restores records with their original `seq`, removes never-announced adds, and puts reverted paths in flight (§8.3).
 >
@@ -286,7 +288,7 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 
 ### 7.5 Applying changes
 
-**Want-list.** Accepted entries go into a per-folder want-list, one want per path: the entry to end up with (`M` for a conflict), its apply mode, and its `sources`: the members that announced exactly that version, meaning the batch's source, the version's author, and any later batch that carries the same `(path, version)`. The engine does not model every peer's index; a source that has moved on answers `NotAvailable` and is dropped from that want. **Selection**: among connected, non-excluded sources the best tier wins (`lan`, then `direct`, then `relay`), ties broken by smaller node ID so two machines with the same view pick the same source; a source whose tier limit (§6.5) the file exceeds is skipped. No candidate → the want is *without source*; every candidate skipped → *deferred*, naming the least demanding tier that would allow it. Both are re-evaluated whenever a peer connects, disconnects or changes tier. At most `max_fetches_per_peer` (default 4) and `max_fetches_per_folder` (default 16) fetches run at once, held in `Rules`, so the engine, not the host, decides parallelism and a deadline means something. **Deadlines**: a fetch with no progress reported for 60 s, or a commit not reported within 30 s, returns the want to *wanted* and reselects, without excluding the source (the stall may have been ours); the host reports fetch progress at most every few seconds. Transfers resume from the temp file's offset, so a false stall costs a round trip, not the bytes. A second hash mismatch from a second source gives the want up until the index changes.
+**Want-list.** Accepted entries go into a per-folder want-list, one want per path: the entry to end up with (`M` for a conflict), its apply mode, and its `sources`: the members that announced exactly that version, meaning the batch's source, the version's author, and any later batch that carries the same `(path, version)`. The engine does not model every peer's index; a source that has moved on answers `NotAvailable` and is dropped from that want. **Selection**: among connected, non-excluded sources the best tier wins (`lan`, then `direct`, then `relay`), ties broken by smaller node ID so two machines with the same view pick the same source; a source whose tier limit (§6.5) the file exceeds is skipped. No candidate → the want is *without source*; every candidate skipped → *deferred*, naming the least demanding tier that would allow it. Both are re-evaluated whenever a peer connects, disconnects or changes tier. At most `max_fetches_per_peer` (default 4) and `max_fetches_per_folder` (default 16) fetches run at once, held in `Rules`, so the engine, not the host, decides parallelism and a deadline means something. **Deadlines**: a fetch with no progress reported for 60 s, or a commit not reported within 30 s, returns the want to *wanted* and reselects, without excluding the source (the stall may have been ours); the host reports fetch progress at most every few seconds. Transfers resume from the temp file's offset, so a false stall costs a round trip, not the bytes. A second hash mismatch from a second source gives the want up; it retries when a new source announces the version, when a peer connects, or when the index changes, so a transient corruption never strands a file.
 
 **In flight.** A path whose want is in a short-lived state (*wanted*, *blocked* on ordering, *fetching*, *committing*) is in flight: observations of it are ignored until the commit succeeds or fails, and the scan bracket's deletion pass skips it. A path whose want is *deferred*, *without source* or *given up* is observable: those states can last for days, and hiding a local edit for days would be a silent loss of sync. The one exception is a want created by `revert` (§8.3): the file is in the trash, so an `Absent` observation is ignored in every state (it is the trash move), while an observed file at the path is a real local change that dominates the restored version and cancels the want.
 
@@ -579,7 +581,11 @@ logs/            rotating, 7 days
 **SQLite schema (sketch):**
 
 ```sql
-folders        (id, name, created_by, rules_json, meta_version)
+folders        (id, name, created_by, rules_json, meta_version,
+                announced_seq, announced_tracked, paused_json)     -- per-folder engine state that is small
+pending        (folder, path, announced_record_json)              -- the record peers last saw, per unannounced path (§7.1)
+acks           (folder, node, acked_seq)                          -- highest of our seq each peer acknowledged (§7.4)
+deferred       (folder, path, entries_json)                       -- incoming versions waiting on a frozen or changed path (§7.5, §8.1)
 members        (folder, node, path, mode, joined_at)
 entries        (folder, path, kind, size, mtime_ns, exec, hash, version_blob, deleted, modified_by, author_host, seq,
                 PRIMARY KEY (folder, path))
@@ -593,6 +599,8 @@ machines       (node, hostname, ts_stable_id, ts_user, trusted, last_seen, deloc
 ```
 
 `seq` per (folder, this node) is a monotonically increasing integer, incremented on every local write to `entries`.
+
+**Persistence contract.** The engine's per-folder state (`FolderState`: index, pending set, sequence watermarks, peer seqs and acks, quarantine, wants, paused state, deferred entries) is the unit of restart: the daemon rebuilds it from these tables and hands it to `Engine::restore`. Every write the engine reports is made durable before the daemon feeds the engine its next event, so `seq` never rewinds and a crash loses only in-flight host operations and temp files. The engine reports index and want changes as actions today; Phase 2 adds the equivalent hooks for the remaining small state, or derives it from the tables above.
 
 ---
 
@@ -624,7 +632,7 @@ Protocol version is a single integer, bumped on any incompatible change. Two mac
 | Disk full during transfer | Abort that transfer, pause the folder's inbound, `status` warns. Resume when space frees. |
 | Permission denied on a path | Skip, count, show in `status`. Never fatal. |
 | Crash during transfer | Temp file resumes from offset on restart; verified by hash. |
-| Crash between rename and index write | Next scan sees a "new local change" with content matching a known version → merges by identical-content rule. |
+| Crash after a commit's rename but before its report reached the engine | Next scan sees a "new local change" with content matching a known version → merges by identical-content rule. |
 | Peer offers a version it no longer has | `NotAvailable`; try another source; otherwise wait. |
 | Protocol mismatch | Refuse politely; `status` shows who needs `delocal update`. |
 | Case collision on macOS | Neither applied; `status` names the pair. |
@@ -643,7 +651,7 @@ The engine is pure, so it can be driven by an in-memory filesystem and an in-mem
 
 - file create / modify / delete / rename, on random nodes, including the same path on several nodes in the same step
 - network partitions and heals, node offline and returning after arbitrary time
-- node crash: drop all in-flight transfers and un-fsynced state, restart
+- node crash: drop all in-flight host operations and temp files, restart from the persisted folder state (§11); a crash may land after a commit's rename but before its report, and the restarted node must recover through its scan
 - message delay and reordering
 - clock skew per node
 - mass-delete and mass-modify events (to exercise the brake)
@@ -653,9 +661,9 @@ Invariants checked at the end of every run and at random quiescent points:
 | # | Invariant |
 |---|---|
 | I1 | **Convergence.** When all nodes are connected and quiescent, every member has the identical set of paths, kinds, hashes and exec bits (excluding `.delocal/`). |
-| I2 | **No loss.** Every distinct content hash that ever existed in any node's folder exists at the end in some node's folder or trash. |
+| I2 | **No loss.** Every content hash that was ever **announced** (appeared in a batch some node sent) exists at the end in some node's folder or trash. Content overwritten locally before it was ever announced is not protected, by design (§8.6). |
 | I3 | **No resurrection.** A path deleted on a connected node and not concurrently modified is absent on every node after convergence. |
-| I4 | **Bounded conflicts.** Each concurrent-edit event produces at most one conflict copy per losing version, never per node. |
+| I4 | **Bounded conflicts.** A losing version is a version that `winner` (§7.6) ranks below a concurrent version with different content at the same path. Every conflict copy present at the end has the deterministic name of some losing version at that path and that version's content, and there is exactly one copy path per losing version, never one per node. Two different losing versions may legitimately have identical content. |
 | I5 | **Brake.** No batch that trips H1/H2 is ever applied without an explicit approve step in the simulation. |
 | I6 | **Determinism.** Same seed → byte-identical outcome. |
 
