@@ -151,3 +151,66 @@ fn entries_readmitted_from_the_deferred_set_respect_the_quarantine() {
         ],
     );
 }
+
+/// `revert` put the announced records back and removed never-announced adds
+/// without reporting either, so the persisted index kept the pending
+/// records and a restart would have re-announced the reverted changes.
+#[test]
+fn a_revert_reports_every_index_write() {
+    passes(
+        0,
+        &[
+            Step::Settle { secs: 34 },
+            Step::Modify {
+                node: 1,
+                path: 10,
+                content: 5,
+            },
+            Step::Chmod { node: 4, path: 5 },
+            Step::Offline { node: 7 },
+            Step::Touch { node: 2, path: 2 },
+            Step::Settle { secs: 3 },
+            Step::Everywhere {
+                path: 5,
+                contents: vec![None, None, Some(3), Some(4), Some(5), Some(3)],
+            },
+            Step::User {
+                node: 5,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 2,
+            },
+            Step::Partition { a: 7, b: 4 },
+            Step::Modify {
+                node: 3,
+                path: 5,
+                content: 5,
+            },
+            Step::Create {
+                node: 4,
+                path: 5,
+                content: 4,
+            },
+            Step::Offline { node: 1 },
+            Step::Delete { node: 7, path: 11 },
+            Step::Create {
+                node: 5,
+                path: 2,
+                content: 2,
+            },
+            Step::MassDelete {
+                node: 2,
+                fraction: 95,
+            },
+            Step::Modify {
+                node: 1,
+                path: 2,
+                content: 5,
+            },
+            Step::User {
+                node: 2,
+                action: crate::UserAction::Revert,
+                delay_secs: 5,
+            },
+        ],
+    );
+}

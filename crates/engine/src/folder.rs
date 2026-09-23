@@ -51,7 +51,7 @@ use crate::batch::{self, ApplyItem, ApplyMode, ApplySet, Batch, Decision, Summar
 use crate::brake::{self, HoldReason, Verdict};
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
-use crate::index::{Index, IndexRecord, LocalChange};
+use crate::index::{Index, IndexRecord, LocalChange, Reverted};
 use crate::path::RelPath;
 use crate::quarantine::{HeldItem, Quarantine};
 use crate::rules::Rules;
@@ -276,6 +276,10 @@ pub enum Approved {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevertOutcome {
     pub batch: BatchId,
+    /// Every index write the revert made, in index order: the record put
+    /// back (`restored`) or removed. The persistence hooks come from here;
+    /// §11 says every write the engine makes is reported.
+    pub reverted: Vec<Reverted>,
     /// Paths whose current file the host moves to trash.
     pub trash: Vec<RelPath>,
     /// Restored live entries wanted again.
@@ -1112,11 +1116,12 @@ impl FolderState {
         let others: BTreeSet<NodeId> = self.members.iter().copied().filter(|m| *m != own).collect();
         let mut trash = Vec::new();
         let mut refetch = 0;
-        for reverted in self.index.revert_pending() {
-            if reverted.current.is_some_and(|e| !e.deleted) {
+        let reverted = self.index.revert_pending();
+        for reverted in &reverted {
+            if reverted.current.as_ref().is_some_and(|e| !e.deleted) {
                 trash.push(reverted.path.clone());
             }
-            if let Some(record) = reverted.restored
+            if let Some(record) = &reverted.restored
                 && !record.entry.deleted
             {
                 let mode = if record.entry.kind == Kind::Dir {
@@ -1126,7 +1131,7 @@ impl FolderState {
                 };
                 refetch += 1;
                 self.wants.insert_restoring(Want {
-                    entry: record.entry,
+                    entry: record.entry.clone(),
                     mode,
                     conflict: None,
                     batch: paused.batch,
@@ -1145,6 +1150,7 @@ impl FolderState {
         self.unfreeze(now);
         Some(RevertOutcome {
             batch: paused.batch,
+            reverted,
             trash,
             refetch,
         })
@@ -2302,6 +2308,23 @@ mod tests {
             out.trash,
             vec![p("f08"), p("junk")],
             "deleted paths have nothing to trash"
+        );
+        assert_eq!(out.reverted.len(), 10, "one write per pending path");
+        let restored: Vec<&IndexRecord> = out
+            .reverted
+            .iter()
+            .filter_map(|r| r.restored.as_ref())
+            .collect();
+        let untouched: Vec<&IndexRecord> = announced
+            .iter()
+            .filter(|r| r.entry.path != p("f09"))
+            .collect();
+        assert_eq!(restored, untouched, "f09 was never pending");
+        assert!(
+            out.reverted
+                .iter()
+                .any(|r| r.path == p("junk") && r.restored.is_none()),
+            "a path peers never saw is reported removed"
         );
         assert_eq!(
             out.refetch, 9,
