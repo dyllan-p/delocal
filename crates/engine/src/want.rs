@@ -309,7 +309,9 @@ impl WantList {
     }
 
     /// A want persisted by the host comes back after a restart. Transient
-    /// states become `Wanted`.
+    /// states become `Wanted`, and fetched content is forgotten: a crash
+    /// loses the temp files along with the host's in-flight operations
+    /// (§11), so what was fetched has to be fetched again.
     pub fn restore(&mut self, mut want: Want) {
         if matches!(
             want.state,
@@ -317,6 +319,7 @@ impl WantList {
         ) {
             want.state = WantState::Wanted;
         }
+        want.fetched = false;
         let path = want.path().clone();
         self.wants.insert(path.clone(), want);
         self.note(&path);
@@ -957,6 +960,34 @@ mod tests {
             })
             .collect();
         assert_eq!(committed, ["d/inner", "old"]);
+    }
+
+    #[test]
+    fn a_restart_forgets_fetched_content() {
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        let v = entry("f", Kind::File, 10, 2, false).version;
+        l.dispatch(t(0), &Rules::default(), &peers(&[(2, Tier::Lan)]));
+        l.fetched(&p("f"), &v, FetchReport::Ok);
+        let steps = l.dispatch(t(1), &Rules::default(), &peers(&[(2, Tier::Lan)]));
+        assert!(
+            matches!(&steps[0], WantStep::Commit(_)),
+            "content in hand: commit"
+        );
+        let mut w = l.get(&p("f")).unwrap().clone();
+        assert!(w.fetched);
+        assert!(matches!(w.state, WantState::Committing { .. }));
+        // The process dies before the commit is reported; the temp file with it.
+        let mut restored = WantList::default();
+        w.sources = l.get(&p("f")).unwrap().sources.clone();
+        restored.restore(w);
+        let w = restored.get(&p("f")).unwrap();
+        assert!(!w.fetched, "the temp file died with the process");
+        assert_eq!(w.state, WantState::Wanted);
+        let steps = restored.dispatch(t(2), &Rules::default(), &peers(&[(2, Tier::Lan)]));
+        assert!(
+            matches!(&steps[0], WantStep::Fetch { .. }),
+            "fetched again, not committed from nothing: {steps:?}"
+        );
     }
 
     #[test]
