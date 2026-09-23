@@ -14,10 +14,12 @@
 //! - [`index`]: the per-folder index, local changes, tombstones (§7.1, §7.2, §7.7)
 //! - [`time`]: timestamps as inputs and the batch window constants (§7.4)
 //! - [`rules`]: per-folder thresholds and limits (§8.1, §6.5)
+//! - [`batch`]: batch formation, the summary, decisions, the apply set (§7.4)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod batch;
 pub mod entry;
 pub mod id;
 pub mod index;
@@ -26,6 +28,9 @@ pub mod rules;
 pub mod time;
 pub mod version;
 
+pub use batch::{
+    ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Decision, Summary,
+};
 pub use entry::{ContentHash, Entry, Kind, Observed};
 pub use id::{BatchId, FolderId, HostName, NodeId};
 pub use index::{ChangeKind, Index, IndexRecord, LocalChange};
