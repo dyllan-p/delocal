@@ -290,6 +290,7 @@ mod tests {
             node(2),
             crate::time::Timestamp::from_unix_nanos(1),
             &remote.unannounced(),
+            0,
         )
         .remove(0);
         let set = apply_set(&local, &batch);

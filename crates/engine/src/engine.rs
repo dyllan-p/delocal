@@ -768,7 +768,10 @@ impl Engine {
                 batch: batch.id,
                 folder: batch.folder,
                 decision: decision.clone(),
-                seq_high: batch.seq_high,
+                // The acknowledgement is our contiguous watermark of the
+                // sender's records, not this batch's seq_high: below it
+                // when an earlier batch never arrived (§7.4).
+                seq_high: folder.index().peer_seq(from),
             }),
         });
         out.push(Action::RecordBatch {

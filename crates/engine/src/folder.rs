@@ -831,6 +831,7 @@ impl FolderState {
             self.index.own(),
             now,
             &self.index.unannounced(),
+            self.index.announced_seq(),
         );
         self.index.mark_announced();
         self.window = None;
@@ -875,6 +876,7 @@ impl FolderState {
                     self.index.own(),
                     now,
                     &self.index.unannounced(),
+                    self.index.announced_seq(),
                 );
                 self.paused = Some(Paused {
                     batch: base,
@@ -927,12 +929,15 @@ impl FolderState {
                 .into_iter()
                 .map(|r| (r, None))
                 .collect();
+            // The peer holds everything up to `after`, so the chain resumes
+            // there and the receiver sees no gap.
             let batches = batch::form(
                 base.successor(used),
                 self.id,
                 self.index.own(),
                 now,
                 &records,
+                after,
             );
             used += batches.len() as u128;
             if !batches.is_empty() {
@@ -947,7 +952,8 @@ impl FolderState {
     /// want-list; every entry the batch carries names its source as a
     /// holder of that version (§7.5).
     pub fn receive(&mut self, now: Timestamp, batch: &Batch) -> Received {
-        self.index.set_peer_seq(batch.source, batch.seq_high);
+        self.index
+            .received_range(batch.source, batch.seq_low, batch.seq_high);
         let mut set = batch::apply_set(&self.index, batch);
         self.winner_fallbacks += set.fallbacks as u64;
 
@@ -1222,11 +1228,18 @@ impl FolderState {
         out
     }
 
-    /// A peer's decision on one of our batches acknowledges our records up
-    /// to `seq_high` (§7.4). Never moves backwards.
-    pub fn acknowledged(&mut self, peer: NodeId, seq_high: u64) {
-        let slot = self.acked.entry(peer).or_insert(0);
-        *slot = (*slot).max(seq_high);
+    /// A peer's decision on one of our batches carries its contiguous
+    /// watermark of our records (§7.4). It replaces what we knew, being the
+    /// truth about what the peer holds; below what we have announced, the
+    /// peer missed a batch (lost or still in flight), and catch-up at the
+    /// next tick re-sends everything above the watermark, exactly as a
+    /// reconnect does. A duplicate costs a batch the receiver drops as
+    /// already held; a missing one would never converge.
+    pub fn acknowledged(&mut self, peer: NodeId, watermark: u64) {
+        self.acked.insert(peer, watermark);
+        if watermark < self.index.announced_seq() {
+            self.catchup.insert(peer);
+        }
     }
 
     /// A peer disconnected: fetches from it are over (§7.5).
@@ -1747,12 +1760,56 @@ mod tests {
     }
 
     #[test]
-    fn acknowledgements_never_move_backwards() {
+    fn acknowledgements_replace_what_we_knew() {
         let mut f = folder();
         assert_eq!(f.acked_by(node(2)), 0);
         f.acknowledged(node(2), 7);
         f.acknowledged(node(2), 3);
-        assert_eq!(f.acked_by(node(2)), 7);
+        assert_eq!(f.acked_by(node(2)), 3, "the peer's watermark is the truth");
+    }
+
+    #[test]
+    fn a_batch_lost_in_flight_is_caught_up_from_the_watermark() {
+        // A announces f00 (seq 1) in one batch and f01 (seq 2) in the next;
+        // only the second reaches B. B has a gap, acknowledges its watermark
+        // 0, and A re-sends everything above 0 at the next tick (§7.4).
+        let mut a = folder_with(Rules::default(), 1, "alpha");
+        let mut b = folder_with(Rules::default(), 2, "bravo");
+        a.scanned(t(1.0), p("f00"), file(1, 1));
+        let first = a.form_batches(t(3.0), bid(1)).remove(0);
+        a.scanned(t(4.0), p("f01"), file(2, 2));
+        let second = a.form_batches(t(6.0), bid(2)).remove(0);
+        assert_eq!((first.seq_low, first.seq_high), (0, 1));
+        assert_eq!((second.seq_low, second.seq_high), (1, 2), "the chain");
+
+        let r = b.receive(t(6.0), &second);
+        assert_eq!(r.decision, Decision::Accepted, "processed all the same");
+        assert_eq!(b.wants().len(), 1, "f01 is wanted");
+        assert_eq!(
+            b.index().peer_seq(node(1)),
+            0,
+            "acknowledged at the watermark"
+        );
+        assert!(b.index().peer_has_gap(node(1)));
+
+        a.acknowledged(node(2), b.index().peer_seq(node(1)));
+        assert!(a.wake_now(), "catch-up at the next tick");
+        let (mut batches, _) = a.catchup_batches(t(7.0), bid(3));
+        let (peer, mut sent) = batches.remove(0);
+        assert_eq!(peer, node(2));
+        let resend = sent.remove(0);
+        assert_eq!((resend.seq_low, resend.seq_high), (0, 2));
+        assert_eq!(resend.entries.len(), 2, "both records, f01 again");
+        let r = b.receive(t(7.0), &resend);
+        assert_eq!(
+            r.already_wanted, 1,
+            "f01's copy only names the source again"
+        );
+        assert_eq!(b.wants().len(), 2);
+        assert_eq!(b.index().peer_seq(node(1)), 2, "the gap filled");
+        assert!(!b.index().peer_has_gap(node(1)));
+        a.acknowledged(node(2), 2);
+        assert!(!a.wake_now(), "nothing left to catch up");
     }
 
     #[test]

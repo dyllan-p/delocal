@@ -5,9 +5,12 @@
 //! **Formation.** A batch carries every record written since the last one,
 //! local changes and adopted records alike, in the sender's `seq` order. A
 //! run longer than [`MAX_BATCH_ENTRIES`] is split on `seq` boundaries so
-//! every batch covers a contiguous `seq` range and its `seq_high` is a true
-//! watermark. The summary counts only this machine's own local changes,
-//! classified as in §8.1.
+//! every batch covers a contiguous `seq` range `(seq_low, seq_high]`, and
+//! a sender's batches chain: each `seq_low` is the previous batch's
+//! `seq_high` (0 for the first), so a receiver can tell a batch it never
+//! got from one it did, whatever order the transport delivered them in.
+//! The summary counts only this machine's own local changes, classified as
+//! in §8.1.
 //!
 //! **Receiving.** Each entry is compared with the local record (absent is
 //! the empty version, dominated by everything): dominates gives a candidate
@@ -83,8 +86,15 @@ pub struct Batch {
     pub source: NodeId,
     /// When the sender formed it. Informational (§7.8).
     pub created_at: Timestamp,
-    /// The sender's `seq` of the newest entry. Acknowledged by the receiver's
-    /// decision; the next batch to that receiver starts above it (§7.4).
+    /// The `seq_high` of the sender's previous batch for this folder, 0 for
+    /// the first: every record of the sender with `seq` in
+    /// `(seq_low, seq_high]` that still exists and is announced is in this
+    /// batch. A receiver whose contiguous watermark is below it has a gap
+    /// (§7.4).
+    pub seq_low: u64,
+    /// The sender's `seq` of the newest entry. The receiver's decision
+    /// acknowledges its contiguous watermark, which reaches `seq_high` once
+    /// every earlier batch has arrived too (§7.4).
     pub seq_high: u64,
     /// In the sender's `seq` order.
     pub entries: Vec<Entry>,
@@ -136,15 +146,20 @@ pub fn form(
     source: NodeId,
     now: Timestamp,
     records: &[(&IndexRecord, Option<ChangeKind>)],
+    seq_low: u64,
 ) -> Vec<Batch> {
     debug_assert!(
         records.windows(2).all(|w| w[0].0.seq < w[1].0.seq),
         "records must be in strictly increasing seq order"
     );
+    // Chunks chain: the second starts where the first ended.
+    let mut low = seq_low;
     records
         .chunks(MAX_BATCH_ENTRIES)
         .enumerate()
         .map(|(i, chunk)| {
+            let seq_low = low;
+            low = chunk.last().map_or(low, |(r, _)| r.seq);
             let mut summary = Summary::default();
             let mut entries = Vec::with_capacity(chunk.len());
             for (record, kind) in chunk {
@@ -158,7 +173,8 @@ pub fn form(
                 folder,
                 source,
                 created_at: now,
-                seq_high: chunk.last().map_or(0, |(r, _)| r.seq),
+                seq_low,
+                seq_high: chunk.last().map_or(seq_low, |(r, _)| r.seq),
                 entries,
                 summary,
             }
@@ -493,6 +509,7 @@ mod tests {
             folder: folder(),
             source: node(2),
             created_at: now(),
+            seq_low: 0,
             seq_high,
             entries,
             summary: Summary::default(),
@@ -547,7 +564,7 @@ mod tests {
 
     #[test]
     fn forms_nothing_from_nothing() {
-        assert!(form(batch_id(1), folder(), node(1), now(), &[]).is_empty());
+        assert!(form(batch_id(1), folder(), node(1), now(), &[], 0).is_empty());
     }
 
     #[test]
@@ -557,7 +574,7 @@ mod tests {
         let adopted = entry("m", 9, Version::empty().incremented(node(2)), 2);
         idx.adopt(adopted.clone()); // seq 2
         idx.observe(p("a"), file(2, 2)).unwrap(); // seq 3
-        let batches = form(batch_id(1), folder(), node(1), now(), &idx.unannounced());
+        let batches = form(batch_id(1), folder(), node(1), now(), &idx.unannounced(), 0);
         assert_eq!(batches.len(), 1);
         let b = &batches[0];
         assert_eq!(b.id, batch_id(1));
@@ -580,7 +597,7 @@ mod tests {
             idx.observe(p(&format!("f{i:05}")), file(1, i as i64))
                 .unwrap();
         }
-        let batches = form(batch_id(1), folder(), node(1), now(), &idx.unannounced());
+        let batches = form(batch_id(1), folder(), node(1), now(), &idx.unannounced(), 0);
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].id, batch_id(1));
         assert_eq!(batches[1].id, batch_id(1).successor(1));
@@ -588,6 +605,11 @@ mod tests {
         assert_eq!(batches[1].entries.len(), 5);
         assert_eq!(batches[0].seq_high, MAX_BATCH_ENTRIES as u64);
         assert_eq!(batches[1].seq_high, MAX_BATCH_ENTRIES as u64 + 5);
+        assert_eq!(batches[0].seq_low, 0, "the caller's seq_low");
+        assert_eq!(
+            batches[1].seq_low, MAX_BATCH_ENTRIES as u64,
+            "the second chunk starts where the first ended"
+        );
         assert_eq!(batches[0].summary.adds, MAX_BATCH_ENTRIES as u64);
         assert_eq!(batches[1].summary.adds, 5);
     }
@@ -723,7 +745,7 @@ mod tests {
     fn batch_and_decision_round_trip() {
         let mut idx = index(1);
         idx.observe(p("a"), file(1, 1)).unwrap();
-        let b = form(batch_id(1), folder(), node(1), now(), &idx.unannounced()).remove(0);
+        let b = form(batch_id(1), folder(), node(1), now(), &idx.unannounced(), 0).remove(0);
         let json = serde_json::to_string(&b).unwrap();
         assert_eq!(serde_json::from_str::<Batch>(&json).unwrap(), b);
         let bytes = postcard::to_stdvec(&b).unwrap();
@@ -795,7 +817,7 @@ mod tests {
             let mut idx = index(1);
             drive(&mut idx, &steps);
             let unannounced = idx.unannounced();
-            let batches = form(batch_id(1), folder(), node(1), now(), &unannounced);
+            let batches = form(batch_id(1), folder(), node(1), now(), &unannounced, 0);
             let total: usize = batches.iter().map(|b| b.entries.len()).sum();
             prop_assert_eq!(total, unannounced.len());
             let mut expected = unannounced.iter().map(|(r, _)| r.entry.clone());
@@ -825,8 +847,8 @@ mod tests {
             let mut idx = index(1);
             drive(&mut idx, &steps);
             let other = idx.clone();
-            let a = form(batch_id(1), folder(), node(1), now(), &idx.unannounced());
-            let b = form(batch_id(1), folder(), node(1), now(), &other.unannounced());
+            let a = form(batch_id(1), folder(), node(1), now(), &idx.unannounced(), 0);
+            let b = form(batch_id(1), folder(), node(1), now(), &other.unannounced(), 0);
             prop_assert_eq!(postcard::to_stdvec(&a).unwrap(), postcard::to_stdvec(&b).unwrap());
         }
 
@@ -841,7 +863,7 @@ mod tests {
             drive(&mut local, &local_steps);
             let mut remote = index(3);
             drive(&mut remote, &remote_steps);
-            let batches = form(batch_id(1), folder(), node(3), now(), &remote.unannounced());
+            let batches = form(batch_id(1), folder(), node(3), now(), &remote.unannounced(), 0);
             for batch in &batches {
                 let set = apply_set(&local, batch);
                 let again = apply_set(&local, batch);

@@ -109,8 +109,9 @@ pub struct Index {
     records: BTreeMap<RelPath, IndexRecord>,
     /// Last `seq` handed out. 0 means nothing has been written yet.
     seq: u64,
-    /// Highest `seq` received from each remote member (§7.1, §7.4 catch-up).
-    peer_seq: BTreeMap<NodeId, u64>,
+    /// What we hold of each remote member's `seq` space (§7.4): the
+    /// contiguous watermark and the received ranges above it.
+    peer_seq: BTreeMap<NodeId, Watermark>,
     /// Local changes not yet announced, with the record peers last saw at
     /// the path (`None` if they never saw it). Fixes the change's kind and
     /// `prev_hash`, and is what `revert` restores.
@@ -121,6 +122,15 @@ pub struct Index {
     /// Tracked count as of the last announcement: the sender's H1
     /// denominator (§8.1).
     announced_tracked: usize,
+}
+
+/// What this machine holds of one peer's `seq` space (§7.4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Watermark {
+    /// Every `seq` up to here has been received.
+    contiguous: u64,
+    /// Ranges `(low, high]` received above a gap, keyed by `low`.
+    ranges: BTreeMap<u64, u64>,
 }
 
 impl Index {
@@ -241,16 +251,40 @@ impl Index {
         out
     }
 
-    /// Highest `seq` received from a peer, 0 if none.
+    /// The contiguous watermark for `peer`: every `seq` of theirs up to it
+    /// has been received, 0 if none. This is what a decision acknowledges
+    /// and what `have_up_to` reports (§7.4).
     pub fn peer_seq(&self, peer: NodeId) -> u64 {
-        self.peer_seq.get(&peer).copied().unwrap_or(0)
+        self.peer_seq.get(&peer).map_or(0, |w| w.contiguous)
     }
 
-    /// Record that `peer`'s records up to `seq` have been received. Never
-    /// moves backwards.
-    pub fn set_peer_seq(&mut self, peer: NodeId, seq: u64) {
-        let slot = self.peer_seq.entry(peer).or_insert(0);
-        *slot = (*slot).max(seq);
+    /// True if batches from `peer` above the watermark have arrived while
+    /// something below them has not (§7.4).
+    pub fn peer_has_gap(&self, peer: NodeId) -> bool {
+        self.peer_seq
+            .get(&peer)
+            .is_some_and(|w| !w.ranges.is_empty())
+    }
+
+    /// A batch from `peer` covering `(seq_low, seq_high]` arrived (§7.4). The
+    /// watermark advances when the range starts at or below it, and then
+    /// absorbs every range that has become contiguous; a range above a gap
+    /// is remembered until the gap fills.
+    pub fn received_range(&mut self, peer: NodeId, seq_low: u64, seq_high: u64) {
+        let w = self.peer_seq.entry(peer).or_default();
+        if seq_high <= w.contiguous {
+            return;
+        }
+        if seq_low <= w.contiguous {
+            w.contiguous = seq_high;
+        } else {
+            let high = w.ranges.entry(seq_low).or_insert(seq_high);
+            *high = (*high).max(seq_high);
+        }
+        while let Some((&low, &high)) = w.ranges.range(..=w.contiguous).next() {
+            w.ranges.remove(&low);
+            w.contiguous = w.contiguous.max(high);
+        }
     }
 
     /// Local changes not yet announced, in path order, with the coalesced
@@ -1076,9 +1110,31 @@ mod tests {
         );
         assert_eq!(idx.records_since(3).count(), 0);
         assert_eq!(idx.peer_seq(node(2)), 0);
-        idx.set_peer_seq(node(2), 5);
-        idx.set_peer_seq(node(2), 3);
+        idx.received_range(node(2), 0, 5);
+        idx.received_range(node(2), 0, 3);
         assert_eq!(idx.peer_seq(node(2)), 5, "never moves backwards");
+    }
+
+    #[test]
+    fn the_watermark_waits_for_a_gap_to_fill() {
+        let mut idx = index();
+        idx.received_range(node(2), 0, 4);
+        // Batches (7, 9] and (9, 12] arrive before (4, 7]: a gap.
+        idx.received_range(node(2), 7, 9);
+        idx.received_range(node(2), 9, 12);
+        assert_eq!(idx.peer_seq(node(2)), 4, "acknowledged at the watermark");
+        assert!(idx.peer_has_gap(node(2)));
+        // Catch-up re-sends everything above the acknowledged 4.
+        idx.received_range(node(2), 4, 7);
+        assert_eq!(
+            idx.peer_seq(node(2)),
+            12,
+            "the gap filled, the ranges absorbed"
+        );
+        assert!(!idx.peer_has_gap(node(2)));
+        // A range entirely below the watermark is old news.
+        idx.received_range(node(2), 2, 3);
+        assert_eq!(idx.peer_seq(node(2)), 12);
     }
 
     #[test]
@@ -1118,7 +1174,7 @@ mod tests {
         idx.observe(p("a"), file(1, 1)).unwrap();
         idx.observe_absent(&p("a"), 2).unwrap();
         idx.observe(p("b"), file(1, 1)).unwrap();
-        idx.set_peer_seq(node(2), 4);
+        idx.received_range(node(2), 0, 4);
         let json = serde_json::to_string(&idx).unwrap();
         assert_eq!(serde_json::from_str::<Index>(&json).unwrap(), idx);
         let bytes = postcard::to_stdvec(&idx).unwrap();
