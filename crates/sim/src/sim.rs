@@ -763,7 +763,14 @@ impl Sim {
         if self.approved.contains(&(id, want.batch)) {
             return None;
         }
-        folder.quarantine().get(want.batch).map(|_| path.clone())
+        // The item must hold this path: a batch id names a review item, and
+        // entries of a batch that passed can be held later under its id
+        // (§8.2 re-admission) while the accepted ones are still committing.
+        folder
+            .quarantine()
+            .get(want.batch)
+            .filter(|item| item.entries.contains_key(path))
+            .map(|_| path.clone())
     }
 
     fn act(&mut self, id: NodeId, action: Action) -> Result<(), Failure> {
