@@ -18,13 +18,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{ApplySet, Batch, BatchDecision, BatchRole, Decision};
 use crate::entry::{ContentHash, Entry};
-use crate::folder::{ApplyOutcome, Approved, FolderState, FolderStatus, ScanState, Ticked};
+use crate::folder::{
+    ApplyOutcome, Approved, Displace, Expected, FolderState, FolderStatus, HostStep, ScanState,
+    Ticked,
+};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
 use crate::path::RelPath;
 use crate::rules::Rules;
 use crate::time::Timestamp;
 use crate::version::Version;
+use crate::want::{FetchReport, Tier, Want};
 
 /// What the host tells the engine about this machine at start-up.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -35,46 +39,17 @@ pub struct NodeConfig {
     pub author_host: HostName,
 }
 
-/// How a peer is currently reached (§6.4). Input only in Phase 1.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum Tier {
-    Lan,
-    Direct,
-    Relay,
-}
-
-/// The result of a host's fetch (§7.5 steps 1 to 5). PR 6.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum FetchOutcome {
-    Ok,
-    /// The source no longer has that exact version.
-    NotAvailable,
-    /// Content did not verify against the expected hash.
-    HashMismatch,
-}
-
-/// What the index believes is at a path when a commit is ordered (§7.5
-/// step 6). `None` means absent. PR 6.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Expected {
-    pub size: u64,
-    pub mtime_ns: i64,
-}
-
-/// Where a commit moves the file it displaces (§7.5 step 7). PR 6.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Displace {
-    /// To `.delocal/trash/` (§8.4).
-    Trash,
-    /// To the conflict-copy path: the displaced file is the losing content (§7.6).
-    ConflictCopy(RelPath),
-}
-
 /// A message for a peer. The binary crate wraps it in its wire envelope (§12).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Outbound {
     Batch(Batch),
     Decision(BatchDecision),
+    /// The highest `seq` of the recipient's records we hold, per folder
+    /// (§7.4, `FolderMeta.have_up_to` in §12). Sent on connect.
+    HaveUpTo {
+        folder: FolderId,
+        seq: u64,
+    },
 }
 
 /// Everything the host can tell the engine.
@@ -142,12 +117,32 @@ pub enum Event {
         decision: BatchDecision,
     },
 
-    /// The host finished a fetch the engine asked for (§7.5). PR 6.
+    /// A peer told us the highest `seq` of ours it holds (§7.4). Replaces
+    /// our memory of its acks; catch-up follows at the next tick.
+    HaveUpToReceived {
+        from: NodeId,
+        folder: FolderId,
+        seq: u64,
+    },
+
+    /// The host finished a fetch the engine asked for (§7.5).
     Fetched {
         folder: FolderId,
         path: RelPath,
         version: Version,
-        outcome: FetchOutcome,
+        outcome: FetchReport,
+    },
+    /// Bytes are arriving for a fetch; the host sends this at most every
+    /// few seconds. Pushes the stall deadline out (§7.5).
+    FetchProgress {
+        folder: FolderId,
+        path: RelPath,
+        version: Version,
+    },
+    /// A want the host persisted comes back after a restart (Phase 2).
+    WantRestored {
+        folder: FolderId,
+        want: Box<Want>,
     },
     /// The host finished a commit the engine asked for (§7.5). On `Ok` the
     /// index adopts the entry.
@@ -180,7 +175,7 @@ pub enum Action {
     /// Send a message to a connected peer.
     Send { to: NodeId, payload: Outbound },
 
-    /// Pull one file from one source (§7.5 steps 1 to 5). PR 6.
+    /// Pull one file from one source (§7.5 steps 1 to 5).
     Fetch {
         folder: FolderId,
         path: RelPath,
@@ -191,7 +186,7 @@ pub enum Action {
     },
     /// Commit as one operation (§7.5 steps 6 to 9): check `expected`
     /// against the path, displace any existing file, rename the content in,
-    /// set mtime and exec. Report with [`Event::Applied`]. PR 6.
+    /// set mtime and exec. Report with [`Event::Applied`].
     Write {
         folder: FolderId,
         path: RelPath,
@@ -200,20 +195,20 @@ pub enum Action {
         displace: Displace,
     },
     /// Delete as one operation: check `expected`, move to trash, report.
-    /// Directories only when empty. PR 6.
+    /// Directories only when empty.
     Remove {
         folder: FolderId,
         path: RelPath,
         expected: Option<Expected>,
     },
-    /// Metadata-only apply (§7.5): set mtime and exec, no transfer. PR 6.
+    /// Metadata-only apply (§7.5): set mtime and exec, no transfer.
     SetMeta {
         folder: FolderId,
         path: RelPath,
         mtime_ns: i64,
         exec: bool,
     },
-    /// Move a local file aside with nothing to rename in: revert only (§8.3). PR 5.
+    /// Move a local file aside with nothing to rename in: revert only (§8.3).
     MoveToTrash { folder: FolderId, path: RelPath },
 
     /// History (§8.5).
@@ -226,6 +221,12 @@ pub enum Action {
     IndexChanged {
         folder: FolderId,
         record: IndexRecord,
+    },
+    /// A want changed or ended; persistence hook for Phase 2 (§7.5).
+    WantChanged {
+        folder: FolderId,
+        path: RelPath,
+        want: Option<Box<Want>>,
     },
     /// Something for `status`.
     StatusChanged {
@@ -242,6 +243,8 @@ pub struct Engine {
     peers: BTreeMap<NodeId, Tier>,
     /// The last `WakeAt` emitted per folder, so it is not repeated.
     woke: BTreeMap<FolderId, Timestamp>,
+    /// The time of the event being handled, for an immediate wake-up.
+    now_hint: Timestamp,
 }
 
 impl Engine {
@@ -251,6 +254,7 @@ impl Engine {
             folders: BTreeMap::new(),
             peers: BTreeMap::new(),
             woke: BTreeMap::new(),
+            now_hint: Timestamp::default(),
         }
     }
 
@@ -275,6 +279,7 @@ impl Engine {
 
     /// Handle one event at time `now` and return what the host should do.
     pub fn handle(&mut self, now: Timestamp, event: Event) -> Vec<Action> {
+        self.now_hint = now;
         let mut out = Vec::new();
         match event {
             Event::Tick { fresh_batch_id } => self.tick(now, fresh_batch_id, &mut out),
@@ -358,12 +363,34 @@ impl Engine {
                 }
                 None => out.push(unknown_folder(folder)),
             },
-            Event::PeerConnected { peer, tier } | Event::PeerTierChanged { peer, tier } => {
+            Event::PeerConnected { peer, tier } => {
+                self.peers.insert(peer, tier);
+                // Tell the peer how far its records reach here (§7.4, §12).
+                for (id, folder) in &self.folders {
+                    if folder.is_member(peer) {
+                        out.push(Action::Send {
+                            to: peer,
+                            payload: Outbound::HaveUpTo {
+                                folder: *id,
+                                seq: folder.index().peer_seq(peer),
+                            },
+                        });
+                    }
+                }
+            }
+            Event::PeerTierChanged { peer, tier } => {
                 self.peers.insert(peer, tier);
             }
             Event::PeerDisconnected { peer } => {
                 self.peers.remove(&peer);
+                for folder in self.folders.values_mut() {
+                    folder.peer_gone(peer);
+                }
             }
+            Event::HaveUpToReceived { from, folder, seq } => match self.folders.get_mut(&folder) {
+                Some(f) => f.have_up_to(from, seq),
+                None => out.push(unknown_folder(folder)),
+            },
             Event::BatchReceived { from, batch } => self.receive(now, from, batch, &mut out),
             Event::DecisionReceived { from, decision } => {
                 match self.folders.get_mut(&decision.folder) {
@@ -384,8 +411,34 @@ impl Engine {
                 }
                 None => out.push(unknown_folder(folder)),
             },
-            // PR 6: fetch results feed the want-list.
-            Event::Fetched { .. } => {}
+            Event::Fetched {
+                folder,
+                path,
+                version,
+                outcome,
+            } => match self.folders.get_mut(&folder) {
+                Some(f) => {
+                    if f.fetched(&path, &version, outcome) == Some(crate::want::WantState::GaveUp) {
+                        out.push(Action::StatusChanged {
+                            folder,
+                            status: FolderStatus::GaveUp { path },
+                        });
+                    }
+                }
+                None => out.push(unknown_folder(folder)),
+            },
+            Event::FetchProgress {
+                folder,
+                path,
+                version,
+            } => match self.folders.get_mut(&folder) {
+                Some(f) => f.progress(now, &path, &version),
+                None => out.push(unknown_folder(folder)),
+            },
+            Event::WantRestored { folder, want } => match self.folders.get_mut(&folder) {
+                Some(f) => f.restore_want(*want),
+                None => out.push(unknown_folder(folder)),
+            },
             Event::Approve { folder, batch } => match self.folders.get_mut(&folder) {
                 Some(f) => match f.approve(now, batch) {
                     Approved::Released(set) => out.push(Action::StatusChanged {
@@ -455,8 +508,77 @@ impl Engine {
                 None => out.push(unknown_folder(folder)),
             },
         }
+        self.pump(now, &mut out);
         self.schedule(&mut out);
         out
+    }
+
+    /// Drive every folder's want-list (§7.5): emit fetches and commits,
+    /// report adoptions and want changes.
+    fn pump(&mut self, now: Timestamp, out: &mut Vec<Action>) {
+        let peers = self.peers.clone();
+        for (id, folder) in &mut self.folders {
+            let folder_id = *id;
+            let (steps, adopted) = folder.dispatch(now, &peers);
+            for step in steps {
+                out.push(match step {
+                    HostStep::Fetch {
+                        path,
+                        version,
+                        hash,
+                        size,
+                        from,
+                    } => Action::Fetch {
+                        folder: folder_id,
+                        path,
+                        version,
+                        hash,
+                        size,
+                        from,
+                    },
+                    HostStep::Write {
+                        path,
+                        entry,
+                        expected,
+                        displace,
+                    } => Action::Write {
+                        folder: folder_id,
+                        path,
+                        entry,
+                        expected,
+                        displace,
+                    },
+                    HostStep::Remove { path, expected } => Action::Remove {
+                        folder: folder_id,
+                        path,
+                        expected,
+                    },
+                    HostStep::SetMeta {
+                        path,
+                        mtime_ns,
+                        exec,
+                    } => Action::SetMeta {
+                        folder: folder_id,
+                        path,
+                        mtime_ns,
+                        exec,
+                    },
+                });
+            }
+            for record in adopted {
+                out.push(Action::IndexChanged {
+                    folder: folder_id,
+                    record,
+                });
+            }
+            for (path, want) in folder.want_changes() {
+                out.push(Action::WantChanged {
+                    folder: folder_id,
+                    path,
+                    want: want.map(Box::new),
+                });
+            }
+        }
     }
 
     /// Form and send batches for every folder whose window is due (§7.4).
@@ -472,6 +594,27 @@ impl Engine {
             let Some(folder) = self.folders.get_mut(&id) else {
                 continue;
             };
+            for path in folder.expire(now) {
+                out.push(Action::StatusChanged {
+                    folder: id,
+                    status: FolderStatus::Stalled { path },
+                });
+            }
+            let (catchup, spent) = folder.catchup_batches(now, fresh.successor(used));
+            used += spent;
+            for (peer, batches) in catchup {
+                for batch in batches {
+                    out.push(Action::Send {
+                        to: peer,
+                        payload: Outbound::Batch(batch.clone()),
+                    });
+                    out.push(Action::RecordBatch {
+                        batch,
+                        role: BatchRole::Sent,
+                        decision: None,
+                    });
+                }
+            }
             match folder.tick(now, fresh.successor(used)) {
                 Ticked::Nothing => {}
                 Ticked::Sent(batches) => {
@@ -591,6 +734,11 @@ impl Engine {
     /// Ask for a tick at each folder's due time, once per change of it.
     fn schedule(&mut self, out: &mut Vec<Action>) {
         for (id, folder) in &self.folders {
+            if folder.wake_now() {
+                out.push(Action::WakeAt(self.now_hint));
+                self.woke.remove(id);
+                continue;
+            }
             match folder.due() {
                 Some(due) => {
                     if self.woke.get(id) != Some(&due) {
@@ -615,13 +763,14 @@ fn unknown_folder(folder: FolderId) -> Action {
 
 #[cfg(test)]
 mod tests {
+    use crate::want::WantState;
     use proptest::prelude::*;
 
     use crate::batch::Summary;
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::batch::{ApplyItem, ApplyMode};
+    use crate::batch::ApplyMode;
     use crate::entry::{Kind, Observed};
     use crate::index::IndexRecord;
     use crate::time::NANOS_PER_SECOND;
@@ -720,6 +869,9 @@ mod tests {
                     let event = match payload {
                         Outbound::Batch(batch) => Event::BatchReceived { from, batch },
                         Outbound::Decision(decision) => Event::DecisionReceived { from, decision },
+                        Outbound::HaveUpTo { folder, seq } => {
+                            Event::HaveUpToReceived { from, folder, seq }
+                        }
                     };
                     let replies = engines.get_mut(&to).unwrap().handle(now, event);
                     rest.extend(deliver(now, to, replies, engines));
@@ -728,6 +880,16 @@ mod tests {
             }
         }
         rest
+    }
+
+    /// Actions without the `WantChanged` persistence hooks, for tests that
+    /// assert on exact positions.
+    fn core(actions: &[Action]) -> Vec<Action> {
+        actions
+            .iter()
+            .filter(|a| !matches!(a, Action::WantChanged { .. }))
+            .cloned()
+            .collect()
     }
 
     fn sends(actions: &[Action]) -> Vec<(NodeId, &Outbound)> {
@@ -864,16 +1026,15 @@ mod tests {
             }
         ));
         let b = &engines[&node(2)];
-        let set = &b.folder(folder()).unwrap().accepted()[0];
-        assert_eq!(set.source, node(1));
-        assert_eq!(set.items.len(), 1);
-        assert!(matches!(
-            set.items[0],
-            ApplyItem::Apply {
-                mode: ApplyMode::Fetch,
-                ..
-            }
-        ));
+        let f = b.folder(folder()).unwrap();
+        let want = f.wants().get(&p("x")).unwrap();
+        assert_eq!(want.source, node(1));
+        assert_eq!(f.wants().len(), 1);
+        assert_eq!(want.mode, ApplyMode::Fetch);
+        assert!(
+            matches!(want.state, WantState::Fetching { from, .. } if from == node(1)),
+            "A is connected and announced it, so the fetch started"
+        );
         // A's watermark for B moved to the batch's seq_high.
         assert_eq!(
             engines[&node(1)]
@@ -883,7 +1044,7 @@ mod tests {
             1
         );
         // Receiving is not writing: B has no window.
-        assert_eq!(b.folder(folder()).unwrap().due(), None);
+        assert_eq!(b.folder(folder()).unwrap().window(), None);
     }
 
     #[test]
@@ -926,8 +1087,14 @@ mod tests {
 
         // B's host "fetches and commits" the item and reports back.
         let b = engines.get_mut(&node(2)).unwrap();
-        let item = b.folder(folder()).unwrap().accepted()[0].items[0]
-            .incoming()
+        let item = b
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .iter()
+            .next()
+            .unwrap()
+            .entry
             .clone();
         let out = b.handle(
             t(4.0),
@@ -938,6 +1105,7 @@ mod tests {
                 outcome: ApplyOutcome::Ok,
             },
         );
+        let out = core(&out);
         assert!(matches!(out[0], Action::IndexChanged { .. }));
         assert_eq!(
             out[1],
@@ -964,9 +1132,14 @@ mod tests {
 
         // C has A's record with A's version, modified_by and author_host.
         let c = &engines[&node(3)];
-        let set = &c.folder(folder()).unwrap().accepted()[0];
-        assert_eq!(set.source, node(2), "arrived via B");
-        let got = set.items[0].incoming();
+        let want = c
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .get(&p("dir/note.md"))
+            .unwrap();
+        assert_eq!(want.source, node(2), "arrived via B");
+        let got = &want.entry;
         assert_eq!(got, &a_entry);
         assert_eq!(got.version, Version::empty().incremented(node(1)));
         assert_eq!(got.modified_by, node(1));
@@ -974,7 +1147,7 @@ mod tests {
 
         // A ignored the equal version and B's window closed; nothing loops.
         let a = &engines[&node(1)];
-        assert!(a.folder(folder()).unwrap().accepted().is_empty());
+        assert!(a.folder(folder()).unwrap().wants().is_empty());
         assert_eq!(engines[&node(2)].folder(folder()).unwrap().due(), None);
     }
 
@@ -1004,8 +1177,14 @@ mod tests {
         engines.insert(node(1), a);
         engines.insert(node(2), b);
         deliver(t(3.0), node(2), out, &mut engines);
-        let base = engines[&node(1)].folder(folder()).unwrap().accepted()[0].items[0]
-            .incoming()
+        let base = engines[&node(1)]
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .iter()
+            .next()
+            .unwrap()
+            .entry
             .clone();
         engines.get_mut(&node(1)).unwrap().handle(
             t(4.0),
@@ -1057,19 +1236,25 @@ mod tests {
         deliver(t(12.0), node(2), out_b, &mut engines);
 
         // A holds L: fetch W's content, displace to the conflict copy.
-        let a_item = engines[&node(1)].folder(folder()).unwrap().accepted()[0].items[0].clone();
-        assert_eq!(a_item.mode(), ApplyMode::Fetch);
-        let copy = a_item.conflict().unwrap().clone();
+        let a_want = engines[&node(1)]
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .get(&p("x"))
+            .unwrap()
+            .clone();
+        assert_eq!(a_want.mode, ApplyMode::Fetch);
+        let copy = a_want.conflict.clone().unwrap();
         assert_eq!(copy.path.as_str(), "x.conflict-19700101-000000-alpha");
         assert_eq!(copy.loser.hash, hash(5));
-        let m = a_item.incoming().clone();
+        let m = a_want.entry.clone();
         assert_eq!(m.hash, hash(6));
         assert_eq!(m.modified_by, node(2));
-        // B holds W: index-only, no copy, the same M.
-        let b_item = engines[&node(2)].folder(folder()).unwrap().accepted()[0].items[0].clone();
-        assert_eq!(b_item.mode(), ApplyMode::IndexOnly);
-        assert!(b_item.conflict().is_none());
-        assert_eq!(b_item.incoming(), &m);
+        // B holds W: index-only, no copy, the same M, adopted at once with
+        // nothing for the host to do.
+        let b_folder = engines[&node(2)].folder(folder()).unwrap();
+        assert!(b_folder.wants().is_empty());
+        assert_eq!(b_folder.index().get(&p("x")).unwrap().entry, m);
 
         // Both hosts commit. A writes two records: M and the copy.
         let out = engines.get_mut(&node(1)).unwrap().handle(
@@ -1108,11 +1293,9 @@ mod tests {
                 outcome: ApplyOutcome::Ok,
             },
         );
-        assert_eq!(
-            out.iter()
-                .filter(|a| matches!(a, Action::IndexChanged { .. }))
-                .count(),
-            1
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::IndexChanged { .. })),
+            "B already adopted M; a stray report changes nothing"
         );
 
         // A's next batch carries M and the copy; B ignores M and takes the copy.
@@ -1133,11 +1316,14 @@ mod tests {
         deliver(t(15.0), node(1), out, &mut engines);
         let b_folder = engines[&node(2)].folder(folder()).unwrap();
         assert_eq!(b_folder.index().get(&p("x")).unwrap().entry, m);
-        let set = &b_folder.accepted()[0];
-        assert_eq!(set.ignored, 1, "M is equal on B");
-        assert_eq!(set.items[0].path(), &copy.path);
-        assert_eq!(set.items[0].mode(), ApplyMode::Fetch);
-        assert!(set.items[0].conflict().is_none());
+        assert_eq!(
+            b_folder.wants().len(),
+            1,
+            "M is equal on B; only the copy is wanted"
+        );
+        let want = b_folder.wants().get(&copy.path).unwrap();
+        assert_eq!(want.mode, ApplyMode::Fetch);
+        assert!(want.conflict.is_none());
         assert_eq!(b_folder.winner_fallbacks(), 0);
         assert_eq!(
             engines[&node(1)]
@@ -1197,10 +1383,9 @@ mod tests {
         let items: Vec<(RelPath, Version)> = b
             .folder(folder())
             .unwrap()
-            .accepted()
+            .wants()
             .iter()
-            .flat_map(|s| s.items.iter())
-            .map(|i| (i.path().clone(), i.incoming().version.clone()))
+            .map(|w| (w.path().clone(), w.version().clone()))
             .collect();
         for (path, version) in items {
             b.handle(
@@ -1343,7 +1528,7 @@ mod tests {
             engines[&node(1)]
                 .folder(folder())
                 .unwrap()
-                .accepted()
+                .wants()
                 .is_empty()
         );
         assert_eq!(
@@ -1394,6 +1579,15 @@ mod tests {
             },
         );
         let out = b.handle(t(13.0), Event::Revert { folder: folder() });
+        let fetches = out
+            .iter()
+            .filter(|a| matches!(a, Action::Fetch { .. }))
+            .count();
+        assert_eq!(
+            fetches, 4,
+            "eight restored wants, four fetch slots per peer"
+        );
+        let out = core(&out);
         assert_eq!(
             out[0],
             Action::MoveToTrash {
@@ -1412,7 +1606,10 @@ mod tests {
                 }
             }
         );
-        assert_eq!(out.len(), 2, "no wake: nothing pending");
+        assert!(
+            matches!(out.last(), Some(Action::WakeAt(_))),
+            "a wake for the fetch deadlines"
+        );
         let f = b.folder(folder()).unwrap();
         assert_eq!(f.index().tracked_count(), 10);
         assert_eq!(f.index().pending_count(), 0);
@@ -1524,8 +1721,250 @@ mod tests {
             }
         )));
         let a = engines[&node(1)].folder(folder()).unwrap();
-        assert_eq!(a.accepted().len(), 1);
-        assert_eq!(a.accepted()[0].items.len(), 8, "A fetches its files back");
+        assert_eq!(a.wants().len(), 8, "A fetches its files back");
+    }
+
+    #[test]
+    fn connecting_exchanges_have_up_to_and_catch_up_follows_at_the_next_tick() {
+        let mut a = engine(1, "alpha");
+        let mut b = engine(2, "bravo");
+        join(&mut a, &[1, 2]);
+        join(&mut b, &[1, 2]);
+        // A announces three files while B is not connected.
+        for i in 0..3 {
+            a.handle(
+                t(1.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i}")),
+                    state: file(1, 1),
+                },
+            );
+        }
+        let out = a.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        assert!(sends(&out).is_empty(), "nobody connected");
+        // Both sides connect: each tells the other what it holds.
+        let out_a = a.handle(
+            t(5.0),
+            Event::PeerConnected {
+                peer: node(2),
+                tier: Tier::Lan,
+            },
+        );
+        assert_eq!(
+            sends(&out_a),
+            [(
+                node(2),
+                &Outbound::HaveUpTo {
+                    folder: folder(),
+                    seq: 0
+                }
+            )]
+        );
+        let out_b = b.handle(
+            t(5.0),
+            Event::PeerConnected {
+                peer: node(1),
+                tier: Tier::Lan,
+            },
+        );
+        assert_eq!(
+            sends(&out_b),
+            [(
+                node(1),
+                &Outbound::HaveUpTo {
+                    folder: folder(),
+                    seq: 0
+                }
+            )]
+        );
+        let mut engines = BTreeMap::from([(node(1), a), (node(2), b)]);
+        let rest = deliver(t(5.0), node(1), out_a, &mut engines);
+        // B received A's have_up_to: it has nothing above 0 of A's... it asks
+        // for an immediate tick to check.
+        assert!(rest.iter().any(|(who, a)| *who == node(2) && matches!(a, Action::WakeAt(ts) if *ts == t(5.0))));
+        let rest = deliver(t(5.0), node(2), out_b, &mut engines);
+        assert!(rest.iter().any(|(who, a)| *who == node(1) && matches!(a, Action::WakeAt(ts) if *ts == t(5.0))));
+        // A's tick sends the catch-up batch; B's tick has nothing to send.
+        let out = engines.get_mut(&node(1)).unwrap().handle(
+            t(5.0),
+            Event::Tick {
+                fresh_batch_id: fresh(2),
+            },
+        );
+        let Outbound::Batch(batch) = sends(&out)[0].1.clone() else {
+            panic!()
+        };
+        assert_eq!(batch.id, fresh(2));
+        assert_eq!(batch.entries.len(), 3);
+        assert_eq!(batch.seq_high, 3);
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::RecordBatch {
+                role: BatchRole::Sent,
+                ..
+            }
+        )));
+        deliver(t(5.0), node(1), out, &mut engines);
+        let out = engines.get_mut(&node(2)).unwrap().handle(
+            t(5.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        assert!(sends(&out).is_empty());
+        let b = engines[&node(2)].folder(folder()).unwrap();
+        assert_eq!(b.wants().len(), 3);
+        assert_eq!(
+            engines[&node(1)]
+                .folder(folder())
+                .unwrap()
+                .acked_by(node(2)),
+            3,
+            "the decision acknowledged it"
+        );
+    }
+
+    #[test]
+    fn the_fetch_flow_through_the_engine() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        let rest = deliver(t(12.0), node(1), out, &mut engines);
+        let fetch = rest
+            .iter()
+            .find_map(|(who, a)| match a {
+                Action::Fetch {
+                    path,
+                    version,
+                    hash: h,
+                    size,
+                    from,
+                    ..
+                } if *who == node(2) => Some((path.clone(), version.clone(), *h, *size, *from)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            (fetch.0.as_str(), fetch.2, fetch.3, fetch.4),
+            ("n", hash(7), 10, node(1))
+        );
+        assert!(
+            rest.iter().any(|(who, a)| *who == node(2)
+                && matches!(a, Action::WantChanged { want: Some(_), .. }))
+        );
+        let b = engines.get_mut(&node(2)).unwrap();
+        // Progress pushes the deadline; the wake follows it.
+        let out = b.handle(
+            t(40.0),
+            Event::FetchProgress {
+                folder: folder(),
+                path: p("n"),
+                version: fetch.1.clone(),
+            },
+        );
+        assert_eq!(out.last(), Some(&Action::WakeAt(t(100.0))));
+        let out = b.handle(
+            t(50.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                version: fetch.1.clone(),
+                outcome: FetchReport::Ok,
+            },
+        );
+        let write = out
+            .iter()
+            .find(|a| matches!(a, Action::Write { .. }))
+            .unwrap();
+        assert!(
+            matches!(write, Action::Write { path, expected: None, displace: Displace::Trash, entry, .. } if path == &p("n") && entry.hash == hash(7))
+        );
+        assert_eq!(
+            out.last(),
+            Some(&Action::WakeAt(t(80.0))),
+            "the commit deadline"
+        );
+        let out = b.handle(
+            t(51.0),
+            Event::Applied {
+                folder: folder(),
+                path: p("n"),
+                version: fetch.1.clone(),
+                outcome: ApplyOutcome::Ok,
+            },
+        );
+        assert!(
+            matches!(&out[0], Action::IndexChanged { record, .. } if record.entry.hash == hash(7))
+        );
+        assert!(
+            out.iter().any(
+                |a| matches!(a, Action::WantChanged { want: None, path, .. } if path == &p("n"))
+            )
+        );
+        assert!(b.folder(folder()).unwrap().wants().is_empty());
+    }
+
+    #[test]
+    fn a_stalled_fetch_is_reported_and_retried_at_the_next_tick() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        deliver(t(12.0), node(1), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        let out = b.handle(
+            t(71.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        assert!(
+            !out.iter().any(|a| matches!(a, Action::Fetch { .. })),
+            "1 s before the deadline"
+        );
+        let out = b.handle(
+            t(72.0),
+            Event::Tick {
+                fresh_batch_id: fresh(5),
+            },
+        );
+        assert!(out.iter().any(|a| matches!(a, Action::StatusChanged { status: FolderStatus::Stalled { path }, .. } if path == &p("n"))));
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::Fetch { from, .. } if *from == node(1))),
+            "retried, same source"
+        );
     }
 
     #[test]
@@ -1917,6 +2356,7 @@ mod tests {
                 .entry
                 .clone(),
             expected: Some(Expected {
+                kind: Kind::File,
                 size: 1,
                 mtime_ns: 2,
             }),
@@ -1956,6 +2396,44 @@ mod tests {
             prop_assert!(b.folder(folder()).unwrap().paused().is_some());
             let out = b.handle(now.plus_nanos(1), Event::Approve { folder: folder(), batch: fresh(3) });
             prop_assert_eq!(sends(&out).len(), 1);
+        }
+
+        /// I6 groundwork: two engines fed the same events, FetchProgress
+        /// timings included, emit byte-identical actions.
+        #[test]
+        fn progress_timings_do_not_break_determinism(
+            progress in prop::collection::vec(1i64..70, 0..6),
+            connect_c: bool,
+        ) {
+            let run = |seed: u8| -> Vec<u8> {
+                let mut a = engine(1, "alpha");
+                let mut b = engine(2, "bravo");
+                join(&mut a, &[1, 2, 3]);
+                join(&mut b, &[1, 2, 3]);
+                connect(&mut a, &mut b);
+                if connect_c {
+                    b.handle(t(0.0), Event::PeerConnected { peer: node(3), tier: Tier::Relay });
+                }
+                a.handle(t(1.0), Event::Scanned { folder: folder(), path: p("n"), state: file(seed, 1) });
+                let out = a.handle(t(3.0), Event::Tick { fresh_batch_id: fresh(1) });
+                let mut engines = BTreeMap::from([(node(1), a), (node(2), b)]);
+                let mut all = deliver(t(3.0), node(1), out, &mut engines);
+                let v = engines[&node(2)].folder(folder()).unwrap().wants().get(&p("n")).map(|w| w.version().clone());
+                let mut now = t(3.0);
+                for gap in &progress {
+                    now = now.plus_nanos(gap * NANOS_PER_SECOND);
+                    let b = engines.get_mut(&node(2)).unwrap();
+                    if let Some(v) = &v {
+                        all.extend(b.handle(now, Event::FetchProgress { folder: folder(), path: p("n"), version: v.clone() }).into_iter().map(|a| (node(2), a)));
+                    }
+                    all.extend(b.handle(now.plus_nanos(1), Event::Tick { fresh_batch_id: fresh(9) }).into_iter().map(|a| (node(2), a)));
+                }
+                let actions: Vec<Action> = all.into_iter().map(|(_, a)| a).collect();
+                let mut bytes = postcard::to_stdvec(&actions).unwrap();
+                bytes.extend(postcard::to_stdvec(&engines[&node(2)]).unwrap());
+                bytes
+            };
+            prop_assert_eq!(run(7), run(7));
         }
     }
 }
