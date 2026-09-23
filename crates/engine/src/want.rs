@@ -108,9 +108,15 @@ pub struct Want {
     pub source: NodeId,
     pub seq_high: u64,
     /// Members that announced exactly this version: the batch's source, the
-    /// version's author, and later batches carrying the same version.
+    /// version's author, and later batches carrying the same version. One
+    /// that answers `NotAvailable` has moved on and is removed (§7.5 step
+    /// 3); announcing the version again puts it back, since it now says it
+    /// holds it. A conflict's `M` exists nowhere until someone merges, so
+    /// its first announcer is often the winner's holder, which can answer
+    /// `NotAvailable` until it has seen the loser too.
     pub sources: BTreeSet<NodeId>,
-    /// Sources that answered `NotAvailable` or served a hash mismatch.
+    /// Sources that served a hash mismatch: never asked again for this
+    /// want, whatever they announce (§7.5 step 4 retries from another).
     pub excluded: BTreeSet<NodeId>,
     pub mismatches: u8,
     /// Content has been fetched and verified; only the commit remains.
@@ -367,7 +373,7 @@ impl WantList {
             }
             FetchReport::NotAvailable => {
                 if let Some(from) = from {
-                    want.excluded.insert(from);
+                    want.sources.remove(&from);
                 }
                 want.state = WantState::Wanted;
             }
@@ -734,6 +740,35 @@ mod tests {
         assert!(Tier::Direct.allows(&r, r.direct_limit));
         assert!(!Tier::Direct.allows(&r, r.direct_limit + 1));
         assert!(!Tier::Relay.allows(&r, r.relay_limit + 1));
+    }
+
+    #[test]
+    fn a_source_that_was_not_available_is_a_source_again_when_it_announces() {
+        // Only node 2 (the batch source) announced the version.
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        let version = entry("f", Kind::File, 10, 2, false).version;
+        let peers = peers(&[(2, Tier::Direct), (3, Tier::Direct)]);
+        let steps = l.dispatch(t(0), &Rules::default(), &peers);
+        assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
+        l.fetched(&p("f"), &version, FetchReport::NotAvailable);
+        assert!(l.dispatch(t(1), &Rules::default(), &peers).is_empty());
+        assert_eq!(l.get(&p("f")).unwrap().state, WantState::NoSource);
+        assert!(
+            l.get(&p("f")).unwrap().excluded.is_empty(),
+            "not available is not a mismatch"
+        );
+        // Node 2 announces the version again (it has merged to it): asked again.
+        l.note_announced(&p("f"), &version, node(2));
+        let steps = l.dispatch(t(2), &Rules::default(), &peers);
+        assert!(
+            matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)),
+            "{steps:?}"
+        );
+        // A mismatch, by contrast, sticks.
+        l.fetched(&p("f"), &version, FetchReport::HashMismatch);
+        l.note_announced(&p("f"), &version, node(2));
+        assert!(l.dispatch(t(3), &Rules::default(), &peers).is_empty());
+        assert_eq!(l.get(&p("f")).unwrap().state, WantState::NoSource);
     }
 
     #[test]
