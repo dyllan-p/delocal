@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 8 · 23 September 2026 · Status: **for review** · Changes from draft 7: directories and symlinks carry no mtime (§7.1, §7.5); a commit that finds the file changed underneath is re-evaluated after the next observation rather than dropped (§7.5); H1 excludes directories on both sides of the ratio, and the sender cannot see exec-only changes (§8.1).
+> Draft 9 · 23 September 2026 · Status: **for review** · Changes from draft 8: the winner rule is a total order in five steps (§7.6); the conflict copy is this machine's change (§7.6); an occupied conflict path displaces to trash (§7.6); a displacement target that appears late is `ChangedUnderneath` (§7.5); non-empty directory losers noted as known behaviour (§7.6).
+>
+> Changes from draft 7: directories and symlinks carry no mtime (§7.1, §7.5); a commit that finds the file changed underneath is re-evaluated after the next observation rather than dropped (§7.5); H1 excludes directories on both sides of the ratio, and the sender cannot see exec-only changes (§8.1).
 >
 > Changes from draft 6: batch entries ordered by `seq`, `seq_high` on every batch, the decision doubles as the acknowledgement, and the connect-time watermark exchange (§7.4, §12); the sender's summary counts local changes only (§7.4).
 >
@@ -290,7 +292,7 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 
 **Committing.**
 
-6. Check the target path is still what the index said it was when the decision was made (same `size` and `mtime_ns` for a file; same kind for a directory or symlink; or absent). If not, the local file changed underneath us: abort the commit and report `ChangedUnderneath`. The engine keeps the incoming entry and re-evaluates it against the index after the next observation of that path arrives, which will find a new local version and classify the pair as a conflict (§7.6) or as dominated. The incoming version is never dropped: the sender has already been acknowledged for it and would not send it again.
+6. Check the target path is still what the index said it was when the decision was made (same `size` and `mtime_ns` for a file; same kind for a directory or symlink; or absent). If not, the local file changed underneath us: abort the commit and report `ChangedUnderneath`. The same outcome is reported if the commit's displacement target (§7.6) exists when the host gets there. The engine keeps the incoming entry and re-evaluates it against the index after the next observation of that path arrives, which will find a new local version and classify the pair as a conflict (§7.6) or as dominated. The incoming version is never dropped: the sender has already been acknowledged for it and would not send it again.
 7. If a file exists at the target, **move it to trash** (§8.4), or, when the commit resolves a conflict and the existing file is the losing content, to the conflict-copy path (§7.6). Same filesystem, so this is a rename either way. The engine says which in the commit action; the host never chooses.
 8. `rename(tmp, target)`. Ensure parent directories exist (creating them as index entries if they arrived in the same batch).
 9. Update the index record and `fsync` the parent directory.
@@ -309,13 +311,15 @@ Two versions of the same path are in conflict when they are **concurrent** (§7.
 
 **Deterministic winner.** Every machine must pick the same winner without communicating:
 
-1. If exactly one side is a metadata-only change (`hash == prev_hash`, §7.1), the other side wins. A real edit is never demoted to a conflict copy by a touch.
-2. Otherwise the version with the larger `mtime_ns` wins.
-3. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
+1. If exactly one side is a tombstone, the live side wins (delete vs modify: a file someone is still editing should not vanish).
+2. If exactly one side is a metadata-only change (`hash == prev_hash`, §7.1), the other side wins. A real edit is never demoted to a conflict copy by a touch.
+3. Otherwise the version with the larger `mtime_ns` wins.
+4. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
+5. Tie: larger `hash`, then `exec` set. Two concurrent versions from one author should be impossible (a node's versions of a path form a chain), so this step exists only to make the rule total; the simulator counts how often it fires, and any count above zero is a bug to find.
 
 **Actions.** Let `W` be the winning version and `L` the losing one, and let `M = merge(W, L)` (§7.2): `W`'s content fields (kind, size, mtime_ns, exec, hash, modified_by, author_host, prev_hash) under the component-wise maximum of the two vectors. `M` dominates both `W` and `L`, and every machine computes the same `M` from the same two inputs, so no increment is needed and no machine has to be told what the others decided. (This is the identical-content merge of §7.2 with a rule for whose content to keep. `deny` in §8.2 does increment, because the choice it encodes is the user's and two machines could choose differently.)
 
-- A machine that currently **holds L** locally fetches `W`'s content, then commits in one host operation: the existing file is moved to the conflict-copy path instead of the trash, and `W`'s content is renamed in (§7.5 step 7). The index adopts `M` at the original path and records the conflict copy as a local add at the conflict path with `L`'s content fields, `prev_hash = EMPTY` and a fresh version. The path is never absent in between, so no scan can mistake the displacement for a deletion.
+- A machine that currently **holds L** locally fetches `W`'s content, then commits in one host operation: the existing file is moved to the conflict-copy path instead of the trash, and `W`'s content is renamed in (§7.5 step 7). The index adopts `M` at the original path and records the conflict copy as a local add at the conflict path: `L`'s kind, size, mtime_ns, exec and hash, `prev_hash = EMPTY`, a fresh version, and **this machine** as `modified_by` and `author_host`, because the copy is this machine's change (`L`'s author survives in the copy's name). The path is never absent in between, so no scan can mistake the displacement for a deletion. If the conflict path already holds a live record when the conflict is classified (another `L`-holder's copy arrived first), the displaced file goes to the trash instead and the record already there is the conflict copy; if the target appears between classification and commit, the host reports `ChangedUnderneath` (§7.5 step 6) and the entry is re-evaluated.
 - A machine that currently **holds W** locally adopts `M` as a metadata-only apply (§7.5): nothing changes on disk.
 - A machine that holds **neither** (an older version, or nothing) applies `M` as an ordinary change and never creates a conflict copy.
 
@@ -334,7 +338,7 @@ If `author_host` is empty (should not happen, but the format must be total), the
 
 - **Delete vs modify:** the modification wins regardless of mtime. The deletion is dropped. A file that someone is still editing should not vanish.
 - **Modify vs modify on a directory** cannot happen; directories carry no content.
-- **File vs directory at the same path:** the newer (by the winner rule) wins; the loser is renamed with the conflict suffix. Expected to be vanishingly rare.
+- **File vs directory at the same path:** the winner rule decides; the loser is renamed with the conflict suffix. Expected to be vanishingly rare. If the loser is a non-empty directory, displacing it moves its children too: their old records are tombstoned and the moved children appear as adds on the next scan, which may trip the brake on that machine. Known behaviour, accepted; the brake is the safety net.
 - **Case-insensitive filesystems (macOS default):** two index paths that differ only by case cannot both exist. Neither is applied; `status` reports the pair and the user resolves it on a case-sensitive machine. **[decision]** This is the Syncthing approach and is good enough for v1.
 
 ### 7.7 Tombstones
