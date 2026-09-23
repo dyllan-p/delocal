@@ -1,0 +1,17 @@
+[package]
+name = "delocal"
+description = "Keep a folder identical across all of your machines, over your tailnet."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "delocal"
+path = "src/main.rs"
+
+[dependencies]
+delocal-engine.workspace = true
+
+[lints]
+workspace = true

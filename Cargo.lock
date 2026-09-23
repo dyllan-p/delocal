@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "delocal"
+version = "0.1.0"
+dependencies = [
+ "delocal-engine",
+]
+
+[[package]]
 name = "delocal-engine"
 version = "0.1.0"
