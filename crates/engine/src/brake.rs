@@ -17,6 +17,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{ApplyItem, ApplyMode, ApplySet, Summary};
+use crate::entry::Kind;
 use crate::index::Index;
 use crate::rules::Rules;
 
@@ -90,10 +91,15 @@ pub fn evaluate(rules: &Rules, summary: &Summary, tracked_before: usize) -> Verd
 
 /// Classify an apply set against the local records the way §8.1 says the
 /// receiver can: a metadata-only or index-only apply counts as nothing; a
-/// tombstone over a live record is a del; a live entry over absent or a
-/// tombstone is an add; anything else (content, kind or exec differs) is a
-/// mod. Bytes are the sizes of counted adds and mods. A conflict item is
-/// `M` against the losing local record, so a mod.
+/// tombstone over a live file or symlink is a del; a live entry over absent
+/// or a tombstone is an add; anything else (content, kind or exec differs)
+/// is a mod. Bytes are the sizes of counted adds and mods. A conflict item
+/// is `M` against the losing local record, so a mod.
+///
+/// A directory tombstone is not a del: directories are out of the H1 ratio
+/// on both sides (§8.1). `tracked_count` leaves them out of the denominator
+/// and the sender never counts them (a directory and its tombstone share
+/// the empty hash), so the receiver must not either.
 pub fn receiver_summary(index: &Index, set: &ApplySet) -> Summary {
     let mut summary = Summary::default();
     for item in &set.items {
@@ -101,15 +107,19 @@ pub fn receiver_summary(index: &Index, set: &ApplySet) -> Summary {
         if matches!(mode, ApplyMode::MetadataOnly | ApplyMode::IndexOnly) {
             continue;
         }
-        let local_live = index.live(&entry.path).is_some();
-        match (local_live, entry.deleted) {
-            (true, true) => summary.dels += 1,
-            (false, true) => {} // a tombstone for something we do not have
-            (false, false) => {
+        let local = index.live(&entry.path).map(|r| &r.entry);
+        match (local, entry.deleted) {
+            (Some(local), true) => {
+                if local.kind != Kind::Dir {
+                    summary.dels += 1;
+                }
+            }
+            (None, true) => {} // a tombstone for something we do not have
+            (None, false) => {
                 summary.adds += 1;
                 summary.bytes += entry.size;
             }
-            (true, false) => {
+            (Some(_), false) => {
                 summary.mods += 1;
                 summary.bytes += entry.size;
             }
@@ -200,6 +210,107 @@ mod tests {
             evaluate(&r, &summary(0, 100, 0, r.hold_size + 1), 100),
             Verdict::Hold(HoldReason::Count { .. })
         ));
+    }
+
+    #[test]
+    fn receiver_classifies_against_the_local_record() {
+        use crate::batch::apply_set;
+        use crate::entry::{ContentHash, Observed};
+        use crate::id::{HostName, NodeId};
+        use crate::index::Index;
+        use crate::path::RelPath;
+
+        fn node(i: u8) -> NodeId {
+            let mut b = [0u8; 16];
+            b[0] = i;
+            NodeId::from_bytes(b)
+        }
+        fn hash(i: u8) -> ContentHash {
+            let mut b = [0u8; 32];
+            b[0] = i;
+            b[31] = 1;
+            ContentHash::from_bytes(b)
+        }
+        let p = |s: &str| RelPath::new(s).unwrap();
+        let obs = |kind: Kind, h: u8, mtime: i64, exec: bool| Observed {
+            kind,
+            size: if kind == Kind::Dir { 0 } else { 10 },
+            mtime_ns: if kind == Kind::File { mtime } else { 0 },
+            exec,
+            hash: if kind == Kind::Dir {
+                ContentHash::EMPTY
+            } else {
+                hash(h)
+            },
+        };
+
+        // The remote (node 2) and the local (node 1) start from the same
+        // announced state, built on the remote and adopted locally.
+        let mut remote = Index::new(node(2), HostName::new("r").unwrap());
+        let mut local = Index::new(node(1), HostName::new("l").unwrap());
+        for (path, kind, h) in [
+            ("touched", Kind::File, 1),
+            ("edited", Kind::File, 2),
+            ("chmod", Kind::File, 3),
+            ("gone", Kind::File, 4),
+            ("link", Kind::Symlink, 5),
+            ("dir", Kind::Dir, 0),
+            ("dir/inner", Kind::File, 6),
+            ("same", Kind::File, 7),
+        ] {
+            let c = remote.observe(p(path), obs(kind, h, 1, false)).unwrap();
+            local.adopt(c.record.entry);
+        }
+        remote.mark_announced();
+        local.mark_announced();
+
+        remote
+            .observe(p("touched"), obs(Kind::File, 1, 9, false))
+            .unwrap(); // metadata only
+        remote
+            .observe(p("edited"), obs(Kind::File, 8, 9, false))
+            .unwrap(); // mod
+        remote
+            .observe(p("chmod"), obs(Kind::File, 3, 1, true))
+            .unwrap(); // exec only: a mod
+        remote.observe_absent(&p("gone"), 9).unwrap(); // del
+        remote.observe_absent(&p("link"), 9).unwrap(); // del: symlinks are tracked
+        remote.observe_absent(&p("dir/inner"), 9).unwrap(); // del
+        remote.observe_absent(&p("dir"), 9).unwrap(); // NOT a del: directories are out of the ratio
+        remote
+            .observe(p("new"), obs(Kind::File, 9, 9, false))
+            .unwrap(); // add
+        remote
+            .observe(p("newdir"), obs(Kind::Dir, 0, 0, false))
+            .unwrap(); // add (0 bytes)
+        remote.observe_absent(&p("never"), 9); // no record: nothing happens
+        let batch = crate::batch::form(
+            crate::id::BatchId::from_bytes([1; 16]),
+            crate::id::FolderId::from_bytes([7; 16]),
+            node(2),
+            crate::time::Timestamp::from_unix_nanos(1),
+            &remote.unannounced(),
+        )
+        .remove(0);
+        let set = apply_set(&local, &batch);
+        assert_eq!(set.items.len(), 9);
+        let s = receiver_summary(&local, &set);
+        assert_eq!(
+            s,
+            Summary {
+                adds: 2,
+                mods: 2,
+                dels: 3,
+                bytes: 30,
+            },
+            "touch ignored; edited and chmod are mods; gone, link and dir/inner are dels; dir is not"
+        );
+        assert_eq!(s.destructive(), 5);
+        assert_eq!(
+            local.tracked_count(),
+            7,
+            "the denominator leaves the directory out too"
+        );
     }
 
     #[test]
