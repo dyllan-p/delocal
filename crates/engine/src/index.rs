@@ -313,6 +313,43 @@ impl Index {
         Some(self.write(true, entry))
     }
 
+    /// The conflict copy of a displaced losing file (§7.6): `loser`'s kind,
+    /// size, mtime, exec and hash at `path`, a fresh version, and this
+    /// machine as `modified_by` and `author_host`, because the copy is this
+    /// machine's change (the loser's author is in the file name). A local
+    /// add; the path joins the pending set.
+    ///
+    /// `prev_hash` is the hash of the last version of `path` peers could have
+    /// seen, exactly as for any local change. That is `EMPTY`, as §7.6 says,
+    /// whenever the conflict path was absent or a tombstone when the
+    /// conflict was classified, which is every case §7.6 describes. It
+    /// differs only if peers saw a live file there that was deleted inside
+    /// the current batch window, where the §7.1 definition of `prev_hash`
+    /// must win or the announced step would be wrong.
+    pub fn record_conflict_copy(&mut self, path: RelPath, loser: &Entry) -> LocalChange {
+        let previous = self.records.get(&path);
+        let previous_live = previous.is_some_and(|r| !r.entry.deleted);
+        let version = previous
+            .map(|r| r.entry.version.clone())
+            .unwrap_or_default()
+            .incremented(self.own);
+        let prev_hash = self.announced_hash(&path);
+        let entry = Entry {
+            path,
+            kind: loser.kind,
+            size: loser.size,
+            mtime_ns: loser.mtime_ns,
+            exec: loser.exec,
+            hash: loser.hash,
+            prev_hash,
+            version,
+            deleted: false,
+            modified_by: self.own,
+            author_host: self.host.clone(),
+        };
+        self.write(previous_live, entry)
+    }
+
     /// A remote entry has been committed to disk (or a remote tombstone
     /// applied) and the index takes it over unchanged, with a new `seq`.
     /// Called only after the host reports the commit, never on accept.
@@ -600,6 +637,39 @@ mod tests {
     }
 
     #[test]
+    fn conflict_copy_is_a_local_add_with_the_losers_content_and_our_authorship() {
+        let mut idx = index();
+        let loser = remote("x.txt", 4, Version::empty().incremented(node(2)));
+        let change = idx.record_conflict_copy(p("x.conflict-copy.txt"), &loser);
+        assert_eq!(change.kind, ChangeKind::Add);
+        let e = &change.record.entry;
+        assert_eq!(e.path, p("x.conflict-copy.txt"));
+        assert_eq!(
+            (e.kind, e.size, e.mtime_ns, e.exec, e.hash),
+            (
+                loser.kind,
+                loser.size,
+                loser.mtime_ns,
+                loser.exec,
+                loser.hash
+            )
+        );
+        assert_eq!(e.prev_hash, ContentHash::EMPTY);
+        assert_eq!(e.version, idx.first_version());
+        assert_eq!(
+            e.modified_by,
+            node(1),
+            "this machine, not the loser's author"
+        );
+        assert_eq!(e.author_host.as_str(), "laptop");
+        assert!(!e.deleted);
+        assert_eq!(
+            idx.pending_kind(&p("x.conflict-copy.txt")),
+            Some(ChangeKind::Add)
+        );
+    }
+
+    #[test]
     fn adopt_over_an_existing_record_needs_a_dominating_version() {
         let mut idx = index();
         let mine = idx
@@ -757,8 +827,21 @@ mod tests {
 
     #[derive(Clone, Debug)]
     enum Step {
-        See { path: u8, hash: u8, mtime: i64 },
-        Gone { path: u8, at: i64 },
+        See {
+            path: u8,
+            hash: u8,
+            mtime: i64,
+        },
+        Gone {
+            path: u8,
+            at: i64,
+        },
+        /// A conflict copy landing at `path`, only if no live record is there
+        /// (classification guarantees that, §7.6).
+        Copy {
+            path: u8,
+            hash: u8,
+        },
         Announce,
     }
 
@@ -767,6 +850,7 @@ mod tests {
             4 => (0u8..4, 0u8..3, 0i64..4)
                 .prop_map(|(path, hash, mtime)| Step::See { path, hash, mtime }),
             2 => (0u8..4, 0i64..4).prop_map(|(path, at)| Step::Gone { path, at }),
+            1 => (0u8..4, 0u8..3).prop_map(|(path, hash)| Step::Copy { path, hash }),
             1 => Just(Step::Announce),
         ]
     }
@@ -791,7 +875,9 @@ mod tests {
             let mut changes = 0u64;
             for s in steps {
                 let path = match &s {
-                    Step::See { path, .. } | Step::Gone { path, .. } => path_of(*path),
+                    Step::See { path, .. } | Step::Gone { path, .. } | Step::Copy { path, .. } => {
+                        path_of(*path)
+                    }
                     Step::Announce => {
                         for (record, _) in idx.pending() {
                             announced.insert(
@@ -810,6 +896,20 @@ mod tests {
                 let change = match s {
                     Step::See { hash, mtime, .. } => idx.observe(path.clone(), file(hash, mtime)),
                     Step::Gone { at, .. } => idx.observe_absent(&path, at),
+
+                    Step::Copy { hash, .. } => {
+
+                        if idx.live(&path).is_some() {
+
+                            continue;
+
+                        }
+
+                        let loser = remote("loser", hash, Version::empty().incremented(node(2)));
+
+                        Some(idx.record_conflict_copy(path.clone(), &loser))
+
+                    }
                     Step::Announce => unreachable!(),
                 };
                 match change {
@@ -880,6 +980,22 @@ mod tests {
                         idx.observe_absent(&path, at);
                         last.insert(path, None);
                     }
+                    Step::Copy { path, hash } => {
+
+                        let path = path_of(path);
+
+                        if idx.live(&path).is_none() {
+
+                            let loser = remote("loser", hash, Version::empty().incremented(node(2)));
+
+                            let c = idx.record_conflict_copy(path.clone(), &loser);
+
+                            last.insert(path, Some(c.record.entry.observed()));
+
+                        }
+
+                    }
+
                     Step::Announce => idx.mark_announced(),
                 }
             }
