@@ -1,0 +1,70 @@
+# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds, a slice of them
+# with fetch corruption on, and an issue for the first failure.
+
+name: Nightly simulation
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: Number of seeds
+        default: "100000"
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  SEEDS: ${{ github.event.inputs.seeds || '100000' }}
+
+jobs:
+  simulate:
+    name: simulate (nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: simulate
+
+      - name: Build
+        run: cargo build --release --locked -p delocal-sim
+
+      # Nine tenths of the seeds with the defaults, one tenth with fetch
+      # corruption on, so the HashMismatch path is exercised every night.
+      - name: Simulate
+        id: sim
+        run: |
+          set -uo pipefail
+          main=$(( SEEDS * 9 / 10 ))
+          corrupt=$(( SEEDS - main ))
+          ./target/release/delocal-sim --seeds "$main" 2>&1 | tee sim.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            ./target/release/delocal-sim --seeds "$corrupt" --start "$main" --corruption 0.05 2>&1 | tee -a sim.log
+            status=${PIPESTATUS[0]}
+          fi
+          exit "$status"
+
+      - name: Open an issue for the failure
+        if: failure() && steps.sim.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="Nightly simulation failed: $(grep -m1 '^FAILED' sim.log | cut -c1-120)"
+          {
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo '```'
+            sed -n '/^seed .* failed/,$p' sim.log | head -200
+            echo '```'
+          } > body.md
+          gh issue create --title "$title" --body-file body.md --label simulator
