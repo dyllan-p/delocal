@@ -10,9 +10,14 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
-# This crate does no I/O. It must never depend on tokio, notify, rusqlite or
-# anything else that touches the world (DESIGN.md Appendix B). CI checks.
+# This crate does no I/O. It must never depend on tokio, notify, rusqlite,
+# rand or anything else that touches the world (DESIGN.md Appendix B). serde
+# is allowed so value types serialise directly. CI checks the tree.
 [dependencies]
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
