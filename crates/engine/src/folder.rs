@@ -1142,6 +1142,10 @@ impl FolderState {
         if !changes.is_empty() {
             self.touched(now);
         }
+        // Every index write re-classifies the wants at its path.
+        for path in &paths {
+            self.reclassify_want(now, path);
+        }
         Some(changes)
     }
 
@@ -1346,9 +1350,12 @@ impl FolderState {
                         },
                     });
                 }
-                WantStep::Adopt(entry) => {
-                    let path = entry.path.clone();
-                    adopted.push(self.adopt(now, entry));
+                WantStep::Adopt(want) => {
+                    let path = want.path().clone();
+                    match self.adopt(now, want.entry.clone()) {
+                        Some(record) => adopted.push(record),
+                        None => self.defer_changed_underneath(*want),
+                    }
                     self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
                 }
             }
@@ -1384,37 +1391,57 @@ impl FolderState {
         };
         match outcome {
             ApplyOutcome::Ok => {
-                let mut written = vec![self.adopt(now, want.entry)];
+                let Some(record) = self.adopt(now, want.entry.clone()) else {
+                    // The record moved on under the commit (release-build
+                    // fallback of Index::adopt): keep the entry for the next
+                    // observation rather than overwrite a local write.
+                    self.defer_changed_underneath(want);
+                    return Vec::new();
+                };
+                let mut written = vec![record];
                 if let Some(copy) = want.conflict {
+                    let copy_path = copy.path.clone();
                     let change = self.index.record_conflict_copy(copy.path, &copy.loser);
                     self.touched(now);
                     written.push(change.record);
+                    // Every index write re-classifies the wants at its path: a
+                    // want for a peer's copy of the same loser now meets this
+                    // machine's own copy, an identical-content merge rather
+                    // than a fetch that would land over it.
+                    self.reclassify_want(now, &copy_path);
                 }
                 self.reconsider(now, path, DeferredReason::ChangedUnderneath);
                 written
             }
             ApplyOutcome::ChangedUnderneath => {
-                self.deferred
-                    .entry(path.clone())
-                    .or_default()
-                    .push(Deferred {
-                        entry: want.entry,
-                        batch: want.batch,
-                        source: want.source,
-                        seq_high: want.seq_high,
-                        reason: DeferredReason::ChangedUnderneath,
-                    });
+                self.defer_changed_underneath(want);
                 Vec::new()
             }
         }
     }
 
+    /// Keep a want's entry in the deferred set until the next observation of
+    /// its path (§7.5 step 6).
+    fn defer_changed_underneath(&mut self, want: Want) {
+        self.deferred
+            .entry(want.path().clone())
+            .or_default()
+            .push(Deferred {
+                entry: want.entry,
+                batch: want.batch,
+                source: want.source,
+                seq_high: want.seq_high,
+                reason: DeferredReason::ChangedUnderneath,
+            });
+    }
+
     /// Take a committed remote entry into the index and open the window so
-    /// it is announced (§7.4 "adopted records are announced too").
-    pub fn adopt(&mut self, now: Timestamp, entry: Entry) -> IndexRecord {
-        let record = self.index.adopt(entry).clone();
+    /// it is announced (§7.4 "adopted records are announced too"). `None` if
+    /// the record no longer lets it (see [`Index::adopt`]).
+    pub fn adopt(&mut self, now: Timestamp, entry: Entry) -> Option<IndexRecord> {
+        let record = self.index.adopt(entry)?.clone();
         self.touched(now);
-        record
+        Some(record)
     }
 }
 
@@ -2458,6 +2485,80 @@ mod tests {
         let want = b.wants().get(&p("z")).unwrap();
         assert_eq!(want.version(), &v, "wanted again");
         assert!(!want.fetched, "a fresh want fetches again");
+    }
+
+    #[test]
+    fn writing_our_own_conflict_copy_reclassifies_a_want_for_a_peers_copy() {
+        // B holds L for "f". C, another L-holder, resolved the same conflict
+        // first and announced its copy of L at the conflict path. B wants
+        // that copy (a fetch), then B's own commit of W lands and writes B's
+        // copy record at the very same path. The want must meet B's record
+        // as an identical-content merge, not stay a fetch whose commit would
+        // land over B's own write (I8).
+        let (mut a, mut b) = a_and_b(3, Rules::default());
+        b.scanned(t(10.0), p("f00"), file(5, 50)); // B's L
+        let loser = b.index().get(&p("f00")).unwrap().entry.clone();
+        let copy_path = crate::conflict::conflict_copy_name(&loser).unwrap();
+        a.scanned(t(11.0), p("f00"), file(6, 60)); // A's W, newer
+        let batch = a.form_batches(t(13.0), bid(6)).remove(0);
+        assert_eq!(b.receive(t(13.0), &batch).decision, Decision::Accepted);
+        let want = b.wants().get(&p("f00")).unwrap();
+        let w_version = want.version().clone();
+        assert_eq!(want.conflict.as_ref().map(|c| &c.path), Some(&copy_path));
+
+        // C's copy of the same L arrives: same content as B's future copy,
+        // C's own version.
+        let mut c_copy = loser.clone();
+        c_copy.path = copy_path.clone();
+        c_copy.version = Version::empty().incremented(node(3));
+        c_copy.modified_by = node(3);
+        c_copy.prev_hash = ContentHash::EMPTY;
+        let mut c_batch = batch.clone();
+        c_batch.id = bid(7);
+        c_batch.source = node(3);
+        c_batch.entries = vec![c_copy.clone()];
+        c_batch.seq_low = 0;
+        c_batch.seq_high = 1;
+        assert_eq!(b.receive(t(14.0), &c_batch).decision, Decision::Accepted);
+        assert_eq!(
+            b.wants().get(&copy_path).unwrap().mode,
+            ApplyMode::Fetch,
+            "C's copy is wanted as content to fetch"
+        );
+
+        // B fetches W and commits it, displacing L to the copy path.
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1, 3]));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Fetch { path, .. } if path == &p("f00")))
+        );
+        b.fetched(&p("f00"), &w_version, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1, 3]));
+        assert!(steps.iter().any(|s| matches!(s, HostStep::Write { path, displace: Displace::ConflictCopy(c), .. } if path == &p("f00") && c == &copy_path)));
+        let written = b.applied(t(17.0), &p("f00"), &w_version, ApplyOutcome::Ok);
+        assert_eq!(written.len(), 2, "W adopted and B's copy recorded");
+        let own_copy = b.index().get(&copy_path).unwrap().entry.clone();
+        assert_eq!(own_copy.modified_by, node(2));
+
+        // The want at the copy path was re-classified against B's record:
+        // identical content, so it is a merge that dominates B's copy, not
+        // a fetch of C's bytes.
+        let want = b.wants().get(&copy_path).expect("still wanted, as a merge");
+        assert_ne!(want.mode, ApplyMode::Fetch);
+        assert!(want.version().dominates(&own_copy.version));
+        assert!(want.version().dominates(&c_copy.version));
+        // A late report for the old fetch matches nothing.
+        assert!(
+            b.applied(t(18.0), &copy_path, &c_copy.version, ApplyOutcome::Ok)
+                .is_empty()
+        );
+        // Dispatch adopts the merge index-only; the record dominates both.
+        let (_, adopted) = b.dispatch(t(19.0), &lan(&[1, 3]));
+        assert_eq!(adopted.len(), 1);
+        let record = b.index().get(&copy_path).unwrap();
+        assert!(record.entry.version.dominates(&c_copy.version));
+        assert!(b.wants().get(&copy_path).is_none());
     }
 
     #[test]

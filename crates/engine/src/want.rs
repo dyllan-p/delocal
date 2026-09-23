@@ -191,7 +191,7 @@ pub enum WantStep {
     /// Commit (`Write`, `Remove` or `SetMeta` by mode and entry).
     Commit(Box<Want>),
     /// An index-only apply: adopt without a host action.
-    Adopt(Entry),
+    Adopt(Box<Want>),
 }
 
 /// The per-folder want-list. Every mutation is recorded in `changes` for
@@ -623,9 +623,8 @@ impl WantList {
                 continue;
             }
             if want.mode == ApplyMode::IndexOnly {
-                let want = self.remove(&path).map(|w| w.entry);
-                if let Some(entry) = want {
-                    steps.push(WantStep::Adopt(entry));
+                if let Some(want) = self.remove(&path) {
+                    steps.push(WantStep::Adopt(Box::new(want)));
                 }
                 continue;
             }
