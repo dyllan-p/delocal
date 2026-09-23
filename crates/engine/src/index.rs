@@ -279,7 +279,18 @@ impl Index {
     /// A remote entry has been committed to disk (or a remote tombstone
     /// applied) and the index takes it over unchanged, with a new `seq`.
     /// Called only after the host reports the commit, never on accept.
+    ///
+    /// The adopted version must dominate or equal what the record holds;
+    /// the engine only applies versions that do. Checked in debug builds
+    /// so the simulator catches the first time it is not.
     pub fn adopt(&mut self, entry: Entry) -> &IndexRecord {
+        debug_assert!(
+            self.records
+                .get(&entry.path)
+                .is_none_or(|r| entry.version.dominates_or_equals(&r.entry.version)),
+            "adopting a version that does not dominate the record at {}",
+            entry.path
+        );
         let seq = self.next_seq();
         let path = entry.path.clone();
         self.pending.remove(&path);
@@ -571,6 +582,14 @@ mod tests {
         );
         // Equal is allowed too (a re-commit of the same version).
         idx.adopt(newer);
+    }
+
+    #[test]
+    #[should_panic(expected = "does not dominate")]
+    fn adopt_of_a_concurrent_version_is_a_bug() {
+        let mut idx = index();
+        idx.observe(p("a"), file(1, 1)).unwrap();
+        idx.adopt(remote("a", 5, Version::empty().incremented(node(2))));
     }
 
     #[test]
