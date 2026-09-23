@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 16 · 23 September 2026 · Status: **for review** · Changes from draft 15: the `stamp`, a Lamport timestamp seeded by mtime, is the first key of the winner rule, because the simulator disproved draft 15's claim that one total order was enough (§7.1, §7.6, §7.8); delete-vs-modify restated under the stamp (§7.6); I7 added (§14.1).
+> Draft 17 · 23 September 2026 · Status: **for review** · Changes from draft 16: the stamp rule generalised to every version an increment dominates, covering `deny` (§7.1).
+>
+> Changes from draft 16: the `stamp`, a Lamport timestamp seeded by mtime, is the first key of the winner rule, because the simulator disproved draft 15's claim that one total order was enough (§7.1, §7.6, §7.8); delete-vs-modify restated under the stamp (§7.6); I7 added (§14.1).
 >
 > Changes from draft 15: the scan fast path compares the exec bit (§7.3); one total order for every concurrent pair, identical content included, with the argument for why the merged version is then a function of its vector (§7.2, §7.6).
 >
@@ -216,7 +218,7 @@ Per folder, one record per entry the machine knows about, including deleted ones
 | `exec` | bool; the only permission bit synced |
 | `hash` | BLAKE3 of content (files), of the target string (symlinks); the all-zero sentinel `EMPTY` for directories and tombstones. `EMPTY` is never the hash of a file (BLAKE3 of empty input is not all zeros) |
 | `prev_hash` | The `hash` of the version this one replaced, as it was when the change was made; `EMPTY` if the path did not exist. Set by the author, carried with the entry. A version whose `hash == prev_hash` is a **metadata-only change** (a touch). Used by the conflict rule (§7.6) and the brake (§8.1) |
-| `stamp` | A Lamport timestamp seeded by the modification time, in nanoseconds. For a content change: `max(mtime_ns, stamp of the record being replaced + 1)`; for a metadata-only change, a tombstone, a directory or a symlink: `stamp of the record being replaced + 1`; for a path with no record: `mtime_ns` (or 1 when the kind has none). Set by the author, carried with the entry; a merged record inherits the winner's. Strictly increasing along every machine's chain of versions for a path, which is what makes the winner rule (§7.6) converge. Never compared to a clock |
+| `stamp` | A Lamport timestamp seeded by the modification time, in nanoseconds. For a content change: `max(mtime_ns, stamp of the record being replaced + 1)`; for a metadata-only change, a tombstone, a directory or a symlink: `stamp of the record being replaced + 1`; for a path with no record: `mtime_ns` (or 1 when the kind has none). The general rule, of which those are the common cases: **an increment stamps at least one above every version its vector dominates** that the machine knows of. For an ordinary local change that is the replaced record, whose stamp already bounds its causal past; for `deny`'s bump (§8.2), which folds quarantined versions from outside this machine's chain into its vector, it is the larger of the local record's stamp and the largest quarantined stamp for the path. Set by the author, carried with the entry; a merged record inherits the winner's. Strictly increasing along every machine's chain of versions for a path, which is what makes the winner rule (§7.6) converge. Never compared to a clock |
 | `version` | version vector (§7.2) |
 | `deleted` | bool — this record is a tombstone |
 | `modified_by` | node ID that produced this version |
