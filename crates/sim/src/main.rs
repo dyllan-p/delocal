@@ -2,16 +2,21 @@
 //!
 //! ```text
 //! delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P]
-//!             [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N]
+//!             [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N] [--keep-going]
 //! ```
 //!
 //! On the first failing seed the step list is delta-debugged down to a
 //! minimal list that still fails, and the report (seed, knobs, steps, the
-//! invariant and its counterexample) is printed. Exit status 1 on failure.
+//! invariant and its counterexample) is printed. With `--keep-going` the
+//! sweep runs every seed instead, shrinks nothing, and ends with the failing
+//! seeds grouped by invariant and a pass/fail count: what CI's advisory
+//! sweep prints while the random sweep is still red (§14.1). Exit status 1
+//! on any failure either way.
 
 // The binary may not unwrap or expect either (CLAUDE.md); errors go to stderr.
 // Failure is large by design; see lib.rs.
 #![allow(clippy::result_large_err)]
+use std::collections::BTreeMap;
 use std::process::ExitCode;
 
 use delocal_sim::{Failure, Knobs, Step, run_twice, steps};
@@ -21,6 +26,7 @@ struct Args {
     start: u64,
     steps: usize,
     knobs: Knobs,
+    keep_going: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -29,6 +35,7 @@ fn parse_args() -> Result<Args, String> {
         start: 0,
         steps: 400,
         knobs: Knobs::default(),
+        keep_going: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -64,8 +71,9 @@ fn parse_args() -> Result<Args, String> {
                     hi.parse().map_err(|e| format!("--delay-ms: {e}"))?,
                 );
             }
+            "--keep-going" => args.keep_going = true,
             "--help" | "-h" => {
-                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N]".to_owned());
+                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N] [--keep-going]".to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -122,6 +130,8 @@ fn main() -> ExitCode {
     );
     let started = std::time::Instant::now();
     let mut totals = delocal_sim::sim::Stats::default();
+    // Failing seeds by invariant, for the --keep-going summary.
+    let mut failed: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for (i, seed) in (args.start..args.start + args.seeds).enumerate() {
         let list = steps::generate(seed, &args.knobs, args.steps);
         match run_twice(seed, &args.knobs, &list) {
@@ -144,6 +154,13 @@ fn main() -> ExitCode {
                     println!("  {} seeds ok ({:.0?})", i + 1, started.elapsed());
                 }
             }
+            Err(first) if args.keep_going => {
+                println!("seed {seed} failed ({}): {}", first.invariant, first.detail);
+                failed
+                    .entry(first.invariant.clone())
+                    .or_default()
+                    .push(seed);
+            }
             Err(first) => {
                 println!(
                     "seed {seed} failed ({}); shrinking {} steps...",
@@ -160,11 +177,34 @@ fn main() -> ExitCode {
             }
         }
     }
+    let failures: u64 = failed.values().map(|v| v.len() as u64).sum();
+    if failures == 0 {
+        println!(
+            "all {} seeds passed in {:.0?}: {:?}",
+            args.seeds,
+            started.elapsed(),
+            totals
+        );
+        return ExitCode::SUCCESS;
+    }
     println!(
-        "all {} seeds passed in {:.0?}: {:?}",
+        "{} of {} seeds passed in {:.0?}; {failures} failed:",
+        args.seeds - failures,
         args.seeds,
-        started.elapsed(),
-        totals
+        started.elapsed()
     );
-    ExitCode::SUCCESS
+    for (invariant, seeds) in &failed {
+        let shown: Vec<String> = seeds.iter().take(20).map(u64::to_string).collect();
+        let more = if seeds.len() > 20 { ", ..." } else { "" };
+        println!(
+            "  {:>4}  {invariant}: seeds {}{more}",
+            seeds.len(),
+            shown.join(" ")
+        );
+    }
+    println!(
+        "reproduce one: delocal-sim --seeds 1 --start <seed> --steps {} {}",
+        args.steps, args.knobs
+    );
+    ExitCode::from(1)
 }
