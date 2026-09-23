@@ -526,7 +526,7 @@ impl FolderState {
             self.touched(now);
             self.reclassify_want(now, &path);
         }
-        self.reconsider(now, &path, None);
+        self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
         Scanned {
             change,
             status: None,
@@ -662,17 +662,18 @@ impl FolderState {
         }
     }
 
-    /// Re-classify the deferred entries at `path` against the index as it
-    /// now stands, in arrival order; only those with `reason` if given.
-    /// Each becomes a want (an `Apply`, possibly a conflict's `M`) or is
-    /// dropped if the index has caught up with it.
-    fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: Option<DeferredReason>) {
+    /// Re-classify the deferred entries at `path` that wait for `reason`,
+    /// against the index as it now stands, in arrival order. Each becomes
+    /// a want (an `Apply`, possibly a conflict's `M`) or is dropped if the
+    /// index has caught up with it. Observations and commits re-evaluate
+    /// `ChangedUnderneath` entries only: a `Frozen` entry waits for the
+    /// folder to unpause (§8.1), however often its path is scanned meanwhile.
+    fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: DeferredReason) {
         let Some(list) = self.deferred.remove(path) else {
             return;
         };
-        let (take, keep): (Vec<Deferred>, Vec<Deferred>) = list
-            .into_iter()
-            .partition(|d| reason.is_none_or(|r| d.reason == r));
+        let (take, keep): (Vec<Deferred>, Vec<Deferred>) =
+            list.into_iter().partition(|d| d.reason == reason);
         if !keep.is_empty() {
             self.deferred.insert(path.clone(), keep);
         }
@@ -765,7 +766,7 @@ impl FolderState {
             }
             // A deferred entry whose file vanished underneath is only ever
             // caught here: later scans never report a tombstoned path.
-            self.reconsider(now, path, None);
+            self.reconsider(now, path, DeferredReason::ChangedUnderneath);
         }
         if !changes.is_empty() {
             self.touched(now);
@@ -1296,7 +1297,7 @@ impl FolderState {
                 WantStep::Adopt(entry) => {
                     let path = entry.path.clone();
                     adopted.push(self.adopt(now, entry));
-                    self.reconsider(now, &path, None);
+                    self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
                 }
             }
         }
@@ -1337,7 +1338,7 @@ impl FolderState {
                     self.touched(now);
                     written.push(change.record);
                 }
-                self.reconsider(now, path, None);
+                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
                 written
             }
             ApplyOutcome::ChangedUnderneath => {
@@ -2241,6 +2242,36 @@ mod tests {
             other => panic!("expected a release, got {other:?}"),
         }
         assert_eq!(b.wants().len(), 8);
+    }
+
+    #[test]
+    fn frozen_entries_wait_for_unpause_through_scans_and_commits() {
+        // B edits eight files and pauses. A's edit of f00 arrives frozen.
+        // Scans of f00, a full scan bracket and a commit elsewhere must not
+        // thaw it: only the unpause does (§8.1).
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..8 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), file(2, 20));
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        a.scanned(t(13.0), p("f00"), file(3, 30));
+        let batch = a.form_batches(t(15.0), bid(6)).remove(0);
+        assert_eq!(b.receive(t(15.0), &batch).frozen, 1);
+
+        b.scanned(t(16.0), p("f00"), ScanState::Unchanged);
+        b.scan_started();
+        for i in 0..10 {
+            b.scanned(t(17.0), p(&format!("f{i:02}")), ScanState::Unchanged);
+        }
+        assert!(b.scan_finished(t(18.0)).unwrap().is_empty());
+        let frozen: Vec<&Deferred> = b.deferred().collect();
+        assert_eq!(frozen.len(), 1, "still frozen after the scans");
+        assert_eq!(frozen[0].reason, DeferredReason::Frozen);
+        assert!(b.wants().is_empty(), "nothing wanted while paused");
+
+        assert!(matches!(b.approve(t(20.0), bid(5)), Approved::Sent(_)));
+        assert!(b.deferred().next().is_none(), "the unpause thaws it");
+        assert_eq!(b.wants().len(), 1, "one conflict, wanted");
     }
 
     #[test]
