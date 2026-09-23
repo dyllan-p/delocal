@@ -3087,7 +3087,10 @@ mod tests {
                 if let Some(w) = want {
                     prop_assert!(!w.in_flight(), "nothing left in flight when the host has answered everything");
                     match w.state {
-                        WantState::NoSource => prop_assert!(a_tier.is_none() || w.excluded.contains(&node(1))),
+                        WantState::NoSource => prop_assert!(
+                            a_tier.is_none() || !w.sources.contains(&node(1)) || w.excluded.contains(&node(1)),
+                            "no source only when the announcer moved on or served bad content"
+                        ),
                         WantState::Deferred { need } => {
                             let tier = a_tier.unwrap();
                             prop_assert!(!tier.allows(&rules, e.size));
