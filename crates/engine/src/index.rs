@@ -102,6 +102,9 @@ pub struct Index {
     /// Local changes not yet announced. The value is whether peers last saw
     /// a live entry at the path, which fixes the change's kind.
     pending: BTreeMap<RelPath, bool>,
+    /// `seq` of the newest record in the last batch this machine formed
+    /// (§7.4). Records above it, local or adopted, go in the next batch.
+    announced_seq: u64,
 }
 
 impl Index {
@@ -114,6 +117,7 @@ impl Index {
             seq: 0,
             peer_seq: BTreeMap::new(),
             pending: BTreeMap::new(),
+            announced_seq: 0,
         }
     }
 
@@ -196,10 +200,39 @@ impl Index {
         self.pending.len()
     }
 
-    /// Every pending change has been announced (the batch was sent). Later
-    /// changes to those paths start a new step from the announced version.
+    /// The coalesced kind of the pending local change at `path`, if any.
+    pub fn pending_kind(&self, path: &RelPath) -> Option<ChangeKind> {
+        let announced_live = *self.pending.get(path)?;
+        let record = self.records.get(path)?;
+        Some(ChangeKind::between(announced_live, !record.entry.deleted))
+    }
+
+    /// `seq` of the newest record already announced in a batch (§7.4).
+    pub fn announced_seq(&self) -> u64 {
+        self.announced_seq
+    }
+
+    /// Every record written since the last batch, in `seq` order, with the
+    /// coalesced kind for local changes and `None` for adopted records
+    /// (§7.4 "adopted records are announced too"). What the next batch
+    /// carries.
+    pub fn unannounced(&self) -> Vec<(&IndexRecord, Option<ChangeKind>)> {
+        let mut out: Vec<_> = self
+            .records
+            .iter()
+            .filter(|(_, r)| r.seq > self.announced_seq)
+            .map(|(path, r)| (r, self.pending_kind(path)))
+            .collect();
+        out.sort_by_key(|(r, _)| r.seq);
+        out
+    }
+
+    /// Everything written so far has been announced (the batch was formed).
+    /// Later changes start a new step from the announced version, and the
+    /// next batch starts above the current `seq`.
     pub fn mark_announced(&mut self) {
         self.pending.clear();
+        self.announced_seq = self.seq;
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -628,6 +661,37 @@ mod tests {
         idx.set_peer_seq(node(2), 5);
         idx.set_peer_seq(node(2), 3);
         assert_eq!(idx.peer_seq(node(2)), 5, "never moves backwards");
+    }
+
+    #[test]
+    fn unannounced_is_in_seq_order_and_marks_adopted_records() {
+        let mut idx = index();
+        idx.observe(p("b"), file(1, 1)).unwrap(); // seq 1
+        idx.observe(p("a"), file(2, 2)).unwrap(); // seq 2
+        idx.mark_announced();
+        assert_eq!(idx.announced_seq(), 2);
+        assert!(idx.unannounced().is_empty());
+        idx.observe(p("z"), file(3, 3)).unwrap(); // seq 3, local add
+        idx.adopt(remote("m", 9, Version::empty().incremented(node(2)))); // seq 4
+        idx.observe(p("b"), file(4, 4)).unwrap(); // seq 5, local modify
+        let got: Vec<_> = idx
+            .unannounced()
+            .into_iter()
+            .map(|(r, k)| (r.entry.path.as_str().to_owned(), r.seq, k))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("z".to_owned(), 3, Some(ChangeKind::Add)),
+                ("m".to_owned(), 4, None),
+                ("b".to_owned(), 5, Some(ChangeKind::Modify)),
+            ]
+        );
+        assert_eq!(idx.pending_kind(&p("b")), Some(ChangeKind::Modify));
+        assert_eq!(idx.pending_kind(&p("m")), None);
+        idx.mark_announced();
+        assert_eq!(idx.announced_seq(), 5);
+        assert_eq!(idx.pending_count(), 0);
     }
 
     #[test]
