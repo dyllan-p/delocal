@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{ApplySet, Batch, BatchDecision, BatchRole, Decision};
 use crate::entry::{ContentHash, Entry};
-use crate::folder::{ApplyOutcome, FolderState, FolderStatus, ScanState};
+use crate::folder::{ApplyOutcome, Approved, FolderState, FolderStatus, ScanState, Ticked};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
 use crate::path::RelPath;
@@ -301,7 +301,11 @@ impl Engine {
                 }
             }
             Event::RulesChanged { folder, rules } => match self.folders.get_mut(&folder) {
-                Some(f) => f.set_rules(rules),
+                Some(f) => out.extend(
+                    f.rules_changed(rules)
+                        .into_iter()
+                        .map(|status| Action::StatusChanged { folder, status }),
+                ),
                 None => out.push(unknown_folder(folder)),
             },
             Event::Scanned {
@@ -360,7 +364,7 @@ impl Engine {
             Event::PeerDisconnected { peer } => {
                 self.peers.remove(&peer);
             }
-            Event::BatchReceived { from, batch } => self.receive(from, batch, &mut out),
+            Event::BatchReceived { from, batch } => self.receive(now, from, batch, &mut out),
             Event::DecisionReceived { from, decision } => {
                 match self.folders.get_mut(&decision.folder) {
                     Some(f) => f.acknowledged(from, decision.seq_high),
@@ -382,8 +386,74 @@ impl Engine {
             },
             // PR 6: fetch results feed the want-list.
             Event::Fetched { .. } => {}
-            // PR 5: approve, deny and revert.
-            Event::Approve { .. } | Event::Deny { .. } | Event::Revert { .. } => {}
+            Event::Approve { folder, batch } => match self.folders.get_mut(&folder) {
+                Some(f) => match f.approve(now, batch) {
+                    Approved::Released(set) => out.push(Action::StatusChanged {
+                        folder,
+                        status: FolderStatus::Released {
+                            batch,
+                            items: set.map_or(0, |s| s.items.len()),
+                        },
+                    }),
+                    Approved::Sent(batches) => {
+                        self.send_batches(folder, batches, &mut out);
+                        out.push(Action::StatusChanged {
+                            folder,
+                            status: FolderStatus::Unpaused { batch },
+                        });
+                    }
+                    Approved::Unknown => out.push(Action::StatusChanged {
+                        folder,
+                        status: FolderStatus::UnknownBatch { batch },
+                    }),
+                },
+                None => out.push(unknown_folder(folder)),
+            },
+            Event::Deny { folder, batch } => match self.folders.get_mut(&folder) {
+                Some(f) => match f.deny(now, batch) {
+                    Some(changes) => {
+                        let paths = changes.len();
+                        out.extend(changes.into_iter().map(|c| Action::IndexChanged {
+                            folder,
+                            record: c.record,
+                        }));
+                        out.push(Action::StatusChanged {
+                            folder,
+                            status: FolderStatus::Denied { batch, paths },
+                        });
+                    }
+                    None => out.push(Action::StatusChanged {
+                        folder,
+                        status: FolderStatus::UnknownBatch { batch },
+                    }),
+                },
+                None => out.push(unknown_folder(folder)),
+            },
+            Event::Revert { folder } => match self.folders.get_mut(&folder) {
+                Some(f) => match f.revert(now) {
+                    Some(reverted) => {
+                        for path in &reverted.trash {
+                            out.push(Action::MoveToTrash {
+                                folder,
+                                path: path.clone(),
+                            });
+                        }
+                        out.push(Action::StatusChanged {
+                            folder,
+                            status: FolderStatus::Reverted {
+                                batch: reverted.batch,
+                                trashed: reverted.trash.len(),
+                                refetch: reverted.refetch,
+                            },
+                        });
+                    }
+                    None => out.push(Action::StatusChanged {
+                        folder,
+                        status: FolderStatus::NotPaused,
+                    }),
+                },
+                None => out.push(unknown_folder(folder)),
+            },
         }
         self.schedule(&mut out);
         out
@@ -397,40 +467,72 @@ impl Engine {
     fn tick(&mut self, now: Timestamp, fresh: BatchId, out: &mut Vec<Action>) {
         self.woke.clear();
         let mut used: u128 = 0;
-        for folder in self.folders.values_mut() {
-            if !folder.is_due(now) {
+        let ids: Vec<FolderId> = self.folders.keys().copied().collect();
+        for id in ids {
+            let Some(folder) = self.folders.get_mut(&id) else {
                 continue;
-            }
-            let batches = folder.form_batches(now, fresh.successor(used));
-            used += batches.len() as u128;
-            let recipients: Vec<NodeId> = folder
-                .members()
-                .filter(|m| *m != self.config.node_id && self.peers.contains_key(m))
-                .collect();
-            for batch in batches {
-                for to in &recipients {
-                    out.push(Action::Send {
-                        to: *to,
-                        payload: Outbound::Batch(batch.clone()),
-                    });
+            };
+            match folder.tick(now, fresh.successor(used)) {
+                Ticked::Nothing => {}
+                Ticked::Sent(batches) => {
+                    used += batches.len() as u128;
+                    self.send_batches(id, batches, out);
                 }
-                out.push(Action::RecordBatch {
-                    batch,
-                    role: BatchRole::Sent,
-                    decision: None,
-                });
+                Ticked::Paused {
+                    first,
+                    snapshot,
+                    status,
+                } => {
+                    if first {
+                        // The reserved id is spent even though nothing was sent.
+                        used += 1;
+                        for batch in snapshot {
+                            out.push(Action::RecordBatch {
+                                batch,
+                                role: BatchRole::Paused,
+                                decision: None,
+                            });
+                        }
+                    }
+                    out.push(Action::StatusChanged { folder: id, status });
+                }
             }
         }
     }
 
-    /// A batch arrived: apply set, decision, history (§7.4). The brake (PR 5)
-    /// will decide between `Accepted` and `Held` here.
-    fn receive(&mut self, from: NodeId, batch: Batch, out: &mut Vec<Action>) {
+    /// Send formed batches to every connected member and record them.
+    fn send_batches(&self, folder: FolderId, batches: Vec<Batch>, out: &mut Vec<Action>) {
+        let Some(state) = self.folders.get(&folder) else {
+            return;
+        };
+        let recipients: Vec<NodeId> = state
+            .members()
+            .filter(|m| *m != self.config.node_id && self.peers.contains_key(m))
+            .collect();
+        for batch in batches {
+            for to in &recipients {
+                out.push(Action::Send {
+                    to: *to,
+                    payload: Outbound::Batch(batch.clone()),
+                });
+            }
+            out.push(Action::RecordBatch {
+                batch,
+                role: BatchRole::Sent,
+                decision: None,
+            });
+        }
+    }
+
+    /// A batch arrived: apply set, quarantine, brake, decision, history
+    /// (§7.4, §8.1, §8.2).
+    fn receive(&mut self, now: Timestamp, from: NodeId, batch: Batch, out: &mut Vec<Action>) {
         let Some(folder) = self.folders.get_mut(&batch.folder) else {
             out.push(unknown_folder(batch.folder));
             return;
         };
-        let set: ApplySet = folder.receive(&batch);
+        let received = folder.receive(now, &batch);
+        let set: &ApplySet = &received.set;
         if set.fallbacks > 0 {
             out.push(Action::StatusChanged {
                 folder: batch.folder,
@@ -448,7 +550,28 @@ impl Engine {
                 },
             });
         }
-        let decision = Decision::Accepted;
+        if received.joined > 0 {
+            out.push(Action::StatusChanged {
+                folder: batch.folder,
+                status: FolderStatus::JoinedHeld {
+                    batch: batch.id,
+                    count: received.joined,
+                },
+            });
+        }
+        if let Some(reason) = received.held {
+            out.push(Action::StatusChanged {
+                folder: batch.folder,
+                status: FolderStatus::Held {
+                    batch: batch.id,
+                    source: batch.source,
+                    reason,
+                    summary: received.summary,
+                    paths: set.items.len(),
+                },
+            });
+        }
+        let decision = received.decision;
         out.push(Action::Send {
             to: from,
             payload: Outbound::Decision(BatchDecision {
@@ -492,6 +615,9 @@ fn unknown_folder(folder: FolderId) -> Action {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
+
+    use crate::batch::Summary;
     use std::collections::BTreeMap;
 
     use super::*;
@@ -1022,6 +1148,386 @@ mod tests {
         );
     }
 
+    fn tight() -> Rules {
+        Rules {
+            hold_count: 3,
+            hold_pct: 25,
+            hold_size: 1_000,
+            ..Rules::default()
+        }
+    }
+
+    fn join_with(e: &mut Engine, rules: Rules, members: &[u8]) {
+        e.handle(
+            t(0.0),
+            Event::FolderJoined {
+                folder: folder(),
+                rules,
+                members: members.iter().map(|i| node(*i)).collect(),
+            },
+        );
+    }
+
+    /// A and B connected, both with tight rules, both holding ten files A made.
+    fn two_with_ten_files() -> BTreeMap<NodeId, Engine> {
+        let mut a = engine(1, "alpha");
+        let mut b = engine(2, "bravo");
+        join_with(&mut a, tight(), &[1, 2]);
+        join_with(&mut b, tight(), &[1, 2]);
+        connect(&mut a, &mut b);
+        for i in 0..10 {
+            a.handle(
+                t(1.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: file(1, 1),
+                },
+            );
+        }
+        let out = a.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        let mut engines = BTreeMap::from([(node(1), a), (node(2), b)]);
+        deliver(t(3.0), node(1), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        let items: Vec<(RelPath, Version)> = b
+            .folder(folder())
+            .unwrap()
+            .accepted()
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .map(|i| (i.path().clone(), i.incoming().version.clone()))
+            .collect();
+        for (path, version) in items {
+            b.handle(
+                t(4.0),
+                Event::Applied {
+                    folder: folder(),
+                    path,
+                    version,
+                    outcome: ApplyOutcome::Ok,
+                },
+            );
+        }
+        let out = b.handle(
+            t(6.0),
+            Event::Tick {
+                fresh_batch_id: fresh(2),
+            },
+        );
+        deliver(t(6.0), node(2), out, &mut engines);
+        engines
+    }
+
+    fn statuses(actions: &[Action]) -> Vec<&FolderStatus> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::StatusChanged { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mass_delete_pauses_the_sender_until_approve() {
+        let mut engines = two_with_ten_files();
+        let b = engines.get_mut(&node(2)).unwrap();
+        for i in 0..8 {
+            b.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        let out = b.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        assert!(sends(&out).is_empty(), "nothing leaves");
+        assert!(matches!(
+            out[0],
+            Action::RecordBatch {
+                role: BatchRole::Paused,
+                decision: None,
+                ..
+            }
+        ));
+        assert!(
+            matches!(statuses(&out)[0], FolderStatus::Paused { batch, .. } if *batch == fresh(3))
+        );
+        // Later changes and ticks: still nothing leaves.
+        b.handle(
+            t(13.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("f09"),
+                state: file(2, 2),
+            },
+        );
+        let out = b.handle(
+            t(15.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        assert!(sends(&out).is_empty());
+        assert!(
+            matches!(statuses(&out)[0], FolderStatus::PausedRecheck { batch, would_pass: false, .. } if *batch == fresh(3))
+        );
+        assert!(
+            b.handle(
+                t(16.0),
+                Event::Approve {
+                    folder: folder(),
+                    batch: fresh(9)
+                }
+            )
+            .iter()
+            .any(|a| matches!(
+                a,
+                Action::StatusChanged {
+                    status: FolderStatus::UnknownBatch { .. },
+                    ..
+                }
+            ))
+        );
+        let out = b.handle(
+            t(16.0),
+            Event::Approve {
+                folder: folder(),
+                batch: fresh(3),
+            },
+        );
+        let Outbound::Batch(batch) = sends(&out)[0].1.clone() else {
+            panic!()
+        };
+        assert_eq!(batch.id, fresh(3), "sent under the reserved id");
+        assert_eq!((batch.summary.dels, batch.summary.mods), (8, 1));
+        assert!(matches!(
+            out.last(),
+            Some(Action::StatusChanged {
+                status: FolderStatus::Unpaused { .. },
+                ..
+            })
+        ));
+        // A holds it: 9 destructive of 10 tracked.
+        let rest = deliver(t(16.0), node(2), out, &mut engines);
+        assert!(rest.iter().any(|(who, a)| *who == node(1)
+            && matches!(
+                a,
+                Action::StatusChanged {
+                    status: FolderStatus::Held { .. },
+                    ..
+                }
+            )));
+        assert!(rest.iter().any(|(who, a)| *who == node(1)
+            && matches!(
+                a,
+                Action::RecordBatch {
+                    role: BatchRole::Received,
+                    decision: Some(Decision::Held { .. }),
+                    ..
+                }
+            )));
+        assert!(
+            engines[&node(1)]
+                .folder(folder())
+                .unwrap()
+                .accepted()
+                .is_empty()
+        );
+        assert_eq!(
+            engines[&node(2)]
+                .folder(folder())
+                .unwrap()
+                .acked_by(node(1)),
+            batch.seq_high,
+            "held acknowledges"
+        );
+    }
+
+    #[test]
+    fn revert_emits_trash_moves_and_refetches() {
+        let mut engines = two_with_ten_files();
+        let b = engines.get_mut(&node(2)).unwrap();
+        for i in 0..8 {
+            b.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        b.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("junk"),
+                state: file(6, 6),
+            },
+        );
+        let out = b.handle(t(11.0), Event::Revert { folder: folder() });
+        assert_eq!(
+            out,
+            [Action::StatusChanged {
+                folder: folder(),
+                status: FolderStatus::NotPaused
+            }],
+            "the wake for 12 s was already announced after the scans"
+        );
+        b.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        let out = b.handle(t(13.0), Event::Revert { folder: folder() });
+        assert_eq!(
+            out[0],
+            Action::MoveToTrash {
+                folder: folder(),
+                path: p("junk")
+            }
+        );
+        assert_eq!(
+            out[1],
+            Action::StatusChanged {
+                folder: folder(),
+                status: FolderStatus::Reverted {
+                    batch: fresh(3),
+                    trashed: 1,
+                    refetch: 8
+                }
+            }
+        );
+        assert_eq!(out.len(), 2, "no wake: nothing pending");
+        let f = b.folder(folder()).unwrap();
+        assert_eq!(f.index().tracked_count(), 10);
+        assert_eq!(f.index().pending_count(), 0);
+        assert!(f.in_flight(&p("f00")));
+        let out = b.handle(
+            t(15.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        assert!(sends(&out).is_empty(), "nothing to announce after revert");
+    }
+
+    #[test]
+    fn deny_sends_bumps_and_rule_changes_only_report() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        for i in 0..8 {
+            a.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        assert!(sends(&out).is_empty(), "A's own pre-check pauses it first");
+        let out = a.handle(
+            t(12.0),
+            Event::Approve {
+                folder: folder(),
+                batch: fresh(3),
+            },
+        );
+        assert_eq!(sends(&out).len(), 1, "approved: sent under the reserved id");
+        let rest = deliver(t(12.0), node(1), out, &mut engines);
+        assert!(rest.iter().any(|(who, a)| *who == node(2) && matches!(a, Action::StatusChanged { status: FolderStatus::Held { batch, paths: 8, .. }, .. } if *batch == fresh(3))));
+        let b = engines.get_mut(&node(2)).unwrap();
+        let out = b.handle(
+            t(13.0),
+            Event::RulesChanged {
+                folder: folder(),
+                rules: Rules {
+                    hold_count: 0,
+                    ..Rules::default()
+                },
+            },
+        );
+        assert_eq!(
+            out,
+            [Action::StatusChanged {
+                folder: folder(),
+                status: FolderStatus::RulesRecheck {
+                    batch: fresh(3),
+                    would_pass: true
+                }
+            }]
+        );
+        assert_eq!(
+            b.folder(folder()).unwrap().quarantine().len(),
+            1,
+            "reported, not released"
+        );
+        let out = b.handle(
+            t(14.0),
+            Event::Deny {
+                folder: folder(),
+                batch: fresh(3),
+            },
+        );
+        assert_eq!(
+            out.iter()
+                .filter(|a| matches!(a, Action::IndexChanged { .. }))
+                .count(),
+            8
+        );
+        assert!(out.iter().any(|a| matches!(
+            a,
+            Action::StatusChanged {
+                status: FolderStatus::Denied { paths: 8, .. },
+                ..
+            }
+        )));
+        assert_eq!(out.last(), Some(&Action::WakeAt(t(16.0))));
+        let out = b.handle(
+            t(16.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        let Outbound::Batch(batch) = sends(&out)[0].1.clone() else {
+            panic!()
+        };
+        assert_eq!(batch.entries.len(), 8);
+        assert_eq!(batch.summary, Summary::default(), "touches");
+        let rest = deliver(t(16.0), node(2), out, &mut engines);
+        assert!(!rest.iter().any(|(_, a)| matches!(
+            a,
+            Action::StatusChanged {
+                status: FolderStatus::Held { .. },
+                ..
+            }
+        )));
+        let a = engines[&node(1)].folder(folder()).unwrap();
+        assert_eq!(a.accepted().len(), 1);
+        assert_eq!(a.accepted()[0].items.len(), 8, "A fetches its files back");
+    }
+
     #[test]
     fn scan_bracket_events_flow_through_the_engine() {
         let mut e = engine(1, "a");
@@ -1418,5 +1924,38 @@ mod tests {
         };
         let json = serde_json::to_string(&act).unwrap();
         assert_eq!(serde_json::from_str::<Action>(&json).unwrap(), act);
+    }
+
+    proptest! {
+        /// §8.1: once paused, no batch leaves the folder whatever local
+        /// changes or ticks follow, until Approve.
+        #[test]
+        fn a_paused_folder_never_sends_until_approve(
+            steps in prop::collection::vec((0u8..12, 0u8..3, any::<bool>(), any::<bool>()), 1..20),
+        ) {
+            let mut engines = two_with_ten_files();
+            let b = engines.get_mut(&node(2)).unwrap();
+            for i in 0..8 {
+                b.handle(t(10.0), Event::Scanned { folder: folder(), path: p(&format!("f{i:02}")), state: ScanState::Absent });
+            }
+            let out = b.handle(t(12.0), Event::Tick { fresh_batch_id: fresh(3) });
+            prop_assert!(sends(&out).is_empty());
+            let mut now = t(12.0);
+            for (k, (i, h, gone, tick)) in steps.into_iter().enumerate() {
+                now = now.plus_nanos(1_500_000_000);
+                let path = p(&format!("f{:02}", i));
+                let state = if gone { ScanState::Absent } else { file(h + 1, k as i64 + 20) };
+                let out = b.handle(now, Event::Scanned { folder: folder(), path, state });
+                prop_assert!(sends(&out).is_empty());
+                if tick {
+                    let out = b.handle(now.plus_nanos(12_000_000_000), Event::Tick { fresh_batch_id: fresh(100 + k as u8) });
+                    prop_assert!(sends(&out).is_empty(), "{out:?}");
+                    now = now.plus_nanos(12_000_000_000);
+                }
+            }
+            prop_assert!(b.folder(folder()).unwrap().paused().is_some());
+            let out = b.handle(now.plus_nanos(1), Event::Approve { folder: folder(), batch: fresh(3) });
+            prop_assert_eq!(sends(&out).len(), 1);
+        }
     }
 }

@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc ff7f813ed3607869185d071bb769fe9f1e96fa40bcb582357f3a8f0d63bafd8b # shrinks to l_hash = 0, w_hash = 0, l_mtime = 0, w_mtime = 0, l_exec = false, w_exec = false
+cc 3d18e22426c4a7aaf972cc5d8a2ac461c152bcb0a659f99a419320588245dcfa # shrinks to n = 10, steps = [(0, 0, false)], hold_count = 1, hold_pct = 0, hold_size = 0
