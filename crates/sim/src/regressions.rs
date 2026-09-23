@@ -3159,3 +3159,103 @@ fn a_reissued_vector_replaces_the_discarded_record_whatever_its_content() {
         ],
     );
 }
+
+/// A symlink retargeted under a dropped watcher event was invisible to every
+/// later scan: the fast path matched symlinks by kind alone. The source kept
+/// announcing the old target's hash and served the new target's bytes, so
+/// receivers mismatched twice and gave up. The fast path compares the
+/// target now (§7.3).
+#[test]
+fn a_retargeted_symlink_the_watcher_missed_is_found_by_the_next_scan() {
+    passes(
+        90,
+        &[
+            Step::Create {
+                node: 3,
+                path: 9,
+                content: 2,
+            },
+            Step::MassModify {
+                node: 5,
+                fraction: 73,
+                content: 5,
+            },
+            Step::Delete { node: 3, path: 9 },
+            Step::Partition { a: 1, b: 6 },
+            Step::Everywhere {
+                path: 0,
+                contents: vec![Some(4), Some(5), None],
+            },
+            Step::Crash {
+                node: 3,
+                gap_secs: 46,
+            },
+            Step::Mkdir { node: 2, dir: 0 },
+            Step::Modify {
+                node: 2,
+                path: 7,
+                content: 3,
+            },
+            Step::Crash {
+                node: 1,
+                gap_secs: 81,
+            },
+            Step::Crash {
+                node: 6,
+                gap_secs: 82,
+            },
+            Step::Offline { node: 2 },
+            Step::Crash {
+                node: 1,
+                gap_secs: 29,
+            },
+            Step::Modify {
+                node: 7,
+                path: 9,
+                content: 4,
+            },
+            Step::Delete { node: 1, path: 5 },
+            Step::Delete { node: 0, path: 6 },
+            Step::Delete { node: 1, path: 7 },
+            Step::Settle { secs: 17 },
+            Step::Create {
+                node: 7,
+                path: 4,
+                content: 2,
+            },
+            Step::Touch { node: 5, path: 3 },
+            Step::Settle { secs: 14 },
+            Step::Tier {
+                a: 7,
+                b: 1,
+                tier: 2,
+            },
+            Step::Mkdir { node: 6, dir: 2 },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 10,
+            },
+            Step::Symlink {
+                node: 2,
+                path: 1,
+                target: 2,
+            },
+            Step::Create {
+                node: 4,
+                path: 2,
+                content: 3,
+            },
+            Step::Create {
+                node: 1,
+                path: 6,
+                content: 3,
+            },
+            Step::Symlink {
+                node: 2,
+                path: 1,
+                target: 11,
+            },
+        ],
+    );
+}

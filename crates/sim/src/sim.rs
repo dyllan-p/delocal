@@ -1615,14 +1615,11 @@ impl Sim {
             .map(|(path, file)| {
                 // The §7.3 fast path, the same test a real scanner applies to
                 // what stat returns.
-                let fast = node.persisted.records.get(path).is_some_and(|r| {
-                    r.entry.unchanged_by_stat(
-                        file.kind,
-                        file.content.len() as u64,
-                        file.mtime_ns,
-                        file.exec,
-                    )
-                });
+                let fast = node
+                    .persisted
+                    .records
+                    .get(path)
+                    .is_some_and(|r| r.entry.unchanged_by_stat(&file.observed()));
                 let state = if fast {
                     ScanState::Unchanged
                 } else {

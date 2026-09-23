@@ -126,21 +126,27 @@ impl Entry {
         }
     }
 
-    /// The scan fast path (§7.3): true if what `stat` reports at the path
-    /// means this live entry is unchanged, so the scanner need not hash it.
-    /// A file is unchanged only if kind, size, mtime and the exec bit all
-    /// match; a directory or symlink if its kind matches. The exec bit is
-    /// part of the test because `chmod` changes neither size nor mtime: a
-    /// fast path on those two alone would never notice a `chmod` whose
-    /// watcher event was lost, and the index would disagree with the disk
-    /// forever. A tombstone matches nothing: whatever is on disk is new.
-    pub fn unchanged_by_stat(&self, kind: Kind, size: u64, mtime_ns: i64, exec: bool) -> bool {
-        if self.deleted || self.kind != kind {
+    /// The scan fast path (§7.3): true if what the scanner sees at the path
+    /// without hashing means this live entry is unchanged. A file is
+    /// unchanged only if kind, size, mtime and the exec bit all match (the
+    /// file's `hash` in `seen` is not consulted; the point of the fast path
+    /// is not to compute it); a directory if its kind matches; a symlink
+    /// only if its kind and its target match, the target being its content
+    /// and `readlink` one call, so `seen.hash` is the target's hash. The
+    /// exec bit and the target are in the test because `chmod` and a
+    /// retarget change nothing else the fast path sees: with the watcher
+    /// event lost, the index would disagree with the disk forever. A
+    /// tombstone matches nothing: whatever is on disk is new.
+    pub fn unchanged_by_stat(&self, seen: &Observed) -> bool {
+        if self.deleted || self.kind != seen.kind {
             return false;
         }
-        match kind {
-            Kind::File => self.size == size && self.mtime_ns == mtime_ns && self.exec == exec,
-            Kind::Dir | Kind::Symlink => true,
+        match seen.kind {
+            Kind::File => {
+                self.size == seen.size && self.mtime_ns == seen.mtime_ns && self.exec == seen.exec
+            }
+            Kind::Dir => true,
+            Kind::Symlink => self.hash == seen.hash,
         }
     }
 
@@ -295,36 +301,57 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_path_compares_kind_size_mtime_and_exec() {
+    fn the_fast_path_compares_kind_size_mtime_exec_and_symlink_target() {
         let e = file(1, false);
-        assert!(e.unchanged_by_stat(Kind::File, e.size, e.mtime_ns, false));
+        let seen = |kind, size, mtime_ns, exec, h| Observed {
+            kind,
+            size,
+            mtime_ns,
+            exec,
+            hash: hash(h),
+        };
+        assert!(e.unchanged_by_stat(&seen(Kind::File, e.size, e.mtime_ns, false, 1)));
         assert!(
-            !e.unchanged_by_stat(Kind::File, e.size + 1, e.mtime_ns, false),
+            e.unchanged_by_stat(&seen(Kind::File, e.size, e.mtime_ns, false, 9)),
+            "a file's hash is what the fast path avoids computing"
+        );
+        assert!(
+            !e.unchanged_by_stat(&seen(Kind::File, e.size + 1, e.mtime_ns, false, 1)),
             "size"
         );
         assert!(
-            !e.unchanged_by_stat(Kind::File, e.size, e.mtime_ns + 1, false),
+            !e.unchanged_by_stat(&seen(Kind::File, e.size, e.mtime_ns + 1, false, 1)),
             "mtime"
         );
         assert!(
-            !e.unchanged_by_stat(Kind::File, e.size, e.mtime_ns, true),
+            !e.unchanged_by_stat(&seen(Kind::File, e.size, e.mtime_ns, true, 1)),
             "a chmod is a change"
         );
         assert!(
-            !e.unchanged_by_stat(Kind::Symlink, e.size, e.mtime_ns, false),
+            !e.unchanged_by_stat(&seen(Kind::Symlink, e.size, e.mtime_ns, false, 1)),
             "kind"
         );
         let mut dir = file(1, false);
         dir.kind = Kind::Dir;
         assert!(
-            dir.unchanged_by_stat(Kind::Dir, 4096, 99, true),
+            dir.unchanged_by_stat(&seen(Kind::Dir, 4096, 99, true, 0)),
             "directories match by kind alone"
         );
-        assert!(!dir.unchanged_by_stat(Kind::File, 0, 0, false));
+        assert!(!dir.unchanged_by_stat(&seen(Kind::File, 0, 0, false, 0)));
+        let mut link = file(1, false);
+        link.kind = Kind::Symlink;
+        assert!(
+            link.unchanged_by_stat(&seen(Kind::Symlink, 0, 0, false, 1)),
+            "same target"
+        );
+        assert!(
+            !link.unchanged_by_stat(&seen(Kind::Symlink, 0, 0, false, 2)),
+            "a retarget is a change"
+        );
         let mut dead = file(1, false);
         dead.deleted = true;
         assert!(
-            !dead.unchanged_by_stat(Kind::File, dead.size, dead.mtime_ns, false),
+            !dead.unchanged_by_stat(&seen(Kind::File, dead.size, dead.mtime_ns, false, 1)),
             "a tombstone matches nothing"
         );
     }
