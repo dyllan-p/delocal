@@ -966,19 +966,16 @@ impl Sim {
                             && existing.hash == record.entry.hash
                             && existing.exec == record.entry.exec
                             && existing.deleted == record.entry.deleted;
-                        if !same {
-                            let seen = self
-                                .seen_at
-                                .get(&path)
-                                .and_then(|v| v.iter().find(|(ver, _)| *ver == existing.version))
-                                .map_or(0, |(_, at)| *at);
-                            // The earlier record was discarded by its author's
-                            // revert after it was written: nobody else ever saw
-                            // it, and the vector is free to be reached again,
-                            // by that author's next change or by any merge
-                            // that includes it.
-                            let reissue = self.discarded_since(&existing, seen);
-                            if !reissue {
+                        // The earlier record was discarded by its author's
+                        // revert after it was written: nobody else ever saw
+                        // it, and the vector is free to be reached again, by
+                        // that author's next change or by any merge that
+                        // includes it. The new record replaces it whatever the
+                        // content, so that conflict-copy names (from the
+                        // loser's mtime) are checked against what exists.
+                        let discarded = self.discarded_by_revert(&existing);
+                        if !same || discarded {
+                            if !same && !discarded {
                                 return Err(self.fail(
                                     "I7 version identity",
                                     format!(

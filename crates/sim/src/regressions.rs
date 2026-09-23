@@ -2946,3 +2946,216 @@ fn a_tombstone_a_revert_discarded_is_not_a_deletion() {
         ],
     );
 }
+
+/// A node's first version of a path was discarded by its revert; its next
+/// change re-issued the same vector with the same content but a later
+/// mtime. The version table kept the discarded record (same content, no
+/// I7 clash), so the conflict copy the node later made of the newer record
+/// was named after an mtime the table did not know.
+#[test]
+fn a_reissued_vector_replaces_the_discarded_record_whatever_its_content() {
+    passes(
+        26,
+        &[
+            Step::Touch { node: 6, path: 3 },
+            Step::Tier {
+                a: 7,
+                b: 6,
+                tier: 0,
+            },
+            Step::Create {
+                node: 5,
+                path: 6,
+                content: 5,
+            },
+            Step::Online { node: 3 },
+            Step::Chmod { node: 3, path: 10 },
+            Step::Create {
+                node: 6,
+                path: 5,
+                content: 2,
+            },
+            Step::Create {
+                node: 1,
+                path: 6,
+                content: 1,
+            },
+            Step::Tier {
+                a: 6,
+                b: 5,
+                tier: 0,
+            },
+            Step::Online { node: 1 },
+            Step::Create {
+                node: 6,
+                path: 1,
+                content: 4,
+            },
+            Step::MassModify {
+                node: 3,
+                fraction: 88,
+                content: 3,
+            },
+            Step::Delete { node: 0, path: 10 },
+            Step::Chmod { node: 1, path: 11 },
+            Step::Create {
+                node: 6,
+                path: 1,
+                content: 3,
+            },
+            Step::Online { node: 5 },
+            Step::Rename {
+                node: 0,
+                from: 0,
+                to: 8,
+            },
+            Step::Tier {
+                a: 5,
+                b: 4,
+                tier: 2,
+            },
+            Step::Touch { node: 4, path: 11 },
+            Step::User {
+                node: 0,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 26,
+            },
+            Step::Create {
+                node: 5,
+                path: 4,
+                content: 2,
+            },
+            Step::Delete { node: 1, path: 3 },
+            Step::Everywhere {
+                path: 9,
+                contents: vec![Some(4), None, Some(5), None],
+            },
+            Step::Create {
+                node: 4,
+                path: 11,
+                content: 5,
+            },
+            Step::Create {
+                node: 7,
+                path: 1,
+                content: 1,
+            },
+            Step::Crash {
+                node: 3,
+                gap_secs: 41,
+            },
+            Step::Everywhere {
+                path: 5,
+                contents: vec![Some(4), Some(1), Some(3), None, Some(3)],
+            },
+            Step::Create {
+                node: 5,
+                path: 5,
+                content: 5,
+            },
+            Step::MassDelete {
+                node: 7,
+                fraction: 83,
+            },
+            Step::Modify {
+                node: 7,
+                path: 2,
+                content: 1,
+            },
+            Step::MassModify {
+                node: 4,
+                fraction: 80,
+                content: 3,
+            },
+            Step::Create {
+                node: 4,
+                path: 7,
+                content: 5,
+            },
+            Step::Rename {
+                node: 1,
+                from: 4,
+                to: 3,
+            },
+            Step::Modify {
+                node: 2,
+                path: 3,
+                content: 2,
+            },
+            Step::Touch { node: 3, path: 9 },
+            Step::Rmdir { node: 6, dir: 1 },
+            Step::Touch { node: 7, path: 9 },
+            Step::User {
+                node: 0,
+                action: crate::UserAction::Revert,
+                delay_secs: 38,
+            },
+            Step::Delete { node: 6, path: 11 },
+            Step::Partition { a: 4, b: 3 },
+            Step::Tier {
+                a: 1,
+                b: 4,
+                tier: 1,
+            },
+            Step::Offline { node: 2 },
+            Step::Create {
+                node: 0,
+                path: 9,
+                content: 3,
+            },
+            Step::Settle { secs: 21 },
+            Step::Create {
+                node: 6,
+                path: 11,
+                content: 4,
+            },
+            Step::Modify {
+                node: 7,
+                path: 3,
+                content: 1,
+            },
+            Step::Offline { node: 3 },
+            Step::MassModify {
+                node: 1,
+                fraction: 87,
+                content: 4,
+            },
+            Step::Modify {
+                node: 5,
+                path: 3,
+                content: 2,
+            },
+            Step::Modify {
+                node: 2,
+                path: 5,
+                content: 1,
+            },
+            Step::Create {
+                node: 2,
+                path: 0,
+                content: 1,
+            },
+            Step::Partition { a: 5, b: 7 },
+            Step::Modify {
+                node: 7,
+                path: 0,
+                content: 3,
+            },
+            Step::User {
+                node: 4,
+                action: crate::UserAction::Revert,
+                delay_secs: 14,
+            },
+            Step::Modify {
+                node: 0,
+                path: 9,
+                content: 3,
+            },
+            Step::Online { node: 2 },
+            Step::Everywhere {
+                path: 7,
+                contents: vec![Some(5), Some(1)],
+            },
+        ],
+    );
+}
