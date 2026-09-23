@@ -15,12 +15,14 @@
 //! - [`time`]: timestamps as inputs and the batch window constants (§7.4)
 //! - [`rules`]: per-folder thresholds and limits (§8.1, §6.5)
 //! - [`batch`]: batch formation, the summary, decisions, the apply set (§7.4)
+//! - [`folder`]: per-folder state: window, scan bracket, accepted work (§7.3, §7.4)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod batch;
 pub mod entry;
+pub mod folder;
 pub mod id;
 pub mod index;
 pub mod path;
@@ -32,6 +34,7 @@ pub use batch::{
     ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Decision, Summary,
 };
 pub use entry::{ContentHash, Entry, Kind, Observed};
+pub use folder::{ApplyOutcome, FolderState, FolderStatus, ScanState, Window};
 pub use id::{BatchId, FolderId, HostName, NodeId};
 pub use index::{ChangeKind, Index, IndexRecord, LocalChange};
 pub use path::RelPath;
