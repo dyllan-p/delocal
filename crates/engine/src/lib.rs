@@ -16,11 +16,13 @@
 //! - [`rules`]: per-folder thresholds and limits (§8.1, §6.5)
 //! - [`batch`]: batch formation, the summary, decisions, the apply set (§7.4)
 //! - [`folder`]: per-folder state: window, scan bracket, accepted work (§7.3, §7.4)
+//! - [`engine`]: the `Engine`, its `Event`s and `Action`s (§7)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod batch;
+pub mod engine;
 pub mod entry;
 pub mod folder;
 pub mod id;
@@ -32,6 +34,9 @@ pub mod version;
 
 pub use batch::{
     ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Decision, Summary,
+};
+pub use engine::{
+    Action, Displace, Engine, Event, Expected, FetchOutcome, NodeConfig, Outbound, Tier,
 };
 pub use entry::{ContentHash, Entry, Kind, Observed};
 pub use folder::{ApplyOutcome, FolderState, FolderStatus, ScanState, Window};
