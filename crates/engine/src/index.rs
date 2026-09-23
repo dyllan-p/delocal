@@ -684,7 +684,7 @@ mod tests {
         assert_eq!(
             idx.pending_count(),
             0,
-            "the pending local change was superseded"
+            "the one legitimate adopt over a pending path: a conflict's merged version M (§7.6)"
         );
         // Equal is allowed too (a re-commit of the same version).
         idx.adopt(newer);
