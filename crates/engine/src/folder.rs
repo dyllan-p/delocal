@@ -341,6 +341,9 @@ pub struct FolderState {
 /// came from.
 struct Candidate {
     item: ApplyItem,
+    /// The entry as it arrived, for the quarantine (§8.2 holds versions as
+    /// received, never a conflict's `M`).
+    raw: Entry,
     batch: BatchId,
     source: NodeId,
     seq_high: u64,
@@ -540,10 +543,14 @@ impl FolderState {
         }
         if let Some(item) = classified.item {
             let same = item.incoming().version == old.entry.version;
+            // A want keeps only what it is to end up with; for a conflict
+            // that is `M`, the nearest thing to the entry as received.
+            let raw = old.entry.clone();
             self.admit(
                 now,
                 vec![Candidate {
                     item,
+                    raw,
                     batch: old.batch,
                     source: old.source,
                     seq_high: old.seq_high,
@@ -566,7 +573,7 @@ impl FolderState {
     /// that batch's id or wanted. `brake` is false for an explicit
     /// `approve`, which is the release itself.
     fn admit(&mut self, now: Timestamp, candidates: Vec<Candidate>, brake: bool) {
-        let mut groups: BTreeMap<(BatchId, NodeId, u64), Vec<ApplyItem>> = BTreeMap::new();
+        let mut groups: BTreeMap<(BatchId, NodeId, u64), Vec<(ApplyItem, Entry)>> = BTreeMap::new();
         for c in candidates {
             let entry = c.item.incoming();
             if let Some(want) = self.wants.get(c.item.path())
@@ -576,8 +583,8 @@ impl FolderState {
                     .note_announced(c.item.path(), &entry.version, c.source);
                 continue;
             }
-            if let Some(held) = self.quarantine.matching(entry) {
-                self.quarantine.join(held, entry.clone());
+            if let Some(held) = self.quarantine.matching(&c.raw) {
+                self.quarantine.join(held, c.raw);
                 self.statuses.push(FolderStatus::JoinedHeld {
                     batch: held,
                     count: 1,
@@ -587,10 +594,16 @@ impl FolderState {
             groups
                 .entry((c.batch, c.source, c.seq_high))
                 .or_default()
-                .push(c.item);
+                .push((c.item, c.raw));
         }
-        for ((batch, source, seq_high), mut items) in groups {
-            items.sort_by(|a, b| a.path().cmp(b.path()));
+        for ((batch, source, seq_high), mut pairs) in groups {
+            pairs.sort_by(|a, b| a.0.path().cmp(b.0.path()));
+            let mut raws: BTreeMap<RelPath, Entry> = BTreeMap::new();
+            let mut items = Vec::with_capacity(pairs.len());
+            for (item, raw) in pairs {
+                raws.insert(item.path().clone(), raw);
+                items.push(item);
+            }
             let set = ApplySet {
                 folder: self.id,
                 batch,
@@ -611,8 +624,8 @@ impl FolderState {
                 Verdict::Hold(reason) => {
                     let paths = set.items.len();
                     if self.quarantine.get(batch).is_some() {
-                        for item in set.items {
-                            self.quarantine.join(batch, item.incoming().clone());
+                        for (_, raw) in raws {
+                            self.quarantine.join(batch, raw);
                         }
                         self.statuses.push(FolderStatus::JoinedHeld {
                             batch,
@@ -625,11 +638,7 @@ impl FolderState {
                             seq_high,
                             held_at: now,
                             reason,
-                            entries: set
-                                .items
-                                .into_iter()
-                                .map(|i| (i.path().clone(), i.incoming().clone()))
-                                .collect(),
+                            entries: raws,
                         });
                         self.statuses.push(FolderStatus::Held {
                             batch,
@@ -679,6 +688,7 @@ impl FolderState {
             if let Some(item) = classified.item {
                 out.push(Candidate {
                     item,
+                    raw: d.entry,
                     batch: d.batch,
                     source: d.source,
                     seq_high: d.seq_high,
@@ -1044,6 +1054,11 @@ impl FolderState {
                 .iter()
                 .cloned()
                 .map(|it| Candidate {
+                    raw: item
+                        .entries
+                        .get(it.path())
+                        .cloned()
+                        .unwrap_or_else(|| it.incoming().clone()),
                     item: it,
                     batch: item.batch,
                     source: item.source,
