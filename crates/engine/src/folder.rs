@@ -572,12 +572,16 @@ impl FolderState {
     /// Admit re-classified items the way `receive` admits new ones (§7.4,
     /// §8.1, §8.2): an item whose version this machine already wants only
     /// names a source; one whose version is quarantined, or dominates a
-    /// quarantined version, joins that held item; the rest go through the
-    /// brake as one apply set per originating batch, and are held under
-    /// that batch's id or wanted. `brake` is false for an explicit
-    /// `approve`, which is the release itself.
+    /// quarantined version, joins that held item; one whose own batch is
+    /// still under review joins it too, since a batch that tripped the
+    /// brake is applied only by approve, however its entries arrive at the
+    /// want-list; the rest go through the brake as one apply set per
+    /// originating batch, and are held under that batch's id or wanted.
+    /// `brake` is false for an explicit `approve`, which is the release
+    /// itself.
     fn admit(&mut self, now: Timestamp, candidates: Vec<Candidate>, brake: bool) {
         let mut groups: BTreeMap<(BatchId, NodeId, u64), Vec<(ApplyItem, Entry)>> = BTreeMap::new();
+        let mut joined: BTreeMap<BatchId, usize> = BTreeMap::new();
         for c in candidates {
             let entry = c.item.incoming();
             if let Some(want) = self.wants.get(c.item.path())
@@ -589,16 +593,22 @@ impl FolderState {
             }
             if let Some(held) = self.quarantine.matching(&c.raw) {
                 self.quarantine.join(held, c.raw);
-                self.statuses.push(FolderStatus::JoinedHeld {
-                    batch: held,
-                    count: 1,
-                });
+                *joined.entry(held).or_insert(0) += 1;
+                continue;
+            }
+            if brake && self.quarantine.get(c.batch).is_some() {
+                self.quarantine.join(c.batch, c.raw);
+                *joined.entry(c.batch).or_insert(0) += 1;
                 continue;
             }
             groups
                 .entry((c.batch, c.source, c.seq_high))
                 .or_default()
                 .push((c.item, c.raw));
+        }
+        for (batch, count) in joined {
+            self.statuses
+                .push(FolderStatus::JoinedHeld { batch, count });
         }
         for ((batch, source, seq_high), mut pairs) in groups {
             pairs.sort_by(|a, b| a.0.path().cmp(b.0.path()));
@@ -2272,6 +2282,56 @@ mod tests {
         assert!(matches!(b.approve(t(20.0), bid(5)), Approved::Sent(_)));
         assert!(b.deferred().next().is_none(), "the unpause thaws it");
         assert_eq!(b.wants().len(), 1, "one conflict, wanted");
+    }
+
+    #[test]
+    fn frozen_entries_of_a_held_batch_join_it_at_unpause() {
+        // B edits seven files and pauses. A's batch edits the same seven
+        // (frozen) and deletes the other three (held: three of ten). At
+        // unpause the seven belong with the held batch, not in front of the
+        // brake on their own (§8.2, I5).
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..7 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), file(2, 20));
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        for i in 0..7 {
+            a.scanned(t(13.0), p(&format!("f{i:02}")), file(3, 30));
+        }
+        for i in 7..10 {
+            a.scanned(t(13.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let batch = a.form_batches(t(15.0), bid(6)).remove(0);
+        let r = b.receive(t(15.0), &batch);
+        assert_eq!(r.frozen, 7);
+        assert!(matches!(r.decision, Decision::Held { .. }));
+        assert_eq!(b.quarantine().get(bid(6)).unwrap().entries.len(), 3);
+        b.take_statuses();
+
+        assert!(matches!(b.approve(t(20.0), bid(5)), Approved::Sent(_)));
+        assert!(b.deferred().next().is_none(), "thawed");
+        assert!(
+            b.wants().is_empty(),
+            "nothing wanted: the batch is under review"
+        );
+        let held = b.quarantine().get(bid(6)).unwrap();
+        assert_eq!(held.entries.len(), 10, "the seven joined the three");
+        assert!(
+            held.entries.values().all(|e| e.modified_by == node(1)),
+            "held as received from A, not as B's merge"
+        );
+        assert_eq!(
+            b.take_statuses(),
+            vec![FolderStatus::JoinedHeld {
+                batch: bid(6),
+                count: 7
+            }]
+        );
+        match b.approve(t(21.0), bid(6)) {
+            Approved::Released(Some(set)) => assert_eq!(set.items.len(), 10),
+            other => panic!("expected a release, got {other:?}"),
+        }
+        assert_eq!(b.wants().len(), 10);
     }
 
     #[test]
