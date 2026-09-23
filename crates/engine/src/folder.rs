@@ -47,9 +47,21 @@ pub enum ScanState {
 pub enum ApplyOutcome {
     /// Displaced, renamed in, index may adopt.
     Ok,
-    /// The local file was not what the index said. Nothing was written; the
-    /// next scan will see a local change (§7.5).
+    /// The local file was not what the index said. Nothing was written. The
+    /// engine keeps the entry and re-evaluates it after the next observation
+    /// of the path (§7.5).
     ChangedUnderneath,
+}
+
+/// An incoming entry whose commit found the file changed underneath (§7.5
+/// step 6), waiting for the next observation of its path.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deferred {
+    pub entry: Entry,
+    /// The batch it arrived in, so the re-evaluated item keeps its origin.
+    pub batch: BatchId,
+    pub source: NodeId,
+    pub seq_high: u64,
 }
 
 /// Something the folder wants `status` to know about.
@@ -106,6 +118,9 @@ pub struct FolderState {
     accepted: Vec<ApplySet>,
     /// This machine's `seq` as acknowledged by each peer's decisions (§7.4).
     acked: BTreeMap<NodeId, u64>,
+    /// Entries whose commit found the file changed underneath, by path,
+    /// waiting for the next observation (§7.5 step 6).
+    deferred: BTreeMap<RelPath, Deferred>,
 }
 
 impl FolderState {
@@ -126,6 +141,7 @@ impl FolderState {
             scan: None,
             accepted: Vec::new(),
             acked: BTreeMap::new(),
+            deferred: BTreeMap::new(),
         }
     }
 
@@ -180,6 +196,11 @@ impl FolderState {
         self.acked.get(&peer).copied().unwrap_or(0)
     }
 
+    /// Entries waiting for the next observation of their path (§7.5 step 6).
+    pub fn deferred(&self) -> impl Iterator<Item = &Deferred> {
+        self.deferred.values()
+    }
+
     /// A record was written at `now`: open or extend the window.
     fn touched(&mut self, now: Timestamp) {
         self.window = Some(match self.window {
@@ -200,7 +221,7 @@ impl FolderState {
             seen.insert(path.clone());
         }
         let change = match state {
-            ScanState::Observed(observed) => self.index.observe(path, observed),
+            ScanState::Observed(observed) => self.index.observe(path.clone(), observed),
             ScanState::Absent => self.index.observe_absent(&path, now.as_unix_nanos()),
             ScanState::Unchanged => {
                 if self.index.live(&path).is_none() {
@@ -215,9 +236,32 @@ impl FolderState {
         if change.is_some() {
             self.touched(now);
         }
+        self.reconsider(&path);
         Scanned {
             change,
             status: None,
+        }
+    }
+
+    /// A path with a deferred entry has been observed again: classify the
+    /// entry against the index as it now stands (§7.5 step 6). It becomes a
+    /// one-item accepted set, an `Apply` if it still dominates or a
+    /// `Conflict` if the new local version is concurrent, or is dropped if
+    /// the index has caught up with it.
+    fn reconsider(&mut self, path: &RelPath) {
+        let Some(deferred) = self.deferred.remove(path) else {
+            return;
+        };
+        if let Some(item) = batch::classify(&self.index, &deferred.entry) {
+            self.accepted.push(ApplySet {
+                folder: self.id,
+                batch: deferred.batch,
+                source: deferred.source,
+                seq_high: deferred.seq_high,
+                items: vec![item],
+                ignored: 0,
+                duplicates: 0,
+            });
         }
     }
 
@@ -293,9 +337,12 @@ impl FolderState {
 
     /// The host finished committing (or failed to commit) an accepted item
     /// (§7.5 steps 6 to 9). On `Ok` the index adopts the entry and the
-    /// window opens so the adoption is announced (§7.4). Either way the item
-    /// leaves the accepted sets. Returns the adopted record, or `None` if
-    /// nothing matched or the commit failed.
+    /// window opens so the adoption is announced (§7.4). On
+    /// `ChangedUnderneath` the entry is kept in the deferred set until the
+    /// path is observed again; the sender has been acknowledged for it and
+    /// will not send it twice. Either way the item leaves the accepted sets.
+    /// Returns the adopted record, or `None` if nothing matched or the
+    /// commit did not happen.
     pub fn applied(
         &mut self,
         now: Timestamp,
@@ -303,22 +350,30 @@ impl FolderState {
         version: &Version,
         outcome: ApplyOutcome,
     ) -> Option<IndexRecord> {
-        let mut found: Option<Entry> = None;
+        let mut found: Option<Deferred> = None;
         for set in &mut self.accepted {
             if let Some(pos) = set.items.iter().position(|item| {
                 matches!(item, ApplyItem::Apply { entry, .. } if &entry.path == path && &entry.version == version)
             }) {
                 if let ApplyItem::Apply { entry, .. } = set.items.remove(pos) {
-                    found = Some(entry);
+                    found = Some(Deferred {
+                        entry,
+                        batch: set.batch,
+                        source: set.source,
+                        seq_high: set.seq_high,
+                    });
                 }
                 break;
             }
         }
         self.accepted.retain(|set| !set.is_empty());
-        let entry = found?;
+        let deferred = found?;
         match outcome {
-            ApplyOutcome::Ok => Some(self.adopt(now, entry)),
-            ApplyOutcome::ChangedUnderneath => None,
+            ApplyOutcome::Ok => Some(self.adopt(now, deferred.entry)),
+            ApplyOutcome::ChangedUnderneath => {
+                self.deferred.insert(path.clone(), deferred);
+                None
+            }
         }
     }
 
@@ -336,6 +391,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::batch::ApplyMode;
     use crate::entry::{ContentHash, Kind};
     use crate::time::NANOS_PER_SECOND;
 
@@ -535,11 +591,17 @@ mod tests {
     }
 
     #[test]
-    fn changed_underneath_drops_the_item_without_adopting() {
+    fn changed_underneath_keeps_the_entry_until_the_path_is_observed() {
         let mut a = folder();
         a.scanned(t(1.0), p("x"), file(1, 1));
         let batch = a.form_batches(t(3.0), batch_id()).remove(0);
-        let mut b = folder();
+        let mut b = FolderState::new(
+            a.id(),
+            Rules::default(),
+            [node(1), node(2)],
+            node(2),
+            HostName::new("desktop").unwrap(),
+        );
         let set = b.receive(&batch);
         let entry = set.items[0].incoming().clone();
         let out = b.applied(
@@ -552,6 +614,55 @@ mod tests {
         assert!(b.accepted().is_empty());
         assert_eq!(b.index().get(&p("x")), None);
         assert_eq!(b.due(), None);
+        let kept: Vec<_> = b.deferred().collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].entry, entry);
+        assert_eq!(
+            (kept[0].batch, kept[0].source, kept[0].seq_high),
+            (batch.id, node(1), 1)
+        );
+
+        // The scan finds the file the user created underneath: a new local
+        // version, concurrent with A's, so the entry comes back as a conflict.
+        b.scanned(t(6.0), p("x"), file(9, 9));
+        assert!(b.deferred().next().is_none());
+        assert_eq!(b.accepted().len(), 1);
+        let set = &b.accepted()[0];
+        assert_eq!(
+            (set.batch, set.source, set.seq_high),
+            (batch.id, node(1), 1)
+        );
+        match &set.items[0] {
+            ApplyItem::Conflict { incoming, local } => {
+                assert_eq!(incoming, &entry);
+                assert_eq!(local.hash, hash(9));
+                assert_eq!(local.modified_by, node(2));
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deferred_entry_that_still_dominates_is_re_accepted() {
+        let mut a = folder();
+        a.scanned(t(1.0), p("x"), file(1, 1));
+        let batch = a.form_batches(t(3.0), batch_id()).remove(0);
+        let mut b = folder();
+        let entry = b.receive(&batch).items[0].incoming().clone();
+        b.applied(
+            t(5.0),
+            &entry.path,
+            &entry.version,
+            ApplyOutcome::ChangedUnderneath,
+        );
+        // The observation finds nothing there after all (a transient file).
+        b.scanned(t(6.0), p("x"), ScanState::Absent);
+        assert_eq!(b.accepted().len(), 1);
+        assert!(matches!(
+            &b.accepted()[0].items[0],
+            ApplyItem::Apply { entry: e, mode: ApplyMode::Fetch } if *e == entry
+        ));
+        assert!(b.deferred().next().is_none());
     }
 
     #[test]
