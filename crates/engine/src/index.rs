@@ -22,16 +22,17 @@
 //!   received version enters the index: there is no slot for an
 //!   accepted-but-unapplied version.
 //!
-//! **`prev_hash` and coalescing.** `prev_hash` is the hash of the version
-//! this change replaced *as peers last saw it* (§7.1). For a path with no
-//! pending change that is the current record's hash. For a path that
-//! already has a pending (unannounced) change, it is the pending record's
-//! own `prev_hash`, so several changes inside one batch window collapse to
-//! one step from the last announced version. The change's kind is derived
-//! the same way, from whether peers last saw a live entry and whether one
-//! is there now: an add then a modify is still an add, a delete then a
-//! re-creation is a modify, an add then a delete is a delete of something
-//! peers never had (a tombstone with `hash == prev_hash == EMPTY`).
+//! **The pending set and `prev_hash`.** For every path with an unannounced
+//! local change the index keeps the record peers last saw: the record that
+//! was there before the first pending change, or nothing if the path was
+//! unknown to them. `prev_hash` is that record's hash (§7.1), so several
+//! changes inside one batch window collapse to one step from the last
+//! announced version. The change's kind is derived the same way, from
+//! whether peers last saw a live entry and whether one is there now: an add
+//! then a modify is still an add, a delete then a re-creation is a modify,
+//! an add then a delete is a delete of something peers never had (a
+//! tombstone with `hash == prev_hash == EMPTY`). The same stored record is
+//! what `revert` (§8.3) puts back, `seq` included.
 //!
 //! What counts as a local change: any difference between the observation
 //! and the record in kind, size, mtime, exec or hash. An mtime-only change
@@ -81,6 +82,17 @@ impl ChangeKind {
     }
 }
 
+/// One path undone by `revert` (§8.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reverted {
+    pub path: RelPath,
+    /// The record that was there, always present (it was pending).
+    pub current: Option<Entry>,
+    /// The record peers last saw, now back in place; `None` if the record
+    /// was removed because peers never saw the path.
+    pub restored: Option<IndexRecord>,
+}
+
 /// A local change the index has recorded and the engine will batch (§7.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalChange {
@@ -99,12 +111,16 @@ pub struct Index {
     seq: u64,
     /// Highest `seq` received from each remote member (§7.1, §7.4 catch-up).
     peer_seq: BTreeMap<NodeId, u64>,
-    /// Local changes not yet announced. The value is whether peers last saw
-    /// a live entry at the path, which fixes the change's kind.
-    pending: BTreeMap<RelPath, bool>,
+    /// Local changes not yet announced, with the record peers last saw at
+    /// the path (`None` if they never saw it). Fixes the change's kind and
+    /// `prev_hash`, and is what `revert` restores.
+    pending: BTreeMap<RelPath, Option<IndexRecord>>,
     /// `seq` of the newest record in the last batch this machine formed
     /// (§7.4). Records above it, local or adopted, go in the next batch.
     announced_seq: u64,
+    /// Tracked count as of the last announcement: the sender's H1
+    /// denominator (§8.1).
+    announced_tracked: usize,
 }
 
 impl Index {
@@ -118,6 +134,7 @@ impl Index {
             peer_seq: BTreeMap::new(),
             pending: BTreeMap::new(),
             announced_seq: 0,
+            announced_tracked: 0,
         }
     }
 
@@ -192,11 +209,29 @@ impl Index {
     /// Local changes not yet announced, in path order, with the coalesced
     /// kind of each. Batch formation (§7.4) reads this.
     pub fn pending(&self) -> impl Iterator<Item = (&IndexRecord, ChangeKind)> {
-        self.pending.iter().filter_map(|(path, announced_live)| {
-            self.records
-                .get(path)
-                .map(|r| (r, ChangeKind::between(*announced_live, !r.entry.deleted)))
+        self.pending.iter().filter_map(|(path, announced)| {
+            self.records.get(path).map(|r| {
+                (
+                    r,
+                    ChangeKind::between(Self::is_live(announced), !r.entry.deleted),
+                )
+            })
         })
+    }
+
+    /// True if a stored announced record is a live entry.
+    fn is_live(announced: &Option<IndexRecord>) -> bool {
+        announced.as_ref().is_some_and(|r| !r.entry.deleted)
+    }
+
+    /// True if `path` has an unannounced local change.
+    pub fn is_pending(&self, path: &RelPath) -> bool {
+        self.pending.contains_key(path)
+    }
+
+    /// Paths with an unannounced local change, in path order.
+    pub fn pending_paths(&self) -> impl Iterator<Item = &RelPath> {
+        self.pending.keys()
     }
 
     /// Number of paths with an unannounced local change.
@@ -206,9 +241,17 @@ impl Index {
 
     /// The coalesced kind of the pending local change at `path`, if any.
     pub fn pending_kind(&self, path: &RelPath) -> Option<ChangeKind> {
-        let announced_live = *self.pending.get(path)?;
+        let announced = self.pending.get(path)?;
         let record = self.records.get(path)?;
-        Some(ChangeKind::between(announced_live, !record.entry.deleted))
+        Some(ChangeKind::between(
+            Self::is_live(announced),
+            !record.entry.deleted,
+        ))
+    }
+
+    /// Tracked count as of the last announcement (§8.1, sender pre-check).
+    pub fn announced_tracked(&self) -> usize {
+        self.announced_tracked
     }
 
     /// `seq` of the newest record already announced in a batch (§7.4).
@@ -237,6 +280,7 @@ impl Index {
     pub fn mark_announced(&mut self) {
         self.pending.clear();
         self.announced_seq = self.seq;
+        self.announced_tracked = self.tracked_count();
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -248,10 +292,14 @@ impl Index {
     /// the pending change's `prev_hash` if there is one, else the current
     /// record's hash, else `EMPTY`.
     fn announced_hash(&self, path: &RelPath) -> ContentHash {
-        match self.records.get(path) {
-            None => ContentHash::EMPTY,
-            Some(r) if self.pending.contains_key(path) => r.entry.prev_hash,
-            Some(r) => r.entry.hash,
+        match self.pending.get(path) {
+            Some(announced) => announced
+                .as_ref()
+                .map_or(ContentHash::EMPTY, |r| r.entry.hash),
+            None => self
+                .records
+                .get(path)
+                .map_or(ContentHash::EMPTY, |r| r.entry.hash),
         }
     }
 
@@ -264,15 +312,12 @@ impl Index {
     pub fn observe(&mut self, path: RelPath, observed: Observed) -> Option<LocalChange> {
         let observed = observed.normalised();
         let previous = self.records.get(&path);
-        let previous_live = match previous {
-            Some(r) if !r.entry.deleted => {
-                if r.entry.observed() == observed {
-                    return None;
-                }
-                true
-            }
-            _ => false,
-        };
+        if let Some(r) = previous
+            && !r.entry.deleted
+            && r.entry.observed() == observed
+        {
+            return None;
+        }
         let version = previous
             .map(|r| r.entry.version.clone())
             .unwrap_or_default()
@@ -290,7 +335,7 @@ impl Index {
             modified_by: self.own,
             author_host: self.host.clone(),
         };
-        Some(self.write(previous_live, entry))
+        Some(self.write(entry))
     }
 
     /// The scanner found nothing at `path`. If a live entry was there, it
@@ -310,7 +355,7 @@ impl Index {
             modified_by: self.own,
             author_host: self.host.clone(),
         };
-        Some(self.write(true, entry))
+        Some(self.write(entry))
     }
 
     /// The conflict copy of a displaced losing file (§7.6): `loser`'s kind,
@@ -328,7 +373,6 @@ impl Index {
     /// must win or the announced step would be wrong.
     pub fn record_conflict_copy(&mut self, path: RelPath, loser: &Entry) -> LocalChange {
         let previous = self.records.get(&path);
-        let previous_live = previous.is_some_and(|r| !r.entry.deleted);
         let version = previous
             .map(|r| r.entry.version.clone())
             .unwrap_or_default()
@@ -347,7 +391,7 @@ impl Index {
             modified_by: self.own,
             author_host: self.host.clone(),
         };
-        self.write(previous_live, entry)
+        self.write(entry)
     }
 
     /// A remote entry has been committed to disk (or a remote tombstone
@@ -373,17 +417,80 @@ impl Index {
         &self.records[&path]
     }
 
-    /// Record a local change. `previous_live` says whether a live entry was
-    /// at the path just before; if the path already has a pending change,
-    /// what peers last saw is kept from that instead.
-    fn write(&mut self, previous_live: bool, entry: Entry) -> LocalChange {
+    /// Record a local change. If the path has no pending change yet, the
+    /// record being replaced is what peers last saw, and is kept for
+    /// `prev_hash`, the change's kind and `revert`.
+    fn write(&mut self, entry: Entry) -> LocalChange {
         let seq = self.next_seq();
         let path = entry.path.clone();
-        let announced_live = *self.pending.entry(path.clone()).or_insert(previous_live);
-        let kind = ChangeKind::between(announced_live, !entry.deleted);
+        let previous = self.records.get(&path).cloned();
+        let announced = self.pending.entry(path.clone()).or_insert(previous);
+        let kind = ChangeKind::between(Self::is_live(announced), !entry.deleted);
         let record = IndexRecord { entry, seq };
         self.records.insert(path, record.clone());
         LocalChange { kind, record }
+    }
+
+    /// `deny` (§8.2): a local change at `path` whose version is
+    /// `merge(local, every quarantined version).incremented(self)`, so it
+    /// dominates all of them, with content unchanged. With no local record
+    /// the result is a tombstone dated `at_ns`. `hash == prev_hash`, so on
+    /// peers that hold the same content this lands as a metadata-only apply.
+    pub fn bump_over(&mut self, path: &RelPath, over: &[Version], at_ns: i64) -> LocalChange {
+        let local = self.records.get(path).map(|r| r.entry.clone());
+        let base = local
+            .as_ref()
+            .map(|e| e.version.clone())
+            .unwrap_or_default();
+        let version = over
+            .iter()
+            .fold(base, |acc, v| acc.merge(v))
+            .incremented(self.own);
+        let prev_hash = self.announced_hash(path);
+        let entry = match local {
+            Some(e) => Entry {
+                version,
+                prev_hash,
+                modified_by: self.own,
+                author_host: self.host.clone(),
+                ..e
+            },
+            None => Entry {
+                path: path.clone(),
+                kind: Kind::File,
+                size: 0,
+                mtime_ns: at_ns,
+                exec: false,
+                hash: ContentHash::EMPTY,
+                prev_hash,
+                version,
+                deleted: true,
+                modified_by: self.own,
+                author_host: self.host.clone(),
+            },
+        };
+        self.write(entry)
+    }
+
+    /// `revert` (§8.3): undo every unannounced local change. Each pending
+    /// path gets back the record peers last saw, `seq` included, so it is
+    /// not re-announced; a path peers never saw loses its record. The
+    /// pending set empties. Returns what happened per path, in path order.
+    pub fn revert_pending(&mut self) -> Vec<Reverted> {
+        let pending = std::mem::take(&mut self.pending);
+        let mut out = Vec::with_capacity(pending.len());
+        for (path, announced) in pending {
+            let current = self.records.remove(&path);
+            if let Some(record) = &announced {
+                self.records.insert(path.clone(), record.clone());
+            }
+            out.push(Reverted {
+                path,
+                current: current.map(|r| r.entry),
+                restored: announced,
+            });
+        }
+        out
     }
 
     /// The version a brand-new local entry gets: `{own: 1}`.
@@ -755,6 +862,98 @@ mod tests {
         idx.observe_absent(&p("d/b"), 5).unwrap();
         assert_eq!(idx.tracked_count(), 1);
         assert_eq!(idx.len(), 3);
+    }
+
+    #[test]
+    fn announced_tracked_is_the_count_at_the_last_announcement() {
+        let mut idx = index();
+        for i in 0..10 {
+            idx.observe(p(&format!("f{i}")), file(1, 1)).unwrap();
+        }
+        assert_eq!(idx.announced_tracked(), 0, "nothing announced yet");
+        idx.mark_announced();
+        assert_eq!(idx.announced_tracked(), 10);
+        for i in 0..8 {
+            idx.observe_absent(&p(&format!("f{i}")), 5).unwrap();
+        }
+        assert_eq!(idx.tracked_count(), 2);
+        assert_eq!(
+            idx.announced_tracked(),
+            10,
+            "the denominator the brake needs"
+        );
+    }
+
+    #[test]
+    fn bump_over_dominates_every_version_and_keeps_content() {
+        let mut idx = index();
+        idx.observe(p("a"), file(1, 1)).unwrap();
+        idx.mark_announced();
+        let mine = idx.get(&p("a")).unwrap().entry.clone();
+        let q1 = Version::empty().incremented(node(2)).incremented(node(2));
+        let q2: Version = [(node(3), 4)].into_iter().collect();
+        let c = idx.bump_over(&p("a"), &[q1.clone(), q2.clone()], 9);
+        let e = &c.record.entry;
+        assert!(e.version.dominates(&q1));
+        assert!(e.version.dominates(&q2));
+        assert!(e.version.dominates(&mine.version));
+        assert_eq!(e.version.counter(node(1)), 2);
+        assert_eq!(
+            (e.hash, e.size, e.mtime_ns, e.kind),
+            (mine.hash, mine.size, mine.mtime_ns, mine.kind)
+        );
+        assert!(e.is_metadata_only(), "content unchanged");
+        assert_eq!(e.modified_by, node(1));
+        assert_eq!(c.kind, ChangeKind::Modify);
+        // No record: a tombstone that still dominates.
+        let c = idx.bump_over(&p("never"), std::slice::from_ref(&q1), 77);
+        let e = &c.record.entry;
+        assert!(e.deleted);
+        assert!(e.version.dominates(&q1));
+        assert_eq!(e.mtime_ns, 77);
+        assert!(e.is_metadata_only());
+        assert_eq!(c.kind, ChangeKind::Delete);
+    }
+
+    #[test]
+    fn revert_pending_restores_announced_records_exactly_and_removes_new_ones() {
+        let mut idx = index();
+        idx.observe(p("keep"), file(1, 1)).unwrap();
+        idx.observe(p("edit"), file(2, 2)).unwrap(); // seq 2
+        idx.observe(p("gone"), file(3, 3)).unwrap(); // seq 3
+        idx.mark_announced();
+        let edit_before = idx.get(&p("edit")).unwrap().clone();
+        let gone_before = idx.get(&p("gone")).unwrap().clone();
+        idx.observe(p("edit"), file(4, 4)).unwrap();
+        idx.observe(p("edit"), file(5, 5)).unwrap();
+        idx.observe_absent(&p("gone"), 6).unwrap();
+        idx.observe(p("new"), file(6, 6)).unwrap();
+        idx.adopt(remote("adopted", 9, Version::empty().incremented(node(2))));
+        let seq_before = idx.seq();
+        assert_eq!(idx.pending_count(), 3);
+
+        let reverted = idx.revert_pending();
+        let paths: Vec<_> = reverted.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, ["edit", "gone", "new"]);
+        assert_eq!(idx.get(&p("edit")), Some(&edit_before), "seq included");
+        assert_eq!(idx.get(&p("gone")), Some(&gone_before));
+        assert_eq!(idx.get(&p("new")), None, "peers never saw it");
+        assert_eq!(reverted[2].restored, None);
+        assert_eq!(reverted[2].current.as_ref().unwrap().hash, hash(6));
+        assert!(reverted[1].current.as_ref().unwrap().deleted);
+        assert_eq!(idx.pending_count(), 0);
+        assert_eq!(idx.seq(), seq_before, "no new seq");
+        let unannounced: Vec<_> = idx
+            .unannounced()
+            .iter()
+            .map(|(r, _)| r.entry.path.as_str().to_owned())
+            .collect();
+        assert_eq!(
+            unannounced,
+            ["adopted"],
+            "restored records are not re-announced"
+        );
+        assert_eq!(idx.get(&p("keep")).unwrap().entry.hash, hash(1));
     }
 
     #[test]
