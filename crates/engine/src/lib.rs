@@ -35,7 +35,7 @@ pub mod time;
 pub mod version;
 
 pub use batch::{
-    ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Decision, Summary,
+    ApplyItem, ApplyMode, ApplySet, Batch, BatchDecision, BatchRole, Classified, Decision, Summary,
 };
 pub use conflict::{ConflictCopy, Resolution, Side, Winner};
 pub use engine::{
