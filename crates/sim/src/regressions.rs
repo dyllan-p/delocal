@@ -512,3 +512,197 @@ fn a_source_that_announces_the_wanted_version_again_is_asked_again() {
         ],
     );
 }
+
+/// A scan of a frozen path thawed its entry while the folder was still
+/// paused, and the entry, from a batch the brake had held for its other
+/// paths, went through the brake alone, passed, and was committed while
+/// its batch was still under review.
+#[test]
+fn an_entry_of_a_held_batch_is_not_committed_before_approve() {
+    passes(
+        5,
+        &[
+            Step::MassDelete {
+                node: 2,
+                fraction: 65,
+            },
+            Step::Modify {
+                node: 0,
+                path: 2,
+                content: 4,
+            },
+            Step::Settle { secs: 20 },
+            Step::Create {
+                node: 3,
+                path: 2,
+                content: 4,
+            },
+            Step::Symlink {
+                node: 6,
+                path: 6,
+                target: 11,
+            },
+            Step::MassDelete {
+                node: 1,
+                fraction: 62,
+            },
+            Step::Modify {
+                node: 5,
+                path: 10,
+                content: 2,
+            },
+            Step::Online { node: 5 },
+            Step::Crash {
+                node: 7,
+                gap_secs: 96,
+            },
+            Step::Rename {
+                node: 4,
+                from: 6,
+                to: 7,
+            },
+            Step::Everywhere {
+                path: 4,
+                contents: vec![Some(3), None, Some(5), Some(4), Some(3)],
+            },
+            Step::Create {
+                node: 3,
+                path: 0,
+                content: 1,
+            },
+            Step::Everywhere {
+                path: 8,
+                contents: vec![Some(4), Some(3), None, None, Some(2), None],
+            },
+            Step::Symlink {
+                node: 7,
+                path: 1,
+                target: 4,
+            },
+            Step::Partition { a: 6, b: 4 },
+            Step::Delete { node: 7, path: 10 },
+            Step::Offline { node: 0 },
+            Step::MassModify {
+                node: 4,
+                fraction: 56,
+                content: 3,
+            },
+            Step::Delete { node: 1, path: 5 },
+            Step::Symlink {
+                node: 5,
+                path: 6,
+                target: 9,
+            },
+            Step::Crash {
+                node: 5,
+                gap_secs: 56,
+            },
+            Step::Online { node: 4 },
+            Step::Modify {
+                node: 3,
+                path: 8,
+                content: 3,
+            },
+            Step::Touch { node: 6, path: 9 },
+            Step::Delete { node: 6, path: 7 },
+            Step::Modify {
+                node: 6,
+                path: 9,
+                content: 3,
+            },
+            Step::Chmod { node: 2, path: 4 },
+            Step::Crash {
+                node: 1,
+                gap_secs: 66,
+            },
+            Step::Delete { node: 4, path: 5 },
+            Step::Crash {
+                node: 0,
+                gap_secs: 72,
+            },
+            Step::Chmod { node: 6, path: 7 },
+            Step::User {
+                node: 2,
+                action: crate::UserAction::Revert,
+                delay_secs: 4,
+            },
+            Step::Partition { a: 2, b: 6 },
+            Step::User {
+                node: 0,
+                action: crate::UserAction::Rules {
+                    hold_count: 1,
+                    hold_pct: 1,
+                },
+                delay_secs: 35,
+            },
+            Step::Partition { a: 1, b: 3 },
+            Step::Chmod { node: 5, path: 8 },
+            Step::Everywhere {
+                path: 0,
+                contents: vec![Some(4), Some(4), Some(1), None, Some(2)],
+            },
+            Step::Create {
+                node: 1,
+                path: 7,
+                content: 3,
+            },
+            Step::Modify {
+                node: 6,
+                path: 10,
+                content: 4,
+            },
+            Step::Create {
+                node: 0,
+                path: 5,
+                content: 2,
+            },
+            Step::User {
+                node: 4,
+                action: crate::UserAction::Rules {
+                    hold_count: 4,
+                    hold_pct: 18,
+                },
+                delay_secs: 35,
+            },
+            Step::User {
+                node: 0,
+                action: crate::UserAction::Revert,
+                delay_secs: 14,
+            },
+            Step::Rename {
+                node: 0,
+                from: 11,
+                to: 10,
+            },
+            Step::Delete { node: 0, path: 7 },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::Revert,
+                delay_secs: 0,
+            },
+            Step::Create {
+                node: 0,
+                path: 2,
+                content: 3,
+            },
+            Step::Heal { a: 4, b: 0 },
+            Step::MassModify {
+                node: 1,
+                fraction: 82,
+                content: 1,
+            },
+            Step::Delete { node: 4, path: 11 },
+            Step::Partition { a: 1, b: 1 },
+            Step::Create {
+                node: 4,
+                path: 10,
+                content: 4,
+            },
+            Step::Modify {
+                node: 0,
+                path: 8,
+                content: 1,
+            },
+        ],
+    );
+}
