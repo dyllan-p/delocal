@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 14 · 23 September 2026 · Status: **for review** · Changes from draft 13: content is requested by hash, not by version, and want-list sources are keyed by content (§7.5, §12); batches carry `seq_low` and acknowledgements are the contiguous watermark, so the protocol is correct over a lossy, reordering transport (§7.4, §12); `IndexRemoved` hook (§11); CI policy for the random sweep (§14.1).
+> Draft 15 · 23 September 2026 · Status: **for review** · Changes from draft 14: the scan fast path compares the exec bit (§7.3); one total order for every concurrent pair, identical content included, with the argument for why the merged version is then a function of its vector (§7.2, §7.6).
+>
+> Changes from draft 14: content is requested by hash, not by version, and want-list sources are keyed by content (§7.5, §12); batches carry `seq_low` and acknowledgements are the contiguous watermark, so the protocol is correct over a lossy, reordering transport (§7.4, §12); `IndexRemoved` hook (§11); CI policy for the random sweep (§14.1).
 >
 > Changes from draft 13: given-up wants retry on a new source or connection (§7.5); the folder state is the unit of persistence and restart, index writes are durable and `seq` never rewinds (§11, §13); simulator crash model, I2 scoped to announced content, I4 defined by losing versions (§14.1).
 >
@@ -234,7 +236,7 @@ Version = BTreeMap<NodeId, u64>
   - every `a[k] ≥ b[k]` and not equal → **a dominates**
   - every `b[k] ≥ a[k]` and not equal → **b dominates**
   - otherwise → **concurrent** (a conflict, unless the content hashes are equal — see §7.6)
-- **Merge** (used when concurrent versions have identical content): component-wise maximum, no increment. Two machines merging the same pair independently produce the same result, so they converge without talking. The merged record takes `mtime_ns`, `modified_by` and `author_host` from the side with the larger `mtime_ns`, and on a tie from the side with the larger `modified_by` (the §7.6 winner rule reused). If the file's mtime on disk then differs from the record, the host sets it (a metadata-only apply, §7.5).
+- **Merge** (used when concurrent versions have identical content): component-wise maximum, no increment. Two machines merging the same pair independently produce the same result, so they converge without talking. The merged record takes its metadata (`mtime_ns`, `modified_by`, `author_host`, `prev_hash`) from the side the §7.6 winner rule ranks higher: the same total order that decides conflicts, applied whole, never a separate tie-break (see "One order for everything" in §7.6). If the file's mtime on disk then differs from the record, the host sets it (a metadata-only apply, §7.5).
 
 Wall-clock time never participates in ordering. See §7.8.
 
@@ -242,7 +244,7 @@ Wall-clock time never participates in ordering. See §7.8.
 
 - `notify` watches every folder root recursively. Events are debounced (2 s of quiet per path).
 - A **full scan** runs at daemon start, every hour **[decision]**, and on `delocal scan`. Watchers drop events under load; the scan is the ground truth.
-- Fast path: an entry whose `size` and `mtime_ns` match the index is unchanged. Anything else is hashed.
+- Fast path: a file whose `size`, `mtime_ns` **and exec bit** match the index is unchanged; a directory or symlink whose kind matches is unchanged. Anything else is hashed. The exec bit is in the fast path because `chmod` changes neither size nor mtime: if its watcher event is dropped, a fast path on size and mtime alone would never notice, and the index would disagree with the disk forever. `stat` returns the mode anyway, so this costs nothing.
 - **A change in mtime alone** (size and hash unchanged) is still a change: it produces a new version with `hash == prev_hash` and propagates, so that every machine holds the same `mtime_ns` for the same version and the conflict tie-break stays deterministic. Receivers apply it as a metadata-only apply (§7.5); it is invisible to the brake (§8.1); and it loses to any real content change in a conflict (§7.6).
 - **mtime precision shim [Phase 2].** Filesystems with coarse timestamps (FAT, exFAT, some network mounts) cannot store the record's `mtime_ns` exactly, so a received file would look touched on the next scan, gain a new version, propagate, and loop forever. After every `Write` or `SetMeta` the host reads back the mtime the filesystem kept; if it differs from the one requested, the host records the pair and reports the requested value to the engine on later scans while the stored value is unchanged. The engine never sees the discrepancy.
 - **Stability check:** a file is not hashed until its mtime has been unchanged for 2 s, and if it changes during hashing the hash is discarded and retried. This avoids announcing half-written files.
@@ -320,6 +322,8 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 ### 7.6 Conflicts
 
 Two versions of the same path are in conflict when they are **concurrent** (§7.2) **and** their hashes differ (kind, hash, and for files exec bit; mtime is not compared). Concurrent versions with identical content are not a conflict: both sides merge vectors and move on. This rule matters because it is how independently-made identical changes, and the conflict-copy mechanism itself, converge without producing duplicates.
+
+**One order for everything.** The winner rule below is a total order on entries (it compares fields lexicographically and never looks at the vector), and it is applied to **every** concurrent pair, whether or not their content differs; for identical content it only decides which side's metadata the merged record carries. This is what makes a merged version a function of its vector. Every vector in the system is either an increment (a node's versions of a path form a chain, each containing the previous) or a union of existing vectors, so a version whose vector lies componentwise within a merged vector is in that merge's causal past, and the merged record's fields are the maximum, under the order, of the increment-created versions in that past. Two machines holding the same vector therefore hold the same content, which is what lets a receiver drop an `Equal` version unread. Using two different comparisons, one for conflicts and another for identical content, breaks this: pairwise merges in different orders can then reach the same vector with different content, and each side drops the other's as equal, forever. The simulator checks the consequence directly: on every node, equal vectors at a path imply equal content and deletion state.
 
 **Deterministic winner.** Every machine must pick the same winner without communicating:
 
