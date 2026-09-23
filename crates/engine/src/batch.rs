@@ -361,8 +361,12 @@ pub fn classify(index: &Index, incoming: &Entry) -> Classified {
                     resolution.fallback,
                 ),
                 // Local holds L: fetch W's content, displace the local file.
+                // A winning tombstone or directory needs no fetch; the local
+                // file is still displaced to its conflict copy, never trashed
+                // (§7.6 "delete vs modify": the edit survives under the
+                // conflict name).
                 Side::First => {
-                    let mode = if resolution.merged.kind == Kind::Dir {
+                    let mode = if resolution.merged.deleted || resolution.merged.kind == Kind::Dir {
                         ApplyMode::Direct
                     } else {
                         ApplyMode::Fetch

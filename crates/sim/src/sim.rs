@@ -1447,15 +1447,25 @@ impl Sim {
                 );
                 ApplyOutcome::Ok
             }
-            Action::Remove { .. } => {
+            Action::Remove { displace, .. } => {
                 if let Some(existing) = node.fs.get(path)
                     && existing.kind == Kind::Dir
                     && node.fs.keys().any(|p| path.is_ancestor_of(p))
                 {
                     return (ApplyOutcome::ChangedUnderneath, created); // not empty
                 }
+                if let Displace::ConflictCopy(target) = displace
+                    && node.fs.contains_key(target)
+                {
+                    return (ApplyOutcome::ChangedUnderneath, created);
+                }
                 if let Some(existing) = node.fs.remove(path) {
-                    trash_file(node, existing);
+                    match displace {
+                        Displace::Trash => trash_file(node, existing),
+                        Displace::ConflictCopy(target) => {
+                            node.fs.insert(target.clone(), existing);
+                        }
+                    }
                 }
                 ApplyOutcome::Ok
             }
