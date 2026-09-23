@@ -116,6 +116,24 @@ impl Entry {
         }
     }
 
+    /// The scan fast path (§7.3): true if what `stat` reports at the path
+    /// means this live entry is unchanged, so the scanner need not hash it.
+    /// A file is unchanged only if kind, size, mtime and the exec bit all
+    /// match; a directory or symlink if its kind matches. The exec bit is
+    /// part of the test because `chmod` changes neither size nor mtime: a
+    /// fast path on those two alone would never notice a `chmod` whose
+    /// watcher event was lost, and the index would disagree with the disk
+    /// forever. A tombstone matches nothing: whatever is on disk is new.
+    pub fn unchanged_by_stat(&self, kind: Kind, size: u64, mtime_ns: i64, exec: bool) -> bool {
+        if self.deleted || self.kind != kind {
+            return false;
+        }
+        match kind {
+            Kind::File => self.size == size && self.mtime_ns == mtime_ns && self.exec == exec,
+            Kind::Dir | Kind::Symlink => true,
+        }
+    }
+
     /// A metadata-only change (§7.1): the content is what it was before.
     /// Touches, and tombstones for paths peers never saw.
     pub fn is_metadata_only(&self) -> bool {
@@ -263,6 +281,41 @@ mod tests {
         assert!(dead.same_content(&dead2));
         assert!(!dead.same_content(&live));
         assert!(!live.same_content(&dead));
+    }
+
+    #[test]
+    fn the_fast_path_compares_kind_size_mtime_and_exec() {
+        let e = file(1, false);
+        assert!(e.unchanged_by_stat(Kind::File, e.size, e.mtime_ns, false));
+        assert!(
+            !e.unchanged_by_stat(Kind::File, e.size + 1, e.mtime_ns, false),
+            "size"
+        );
+        assert!(
+            !e.unchanged_by_stat(Kind::File, e.size, e.mtime_ns + 1, false),
+            "mtime"
+        );
+        assert!(
+            !e.unchanged_by_stat(Kind::File, e.size, e.mtime_ns, true),
+            "a chmod is a change"
+        );
+        assert!(
+            !e.unchanged_by_stat(Kind::Symlink, e.size, e.mtime_ns, false),
+            "kind"
+        );
+        let mut dir = file(1, false);
+        dir.kind = Kind::Dir;
+        assert!(
+            dir.unchanged_by_stat(Kind::Dir, 4096, 99, true),
+            "directories match by kind alone"
+        );
+        assert!(!dir.unchanged_by_stat(Kind::File, 0, 0, false));
+        let mut dead = file(1, false);
+        dead.deleted = true;
+        assert!(
+            !dead.unchanged_by_stat(Kind::File, dead.size, dead.mtime_ns, false),
+            "a tombstone matches nothing"
+        );
     }
 
     #[test]

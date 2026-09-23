@@ -221,7 +221,6 @@ fn a_revert_reports_every_index_write() {
 /// announcement of `M` did not make it a source again, so the want had no
 /// source forever.
 #[test]
-#[ignore = "under fetch-by-hash this seed's run changes course and meets the exec-bit fast-path gap (a chmod whose watcher event is lost is invisible to §7.3's size+mtime fast path); re-enable with that fix"]
 fn a_source_that_announces_the_wanted_version_again_is_asked_again() {
     passes(
         0,
@@ -1188,6 +1187,492 @@ fn a_batch_lost_in_flight_is_caught_up() {
                 node: 4,
                 path: 3,
                 content: 4,
+            },
+        ],
+    );
+}
+
+/// A chmod whose watcher event was dropped was invisible to every later
+/// scan: the fast path compared size and mtime, and chmod changes neither,
+/// so the index disagreed with the disk about the exec bit forever. The
+/// fast path compares the exec bit now (§7.3).
+#[test]
+fn a_chmod_the_watcher_missed_is_found_by_the_next_scan() {
+    passes(
+        83,
+        &[
+            Step::Modify {
+                node: 0,
+                path: 3,
+                content: 2,
+            },
+            Step::Crash {
+                node: 2,
+                gap_secs: 50,
+            },
+            Step::Chmod { node: 2, path: 3 },
+        ],
+    );
+}
+
+/// Same class as above.
+#[test]
+fn a_missed_chmod_of_a_conflict_copy_is_found_by_the_next_scan() {
+    passes(
+        37,
+        &[
+            Step::Partition { a: 1, b: 0 },
+            Step::Heal { a: 2, b: 6 },
+            Step::Rename {
+                node: 6,
+                from: 0,
+                to: 2,
+            },
+            Step::Modify {
+                node: 2,
+                path: 9,
+                content: 5,
+            },
+            Step::Modify {
+                node: 2,
+                path: 2,
+                content: 5,
+            },
+            Step::Settle { secs: 10 },
+            Step::Crash {
+                node: 2,
+                gap_secs: 112,
+            },
+            Step::Heal { a: 3, b: 4 },
+            Step::Settle { secs: 37 },
+            Step::Everywhere {
+                path: 10,
+                contents: vec![Some(3), Some(3), Some(3)],
+            },
+            Step::Online { node: 2 },
+            Step::Rename {
+                node: 3,
+                from: 2,
+                to: 4,
+            },
+            Step::Delete { node: 3, path: 4 },
+            Step::Create {
+                node: 3,
+                path: 4,
+                content: 2,
+            },
+            Step::Partition { a: 4, b: 6 },
+            Step::Chmod { node: 0, path: 8 },
+            Step::Delete { node: 3, path: 3 },
+            Step::Modify {
+                node: 6,
+                path: 9,
+                content: 5,
+            },
+            Step::Create {
+                node: 3,
+                path: 3,
+                content: 2,
+            },
+            Step::User {
+                node: 3,
+                action: crate::UserAction::Rules {
+                    hold_count: 2,
+                    hold_pct: 14,
+                },
+                delay_secs: 29,
+            },
+            Step::Everywhere {
+                path: 1,
+                contents: vec![Some(4), Some(4), Some(3), Some(1)],
+            },
+            Step::Create {
+                node: 0,
+                path: 8,
+                content: 3,
+            },
+            Step::Partition { a: 6, b: 7 },
+            Step::Heal { a: 1, b: 1 },
+            Step::Modify {
+                node: 0,
+                path: 7,
+                content: 5,
+            },
+            Step::Create {
+                node: 2,
+                path: 7,
+                content: 3,
+            },
+            Step::Modify {
+                node: 2,
+                path: 6,
+                content: 3,
+            },
+            Step::Settle { secs: 12 },
+            Step::Everywhere {
+                path: 1,
+                contents: vec![None, Some(1), Some(2), Some(2), Some(3), Some(1)],
+            },
+            Step::Chmod { node: 6, path: 8 },
+            Step::Settle { secs: 2 },
+            Step::Tier {
+                a: 5,
+                b: 6,
+                tier: 2,
+            },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![Some(2), Some(2), None, None, Some(5), Some(4)],
+            },
+            Step::Create {
+                node: 4,
+                path: 9,
+                content: 1,
+            },
+            Step::Create {
+                node: 5,
+                path: 1,
+                content: 2,
+            },
+            Step::Chmod { node: 7, path: 4 },
+            Step::Offline { node: 3 },
+            Step::Everywhere {
+                path: 2,
+                contents: vec![Some(1), Some(3)],
+            },
+            Step::Offline { node: 5 },
+            Step::Touch { node: 0, path: 8 },
+            Step::Create {
+                node: 7,
+                path: 10,
+                content: 5,
+            },
+            Step::Heal { a: 6, b: 1 },
+            Step::Delete { node: 4, path: 4 },
+            Step::Everywhere {
+                path: 7,
+                contents: vec![Some(5), Some(1), Some(4), Some(2)],
+            },
+            Step::Heal { a: 1, b: 4 },
+            Step::Create {
+                node: 5,
+                path: 11,
+                content: 4,
+            },
+            Step::Chmod { node: 3, path: 0 },
+            Step::Create {
+                node: 7,
+                path: 11,
+                content: 5,
+            },
+            Step::MassModify {
+                node: 2,
+                fraction: 60,
+                content: 1,
+            },
+            Step::Mkdir { node: 3, dir: 0 },
+            Step::User {
+                node: 1,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 58,
+            },
+            Step::Settle { secs: 1 },
+            Step::Delete { node: 4, path: 8 },
+            Step::Everywhere {
+                path: 3,
+                contents: vec![Some(1), Some(1), None],
+            },
+            Step::Offline { node: 3 },
+            Step::Heal { a: 0, b: 7 },
+            Step::Settle { secs: 8 },
+            Step::Modify {
+                node: 2,
+                path: 0,
+                content: 1,
+            },
+            Step::Partition { a: 5, b: 1 },
+            Step::Chmod { node: 7, path: 11 },
+            Step::Create {
+                node: 2,
+                path: 8,
+                content: 3,
+            },
+            Step::Create {
+                node: 6,
+                path: 9,
+                content: 4,
+            },
+            Step::Chmod { node: 6, path: 1 },
+            Step::Modify {
+                node: 6,
+                path: 3,
+                content: 3,
+            },
+            Step::Rename {
+                node: 2,
+                from: 11,
+                to: 0,
+            },
+            Step::Create {
+                node: 0,
+                path: 6,
+                content: 4,
+            },
+            Step::Rmdir { node: 2, dir: 1 },
+            Step::Partition { a: 7, b: 5 },
+            Step::Offline { node: 0 },
+            Step::Create {
+                node: 7,
+                path: 3,
+                content: 5,
+            },
+            Step::MassModify {
+                node: 0,
+                fraction: 55,
+                content: 1,
+            },
+        ],
+    );
+}
+
+/// Same class as above.
+#[test]
+fn a_missed_chmod_is_found_after_a_long_run() {
+    passes(
+        76,
+        &[
+            Step::Settle { secs: 32 },
+            Step::Rename {
+                node: 5,
+                from: 11,
+                to: 9,
+            },
+            Step::Rename {
+                node: 2,
+                from: 9,
+                to: 4,
+            },
+            Step::Tier {
+                a: 0,
+                b: 1,
+                tier: 2,
+            },
+            Step::Create {
+                node: 6,
+                path: 4,
+                content: 2,
+            },
+            Step::MassModify {
+                node: 4,
+                fraction: 94,
+                content: 4,
+            },
+            Step::Delete { node: 7, path: 8 },
+            Step::Offline { node: 0 },
+            Step::Settle { secs: 33 },
+            Step::Offline { node: 2 },
+            Step::Create {
+                node: 0,
+                path: 7,
+                content: 2,
+            },
+            Step::Symlink {
+                node: 3,
+                path: 5,
+                target: 8,
+            },
+            Step::Touch { node: 7, path: 4 },
+            Step::Chmod { node: 2, path: 11 },
+            Step::Rename {
+                node: 3,
+                from: 1,
+                to: 4,
+            },
+            Step::Mkdir { node: 6, dir: 2 },
+            Step::Online { node: 4 },
+            Step::Tier {
+                a: 3,
+                b: 0,
+                tier: 1,
+            },
+            Step::Touch { node: 6, path: 1 },
+            Step::MassModify {
+                node: 5,
+                fraction: 95,
+                content: 3,
+            },
+            Step::Crash {
+                node: 4,
+                gap_secs: 94,
+            },
+            Step::Everywhere {
+                path: 1,
+                contents: vec![None, Some(2), None, None, Some(2), Some(5), Some(3)],
+            },
+            Step::Heal { a: 1, b: 5 },
+            Step::Create {
+                node: 3,
+                path: 5,
+                content: 1,
+            },
+            Step::Create {
+                node: 6,
+                path: 11,
+                content: 2,
+            },
+            Step::Modify {
+                node: 5,
+                path: 0,
+                content: 2,
+            },
+            Step::Rename {
+                node: 1,
+                from: 0,
+                to: 1,
+            },
+            Step::Touch { node: 3, path: 4 },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 2,
+            },
+            Step::Create {
+                node: 5,
+                path: 5,
+                content: 5,
+            },
+            Step::Modify {
+                node: 2,
+                path: 5,
+                content: 5,
+            },
+            Step::Heal { a: 6, b: 1 },
+            Step::Mkdir { node: 0, dir: 1 },
+            Step::Delete { node: 4, path: 1 },
+            Step::Crash {
+                node: 2,
+                gap_secs: 21,
+            },
+            Step::Modify {
+                node: 3,
+                path: 7,
+                content: 3,
+            },
+            Step::MassDelete {
+                node: 5,
+                fraction: 93,
+            },
+            Step::Everywhere {
+                path: 6,
+                contents: vec![Some(3), Some(3), Some(4), Some(4)],
+            },
+            Step::Create {
+                node: 2,
+                path: 4,
+                content: 2,
+            },
+            Step::Offline { node: 1 },
+            Step::Modify {
+                node: 4,
+                path: 3,
+                content: 2,
+            },
+            Step::User {
+                node: 6,
+                action: crate::UserAction::Revert,
+                delay_secs: 25,
+            },
+            Step::Modify {
+                node: 3,
+                path: 1,
+                content: 2,
+            },
+            Step::Symlink {
+                node: 1,
+                path: 5,
+                target: 8,
+            },
+            Step::Modify {
+                node: 4,
+                path: 8,
+                content: 4,
+            },
+            Step::Online { node: 2 },
+            Step::Create {
+                node: 2,
+                path: 11,
+                content: 5,
+            },
+            Step::Partition { a: 4, b: 7 },
+            Step::User {
+                node: 0,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 55,
+            },
+            Step::Create {
+                node: 2,
+                path: 10,
+                content: 2,
+            },
+            Step::Everywhere {
+                path: 10,
+                contents: vec![Some(4), None, Some(5), Some(3), Some(2)],
+            },
+            Step::Chmod { node: 1, path: 10 },
+            Step::Offline { node: 5 },
+            Step::Create {
+                node: 1,
+                path: 1,
+                content: 4,
+            },
+            Step::Delete { node: 2, path: 2 },
+            Step::Chmod { node: 2, path: 4 },
+            Step::MassModify {
+                node: 1,
+                fraction: 93,
+                content: 3,
+            },
+            Step::Delete { node: 5, path: 6 },
+            Step::Everywhere {
+                path: 10,
+                contents: vec![Some(3), None, Some(4), Some(3), Some(3), Some(4)],
+            },
+            Step::Create {
+                node: 7,
+                path: 4,
+                content: 4,
+            },
+            Step::Crash {
+                node: 7,
+                gap_secs: 91,
+            },
+            Step::Partition { a: 1, b: 1 },
+            Step::Rename {
+                node: 2,
+                from: 6,
+                to: 10,
+            },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::Rules {
+                    hold_count: 5,
+                    hold_pct: 14,
+                },
+                delay_secs: 36,
+            },
+            Step::Modify {
+                node: 1,
+                path: 9,
+                content: 5,
+            },
+            Step::Everywhere {
+                path: 5,
+                contents: vec![Some(4), None, Some(2), Some(1)],
+            },
+            Step::Chmod { node: 0, path: 7 },
+            Step::Everywhere {
+                path: 11,
+                contents: vec![Some(2), Some(1), Some(4), Some(5), None],
             },
         ],
     );
