@@ -1,12 +1,12 @@
-//! Per-folder state (DESIGN.md §7.3 scan brackets, §7.4 batch window and
-//! receiving, §7.5 commit bookkeeping, §8.1 brake and pause, §8.2
-//! quarantine, §8.3 revert).
+//! Per-folder state (DESIGN.md §7.3 scan brackets, §7.4 batch window,
+//! receiving and catch-up, §7.5 want-list and commit bookkeeping, §8.1
+//! brake and pause, §8.2 quarantine, §8.3 revert).
 //!
 //! One [`FolderState`] per folder this machine is a member of. It owns the
-//! folder's [`Index`], the batch window, the open scan bracket, the apply
-//! sets accepted but not yet committed, each peer's acknowledgement of this
-//! machine's `seq`, the quarantine, and the paused state. `Engine` (in
-//! `engine.rs`) drives it and turns what it returns into actions.
+//! folder's [`Index`], the batch window, the open scan bracket, the
+//! want-list, each peer's acknowledgement of this machine's `seq`, the
+//! quarantine, and the paused state. `Engine` (in `engine.rs`) drives it
+//! and turns what it returns into actions.
 //!
 //! **Window.** Any index write, local or adopted, opens the window if it is
 //! closed and records the time of the last write. The window is due at
@@ -19,18 +19,24 @@
 //! it stays paused until `approve` or `revert`, whatever later changes do;
 //! later ticks re-run the check for `status` only.
 //!
+//! **Catch-up** (§7.4). A peer's `have_up_to` replaces our memory of its
+//! acknowledgement and marks it for catch-up; at the next tick every
+//! announced record above that `seq` goes to it through the same `form()`
+//! as a live batch. Unannounced records wait for the live path and its
+//! pre-check.
+//!
 //! **Receive.** Items whose incoming version is quarantined, or dominates a
 //! quarantined version, join that held item. On a paused folder, items for
 //! paths in the pending set are frozen (kept in arrival order) until the
 //! folder unpauses. The brake runs over the rest with the current tracked
-//! count; `Held` quarantines the raw incoming entries, `Accepted` stores
-//! the apply set.
+//! count; `Held` quarantines the raw incoming entries, `Accepted` puts the
+//! items in the want-list (§7.5).
 //!
-//! **In flight.** A path with an accepted item is in flight: observations
-//! of it are ignored and the scan bracket's deletion pass skips it, so a
-//! displacement or a revert's trash move is never mistaken for a local
-//! deletion (§7.5, §8.3). The path leaves in flight when its item commits
-//! or defers.
+//! **Want-list and in flight** (§7.5). See [`crate::want`]. A path whose
+//! want is in a short-lived state is in flight: observations of it are
+//! ignored and the scan bracket's deletion pass skips it. A `revert`-made
+//! want ignores `Absent` in every state (the trash move, §8.3). A local
+//! change at an observable wanted path re-classifies the want.
 //!
 //! **Scan bracket.** Between `ScanStarted` and `ScanFinished` every path the
 //! host reports is marked seen; at `ScanFinished` every live record not seen
@@ -43,7 +49,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{self, ApplyItem, ApplyMode, ApplySet, Batch, Decision, Summary};
 use crate::brake::{self, HoldReason, Verdict};
-use crate::conflict::ConflictCopy;
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange};
@@ -52,6 +57,7 @@ use crate::quarantine::{HeldItem, Quarantine};
 use crate::rules::Rules;
 use crate::time::{DEBOUNCE_NANOS, Timestamp, WINDOW_NANOS};
 use crate::version::Version;
+use crate::want::{FetchReport, Tier, Want, WantList, WantState, WantStep};
 
 /// What the host reports for one path (§7.3). `Unchanged` is the fast path:
 /// size and mtime matched the record the host holds, so no hash was
@@ -68,17 +74,18 @@ pub enum ScanState {
 pub enum ApplyOutcome {
     /// Displaced, renamed in, index may adopt.
     Ok,
-    /// The local file was not what the index said. Nothing was written. The
-    /// engine keeps the entry and re-evaluates it after the next observation
-    /// of the path (§7.5).
+    /// The local file was not what the index said, or the displacement
+    /// target appeared. Nothing was written. The engine keeps the entry and
+    /// re-evaluates it after the next observation of the path (§7.5).
     ChangedUnderneath,
 }
 
 /// Why an incoming entry is waiting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DeferredReason {
-    /// Its commit found the file changed underneath; re-evaluated at the
-    /// next observation of the path (§7.5 step 6).
+    /// Its commit found the file changed underneath, or it is concurrent
+    /// with a version already wanted at its path; re-evaluated when the
+    /// path is observed or its want ends (§7.5 step 6).
     ChangedUnderneath,
     /// Its path is in a paused folder's pending set; re-evaluated when the
     /// folder unpauses (§8.1).
@@ -109,6 +116,24 @@ pub struct Paused {
     /// True if the pending set would pass the pre-check now (`status`
     /// says so); the folder still waits for `approve` or `revert`.
     pub would_pass: bool,
+}
+
+/// What the index believes is at a path when a commit is ordered (§7.5
+/// step 6). `None` means absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Expected {
+    pub kind: Kind,
+    pub size: u64,
+    pub mtime_ns: i64,
+}
+
+/// Where a commit moves the file it displaces (§7.5 step 7).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Displace {
+    /// To `.delocal/trash/` (§8.4).
+    Trash,
+    /// To the conflict-copy path: the displaced file is the losing content (§7.6).
+    ConflictCopy(RelPath),
 }
 
 /// Something the folder wants `status` to know about.
@@ -169,6 +194,10 @@ pub enum FolderStatus {
     /// A rule change was evaluated against a held item or the paused batch;
     /// nothing is released by itself (§8.1).
     RulesRecheck { batch: BatchId, would_pass: bool },
+    /// A want gave up after two hash mismatches (§7.5 step 4).
+    GaveUp { path: RelPath },
+    /// A fetch or commit deadline passed; the want is wanted again (§7.5).
+    Stalled { path: RelPath },
 }
 
 /// An open batch window (§7.4).
@@ -246,8 +275,35 @@ pub struct RevertOutcome {
     pub batch: BatchId,
     /// Paths whose current file the host moves to trash.
     pub trash: Vec<RelPath>,
-    /// Restored live entries put in flight to be fetched again.
+    /// Restored live entries wanted again.
     pub refetch: usize,
+}
+
+/// One thing the host is asked to do for the want-list (§7.5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostStep {
+    Fetch {
+        path: RelPath,
+        version: Version,
+        hash: crate::entry::ContentHash,
+        size: u64,
+        from: NodeId,
+    },
+    Write {
+        path: RelPath,
+        entry: Entry,
+        expected: Option<Expected>,
+        displace: Displace,
+    },
+    Remove {
+        path: RelPath,
+        expected: Option<Expected>,
+    },
+    SetMeta {
+        path: RelPath,
+        mtime_ns: i64,
+        exec: bool,
+    },
 }
 
 /// State of one folder on this machine. See the module docs.
@@ -260,11 +316,12 @@ pub struct FolderState {
     window: Option<Window>,
     /// Paths reported since `ScanStarted`, while a bracket is open.
     scan: Option<BTreeSet<RelPath>>,
-    /// Accepted apply sets whose items the host has not yet committed (PR 6
-    /// turns these into fetch and commit actions).
-    accepted: Vec<ApplySet>,
-    /// This machine's `seq` as acknowledged by each peer's decisions (§7.4).
+    wants: WantList,
+    /// This machine's `seq` as acknowledged by each peer's decisions or its
+    /// `have_up_to` (§7.4).
     acked: BTreeMap<NodeId, u64>,
+    /// Peers whose `have_up_to` arrived and await catch-up at the next tick.
+    catchup: BTreeSet<NodeId>,
     /// Entries waiting to be classified again, by path, in arrival order.
     deferred: BTreeMap<RelPath, Vec<Deferred>>,
     /// How many conflicts rule 5 of §7.6 has decided here. Should stay 0.
@@ -289,8 +346,9 @@ impl FolderState {
             index: Index::new(own, host),
             window: None,
             scan: None,
-            accepted: Vec::new(),
+            wants: WantList::default(),
             acked: BTreeMap::new(),
+            catchup: BTreeSet::new(),
             deferred: BTreeMap::new(),
             winner_fallbacks: 0,
             quarantine: Quarantine::default(),
@@ -311,6 +369,11 @@ impl FolderState {
         self.members.iter().copied()
     }
 
+    /// True if `node` is a member of this folder.
+    pub fn is_member(&self, node: NodeId) -> bool {
+        self.members.contains(&node)
+    }
+
     pub fn index(&self) -> &Index {
         &self.index
     }
@@ -320,14 +383,23 @@ impl FolderState {
         self.window
     }
 
-    /// When the next batch should form, if a window is open.
+    /// When the engine next needs a tick: the window, or the earliest want
+    /// deadline, whichever is first.
     pub fn due(&self) -> Option<Timestamp> {
-        self.window.map(|w| w.due())
+        match (self.window.map(|w| w.due()), self.wants.next_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
-    /// True if a window is open and due at or before `now`.
+    /// True if the window is open and due at or before `now`.
     pub fn is_due(&self, now: Timestamp) -> bool {
-        self.due().is_some_and(|d| d <= now)
+        self.window.is_some_and(|w| w.due() <= now)
+    }
+
+    /// True if a tick is wanted right away (a peer awaits catch-up).
+    pub fn wake_now(&self) -> bool {
+        !self.catchup.is_empty()
     }
 
     /// True while a scan bracket is open.
@@ -335,9 +407,9 @@ impl FolderState {
         self.scan.is_some()
     }
 
-    /// Apply sets accepted and not yet fully committed.
-    pub fn accepted(&self) -> &[ApplySet] {
-        &self.accepted
+    /// The want-list (§7.5).
+    pub fn wants(&self) -> &WantList {
+        &self.wants
     }
 
     /// Highest `seq` of ours that `peer` has acknowledged, 0 if none.
@@ -366,11 +438,9 @@ impl FolderState {
         self.paused.as_ref()
     }
 
-    /// True if an accepted item exists for `path` (§7.5, §8.3).
+    /// True if the path's want is in a short-lived state (§7.5).
     pub fn in_flight(&self, path: &RelPath) -> bool {
-        self.accepted
-            .iter()
-            .any(|set| set.items.iter().any(|item| item.path() == path))
+        self.wants.in_flight(path)
     }
 
     /// A record was written at `now`: open or extend the window.
@@ -387,13 +457,27 @@ impl FolderState {
         });
     }
 
+    /// What the index believes is at `path`, for a commit's check (§7.5 step 6).
+    fn expected(&self, path: &RelPath) -> Option<Expected> {
+        self.index.live(path).map(|r| Expected {
+            kind: r.entry.kind,
+            size: r.entry.size,
+            mtime_ns: r.entry.mtime_ns,
+        })
+    }
+
     /// The host reported `state` at `path` (§7.3), inside or outside a
-    /// bracket. Reports for a path in flight are ignored.
+    /// bracket. Reports for a path in flight are ignored; so is `Absent`
+    /// for a `revert`-made want (§8.3). A change at an observable wanted
+    /// path re-classifies the want.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
         if let Some(seen) = &mut self.scan {
             seen.insert(path.clone());
         }
-        if self.in_flight(&path) {
+        if self.wants.in_flight(&path) {
+            return Scanned::default();
+        }
+        if state == ScanState::Absent && self.wants.restoring(&path) {
             return Scanned::default();
         }
         let change = match state {
@@ -411,6 +495,7 @@ impl FolderState {
         };
         if change.is_some() {
             self.touched(now);
+            self.reclassify_want(&path);
         }
         self.reconsider(&path, None);
         Scanned {
@@ -419,10 +504,37 @@ impl FolderState {
         }
     }
 
+    /// The index changed under an observable want: classify the wanted
+    /// entry against the new record. A dominating result replaces the want
+    /// (keeping its sources when the version is unchanged); anything else
+    /// ends it.
+    fn reclassify_want(&mut self, path: &RelPath) {
+        let Some(old) = self.wants.remove(path) else {
+            return;
+        };
+        let classified = batch::classify(&self.index, &old.entry);
+        if classified.fallback {
+            self.winner_fallbacks += 1;
+        }
+        if let Some(item) = classified.item {
+            let same = item.incoming().version == old.entry.version;
+            if self
+                .wants
+                .insert(item, old.batch, old.source, old.seq_high)
+                .is_none()
+                && same
+            {
+                for src in old.sources {
+                    self.wants.note_announced(path, &old.entry.version, src);
+                }
+            }
+        }
+    }
+
     /// Re-classify the deferred entries at `path` against the index as it
     /// now stands, in arrival order; only those with `reason` if given.
-    /// Each becomes a one-item accepted set (an `Apply`, possibly a
-    /// conflict's `M`) or is dropped if the index has caught up with it.
+    /// Each becomes a want (an `Apply`, possibly a conflict's `M`) or is
+    /// dropped if the index has caught up with it.
     fn reconsider(&mut self, path: &RelPath, reason: Option<DeferredReason>) {
         let Some(list) = self.deferred.remove(path) else {
             return;
@@ -439,17 +551,25 @@ impl FolderState {
                 self.winner_fallbacks += 1;
             }
             if let Some(item) = classified.item {
-                self.accepted.push(ApplySet {
-                    folder: self.id,
-                    batch: deferred.batch,
-                    source: deferred.source,
-                    seq_high: deferred.seq_high,
-                    items: vec![item],
-                    ignored: 0,
-                    duplicates: 0,
-                    fallbacks: usize::from(classified.fallback),
-                });
+                self.want(item, deferred.batch, deferred.source, deferred.seq_high);
             }
+        }
+    }
+
+    /// Put an accepted item in the want-list, or defer it if it is
+    /// concurrent with or older than the version already wanted there.
+    fn want(&mut self, item: ApplyItem, batch: BatchId, source: NodeId, seq_high: u64) {
+        if let Some(item) = self.wants.insert(item, batch, source, seq_high) {
+            self.deferred
+                .entry(item.path().clone())
+                .or_default()
+                .push(Deferred {
+                    entry: item.incoming().clone(),
+                    batch,
+                    source,
+                    seq_high,
+                    reason: DeferredReason::ChangedUnderneath,
+                });
         }
     }
 
@@ -467,20 +587,21 @@ impl FolderState {
     }
 
     /// A full scan ended: every live record it did not report is gone
-    /// (§7.3), except paths in flight. Returns the tombstones, or `Err` if
-    /// no bracket was open.
+    /// (§7.3), except paths in flight and paths being restored by `revert`.
+    /// Returns the tombstones, or `Err` if no bracket was open.
     pub fn scan_finished(&mut self, now: Timestamp) -> Result<Vec<LocalChange>, FolderStatus> {
         let seen = self.scan.take().ok_or(FolderStatus::ScanNotOpen)?;
         let gone: Vec<RelPath> = self
             .index
             .live_records()
             .map(|r| r.entry.path.clone())
-            .filter(|p| !seen.contains(p) && !self.in_flight(p))
+            .filter(|p| !seen.contains(p) && !self.wants.in_flight(p) && !self.wants.restoring(p))
             .collect();
         let mut changes = Vec::new();
         for path in &gone {
             if let Some(change) = self.index.observe_absent(path, now.as_unix_nanos()) {
                 changes.push(change);
+                self.reclassify_want(path);
             }
             // A deferred entry whose file vanished underneath is only ever
             // caught here: later scans never report a tombstoned path.
@@ -590,8 +711,56 @@ impl FolderState {
         }
     }
 
+    /// Deadlines that have passed return their wants to *wanted* (§7.5).
+    pub fn expire(&mut self, now: Timestamp) -> Vec<RelPath> {
+        self.wants.expire(now)
+    }
+
+    /// A peer told us the highest `seq` of ours it holds (§7.4). It replaces
+    /// our memory of its acks and marks it for catch-up at the next tick.
+    pub fn have_up_to(&mut self, peer: NodeId, seq: u64) {
+        self.acked.insert(peer, seq);
+        self.catchup.insert(peer);
+    }
+
+    /// Catch-up batches for every peer marked by `have_up_to` (§7.4):
+    /// announced records above its `seq`, in `seq` order, through `form()`.
+    /// Ids are `base` and its successors; returns how many were used.
+    pub fn catchup_batches(
+        &mut self,
+        now: Timestamp,
+        base: BatchId,
+    ) -> (Vec<(NodeId, Vec<Batch>)>, u128) {
+        let peers = std::mem::take(&mut self.catchup);
+        let mut out = Vec::new();
+        let mut used: u128 = 0;
+        for peer in peers {
+            let after = self.acked_by(peer);
+            let records: Vec<(&IndexRecord, Option<crate::index::ChangeKind>)> = self
+                .index
+                .announced_since(after)
+                .into_iter()
+                .map(|r| (r, None))
+                .collect();
+            let batches = batch::form(
+                base.successor(used),
+                self.id,
+                self.index.own(),
+                now,
+                &records,
+            );
+            used += batches.len() as u128;
+            if !batches.is_empty() {
+                out.push((peer, batches));
+            }
+        }
+        (out, used)
+    }
+
     /// A batch arrived (§7.4): apply set, quarantine joins, frozen paths,
-    /// the brake, and the decision (§8.1, §8.2).
+    /// the brake, and the decision (§8.1, §8.2). Accepted items join the
+    /// want-list; every entry the batch carries names its source as a
+    /// holder of that version (§7.5).
     pub fn receive(&mut self, now: Timestamp, batch: &Batch) -> Received {
         self.index.set_peer_seq(batch.source, batch.seq_high);
         let mut set = batch::apply_set(&self.index, batch);
@@ -601,6 +770,10 @@ impl FolderState {
         let mut raw: BTreeMap<&RelPath, &Entry> = BTreeMap::new();
         for entry in &batch.entries {
             raw.insert(&entry.path, entry);
+        }
+        for (path, entry) in &raw {
+            self.wants
+                .note_announced(path, &entry.version, batch.source);
         }
 
         let mut joined = 0;
@@ -663,8 +836,8 @@ impl FolderState {
                 }
             }
             Verdict::Pass => {
-                if !set.is_empty() {
-                    self.accepted.push(set.clone());
+                for item in set.items.clone() {
+                    self.want(item, batch.id, batch.source, batch.seq_high);
                 }
                 Received {
                     set,
@@ -706,7 +879,9 @@ impl FolderState {
                 duplicates: 0,
                 fallbacks,
             };
-            self.accepted.push(set.clone());
+            for it in set.items.clone() {
+                self.want(it, item.batch, item.source, item.seq_high);
+            }
             return Approved::Released(Some(set));
         }
         match &self.paused {
@@ -745,12 +920,14 @@ impl FolderState {
 
     /// `revert` (§8.3) on a paused folder: discard the pending changes,
     /// restore every path's announced record, move the current files to
-    /// trash, and put the restored live entries in flight to be fetched.
+    /// trash, and want the restored live entries again as `restoring`.
     /// `None` if the folder is not paused.
-    pub fn revert(&mut self, now: Timestamp) -> Option<RevertOutcome> {
+    pub fn revert(&mut self, _now: Timestamp) -> Option<RevertOutcome> {
         let paused = self.paused.take()?;
+        let own = self.index.own();
+        let others: BTreeSet<NodeId> = self.members.iter().copied().filter(|m| *m != own).collect();
         let mut trash = Vec::new();
-        let mut items = Vec::new();
+        let mut refetch = 0;
         for reverted in self.index.revert_pending() {
             if reverted.current.is_some_and(|e| !e.deleted) {
                 trash.push(reverted.path.clone());
@@ -763,28 +940,24 @@ impl FolderState {
                 } else {
                     ApplyMode::Fetch
                 };
-                items.push(ApplyItem::Apply {
+                refetch += 1;
+                self.wants.insert_restoring(Want {
                     entry: record.entry,
                     mode,
                     conflict: None,
+                    batch: paused.batch,
+                    source: own,
+                    seq_high: 0,
+                    sources: others.clone(),
+                    excluded: BTreeSet::new(),
+                    mismatches: 0,
+                    fetched: false,
+                    restoring: true,
+                    state: WantState::Wanted,
                 });
             }
         }
-        let refetch = items.len();
-        if !items.is_empty() {
-            self.accepted.push(ApplySet {
-                folder: self.id,
-                batch: paused.batch,
-                source: self.index.own(),
-                seq_high: 0,
-                items,
-                ignored: 0,
-                duplicates: 0,
-                fallbacks: 0,
-            });
-        }
         self.window = None;
-        let _ = now;
         self.unfreeze();
         Some(RevertOutcome {
             batch: paused.batch,
@@ -842,15 +1015,106 @@ impl FolderState {
         *slot = (*slot).max(seq_high);
     }
 
-    /// The host finished committing (or failed to commit) an accepted item
-    /// (§7.5 steps 6 to 9). On `Ok` the index adopts the entry and the
-    /// window opens so the adoption is announced (§7.4); if the item
-    /// carried a conflict copy, the displaced file is recorded at the
-    /// conflict path as this machine's local add (§7.6), without waiting for
-    /// a scan. On `ChangedUnderneath` the entry is kept in the deferred set
-    /// until the path is observed again; the sender has been acknowledged
-    /// for it and will not send it twice. Either way the item leaves the
-    /// accepted sets. Returns every record written, in order; empty if
+    /// A peer disconnected: fetches from it are over (§7.5).
+    pub fn peer_gone(&mut self, peer: NodeId) {
+        self.wants.peer_gone(peer);
+    }
+
+    /// The host reported on a fetch (§7.5 steps 3 and 4). Returns the
+    /// want's new state, if the report matched one.
+    pub fn fetched(
+        &mut self,
+        path: &RelPath,
+        version: &Version,
+        report: FetchReport,
+    ) -> Option<WantState> {
+        self.wants.fetched(path, version, report).map(|w| w.state)
+    }
+
+    /// The host reported bytes arriving for a fetch (§7.5).
+    pub fn progress(&mut self, now: Timestamp, path: &RelPath, version: &Version) {
+        self.wants.progress(now, path, version);
+    }
+
+    /// A want persisted by the host comes back after a restart (Phase 2).
+    pub fn restore_want(&mut self, want: Want) {
+        self.wants.restore(want);
+    }
+
+    /// Decide the next host steps for the want-list (§7.5) and adopt every
+    /// index-only want. Returns the steps and the records adopted.
+    pub fn dispatch(
+        &mut self,
+        now: Timestamp,
+        peers: &BTreeMap<NodeId, Tier>,
+    ) -> (Vec<HostStep>, Vec<IndexRecord>) {
+        let steps = self.wants.dispatch(now, &self.rules, peers);
+        let mut host = Vec::new();
+        let mut adopted = Vec::new();
+        for step in steps {
+            match step {
+                WantStep::Fetch {
+                    path,
+                    version,
+                    from,
+                } => {
+                    let (hash, size) = self
+                        .wants
+                        .get(&path)
+                        .map(|w| (w.entry.hash, w.entry.size))
+                        .unwrap_or((crate::entry::ContentHash::EMPTY, 0));
+                    host.push(HostStep::Fetch {
+                        path,
+                        version,
+                        hash,
+                        size,
+                        from,
+                    });
+                }
+                WantStep::Commit(want) => {
+                    let want = *want;
+                    let path = want.path().clone();
+                    let expected = self.expected(&path);
+                    host.push(match want.mode {
+                        ApplyMode::MetadataOnly => HostStep::SetMeta {
+                            path,
+                            mtime_ns: want.entry.mtime_ns,
+                            exec: want.entry.exec,
+                        },
+                        _ if want.entry.deleted => HostStep::Remove { path, expected },
+                        _ => HostStep::Write {
+                            path,
+                            displace: match &want.conflict {
+                                Some(copy) => Displace::ConflictCopy(copy.path.clone()),
+                                None => Displace::Trash,
+                            },
+                            entry: want.entry,
+                            expected,
+                        },
+                    });
+                }
+                WantStep::Adopt(entry) => {
+                    let path = entry.path.clone();
+                    adopted.push(self.adopt(now, entry));
+                    self.reconsider(&path, None);
+                }
+            }
+        }
+        (host, adopted)
+    }
+
+    /// Want-list changes since the last call, for `WantChanged` actions.
+    pub fn want_changes(&mut self) -> Vec<(RelPath, Option<Want>)> {
+        self.wants.drain_changes()
+    }
+
+    /// The host finished committing (or failed to commit) a want (§7.5
+    /// steps 6 to 9). On `Ok` the index adopts the entry and the window
+    /// opens so the adoption is announced (§7.4); if the want carried a
+    /// conflict copy, the displaced file is recorded at the conflict path
+    /// as this machine's local add (§7.6). On `ChangedUnderneath` the entry
+    /// is kept in the deferred set until the path is observed again. Either
+    /// way the want ends. Returns every record written, in order; empty if
     /// nothing matched or the commit did not happen.
     pub fn applied(
         &mut self,
@@ -859,47 +1123,34 @@ impl FolderState {
         version: &Version,
         outcome: ApplyOutcome,
     ) -> Vec<IndexRecord> {
-        let mut found: Option<(Deferred, Option<ConflictCopy>)> = None;
-        for set in &mut self.accepted {
-            if let Some(pos) = set.items.iter().position(|item| {
-                let e = item.incoming();
-                &e.path == path && &e.version == version
-            }) {
-                let ApplyItem::Apply {
-                    entry, conflict, ..
-                } = set.items.remove(pos);
-                found = Some((
-                    Deferred {
-                        entry,
-                        batch: set.batch,
-                        source: set.source,
-                        seq_high: set.seq_high,
-                        reason: DeferredReason::ChangedUnderneath,
-                    },
-                    conflict,
-                ));
-                break;
-            }
+        if self.wants.get(path).is_none_or(|w| w.version() != version) {
+            return Vec::new();
         }
-        self.accepted.retain(|set| !set.is_empty());
-        let Some((deferred, conflict)) = found else {
+        let Some(want) = self.wants.remove(path) else {
             return Vec::new();
         };
         match outcome {
             ApplyOutcome::Ok => {
-                let mut written = vec![self.adopt(now, deferred.entry)];
-                if let Some(copy) = conflict {
+                let mut written = vec![self.adopt(now, want.entry)];
+                if let Some(copy) = want.conflict {
                     let change = self.index.record_conflict_copy(copy.path, &copy.loser);
                     self.touched(now);
                     written.push(change.record);
                 }
+                self.reconsider(path, None);
                 written
             }
             ApplyOutcome::ChangedUnderneath => {
                 self.deferred
                     .entry(path.clone())
                     .or_default()
-                    .push(deferred);
+                    .push(Deferred {
+                        entry: want.entry,
+                        batch: want.batch,
+                        source: want.source,
+                        seq_high: want.seq_high,
+                        reason: DeferredReason::ChangedUnderneath,
+                    });
                 Vec::new()
             }
         }
@@ -1095,7 +1346,7 @@ mod tests {
         );
         let set = b.receive(t(0.0), &batch).set;
         assert_eq!(set.items.len(), 1);
-        assert_eq!(b.accepted().len(), 1);
+        assert_eq!(b.wants().len(), 1);
         // Receiving is not writing: no window.
         assert_eq!(b.due(), None);
 
@@ -1107,7 +1358,7 @@ mod tests {
             .remove(0);
         assert_eq!(record.entry, entry);
         assert_eq!(record.seq, 1);
-        assert!(b.accepted().is_empty(), "the set emptied and was dropped");
+        assert!(b.wants().is_empty(), "the want ended");
         assert_eq!(b.due(), Some(t(7.0)), "an adoption opens the window");
         let relayed = b.form_batches(t(7.0), batch_id().successor(5)).remove(0);
         assert_eq!(relayed.entries, vec![entry.clone()]);
@@ -1117,7 +1368,7 @@ mod tests {
         let again = b.receive(t(0.0), &batch).set;
         assert!(again.is_empty());
         assert_eq!(again.ignored, 1);
-        assert!(b.accepted().is_empty());
+        assert!(b.wants().is_empty());
     }
 
     #[test]
@@ -1141,7 +1392,7 @@ mod tests {
             ApplyOutcome::ChangedUnderneath,
         );
         assert!(out.is_empty());
-        assert!(b.accepted().is_empty());
+        assert!(b.wants().is_empty());
         assert_eq!(b.index().get(&p("x")), None);
         assert_eq!(b.due(), None);
         let kept: Vec<_> = b.deferred().collect();
@@ -1157,22 +1408,21 @@ mod tests {
         // the larger mtime, so A wins and the local file becomes the copy.
         b.scanned(t(6.0), p("x"), file(9, 0));
         assert!(b.deferred().next().is_none());
-        assert_eq!(b.accepted().len(), 1);
-        let set = &b.accepted()[0];
+        assert_eq!(b.wants().len(), 1);
+        let want = b.wants().get(&p("x")).unwrap();
         assert_eq!(
-            (set.batch, set.source, set.seq_high),
+            (want.batch, want.source, want.seq_high),
             (batch.id, node(1), 1)
         );
-        let item = &set.items[0];
-        assert_eq!(item.mode(), ApplyMode::Fetch);
-        let m = item.incoming();
+        assert_eq!(want.mode, ApplyMode::Fetch);
+        let m = &want.entry;
         assert_eq!(m.hash, hash(1), "M carries the winner's content");
         assert!(m.version.dominates(&entry.version));
         assert!(
             m.version
                 .dominates(&b.index().get(&p("x")).unwrap().entry.version)
         );
-        let copy = item.conflict().unwrap();
+        let copy = want.conflict.as_ref().unwrap();
         assert_eq!(copy.loser.hash, hash(9));
         assert_eq!(copy.loser.modified_by, node(2));
         assert_eq!(copy.path.as_str(), "x.conflict-19700101-000000-desktop");
@@ -1220,14 +1470,14 @@ mod tests {
         assert_eq!(changes.len(), 1);
         assert!(changes[0].record.entry.deleted);
         assert!(b.deferred().next().is_none(), "not stuck");
-        assert_eq!(b.accepted().len(), 1);
+        assert_eq!(b.wants().len(), 1);
         // Delete vs modify: the live incoming side wins (§7.6 rule 1). There is
         // no local file to displace, so no conflict copy; M carries A's
         // content under the merged vector.
-        let item = &b.accepted()[0].items[0];
-        assert_eq!(item.mode(), ApplyMode::Fetch);
-        assert!(item.conflict().is_none());
-        let m = item.incoming();
+        let want = b.wants().get(&p("x")).unwrap();
+        assert_eq!(want.mode, ApplyMode::Fetch);
+        assert!(want.conflict.is_none());
+        let m = &want.entry;
         assert!(m.same_content(&entry));
         assert!(!m.deleted);
         let tomb = &b.index().get(&p("x")).unwrap().entry;
@@ -1251,11 +1501,11 @@ mod tests {
         );
         // The observation finds nothing there after all (a transient file).
         b.scanned(t(6.0), p("x"), ScanState::Absent);
-        assert_eq!(b.accepted().len(), 1);
-        assert!(matches!(
-            &b.accepted()[0].items[0],
-            ApplyItem::Apply { entry: e, mode: ApplyMode::Fetch, conflict: None } if *e == entry
-        ));
+        assert_eq!(b.wants().len(), 1);
+        let want = b.wants().get(&p("x")).unwrap();
+        assert_eq!(want.entry, entry);
+        assert_eq!(want.mode, ApplyMode::Fetch);
+        assert!(want.conflict.is_none());
         assert!(b.deferred().next().is_none());
     }
 
@@ -1304,6 +1554,10 @@ mod tests {
         )
     }
 
+    fn file_obs(h: u8) -> ScanState {
+        file(h, 1)
+    }
+
     fn observed(kind: Kind, h: u8, mtime_ns: i64, exec: bool) -> ScanState {
         ScanState::Observed(Observed {
             kind,
@@ -1318,18 +1572,63 @@ mod tests {
         })
     }
 
-    /// Host shorthand: commit every accepted item as `Ok`.
+    /// Host shorthand: every member but this one is on the LAN, every fetch
+    /// succeeds and every commit is `Ok`. Drives the want-list until it is
+    /// empty and returns every record written.
     fn commit_all(f: &mut FolderState, now: Timestamp) -> Vec<IndexRecord> {
-        let items: Vec<(RelPath, Version)> = f
-            .accepted()
-            .iter()
-            .flat_map(|s| s.items.iter())
-            .map(|i| (i.path().clone(), i.incoming().version.clone()))
+        let own = f.index().own();
+        let peers: BTreeMap<NodeId, Tier> = f
+            .members()
+            .filter(|m| *m != own)
+            .map(|m| (m, Tier::Lan))
             .collect();
         let mut out = Vec::new();
-        for (path, version) in items {
-            out.extend(f.applied(now, &path, &version, ApplyOutcome::Ok));
+        for _ in 0..64 {
+            // Settle whatever an earlier dispatch already asked the host for.
+            let in_flight: Vec<(RelPath, Version, WantState)> = f
+                .wants()
+                .iter()
+                .map(|w| (w.path().clone(), w.version().clone(), w.state))
+                .collect();
+            for (path, version, state) in in_flight {
+                match state {
+                    WantState::Fetching { .. } => {
+                        f.fetched(&path, &version, FetchReport::Ok);
+                    }
+                    WantState::Committing { .. } => {
+                        out.extend(f.applied(now, &path, &version, ApplyOutcome::Ok));
+                    }
+                    _ => {}
+                }
+            }
+            let (steps, adopted) = f.dispatch(now, &peers);
+            out.extend(adopted);
+            for step in &steps {
+                match step {
+                    HostStep::Fetch { path, version, .. } => {
+                        f.fetched(path, version, FetchReport::Ok);
+                    }
+                    HostStep::Write { path, entry, .. } => {
+                        out.extend(f.applied(now, path, &entry.version, ApplyOutcome::Ok));
+                    }
+                    HostStep::Remove { path, .. } | HostStep::SetMeta { path, .. } => {
+                        let version = f.wants().get(path).unwrap().version().clone();
+                        out.extend(f.applied(now, path, &version, ApplyOutcome::Ok));
+                    }
+                }
+            }
+            if steps.is_empty() && f.wants().iter().all(|w| !w.in_flight()) {
+                break;
+            }
         }
+        assert!(
+            f.wants().iter().all(|w| !w.in_flight()),
+            "commit_all left work in flight: {:?}",
+            f.wants()
+                .iter()
+                .map(|w| (w.path().as_str(), w.state))
+                .collect::<Vec<_>>()
+        );
         out
     }
 
@@ -1565,7 +1864,7 @@ mod tests {
         );
         assert!(matches!(r.decision, Decision::Held { .. }));
         assert_eq!(r.summary.dels, 8);
-        assert!(b.accepted().is_empty(), "nothing applied");
+        assert!(b.wants().is_empty(), "nothing applied");
         assert_eq!(b.index().tracked_count(), 10);
         let held = b.quarantine().get(bid(3)).unwrap();
         assert_eq!(held.entries.len(), 8);
@@ -1597,7 +1896,7 @@ mod tests {
         let recreate = a.form_batches(t(16.0), bid(5)).remove(0);
         let r = b.receive(t(16.0), &recreate);
         assert_eq!(r.joined, 1);
-        assert!(b.accepted().is_empty());
+        assert!(b.wants().is_empty());
         let stored = &b.quarantine().get(bid(3)).unwrap().entries[&p("f00")];
         assert!(!stored.deleted);
         assert_eq!(stored.hash, hash(7));
@@ -1608,7 +1907,7 @@ mod tests {
         let other = a.form_batches(t(19.0), bid(6)).remove(0);
         let r = b.receive(t(19.0), &other);
         assert_eq!((r.joined, r.decision), (0, Decision::Accepted));
-        assert_eq!(b.accepted().len(), 1);
+        assert_eq!(b.wants().len(), 1);
         commit_all(&mut b, t(20.0));
 
         // Approve re-classifies the stored entries as they stand now.
@@ -1634,7 +1933,7 @@ mod tests {
             other => panic!("expected a release, got {other:?}"),
         }
         assert!(b.quarantine().is_empty());
-        assert_eq!(b.accepted().len(), 1);
+        assert_eq!(b.wants().len(), 8, "one want per released path");
         assert_eq!(b.approve(t(22.0), bid(3)), Approved::Unknown);
     }
 
@@ -1714,12 +2013,11 @@ mod tests {
         let now: Vec<IndexRecord> = b.index().records().cloned().collect();
         assert_eq!(now, announced, "every record back exactly, seq included");
         assert!(b.index().unannounced().is_empty(), "nothing to re-announce");
-        assert_eq!(b.accepted().len(), 1);
+        assert_eq!(b.wants().len(), 9);
         assert!(
-            b.accepted()[0]
-                .items
+            b.wants()
                 .iter()
-                .all(|i| i.mode() == ApplyMode::Fetch && i.conflict().is_none())
+                .all(|w| w.mode == ApplyMode::Fetch && w.conflict.is_none() && w.restoring)
         );
         assert!(b.in_flight(&p("f03")));
 
@@ -1777,14 +2075,11 @@ mod tests {
         // Both versions were classified against B's tombstone: the first is
         // a conflict (delete vs modify) resolving to A's content, the second
         // dominates whatever the first produced and is classified too.
-        let f00_items: Vec<&ApplyItem> = b
-            .accepted()
-            .iter()
-            .flat_map(|s| s.items.iter())
-            .filter(|i| i.path() == &p("f00"))
-            .collect();
-        assert_eq!(f00_items.len(), 2);
-        assert!(f00_items.iter().all(|i| !i.incoming().deleted));
+        // One want per path: the second version dominated the first and
+        // replaced it.
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(!want.entry.deleted);
+        assert_eq!(want.entry.hash, hash(5));
     }
 
     #[test]
@@ -1821,7 +2116,350 @@ mod tests {
         assert_eq!(b.quarantine().len(), 1, "still held");
         assert!(b.paused().unwrap().would_pass);
         assert!(b.paused().is_some(), "still paused");
-        assert!(b.accepted().is_empty());
+        assert!(b.wants().is_empty());
+    }
+
+    // ---- §7.4 catch-up, §7.5 want-list, §8.3 in flight --------------------------
+
+    fn lan(peers: &[u8]) -> BTreeMap<NodeId, Tier> {
+        peers.iter().map(|n| (node(*n), Tier::Lan)).collect()
+    }
+
+    #[test]
+    fn have_up_to_marks_catch_up_of_announced_records_only() {
+        let mut a = folder_with(Rules::default(), 1, "alpha");
+        for i in 0..5 {
+            a.scanned(t(1.0), p(&format!("f{i}")), file(1, 1));
+        }
+        a.form_batches(t(3.0), bid(1));
+        a.scanned(t(4.0), p("pending"), file(2, 2));
+        assert!(!a.wake_now());
+        a.acknowledged(node(2), 4);
+        a.have_up_to(node(2), 2);
+        assert_eq!(
+            a.acked_by(node(2)),
+            2,
+            "have_up_to replaces the ack, even downwards"
+        );
+        assert!(a.wake_now());
+        let (batches, used) = a.catchup_batches(t(5.0), bid(9));
+        assert_eq!(used, 1);
+        assert!(!a.wake_now());
+        assert_eq!(batches.len(), 1);
+        let (peer, list) = &batches[0];
+        assert_eq!(*peer, node(2));
+        assert_eq!(list.len(), 1);
+        let b = &list[0];
+        assert_eq!(b.id, bid(9));
+        let paths: Vec<_> = b.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["f2", "f3", "f4"],
+            "records above seq 2, announced only"
+        );
+        assert_eq!(b.seq_high, 5);
+        assert_eq!(
+            b.summary,
+            Summary::default(),
+            "already-announced records carry no counts"
+        );
+        assert_eq!(
+            a.index().pending_count(),
+            1,
+            "the pending record waits for the live path"
+        );
+        // A peer that holds everything gets nothing.
+        a.have_up_to(node(3), 5);
+        let (batches, used) = a.catchup_batches(t(6.0), bid(10));
+        assert!(batches.is_empty());
+        assert_eq!(used, 0);
+    }
+
+    #[test]
+    fn catch_up_splits_at_ten_thousand_on_seq() {
+        let mut a = folder_with(Rules::default(), 1, "alpha");
+        let n = crate::batch::MAX_BATCH_ENTRIES + 5;
+        for i in 0..n {
+            a.scanned(t(1.0), p(&format!("f{i:05}")), file(1, i as i64));
+        }
+        a.form_batches(t(3.0), bid(1));
+        a.have_up_to(node(2), 0);
+        let (batches, used) = a.catchup_batches(t(5.0), bid(9));
+        assert_eq!(used, 2);
+        let list = &batches[0].1;
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, bid(9));
+        assert_eq!(list[1].id, bid(9).successor(1));
+        assert_eq!(list[0].entries.len(), crate::batch::MAX_BATCH_ENTRIES);
+        assert_eq!(list[0].seq_high, crate::batch::MAX_BATCH_ENTRIES as u64);
+        assert_eq!(list[1].entries.len(), 5);
+        assert_eq!(list[1].seq_high, n as u64);
+    }
+
+    #[test]
+    fn a_paused_pending_set_stays_out_of_catch_up() {
+        let (_, mut b) = a_and_b(10, tight());
+        for i in 0..8 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(
+            b.tick(t(12.0), bid(5)),
+            Ticked::Paused { first: true, .. }
+        ));
+        b.have_up_to(node(1), 0);
+        let (batches, _) = b.catchup_batches(t(13.0), bid(6));
+        let entries = &batches[0].1[0].entries;
+        assert_eq!(entries.len(), 10, "the announced adds only");
+        assert!(
+            entries.iter().all(|e| !e.deleted),
+            "no pending tombstone leaks"
+        );
+    }
+
+    #[test]
+    fn accepted_items_become_wants_and_the_host_is_driven_to_completion() {
+        let (mut a, mut b) = a_and_b(3, Rules::default());
+        a.scanned(t(10.0), p("d"), observed(Kind::Dir, 0, 0, false));
+        a.scanned(t(10.0), p("d/new"), file(7, 7));
+        a.scanned(t(10.0), p("f00"), file(8, 8));
+        a.scanned(t(10.0), p("f01"), file(1, 9)); // touch
+        a.scanned(t(10.0), p("f02"), ScanState::Absent);
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        let r = b.receive(t(12.0), &batch);
+        assert_eq!(r.decision, Decision::Accepted);
+        assert_eq!(b.wants().len(), 5);
+        let (steps, adopted) = b.dispatch(t(12.0), &lan(&[1]));
+        assert!(adopted.is_empty());
+        let kinds: Vec<&str> = steps
+            .iter()
+            .map(|s| match s {
+                HostStep::Fetch { .. } => "fetch",
+                HostStep::Write { .. } => "write",
+                HostStep::Remove { .. } => "remove",
+                HostStep::SetMeta { .. } => "setmeta",
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["fetch", "fetch", "write", "setmeta", "remove"],
+            "fetches first, then commits: d, f01, f02"
+        );
+        assert!(
+            matches!(&steps[2], HostStep::Write { path, expected: None, displace: Displace::Trash, .. } if path == &p("d"))
+        );
+        assert!(
+            matches!(&steps[3], HostStep::SetMeta { path, mtime_ns: 9, exec: false } if path == &p("f01"))
+        );
+        assert!(
+            matches!(&steps[4], HostStep::Remove { path, expected: Some(Expected { kind: Kind::File, size: 10, mtime_ns: 1 }) } if path == &p("f02"))
+        );
+        assert_eq!(
+            b.wants().get(&p("d/new")).unwrap().state,
+            WantState::Fetching {
+                from: node(1),
+                deadline: t(72.0)
+            }
+        );
+        assert!(b.in_flight(&p("d/new")));
+        commit_all(&mut b, t(13.0));
+        assert!(b.wants().is_empty());
+        assert_eq!(
+            b.index().tracked_count(),
+            3,
+            "f00, f01 and d/new; f02 gone; d is a directory"
+        );
+        assert_eq!(b.index().get(&p("d/new")).unwrap().entry.hash, hash(7));
+        assert!(b.index().get(&p("f02")).unwrap().entry.deleted);
+    }
+
+    #[test]
+    fn a_deferred_want_is_observable_and_a_local_edit_reclassifies_it() {
+        let rules = Rules {
+            relay_limit: 5,
+            ..Rules::default()
+        };
+        let (mut a, mut b) = a_and_b(1, rules);
+        a.scanned(t(10.0), p("big"), file(7, 7)); // size 10 > relay limit 5
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let relay: BTreeMap<NodeId, Tier> = [(node(1), Tier::Relay)].into_iter().collect();
+        assert!(b.dispatch(t(12.0), &relay).0.is_empty());
+        assert_eq!(
+            b.wants().get(&p("big")).unwrap().state,
+            WantState::Deferred { need: Tier::Direct }
+        );
+        assert!(!b.in_flight(&p("big")), "deferred is observable");
+        // The user creates their own "big": a real local change, announced.
+        let out = b.scanned(t(13.0), p("big"), file(9, 9));
+        assert!(out.change.is_some());
+        assert_eq!(b.index().pending_count(), 1);
+        let want = b.wants().get(&p("big")).unwrap();
+        assert!(
+            want.entry.version.dominates(&batch.entries[0].version),
+            "the want is now the conflict's M"
+        );
+        assert_eq!(want.entry.hash, hash(9), "the local edit is newer and wins");
+        assert_eq!(want.mode, ApplyMode::IndexOnly, "so nothing to fetch");
+        let (_, adopted) = b.dispatch(t(13.0), &relay);
+        assert_eq!(adopted.len(), 1);
+        assert!(b.wants().is_empty());
+        let sent = b.form_batches(t(15.0), bid(4)).remove(0);
+        assert!(
+            sent.entries
+                .iter()
+                .any(|e| e.path == p("big") && e.hash == hash(9))
+        );
+    }
+
+    #[test]
+    fn a_restoring_want_ignores_absent_but_a_new_file_cancels_it() {
+        let (_, mut b) = a_and_b(
+            2,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(10.0), p("f00"), ScanState::Absent);
+        b.scanned(t(10.0), p("f01"), ScanState::Absent);
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        // Nobody connected: without source, observable, but Absent is the trash move.
+        assert!(b.dispatch(t(13.0), &BTreeMap::new()).0.is_empty());
+        assert_eq!(b.wants().get(&p("f00")).unwrap().state, WantState::NoSource);
+        assert!(!b.in_flight(&p("f00")));
+        assert_eq!(
+            b.scanned(t(14.0), p("f00"), ScanState::Absent),
+            Scanned::default()
+        );
+        b.scan_started();
+        assert!(
+            b.scan_finished(t(15.0)).unwrap().is_empty(),
+            "restoring paths skip the deletion pass"
+        );
+        assert_eq!(b.index().tracked_count(), 2);
+        // A real file appears at f01: a local change that cancels the want.
+        let out = b.scanned(t(16.0), p("f01"), file(9, 9));
+        assert!(out.change.is_some());
+        assert!(b.wants().get(&p("f01")).is_none(), "cancelled");
+        assert!(b.wants().get(&p("f00")).is_some());
+        assert_eq!(b.index().get(&p("f01")).unwrap().entry.hash, hash(9));
+    }
+
+    #[test]
+    fn a_restored_path_leaves_flight_only_when_its_commit_lands() {
+        let (_, mut b) = a_and_b(
+            1,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(10.0), p("f00"), file(5, 5));
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        assert_eq!(b.wants().get(&p("f00")).unwrap().state, WantState::Wanted);
+        assert!(b.in_flight(&p("f00")));
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Fetch { from, .. } if *from == node(1)));
+        assert!(b.in_flight(&p("f00")));
+        b.fetched(&p("f00"), &v, FetchReport::Ok);
+        assert!(b.in_flight(&p("f00")));
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(
+            &steps[0],
+            HostStep::Write {
+                expected: Some(_),
+                ..
+            }
+        ));
+        assert!(b.in_flight(&p("f00")));
+        assert_eq!(b.applied(t(15.0), &p("f00"), &v, ApplyOutcome::Ok).len(), 1);
+        assert!(!b.in_flight(&p("f00")));
+        assert!(b.wants().is_empty());
+    }
+
+    #[test]
+    fn a_persisted_want_comes_back_wanted_and_fetches() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        b.dispatch(t(12.0), &lan(&[1]));
+        let persisted = b.wants().get(&p("n")).unwrap().clone();
+        assert!(matches!(persisted.state, WantState::Fetching { .. }));
+        // A fresh engine after a restart.
+        let mut c = folder_with(Rules::default(), 2, "bravo");
+        c.restore_want(persisted);
+        assert_eq!(c.wants().get(&p("n")).unwrap().state, WantState::Wanted);
+        let (steps, _) = c.dispatch(t(20.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Fetch { path, .. } if path == &p("n")));
+    }
+
+    /// A scripted host for the want-list properties.
+    #[derive(Clone, Debug)]
+    struct Script {
+        outcomes: Vec<FetchReport>,
+    }
+
+    impl Script {
+        fn next(&mut self) -> FetchReport {
+            if self.outcomes.is_empty() {
+                FetchReport::Ok
+            } else {
+                self.outcomes.remove(0)
+            }
+        }
+    }
+
+    fn drive(
+        f: &mut FolderState,
+        peers: &BTreeMap<NodeId, Tier>,
+        script: &mut Script,
+        rules: &Rules,
+    ) -> Vec<HostStep> {
+        let mut all = Vec::new();
+        for round in 0..200 {
+            let now = t(100.0 + round as f64);
+            let (steps, _) = f.dispatch(now, peers);
+            // Never more than the limits in flight.
+            let fetching = f.wants().fetching();
+            assert!(fetching <= rules.max_fetches_per_folder as usize);
+            let mut per_peer: BTreeMap<NodeId, usize> = BTreeMap::new();
+            for w in f.wants().iter() {
+                if let WantState::Fetching { from, .. } = w.state {
+                    *per_peer.entry(from).or_insert(0) += 1;
+                }
+            }
+            assert!(
+                per_peer
+                    .values()
+                    .all(|n| *n <= rules.max_fetches_per_peer as usize)
+            );
+            if steps.is_empty() {
+                break;
+            }
+            for step in &steps {
+                match step {
+                    HostStep::Fetch { path, version, .. } => {
+                        let outcome = script.next();
+                        f.fetched(path, version, outcome);
+                    }
+                    HostStep::Write { path, entry, .. } => {
+                        f.applied(now, path, &entry.version, ApplyOutcome::Ok);
+                    }
+                    HostStep::Remove { path, .. } | HostStep::SetMeta { path, .. } => {
+                        let version = f.wants().get(path).unwrap().version().clone();
+                        f.applied(now, path, &version, ApplyOutcome::Ok);
+                    }
+                }
+            }
+            all.extend(steps);
+        }
+        all
     }
 
     proptest! {
@@ -1972,7 +2610,7 @@ mod tests {
             match expected {
                 Verdict::Hold(reason) => {
                     prop_assert_eq!(r.held, Some(reason));
-                    prop_assert!(b.accepted().is_empty(), "held: nothing applied");
+                    prop_assert!(b.wants().is_empty(), "held: nothing applied");
                     let item = b.quarantine().get(batch.id).unwrap();
                     prop_assert_eq!(item.entries.len(), expected_set.items.len());
                     for e in item.entries.values() {
@@ -2000,7 +2638,7 @@ mod tests {
                     match b.approve(t(13.0), batch.id) {
                         Approved::Released(set) => {
                             prop_assert_eq!(set.as_ref().map_or(0, |s| s.items.len()), expected_set.items.len());
-                            prop_assert_eq!(b.accepted().len(), usize::from(!expected_set.items.is_empty()));
+                            prop_assert_eq!(b.wants().len(), expected_set.items.len());
                         }
                         other => prop_assert!(false, "expected a release, got {other:?}"),
                     }
@@ -2010,7 +2648,7 @@ mod tests {
                     prop_assert_eq!(r.held, None);
                     prop_assert_eq!(r.decision, Decision::Accepted);
                     prop_assert!(b.quarantine().is_empty());
-                    prop_assert_eq!(b.accepted().len(), usize::from(!expected_set.items.is_empty()));
+                    prop_assert_eq!(b.wants().len(), expected_set.items.len());
                 }
             }
         }
@@ -2065,6 +2703,176 @@ mod tests {
             let all: BTreeMap<RelPath, IndexRecord> =
                 b.index().records().map(|r| (r.entry.path.clone(), r.clone())).collect();
             prop_assert_eq!(all, announced);
+        }
+
+        /// §7.5: every accepted item ends as exactly one of applied, deferred,
+        /// without source, or given up; no fetch is ever asked of a peer that
+        /// did not announce the version; the fetch limits hold throughout.
+        #[test]
+        fn every_want_ends_in_exactly_one_place(
+            files in prop::collection::vec((0u8..6, 1u64..60, any::<bool>()), 1..12),
+            a_tier in prop::sample::select(vec![None, Some(Tier::Lan), Some(Tier::Direct), Some(Tier::Relay)]),
+            c_connected: bool,
+            outcomes in prop::collection::vec(
+                prop::sample::select(vec![FetchReport::Ok, FetchReport::NotAvailable, FetchReport::HashMismatch]),
+                0..12,
+            ),
+            per_peer in 1u32..4,
+        ) {
+            let rules = Rules {
+                direct_limit: 40,
+                relay_limit: 20,
+                max_fetches_per_peer: per_peer,
+                max_fetches_per_folder: 3,
+                ..Rules::default()
+            };
+            let mut a = folder_with(Rules::default(), 1, "alpha");
+            for (i, size, is_dir) in &files {
+                let path = p(&format!("f{i}"));
+                if *is_dir {
+                    a.scanned(t(1.0), path, observed(Kind::Dir, 0, 0, false));
+                } else {
+                    a.scanned(t(1.0), path, ScanState::Observed(Observed {
+                        kind: Kind::File,
+                        size: *size,
+                        mtime_ns: 1,
+                        exec: false,
+                        hash: hash(*i + 1),
+                    }));
+                }
+            }
+            let batch = a.form_batches(t(3.0), bid(1)).remove(0);
+            let mut b = folder_with(rules.clone(), 2, "bravo");
+            let r = b.receive(t(3.0), &batch);
+            prop_assert_eq!(r.decision, Decision::Accepted);
+            let wanted: Vec<Entry> = b.wants().iter().map(|w| w.entry.clone()).collect();
+            let mut peers = BTreeMap::new();
+            if let Some(tier) = a_tier { peers.insert(node(1), tier); }
+            if c_connected { peers.insert(node(3), Tier::Lan); }
+            let mut script = Script { outcomes };
+            let steps = drive(&mut b, &peers, &mut script, &rules);
+            for step in &steps {
+                if let HostStep::Fetch { from, .. } = step {
+                    prop_assert_eq!(*from, node(1), "only the announcer is asked");
+                }
+            }
+            for e in &wanted {
+                let applied = b.index().get(&e.path).is_some_and(|r| r.entry == *e);
+                let want = b.wants().get(&e.path);
+                let parked = want.is_some_and(|w| matches!(w.state, WantState::Deferred { .. } | WantState::NoSource | WantState::GaveUp));
+                prop_assert!(applied != parked, "{}: applied={applied} parked={parked} state={:?}", e.path, want.map(|w| w.state));
+                if let Some(w) = want {
+                    prop_assert!(!w.in_flight(), "nothing left in flight when the host has answered everything");
+                    match w.state {
+                        WantState::NoSource => prop_assert!(a_tier.is_none() || w.excluded.contains(&node(1))),
+                        WantState::Deferred { need } => {
+                            let tier = a_tier.unwrap();
+                            prop_assert!(!tier.allows(&rules, e.size));
+                            prop_assert!(need.allows(&rules, e.size));
+                        }
+                        WantState::GaveUp => prop_assert_eq!(w.mismatches, 2),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        /// §7.5: every Write of a path comes after the Write of each ancestor
+        /// directory in the same list, and every directory Remove after the
+        /// Removes of everything under it.
+        #[test]
+        fn writes_respect_parent_order(
+            tree in prop::collection::vec((0u8..3, 0u8..3, 0u8..3), 1..10),
+            delete: bool,
+        ) {
+            let mut a = folder_with(Rules::default(), 1, "alpha");
+            let mut paths = BTreeSet::new();
+            for (x, y, z) in &tree {
+                let d1 = format!("d{x}");
+                let d2 = format!("{d1}/e{y}");
+                let file = format!("{d2}/f{z}");
+                for d in [&d1, &d2] {
+                    if paths.insert(d.clone()) {
+                        a.scanned(t(1.0), p(d), observed(Kind::Dir, 0, 0, false));
+                    }
+                }
+                if paths.insert(file.clone()) {
+                    a.scanned(t(1.0), p(&file), file_obs(*z + 1));
+                }
+            }
+            let mut b = folder_with(Rules::default(), 2, "bravo");
+            let batch = a.form_batches(t(3.0), bid(1)).remove(0);
+            b.receive(t(3.0), &batch);
+            let mut script = Script { outcomes: vec![] };
+            let steps = drive(&mut b, &lan(&[1]), &mut script, &Rules::default());
+            let writes: Vec<RelPath> = steps.iter().filter_map(|s| match s { HostStep::Write { path, .. } => Some(path.clone()), _ => None }).collect();
+            for (i, w) in writes.iter().enumerate() {
+                for anc in writes.iter().filter(|o| o.is_ancestor_of(w)) {
+                    let j = writes.iter().position(|x| x == anc).unwrap();
+                    prop_assert!(j < i, "{anc} must be written before {w}");
+                }
+            }
+            prop_assert!(b.wants().is_empty());
+            if delete {
+                // A removes everything; B must delete children before parents.
+                let all: Vec<RelPath> = a.index().live_records().map(|r| r.entry.path.clone()).collect();
+                for path in &all {
+                    a.scanned(t(10.0), path.clone(), ScanState::Absent);
+                }
+                let batch = a.form_batches(t(12.0), bid(2)).remove(0);
+                let loose = Rules { hold_count: 0, ..Rules::default() };
+                b.rules_changed(loose.clone());
+                let r = b.receive(t(12.0), &batch);
+                prop_assert_eq!(r.decision, Decision::Accepted);
+                let steps = drive(&mut b, &lan(&[1]), &mut script, &loose);
+                let removes: Vec<RelPath> = steps.iter().filter_map(|s| match s { HostStep::Remove { path, .. } => Some(path.clone()), _ => None }).collect();
+                for (i, r) in removes.iter().enumerate() {
+                    for desc in removes.iter().filter(|o| r.is_ancestor_of(o)) {
+                        let j = removes.iter().position(|x| x == desc).unwrap();
+                        prop_assert!(j < i, "{desc} must be removed before {r}");
+                    }
+                }
+                prop_assert_eq!(b.index().tracked_count(), 0);
+                prop_assert!(b.wants().is_empty());
+            }
+        }
+
+        /// §7.5: a fetch with progress stays alive; the first 60 s gap expires
+        /// it at exactly the tick after the deadline, and the want is fetched
+        /// again from the same, un-excluded source.
+        #[test]
+        fn a_stalled_fetch_returns_within_one_tick(
+            gaps in prop::collection::vec(1i64..90, 1..8),
+        ) {
+            let (mut a, mut b) = a_and_b(1, Rules::default());
+            a.scanned(t(10.0), p("n"), file(7, 7));
+            let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+            b.receive(t(12.0), &batch);
+            let v = b.wants().get(&p("n")).unwrap().version().clone();
+            let (steps, _) = b.dispatch(t(12.0), &lan(&[1]));
+            prop_assert_eq!(steps.len(), 1);
+            let mut now = t(12.0);
+            let mut expired_at = None;
+            for gap in gaps {
+                let before = now;
+                now = now.plus_nanos(gap * NANOS_PER_SECOND);
+                let overdue = b.expire(now);
+                if gap >= 60 {
+                    prop_assert_eq!(overdue, vec![p("n")]);
+                    prop_assert_eq!(b.wants().get(&p("n")).unwrap().state, WantState::Wanted);
+                    prop_assert!(b.expire(before.plus_nanos(60 * NANOS_PER_SECOND - 1)).is_empty());
+                    expired_at = Some(now);
+                    break;
+                }
+                prop_assert!(overdue.is_empty(), "progress every {gap} s keeps it alive");
+                b.progress(now, &p("n"), &v);
+            }
+            if let Some(now) = expired_at {
+                let (steps, _) = b.dispatch(now, &lan(&[1]));
+                let retried = matches!(&steps[0], HostStep::Fetch { from, .. } if *from == node(1));
+                prop_assert!(retried, "retried from the same source, got {:?}", steps[0]);
+                prop_assert!(b.wants().get(&p("n")).unwrap().excluded.is_empty());
+            }
         }
     }
 }

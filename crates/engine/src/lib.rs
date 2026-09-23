@@ -45,13 +45,11 @@ pub use batch::{
 };
 pub use brake::{HoldReason, Verdict};
 pub use conflict::{ConflictCopy, Resolution, Side, Winner};
-pub use engine::{
-    Action, Displace, Engine, Event, Expected, FetchOutcome, NodeConfig, Outbound, Tier,
-};
+pub use engine::{Action, Engine, Event, NodeConfig, Outbound};
 pub use entry::{ContentHash, Entry, Kind, Observed};
 pub use folder::{
-    ApplyOutcome, Approved, Deferred, DeferredReason, FolderState, FolderStatus, Paused, Received,
-    RevertOutcome, ScanState, Ticked, Window,
+    ApplyOutcome, Approved, Deferred, DeferredReason, Displace, Expected, FolderState,
+    FolderStatus, HostStep, Paused, Received, RevertOutcome, ScanState, Ticked, Window,
 };
 pub use id::{BatchId, FolderId, HostName, NodeId};
 pub use index::{ChangeKind, Index, IndexRecord, LocalChange};
@@ -60,7 +58,7 @@ pub use quarantine::{HeldItem, Quarantine};
 pub use rules::Rules;
 pub use time::Timestamp;
 pub use version::{Relation, Version};
-pub use want::{FetchReport, Want, WantList, WantState};
+pub use want::{FetchReport, Tier, Want, WantList, WantState};
 
 /// The version of delocal, taken from the workspace at compile time.
 ///
