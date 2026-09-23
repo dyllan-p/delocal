@@ -272,9 +272,11 @@ impl FolderState {
         batches
     }
 
-    /// A batch arrived: compute its apply set (§7.4) and keep it for the
-    /// host to work through. The brake (PR 5) will sit between the two.
+    /// A batch arrived: compute its apply set (§7.4), keep it for the host
+    /// to work through, and note how far the source's records now reach.
+    /// The brake (PR 5) will sit between the apply set and the decision.
     pub fn receive(&mut self, batch: &Batch) -> ApplySet {
+        self.index.set_peer_seq(batch.source, batch.seq_high);
         let set = batch::apply_set(&self.index, batch);
         if !set.is_empty() {
             self.accepted.push(set.clone());
@@ -550,6 +552,19 @@ mod tests {
         assert!(b.accepted().is_empty());
         assert_eq!(b.index().get(&p("x")), None);
         assert_eq!(b.due(), None);
+    }
+
+    #[test]
+    fn receive_records_the_source_seq() {
+        let mut a = folder();
+        a.scanned(t(1.0), p("x"), file(1, 1));
+        a.scanned(t(1.0), p("y"), file(2, 1));
+        let batch = a.form_batches(t(3.0), batch_id()).remove(0);
+        let mut b = folder();
+        assert_eq!(b.index().peer_seq(node(1)), 0);
+        b.receive(&batch);
+        assert_eq!(b.index().peer_seq(node(1)), 2);
+        assert_eq!(b.index().peer_seq(node(1)), batch.seq_high);
     }
 
     #[test]
