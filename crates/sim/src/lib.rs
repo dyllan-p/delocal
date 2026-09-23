@@ -20,6 +20,8 @@
 
 pub mod invariants;
 pub mod knobs;
+#[cfg(test)]
+mod regressions;
 pub mod sim;
 pub mod steps;
 
