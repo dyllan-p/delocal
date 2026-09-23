@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 9 · 23 September 2026 · Status: **for review** · Changes from draft 8: the winner rule is a total order in five steps (§7.6); the conflict copy is this machine's change (§7.6); an occupied conflict path displaces to trash (§7.6); a displacement target that appears late is `ChangedUnderneath` (§7.5); non-empty directory losers noted as known behaviour (§7.6).
+> Draft 10 · 23 September 2026 · Status: **for review** · Changes from draft 9: rule 5 of the winner rule orders on kind as well (§7.6); the conflict copy's `prev_hash` follows §7.1 rather than being fixed at `EMPTY` (§7.6); the conflict-name split and truncation rules are spelled out (§7.6).
+>
+> Changes from draft 8: the winner rule is a total order in five steps (§7.6); the conflict copy is this machine's change (§7.6); an occupied conflict path displaces to trash (§7.6); a displacement target that appears late is `ChangedUnderneath` (§7.5); non-empty directory losers noted as known behaviour (§7.6).
 >
 > Changes from draft 7: directories and symlinks carry no mtime (§7.1, §7.5); a commit that finds the file changed underneath is re-evaluated after the next observation rather than dropped (§7.5); H1 excludes directories on both sides of the ratio, and the sender cannot see exec-only changes (§8.1).
 >
@@ -315,11 +317,11 @@ Two versions of the same path are in conflict when they are **concurrent** (§7.
 2. If exactly one side is a metadata-only change (`hash == prev_hash`, §7.1), the other side wins. A real edit is never demoted to a conflict copy by a touch.
 3. Otherwise the version with the larger `mtime_ns` wins.
 4. Tie: the version whose `modified_by` node ID is larger (byte order, §4) wins.
-5. Tie: larger `hash`, then `exec` set. Two concurrent versions from one author should be impossible (a node's versions of a path form a chain), so this step exists only to make the rule total; the simulator counts how often it fires, and any count above zero is a bug to find.
+5. Tie: larger `hash`, then `kind` (a symlink and a file with the same bytes tie on hash), then `exec` set, then `size`, `prev_hash`, `author_host`, so the rule is total. Two concurrent versions from one author should be impossible (a node's versions of a path form a chain), so this step exists only to make the rule total; the simulator counts how often it fires, and any count above zero is a bug to find.
 
 **Actions.** Let `W` be the winning version and `L` the losing one, and let `M = merge(W, L)` (§7.2): `W`'s content fields (kind, size, mtime_ns, exec, hash, modified_by, author_host, prev_hash) under the component-wise maximum of the two vectors. `M` dominates both `W` and `L`, and every machine computes the same `M` from the same two inputs, so no increment is needed and no machine has to be told what the others decided. (This is the identical-content merge of §7.2 with a rule for whose content to keep. `deny` in §8.2 does increment, because the choice it encodes is the user's and two machines could choose differently.)
 
-- A machine that currently **holds L** locally fetches `W`'s content, then commits in one host operation: the existing file is moved to the conflict-copy path instead of the trash, and `W`'s content is renamed in (§7.5 step 7). The index adopts `M` at the original path and records the conflict copy as a local add at the conflict path: `L`'s kind, size, mtime_ns, exec and hash, `prev_hash = EMPTY`, a fresh version, and **this machine** as `modified_by` and `author_host`, because the copy is this machine's change (`L`'s author survives in the copy's name). The path is never absent in between, so no scan can mistake the displacement for a deletion. If the conflict path already holds a live record when the conflict is classified (another `L`-holder's copy arrived first), the displaced file goes to the trash instead and the record already there is the conflict copy; if the target appears between classification and commit, the host reports `ChangedUnderneath` (§7.5 step 6) and the entry is re-evaluated.
+- A machine that currently **holds L** locally fetches `W`'s content, then commits in one host operation: the existing file is moved to the conflict-copy path instead of the trash, and `W`'s content is renamed in (§7.5 step 7). The index adopts `M` at the original path and records the conflict copy as a local add at the conflict path: `L`'s kind, size, mtime_ns, exec and hash, `prev_hash` as §7.1 defines it (`EMPTY` unless peers last saw a live entry at the conflict path, for instance an earlier copy deleted inside the current window), a fresh version, and **this machine** as `modified_by` and `author_host`, because the copy is this machine's change (`L`'s author survives in the copy's name). The path is never absent in between, so no scan can mistake the displacement for a deletion. If the conflict path already holds a live record when the conflict is classified (another `L`-holder's copy arrived first), the displaced file goes to the trash instead and the record already there is the conflict copy; if the target appears between classification and commit, the host reports `ChangedUnderneath` (§7.5 step 6) and the entry is re-evaluated.
 - A machine that currently **holds W** locally adopts `M` as a metadata-only apply (§7.5): nothing changes on disk.
 - A machine that holds **neither** (an older version, or nothing) applies `M` as an ordinary change and never creates a conflict copy.
 
@@ -332,7 +334,7 @@ Every machine announces `M` once it has adopted it (§7.4); receivers already ho
 report.conflict-20260922-143005-laptop.xlsx
 ```
 
-If `author_host` is empty (should not happen, but the format must be total), the short form of `L.modified_by` is used instead.
+If `author_host` is empty (should not happen, but the format must be total), the short form of `L.modified_by` is used instead. The name is split at the last `.` that is not its first character, so `archive.tar.gz` becomes `archive.tar.conflict-…gz`; a dotfile with no other dot (`.bashrc`) and any directory take the suffix on the whole name. If the result would exceed 255 bytes, the stem is cut first and then the extension, at character boundaries, so the component stays valid and always contains `.conflict-`.
 
 **Special cases.**
 
