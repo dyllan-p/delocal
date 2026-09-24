@@ -1370,7 +1370,15 @@ impl FolderState {
                 WantStep::Commit(want) => {
                     let want = *want;
                     let path = want.path().clone();
-                    let expected = self.expected(&path);
+                    // A restoring want is refetching what `revert` moved to
+                    // trash (§8.3 step 2): until it lands, the index
+                    // deliberately disagrees with the disk, so the guard
+                    // expects the path to be absent, not the restored shape.
+                    let expected = if want.restoring {
+                        None
+                    } else {
+                        self.expected(&path)
+                    };
                     host.push(match want.mode {
                         ApplyMode::MetadataOnly => HostStep::SetMeta {
                             path,
@@ -2714,6 +2722,21 @@ mod tests {
         );
         assert!(b.in_flight(&p("f03")));
 
+        // The refetch commits against absence: revert trashed f08, and its
+        // restored record describes what is to be fetched, not the disk
+        // (§8.3 step 2).
+        let f08 = b.wants().iter().find(|w| w.path() == &p("f08")).unwrap();
+        assert!(b.index().live(&p("f08")).is_some(), "the record says live");
+        let version = f08.version().clone();
+        b.fetched(t(13.5), &p("f08"), &version, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(13.5), &lan(&[1]));
+        assert!(
+            steps.iter().any(
+                |s| matches!(s, HostStep::Write { path, expected: None, .. } if path == &p("f08"))
+            ),
+            "a restoring want's write expects the path to be absent: {steps:?}"
+        );
+
         // In flight: the trash move is not a deletion, and a full scan that
         // does not see the files does not tombstone them.
         assert_eq!(
@@ -3062,13 +3085,8 @@ mod tests {
         b.fetched(t(20.0), &p("f00"), &v, FetchReport::Ok);
         assert!(b.in_flight(&p("f00")));
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
-        assert!(matches!(
-            &steps[0],
-            HostStep::Write {
-                expected: Some(_),
-                ..
-            }
-        ));
+        // The record says live, the disk is in the trash (§8.3 step 2).
+        assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
         assert!(b.in_flight(&p("f00")));
         assert_eq!(b.applied(t(15.0), &p("f00"), &v, ApplyOutcome::Ok).len(), 1);
         assert!(!b.in_flight(&p("f00")));
