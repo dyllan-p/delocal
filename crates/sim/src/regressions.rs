@@ -3425,3 +3425,143 @@ fn a_reverted_deletion_nobody_can_serve_stands() {
         ],
     );
 }
+
+/// A paused folder answered a peer's catch-up with a record it had adopted
+/// but never announced (the pending set kept it as what a later local
+/// change replaced). The batch's seq_high moved the peer's watermark past
+/// the withheld pending records, and when the pause was approved and they
+/// went out, that peer never asked for them: a conflict copy live on one
+/// node and absent on another.
+#[test]
+fn catch_up_never_sends_what_this_machine_has_not_announced() {
+    passes(
+        33,
+        &[
+            Step::Delete { node: 7, path: 10 },
+            Step::Settle { secs: 2 },
+            Step::Delete { node: 5, path: 11 },
+            Step::Delete { node: 7, path: 3 },
+            Step::Create {
+                node: 5,
+                path: 11,
+                content: 4,
+            },
+            Step::Heal { a: 1, b: 1 },
+            Step::Settle { secs: 12 },
+            Step::Touch { node: 6, path: 4 },
+            Step::Settle { secs: 16 },
+            Step::Everywhere {
+                path: 3,
+                contents: vec![None, None, Some(4), Some(2), Some(1), Some(5), Some(3)],
+            },
+            Step::Heal { a: 1, b: 0 },
+            Step::Heal { a: 7, b: 4 },
+            Step::Touch { node: 4, path: 11 },
+            Step::Heal { a: 4, b: 7 },
+            Step::Modify {
+                node: 1,
+                path: 5,
+                content: 3,
+            },
+            Step::User {
+                node: 2,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 39,
+            },
+            Step::Modify {
+                node: 7,
+                path: 9,
+                content: 1,
+            },
+            Step::Online { node: 5 },
+            Step::MassModify {
+                node: 3,
+                fraction: 97,
+                content: 5,
+            },
+            Step::Create {
+                node: 2,
+                path: 11,
+                content: 1,
+            },
+            Step::Chmod { node: 4, path: 2 },
+            Step::Partition { a: 4, b: 1 },
+            Step::User {
+                node: 1,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 54,
+            },
+            Step::Delete { node: 7, path: 6 },
+            Step::Create {
+                node: 4,
+                path: 5,
+                content: 4,
+            },
+            Step::Tier {
+                a: 4,
+                b: 3,
+                tier: 1,
+            },
+            Step::Chmod { node: 4, path: 7 },
+            Step::Modify {
+                node: 7,
+                path: 10,
+                content: 5,
+            },
+            Step::Create {
+                node: 2,
+                path: 4,
+                content: 2,
+            },
+            Step::Modify {
+                node: 0,
+                path: 4,
+                content: 1,
+            },
+            Step::Modify {
+                node: 2,
+                path: 7,
+                content: 1,
+            },
+            Step::Partition { a: 1, b: 6 },
+            Step::Symlink {
+                node: 3,
+                path: 10,
+                target: 4,
+            },
+            Step::Delete { node: 6, path: 9 },
+            Step::Settle { secs: 6 },
+            Step::Online { node: 5 },
+            Step::Rmdir { node: 3, dir: 1 },
+            Step::Create {
+                node: 0,
+                path: 7,
+                content: 2,
+            },
+            Step::Settle { secs: 31 },
+            Step::Partition { a: 7, b: 3 },
+            Step::Delete { node: 1, path: 2 },
+            Step::Modify {
+                node: 5,
+                path: 2,
+                content: 4,
+            },
+            Step::Online { node: 0 },
+            Step::MassDelete {
+                node: 7,
+                fraction: 85,
+            },
+            Step::Rename {
+                node: 3,
+                from: 0,
+                to: 2,
+            },
+            Step::Offline { node: 3 },
+            Step::User {
+                node: 3,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 10,
+            },
+        ],
+    );
+}
