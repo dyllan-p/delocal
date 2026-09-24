@@ -118,15 +118,6 @@ pub struct Paused {
     pub would_pass: bool,
 }
 
-/// What the index believes is at a path when a commit is ordered (§7.5
-/// step 6). `None` means absent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Expected {
-    pub kind: Kind,
-    pub size: u64,
-    pub mtime_ns: i64,
-}
-
 /// Where a commit moves the file it displaces (§7.5 step 7).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Displace {
@@ -310,10 +301,13 @@ pub enum HostStep {
         size: u64,
         from: NodeId,
     },
+    /// Commit as one operation (§7.5 steps 6 to 9): hold `expected` against
+    /// what is on disk with [`Observed::unchanged_by_stat`], displace any
+    /// existing file, rename the content in, set mtime and exec.
     Write {
         path: RelPath,
         entry: Entry,
-        expected: Option<Expected>,
+        expected: Option<Observed>,
         displace: Displace,
     },
     /// Delete as one operation: check `expected`, move the file aside,
@@ -322,11 +316,14 @@ pub enum HostStep {
     /// tombstone won (§7.6).
     Remove {
         path: RelPath,
-        expected: Option<Expected>,
+        expected: Option<Observed>,
         displace: Displace,
     },
+    /// Metadata-only apply (§7.5): set mtime and exec, no transfer, after
+    /// the same guard as every commit.
     SetMeta {
         path: RelPath,
+        expected: Option<Observed>,
         mtime_ns: i64,
         exec: bool,
     },
@@ -506,12 +503,12 @@ impl FolderState {
     }
 
     /// What the index believes is at `path`, for a commit's check (§7.5 step 6).
-    fn expected(&self, path: &RelPath) -> Option<Expected> {
-        self.index.live(path).map(|r| Expected {
-            kind: r.entry.kind,
-            size: r.entry.size,
-            mtime_ns: r.entry.mtime_ns,
-        })
+    /// What the index believes is on disk at `path` when a commit is
+    /// ordered (§7.5 step 6), `None` for absent. The host holds it against
+    /// what it finds with [`Observed::unchanged_by_stat`] before touching
+    /// anything.
+    fn expected(&self, path: &RelPath) -> Option<Observed> {
+        self.index.live(path).map(|r| r.entry.observed())
     }
 
     /// The host reported `state` at `path` (§7.3), inside or outside a
@@ -1377,6 +1374,7 @@ impl FolderState {
                     host.push(match want.mode {
                         ApplyMode::MetadataOnly => HostStep::SetMeta {
                             path,
+                            expected,
                             mtime_ns: want.entry.mtime_ns,
                             exec: want.entry.exec,
                         },
@@ -2943,10 +2941,10 @@ mod tests {
             matches!(&steps[2], HostStep::Write { path, expected: None, displace: Displace::Trash, .. } if path == &p("d"))
         );
         assert!(
-            matches!(&steps[3], HostStep::SetMeta { path, mtime_ns: 9, exec: false } if path == &p("f01"))
+            matches!(&steps[3], HostStep::SetMeta { path, mtime_ns: 9, exec: false , .. } if path == &p("f01"))
         );
         assert!(
-            matches!(&steps[4], HostStep::Remove { path, expected: Some(Expected { kind: Kind::File, size: 10, mtime_ns: 1 }), displace: Displace::Trash } if path == &p("f02"))
+            matches!(&steps[4], HostStep::Remove { path, expected: Some(Observed { kind: Kind::File, size: 10, mtime_ns: 1, .. }), displace: Displace::Trash } if path == &p("f02"))
         );
         assert_eq!(
             b.wants().get(&p("d/new")).unwrap().state,

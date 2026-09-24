@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use delocal_engine::batch::BatchRole;
-use delocal_engine::folder::{ApplyOutcome, Displace, Expected, FolderStatus, ScanState};
+use delocal_engine::folder::{ApplyOutcome, Displace, FolderStatus, ScanState};
 use delocal_engine::want::{FetchReport, Tier, Want, WantState};
 use delocal_engine::{
     Action, BatchId, ContentHash, Engine, Entry, Event, FolderId, FolderState, HostName,
@@ -1477,13 +1477,14 @@ impl Sim {
         let Some(node) = self.nodes.get_mut(&id) else {
             return (ApplyOutcome::ChangedUnderneath, Vec::new());
         };
+        // §7.5 step 6: the same guard before every commit, SetMeta included.
         let expected = match action {
-            Action::Write { expected, .. } | Action::Remove { expected, .. } => *expected,
+            Action::Write { expected, .. }
+            | Action::Remove { expected, .. }
+            | Action::SetMeta { expected, .. } => expected.as_ref(),
             _ => None,
         };
-        if !matches!(action, Action::SetMeta { .. })
-            && !expected_matches(node.fs.get(path), expected)
-        {
+        if !expected_matches(node.fs.get(path), expected) {
             return (ApplyOutcome::ChangedUnderneath, Vec::new());
         }
         let mut created = Vec::new();
@@ -2159,14 +2160,12 @@ fn rel(s: &str) -> RelPath {
     })
 }
 
-fn expected_matches(file: Option<&File>, expected: Option<Expected>) -> bool {
+/// The commit guard (§7.5 step 6): what the engine believes is on disk
+/// against what is, by the scan fast path's predicate.
+fn expected_matches(file: Option<&File>, expected: Option<&Observed>) -> bool {
     match (file, expected) {
         (None, None) => true,
-        (Some(f), Some(e)) => {
-            f.kind == e.kind
-                && (f.kind != Kind::File
-                    || (f.content.len() as u64 == e.size && f.mtime_ns == e.mtime_ns))
-        }
+        (Some(f), Some(e)) => e.unchanged_by_stat(&f.observed()),
         _ => false,
     }
 }
