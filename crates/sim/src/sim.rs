@@ -1015,9 +1015,20 @@ impl Sim {
                 }
                 let now = self.clock;
                 if let Some(n) = self.nodes.get_mut(&id) {
+                    // Content arrived only if the record's hash is new at the
+                    // path: a metadata-only apply (§7.5) adopts a version of
+                    // what the node already holds and lands no bytes.
+                    let landed = n
+                        .persisted
+                        .records
+                        .get(&record.entry.path)
+                        .is_none_or(|prev| {
+                            prev.entry.deleted || prev.entry.hash != record.entry.hash
+                        });
                     if record.entry.modified_by != id
                         && !record.entry.deleted
                         && record.entry.kind != Kind::Dir
+                        && landed
                         && self.reverting != Some(id)
                     {
                         n.synced

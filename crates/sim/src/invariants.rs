@@ -156,9 +156,11 @@ fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
 /// I2: sync never loses content (§14.1). As implemented:
 ///
 /// - An **adoption** is an `IndexChanged` on node N whose record is live,
-///   not a directory, and authored by another node, except the records a
-///   `revert` puts back (§8.3), which are an index reset to what peers hold
-///   and land no content. The simulator records (hash, path, time) for each.
+///   not a directory, authored by another node, and whose hash is new at
+///   the path (a metadata-only apply, §7.5, adopts a version of content the
+///   node already holds and lands no bytes), except the records a `revert`
+///   puts back (§8.3), which are an index reset to what peers hold and land
+///   no content either. The simulator records (hash, path, time) for each.
 /// - At the end of the run, for every adoption on N, the hash must be
 ///   present in N's folder (any path, files and symlinks by content hash)
 ///   or in N's trash (the hashes of everything sync moved aside).
