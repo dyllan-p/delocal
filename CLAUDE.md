@@ -19,6 +19,11 @@ ambiguous, stop and ask rather than deciding yourself. Items marked **[decision]
 the defaults in §17 unless told otherwise; items marked **[verify]** are checked against
 reality in the phase that needs them, not before.
 
+`main` takes pull requests only, with linear history and green CI; nobody pushes to it
+directly. A new DESIGN.md draft therefore arrives in the working tree uncommitted, and the
+PR that implements it commits the draft as its first commit, so the document still changes
+before the code in every history.
+
 ## Crate boundary (DESIGN.md Appendix B)
 
 Three crates:
