@@ -247,7 +247,8 @@ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
 /// mtime and author, so for files one copy path names one losing version;
 /// directories and symlinks carry no mtime (§7.1), and several losing
 /// versions by one author share a name, so the copy must match one of
-/// them. A copy the simulated user edited afterwards (a mass modify picks
+/// them. Content is kind and hash; the exec bit is not compared, see the
+/// check. A copy the simulated user edited afterwards (a mass modify picks
 /// any file) keeps the name check but not the content check: it is the
 /// user's file from then on.
 fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
@@ -303,11 +304,16 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
             if user_edited.contains(path) {
                 continue; // the user's own edit of the copy; the name still checks out
             }
-            let same = losers.iter().any(|loser| {
-                loser.kind == live.kind
-                    && loser.hash == live.hash
-                    && (loser.kind != Kind::File || loser.exec == live.exec)
-            });
+            // Kind and hash, not the exec bit: the copy is the file as it
+            // was on disk when the winner's commit displaced it, and a chmod
+            // between the loser's record and that commit changes neither
+            // size nor mtime, so the commit's check (§7.5 step 6) lets it
+            // through. The copy then carries the user's latest bit; the next
+            // scan records it as the copy's own change. Only the user's
+            // chmod can produce the difference, and it loses nothing.
+            let same = losers
+                .iter()
+                .any(|loser| loser.kind == live.kind && loser.hash == live.hash);
             if !same {
                 let had: Vec<String> = losers
                     .iter()
