@@ -37,9 +37,12 @@ pub struct HeldItem {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quarantine {
     items: BTreeMap<BatchId, HeldItem>,
-    /// Every quarantined version per path with the item it belongs to, in
-    /// arrival order.
-    versions: BTreeMap<RelPath, Vec<(Version, BatchId)>>,
+    /// Every quarantined version per path with its stamp and the item it
+    /// belongs to, in arrival order. Kept apart from the items' entries
+    /// because `join` records a version it does not store: the stored
+    /// entry is the latest per path, and a concurrent joiner is quarantined
+    /// without replacing it.
+    versions: BTreeMap<RelPath, Vec<(Version, i64, BatchId)>>,
 }
 
 impl Quarantine {
@@ -67,18 +70,21 @@ impl Quarantine {
         self.versions
             .get(&entry.path)?
             .iter()
-            .find(|(v, _)| entry.version.dominates_or_equals(v))
-            .map(|(_, id)| *id)
+            .find(|(v, _, _)| entry.version.dominates_or_equals(v))
+            .map(|(_, _, id)| *id)
     }
 
-    /// The largest stamp among the quarantined entries at `path`, `None` if
-    /// none is held there. A `deny` bump (§8.2) dominates every one of them
-    /// and must rank above them all (§7.6), so its stamp starts here.
+    /// The largest stamp among the quarantined versions at `path`, `None`
+    /// if none is held there. A `deny` bump (§8.2) folds every one of them
+    /// into its vector, so it dominates them all and must rank above them
+    /// all (§7.1, §7.6): its stamp starts here. Read from the same list as
+    /// `versions_at`, not from the stored entries, which lack the joiners
+    /// that were concurrent with what an item already held.
     pub fn max_stamp_at(&self, path: &RelPath) -> Option<i64> {
-        self.items
-            .values()
-            .filter_map(|item| item.entries.get(path))
-            .map(|e| e.stamp)
+        self.versions
+            .get(path)?
+            .iter()
+            .map(|(_, stamp, _)| *stamp)
             .max()
     }
 
@@ -86,14 +92,14 @@ impl Quarantine {
     pub fn versions_at(&self, path: &RelPath) -> Vec<Version> {
         self.versions
             .get(path)
-            .map(|v| v.iter().map(|(ver, _)| ver.clone()).collect())
+            .map(|v| v.iter().map(|(ver, _, _)| ver.clone()).collect())
             .unwrap_or_default()
     }
 
     /// Hold a new item with its entries.
     pub fn hold(&mut self, item: HeldItem) {
         for entry in item.entries.values() {
-            self.record(&entry.path, entry.version.clone(), item.batch);
+            self.record(&entry.path, entry.version.clone(), entry.stamp, item.batch);
         }
         self.items.insert(item.batch, item);
     }
@@ -105,7 +111,7 @@ impl Quarantine {
         if !self.items.contains_key(&batch) {
             return false;
         }
-        self.record(&entry.path, entry.version.clone(), batch);
+        self.record(&entry.path, entry.version.clone(), entry.stamp, batch);
         if let Some(item) = self.items.get_mut(&batch) {
             let replace = item
                 .entries
@@ -123,7 +129,7 @@ impl Quarantine {
         let item = self.items.remove(&batch)?;
         for path in item.entries.keys() {
             if let Some(list) = self.versions.get_mut(path) {
-                list.retain(|(_, id)| *id != batch);
+                list.retain(|(_, _, id)| *id != batch);
                 if list.is_empty() {
                     self.versions.remove(path);
                 }
@@ -132,10 +138,10 @@ impl Quarantine {
         Some(item)
     }
 
-    fn record(&mut self, path: &RelPath, version: Version, batch: BatchId) {
+    fn record(&mut self, path: &RelPath, version: Version, stamp: i64, batch: BatchId) {
         let list = self.versions.entry(path.clone()).or_default();
-        if !list.iter().any(|(v, id)| *v == version && *id == batch) {
-            list.push((version, batch));
+        if !list.iter().any(|(v, _, id)| *v == version && *id == batch) {
+            list.push((version, stamp, batch));
         }
     }
 }
@@ -252,6 +258,28 @@ mod tests {
         assert!(q.is_empty());
         assert!(q.versions_at(&p("a")).is_empty());
         assert_eq!(q.matching(&entry("a", v(&[(2, 4)]))), None);
+    }
+
+    #[test]
+    fn a_concurrent_joiner_is_recorded_with_its_stamp() {
+        let mut q = Quarantine::default();
+        q.hold(item(1, vec![entry("a", v(&[(2, 3)]))]));
+        let mut joiner = entry("a", v(&[(3, 1)]));
+        joiner.stamp = 50;
+        assert!(q.join(batch(1), joiner));
+        assert_eq!(
+            q.get(batch(1)).unwrap().entries[&p("a")].version,
+            v(&[(2, 3)]),
+            "concurrent: the stored entry stays"
+        );
+        assert_eq!(q.versions_at(&p("a")).len(), 2);
+        assert_eq!(
+            q.max_stamp_at(&p("a")),
+            Some(50),
+            "the bump over both versions must start above the joiner too"
+        );
+        q.release(batch(1));
+        assert_eq!(q.max_stamp_at(&p("a")), None);
     }
 
     #[test]
