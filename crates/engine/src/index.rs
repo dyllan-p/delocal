@@ -264,15 +264,22 @@ impl Index {
 
     /// Every announced record with `seq` above `after`, in `seq` order: what
     /// catch-up sends a peer (§7.4). For a path with a pending local change
-    /// the announced record is the one the pending set keeps, not the
-    /// current record, so a paused folder's pending set never leaks.
+    /// the candidate is the record the pending set keeps, not the current
+    /// record, so a paused folder's pending set never leaks; and it, too,
+    /// must have been announced. A record adopted after the last batch and
+    /// then changed locally is what the pending set keeps, but nobody has
+    /// heard of it from this machine: sending it would carry a `seq_high`
+    /// above the withheld pending records, the peer's watermark would pass
+    /// them, and when the pause ends and they are announced, that peer would
+    /// never ask for them.
     pub fn announced_since(&self, after: u64) -> Vec<&IndexRecord> {
+        let announced = |r: &&IndexRecord| r.seq <= self.announced_seq;
         let mut out: Vec<&IndexRecord> = self
             .records
             .iter()
             .filter_map(|(path, record)| match self.pending.get(path) {
-                Some(announced) => announced.as_ref(),
-                None => (record.seq <= self.announced_seq).then_some(record),
+                Some(kept) => kept.as_ref().filter(announced),
+                None => Some(record).filter(announced),
             })
             .filter(|r| r.seq > after)
             .collect();
@@ -1145,6 +1152,32 @@ mod tests {
             "restored records are not re-announced"
         );
         assert_eq!(idx.get(&p("keep")).unwrap().entry.hash, hash(1));
+    }
+
+    #[test]
+    fn announced_since_never_sends_a_record_this_machine_has_not_announced() {
+        let mut idx = index();
+        idx.observe(p("a"), file(1, 1)).unwrap(); // seq 1
+        idx.mark_announced();
+        // Adopted after the last batch: seq 2, not announced by this machine.
+        idx.adopt(remote("r", 5, Version::empty().incremented(node(2))));
+        // A local change on top makes r pending, with the adopted record as
+        // what the pending set keeps.
+        idx.observe(p("r"), file(6, 6)).unwrap(); // seq 3
+        idx.observe(p("b"), file(2, 2)).unwrap(); // seq 4, pending add
+        let sent: Vec<(&str, u64)> = idx
+            .announced_since(0)
+            .into_iter()
+            .map(|r| (r.entry.path.as_str(), r.seq))
+            .collect();
+        assert_eq!(
+            sent,
+            [("a", 1)],
+            "neither the pending records nor the adopted record they replaced"
+        );
+        idx.mark_announced();
+        let sent: Vec<u64> = idx.announced_since(0).into_iter().map(|r| r.seq).collect();
+        assert_eq!(sent, [1, 3, 4], "once announced, everything travels");
     }
 
     #[test]
