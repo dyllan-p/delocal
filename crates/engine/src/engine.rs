@@ -17,10 +17,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::batch::{ApplySet, Batch, BatchDecision, BatchRole, Decision};
-use crate::entry::{ContentHash, Entry};
+use crate::entry::{ContentHash, Entry, Observed};
 use crate::folder::{
-    ApplyOutcome, Approved, Displace, Expected, FolderState, FolderStatus, HostStep, ScanState,
-    Ticked,
+    ApplyOutcome, Approved, Displace, FolderState, FolderStatus, HostStep, ScanState, Ticked,
 };
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
@@ -200,7 +199,7 @@ pub enum Action {
         folder: FolderId,
         path: RelPath,
         entry: Entry,
-        expected: Option<Expected>,
+        expected: Option<Observed>,
         displace: Displace,
     },
     /// Delete as one operation: check `expected`, move to trash, report.
@@ -208,15 +207,18 @@ pub enum Action {
     Remove {
         folder: FolderId,
         path: RelPath,
-        expected: Option<Expected>,
+        expected: Option<Observed>,
         /// Trash, or the conflict-copy path when the removed file is the
         /// losing content of a conflict a tombstone won (§7.6).
         displace: Displace,
     },
-    /// Metadata-only apply (§7.5): set mtime and exec, no transfer.
+    /// Metadata-only apply (§7.5): after the same guard as every commit
+    /// (`expected` against what is on disk, `Observed::unchanged_by_stat`),
+    /// set mtime and exec, no transfer. Report with [`Event::Applied`].
     SetMeta {
         folder: FolderId,
         path: RelPath,
+        expected: Option<Observed>,
         mtime_ns: i64,
         exec: bool,
     },
@@ -615,11 +617,13 @@ impl Engine {
                     },
                     HostStep::SetMeta {
                         path,
+                        expected,
                         mtime_ns,
                         exec,
                     } => Action::SetMeta {
                         folder: folder_id,
                         path,
+                        expected,
                         mtime_ns,
                         exec,
                     },
@@ -2702,10 +2706,12 @@ mod tests {
                 .unwrap()
                 .entry
                 .clone(),
-            expected: Some(Expected {
+            expected: Some(Observed {
                 kind: Kind::File,
                 size: 1,
                 mtime_ns: 2,
+                exec: false,
+                hash: hash(1),
             }),
             displace: Displace::ConflictCopy(p("x.conflict")),
         };

@@ -51,6 +51,31 @@ pub struct Observed {
 }
 
 impl Observed {
+    /// The scan fast path's predicate (§7.3), also the commit guard (§7.5
+    /// step 6): true if `seen`, what the scanner or the host sees at the
+    /// path without hashing, means the entry this observation describes is
+    /// unchanged. A file is unchanged only if kind, size, mtime and the exec
+    /// bit all match (the file's `hash` in `seen` is not consulted; the
+    /// point is not to compute it); a directory if its kind matches; a
+    /// symlink only if its kind and its target match, the target being its
+    /// content and `readlink` one call, so `seen.hash` is the target's hash.
+    /// The exec bit and the target are in the test because `chmod` and a
+    /// retarget change nothing else it sees. One predicate for both uses:
+    /// anything the fast path would notice the guard notices, and anything
+    /// the guard lets through the fast path then confirms as unchanged.
+    pub fn unchanged_by_stat(&self, seen: &Observed) -> bool {
+        if self.kind != seen.kind {
+            return false;
+        }
+        match seen.kind {
+            Kind::File => {
+                self.size == seen.size && self.mtime_ns == seen.mtime_ns && self.exec == seen.exec
+            }
+            Kind::Dir => true,
+            Kind::Symlink => self.hash == seen.hash,
+        }
+    }
+
     /// Apply the §7.1 field rules for the kind: directories have no size,
     /// hash, exec bit or mtime; symlinks have no exec bit or mtime. A
     /// directory's mtime changes whenever a child is created or removed, so
@@ -126,28 +151,11 @@ impl Entry {
         }
     }
 
-    /// The scan fast path (§7.3): true if what the scanner sees at the path
-    /// without hashing means this live entry is unchanged. A file is
-    /// unchanged only if kind, size, mtime and the exec bit all match (the
-    /// file's `hash` in `seen` is not consulted; the point of the fast path
-    /// is not to compute it); a directory if its kind matches; a symlink
-    /// only if its kind and its target match, the target being its content
-    /// and `readlink` one call, so `seen.hash` is the target's hash. The
-    /// exec bit and the target are in the test because `chmod` and a
-    /// retarget change nothing else the fast path sees: with the watcher
-    /// event lost, the index would disagree with the disk forever. A
-    /// tombstone matches nothing: whatever is on disk is new.
+    /// The scan fast path (§7.3) for a live record: see
+    /// [`Observed::unchanged_by_stat`]. A tombstone matches nothing:
+    /// whatever is on disk is new.
     pub fn unchanged_by_stat(&self, seen: &Observed) -> bool {
-        if self.deleted || self.kind != seen.kind {
-            return false;
-        }
-        match seen.kind {
-            Kind::File => {
-                self.size == seen.size && self.mtime_ns == seen.mtime_ns && self.exec == seen.exec
-            }
-            Kind::Dir => true,
-            Kind::Symlink => self.hash == seen.hash,
-        }
+        !self.deleted && self.observed().unchanged_by_stat(seen)
     }
 
     /// A metadata-only change (§7.1): the content is what it was before.
