@@ -1308,7 +1308,9 @@ impl FolderState {
             };
         }
         self.wants.remove(path);
-        let change = self.index.observe_absent(path, now.as_unix_nanos());
+        let change = self
+            .index
+            .observe_absent_unrecoverable(path, now.as_unix_nanos());
         if change.is_some() {
             self.touched(now);
         }

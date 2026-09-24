@@ -1590,12 +1590,10 @@ mod tests {
             );
             assert_eq!(e.modified_by, node(2), "a local change");
         }
-        // The tombstones are local changes (§8.3 step 4), so the next tick
-        // runs the sender pre-check over them (§8.1): three deletions of
-        // three tracked files, the very counts that paused the folder the
-        // first time, and the folder pauses again instead of announcing
-        // them. That is the design as written; whether these tombstones
-        // should be exempt from the pre-check is an open question.
+        // The tombstones go out at the next tick (§8.3 step 4) and are
+        // exempt from the sender pre-check (§8.1): the same three deletions
+        // paused the folder when the user made them, and pause nothing now,
+        // since no member holds what they remove.
         let out = b.handle(
             t(30.0),
             Event::Tick {
@@ -1603,22 +1601,31 @@ mod tests {
             },
         );
         assert!(
-            out.iter().any(|a| matches!(
+            !out.iter().any(|a| matches!(
                 a,
                 Action::StatusChanged {
                     status: FolderStatus::Paused { .. },
                     ..
                 }
             )),
-            "paused on its own tombstones: {out:?}"
+            "no pause on unrecoverable tombstones: {out:?}"
         );
-        assert!(!out.iter().any(|a| matches!(
-            a,
-            Action::Send {
-                payload: Outbound::Batch(_),
-                ..
-            }
-        )));
+        let batches: Vec<&Batch> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send {
+                    payload: Outbound::Batch(batch),
+                    ..
+                } => Some(batch),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(batches.len(), 2, "one batch to each connected member");
+        for batch in batches {
+            assert_eq!(batch.entries.len(), 3);
+            assert!(batch.entries.iter().all(|e| e.deleted));
+            assert_eq!(batch.summary.dels, 0, "counted for nothing");
+        }
     }
 
     fn two_with_ten_files() -> BTreeMap<NodeId, Engine> {
