@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 20 · 23 September 2026 · Status: **for review** · Changes from draft 19: the commit guard is the scan fast path's predicate and applies to `SetMeta` as well as `Write` and `Remove` (§7.5).
+> Draft 21 · 24 September 2026 · Status: **for review** · Changes from draft 20: a restoring want's commit expects the path to be absent (§8.3 step 2, §7.5 step 6).
+>
+> Changes from draft 19: the commit guard is the scan fast path's predicate and applies to `SetMeta` as well as `Write` and `Remove` (§7.5).
 >
 > Changes from draft 18: tombstones the engine writes for unrecoverable content are exempt from the sender pre-check (§8.1).
 >
@@ -429,7 +431,7 @@ Approving on one machine does not approve on others in v1 (§3.2).
 `delocal revert ~/Sync` on the machine that paused itself means "make this folder look like the rest of the mesh again":
 
 1. Discard the pending batch.
-2. For every path in it: move the current local file (if any) to trash, and reset the index record to the last version that was actually announced, restoring that record exactly, `seq` included, so it is not re-announced. A path peers never saw has no announced version; its record is removed.
+2. For every path in it: move the current local file (if any) to trash, and reset the index record to the last version that was actually announced, restoring that record exactly, `seq` included, so it is not re-announced. A path peers never saw has no announced version; its record is removed. From this moment until the refetch lands, the index deliberately disagrees with the disk: the record describes what is to be fetched, not what is there, because the engine itself has just moved the file to the trash (or the reverted batch had deleted it). The refetch's commit therefore **expects the path to be absent** (§7.5 step 6 with `expected = None`), not the restored record's shape; anything found there is a real local change and fails the guard as it should.
 3. Adds that were part of the pending batch are also moved to trash **[decision]** — in the destructive scenarios (encryption, a script writing junk) they are the debris.
 4. The normal want-list logic re-fetches every reverted path from peers. Usually they have it: nothing was sent since the damage. But announced is not fetched: a peer that had deferred the file, or was offline, may never have received the bytes, and if the user's own `rm` removed the only copy (a local deletion does not go through the trash, §8.4) the restored record describes content that exists nowhere. So a restoring want asks **every** member, offline members when they connect, and once every member has answered `NotAvailable` the deletion stands: the record becomes a tombstone as a local change, the want is dropped, and `status` reports the path as unrecoverable. Until then `status` names the members not yet asked, since one of them may hold it. Each restored path follows the in-flight rule of §7.5 with the `revert` exception: an `Absent` observation is ignored in every want state, because the file is in the trash and reporting its absence would announce the very deletion `revert` exists to prevent; a real file appearing at the path is a local change that cancels the want.
 
