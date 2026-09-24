@@ -257,12 +257,15 @@ pub struct Sim {
     /// The node whose `revert` is being processed, while it is: the records
     /// it restores are what peers hold, not content that landed (I2).
     reverting: Option<NodeId>,
-    /// When (in events) each node last reverted each path (§8.3). A revert
-    /// discards every version the node wrote at the path since its last
-    /// announcement; nobody else ever saw those records, and their vectors
-    /// can be reached again, by the node's next change or by a merge that
-    /// includes its re-issued counter (I7).
-    reverted_at: BTreeMap<(NodeId, RelPath), u64>,
+    /// When (in events) each node last reverted each path (§8.3), and the
+    /// record the revert put back there (`None` if it removed the record). A
+    /// revert discards every version the node wrote at the path since its
+    /// last announcement, which is every version of the node's that
+    /// dominates the restored one; nobody else ever saw those records, and
+    /// their vectors can be reached again, by the node's next change or by a
+    /// merge that includes its re-issued counter (I3, I4, I7). The restored
+    /// record itself, and everything before it, was announced and stands.
+    reverted_at: BTreeMap<(NodeId, RelPath), (u64, Option<Version>)>,
     /// When (in events) each version at each path was first seen, for the
     /// revert exemption above.
     seen_at: BTreeMap<RelPath, Vec<(Version, u64)>>,
@@ -997,11 +1000,16 @@ impl Sim {
                             if let Some(list) = self.versions.get_mut(&path) {
                                 list[at] = record.entry.clone();
                             }
+                            // The replacement is a new record: it was first
+                            // seen now, after the revert that discarded the
+                            // old one, or the next revert check would set it
+                            // aside too.
                             let now_ev = self.stats.events;
-                            self.seen_at
-                                .entry(path.clone())
-                                .or_default()
-                                .push((record.entry.version.clone(), now_ev));
+                            let seen = self.seen_at.entry(path.clone()).or_default();
+                            match seen.iter_mut().find(|(v, _)| *v == record.entry.version) {
+                                Some(slot) => slot.1 = now_ev,
+                                None => seen.push((record.entry.version.clone(), now_ev)),
+                            }
                         }
                     }
                     None => {
@@ -2009,9 +2017,6 @@ impl Sim {
                     self.stats.reverts += 1;
                     let pending: Vec<RelPath> = f.index().pending_paths().cloned().collect();
                     let at = self.stats.events;
-                    for path in pending {
-                        self.reverted_at.insert((id, path), at);
-                    }
                     // §8.3 puts the announced records back and re-fetches
                     // them; no content lands, so these writes are not
                     // adoptions for I2.
@@ -2019,6 +2024,14 @@ impl Sim {
                     let fed = self.feed(id, Event::Revert { folder });
                     self.reverting = None;
                     fed?;
+                    for path in pending {
+                        let restored = self
+                            .engine(id)
+                            .and_then(|e| e.folder(folder))
+                            .and_then(|f| f.index().get(&path))
+                            .map(|r| r.entry.version.clone());
+                        self.reverted_at.insert((id, path), (at, restored));
+                    }
                 }
             }
             UserAction::Rules {
@@ -2069,7 +2082,12 @@ impl Sim {
     fn discarded_since(&self, entry: &Entry, seen: u64) -> bool {
         self.reverted_at
             .get(&(entry.modified_by, entry.path.clone()))
-            .is_some_and(|&reverted| reverted >= seen)
+            .is_some_and(|(reverted, restored)| {
+                *reverted >= seen
+                    && restored
+                        .as_ref()
+                        .is_none_or(|kept| !kept.dominates_or_equals(&entry.version))
+            })
     }
 
     /// True if `entry`, as recorded in the version table, was discarded by
