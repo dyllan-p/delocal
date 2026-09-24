@@ -187,7 +187,7 @@ jobs:
           key: simulate
 
       - name: Pinned regression seeds
-        run: cargo test --release --locked -p delocal-sim -- regressions::
+        run: cargo test --release --locked -p delocal-sim -- 'regressions::'
 
       - name: Random sweep (advisory)
         continue-on-error: true
