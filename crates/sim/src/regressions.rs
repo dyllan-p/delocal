@@ -21357,3 +21357,182 @@ fn two_symlink_losers_under_one_reissued_vector_both_count() {
         ],
     );
 }
+
+/// Seed 90745 of the first 100,000-seed run, fetch corruption on: 42 of
+/// its 400 steps. The full seed no longer fails once the exclusion fix
+/// changes its course, so this list was found among its subsets by a
+/// search for one that fails without the fix and passes with it, then
+/// shrunk. It fails as the first run did, on the same node and at d1/f10:
+/// batch 092c0285 is held, denied, held again under the same id from the
+/// deferred set, and then revert returns the denied item into that id. One
+/// item replaced the other, and a later version at d1/f10 joined the
+/// orphaned id and was lost (§8.2).
+#[test]
+fn a_denied_item_returned_into_a_held_id_loses_nothing() {
+    passes_with(
+        90745,
+        &corrupting(),
+        &[
+            Step::Create {
+                node: 0,
+                path: 1,
+                content: 5,
+            },
+            Step::Everywhere {
+                path: 0,
+                contents: vec![Some(4), Some(2), None, None, None],
+            },
+            Step::Partition { a: 4, b: 4 },
+            Step::Symlink {
+                node: 6,
+                path: 10,
+                target: 8,
+            },
+            Step::User {
+                node: 5,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 26,
+            },
+            Step::Modify {
+                node: 4,
+                path: 11,
+                content: 5,
+            },
+            Step::Create {
+                node: 1,
+                path: 4,
+                content: 4,
+            },
+            Step::User {
+                node: 7,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 1,
+            },
+            Step::Modify {
+                node: 3,
+                path: 10,
+                content: 3,
+            },
+            Step::Create {
+                node: 4,
+                path: 7,
+                content: 3,
+            },
+            Step::Rmdir { node: 1, dir: 2 },
+            Step::Create {
+                node: 1,
+                path: 5,
+                content: 3,
+            },
+            Step::Partition { a: 3, b: 1 },
+            Step::Symlink {
+                node: 3,
+                path: 3,
+                target: 0,
+            },
+            Step::Create {
+                node: 7,
+                path: 10,
+                content: 3,
+            },
+            Step::Modify {
+                node: 2,
+                path: 11,
+                content: 2,
+            },
+            Step::Offline { node: 0 },
+            Step::Create {
+                node: 5,
+                path: 10,
+                content: 2,
+            },
+            Step::Create {
+                node: 4,
+                path: 2,
+                content: 3,
+            },
+            Step::Create {
+                node: 7,
+                path: 0,
+                content: 3,
+            },
+            Step::Create {
+                node: 3,
+                path: 8,
+                content: 2,
+            },
+            Step::Modify {
+                node: 2,
+                path: 6,
+                content: 1,
+            },
+            Step::Offline { node: 6 },
+            Step::Modify {
+                node: 1,
+                path: 0,
+                content: 5,
+            },
+            Step::Chmod { node: 0, path: 1 },
+            Step::Modify {
+                node: 5,
+                path: 0,
+                content: 3,
+            },
+            Step::Online { node: 0 },
+            Step::Settle { secs: 36 },
+            Step::Create {
+                node: 2,
+                path: 9,
+                content: 5,
+            },
+            Step::Modify {
+                node: 2,
+                path: 5,
+                content: 4,
+            },
+            Step::Mkdir { node: 4, dir: 1 },
+            Step::Offline { node: 0 },
+            Step::User {
+                node: 4,
+                action: crate::UserAction::Rules {
+                    hold_count: 1,
+                    hold_pct: 3,
+                },
+                delay_secs: 15,
+            },
+            Step::Modify {
+                node: 4,
+                path: 0,
+                content: 4,
+            },
+            Step::User {
+                node: 0,
+                action: crate::UserAction::DenyAll,
+                delay_secs: 58,
+            },
+            Step::Create {
+                node: 6,
+                path: 6,
+                content: 2,
+            },
+            Step::Delete { node: 2, path: 1 },
+            Step::MassModify {
+                node: 4,
+                fraction: 66,
+                content: 3,
+            },
+            Step::Tier {
+                a: 2,
+                b: 6,
+                tier: 0,
+            },
+            Step::Partition { a: 4, b: 3 },
+            Step::Online { node: 0 },
+            Step::User {
+                node: 4,
+                action: crate::UserAction::Revert,
+                delay_secs: 4,
+            },
+        ],
+    );
+}
