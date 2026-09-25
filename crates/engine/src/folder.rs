@@ -1783,6 +1783,12 @@ impl FolderState {
         self.wants.peer_gone(peer);
     }
 
+    /// A peer connected (§7.5): a want that excluded it after a hash
+    /// mismatch, or gave up because of it, may ask it again.
+    pub fn peer_connected(&mut self, peer: NodeId) {
+        self.wants.reconnected(peer);
+    }
+
     /// The host reported on a fetch (§7.5 steps 3 and 4). Returns the
     /// want's new state, if the report matched one, and the tombstone
     /// written if the report settled a restoring want as unrecoverable

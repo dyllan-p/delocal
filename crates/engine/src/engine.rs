@@ -406,6 +406,9 @@ impl Engine {
             },
             Event::PeerConnected { peer, tier } => {
                 self.peers.insert(peer, tier);
+                for folder in self.folders.values_mut() {
+                    folder.peer_connected(peer);
+                }
                 // Tell the peer how far its records reach here (§7.4, §12).
                 for (id, folder) in &self.folders {
                     if folder.is_member(peer) {
