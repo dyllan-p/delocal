@@ -891,6 +891,12 @@ fn decide(
                         refetch: reverted.refetch,
                     },
                 });
+                for (batch, paths) in reverted.returned {
+                    out.push(Action::StatusChanged {
+                        folder,
+                        status: FolderStatus::Returned { batch, paths },
+                    });
+                }
             }
             None => out.push(Action::StatusChanged {
                 folder,
