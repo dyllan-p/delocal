@@ -262,9 +262,13 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
         user_edited.extend(local_edit_at.keys().cloned());
     }
     // Losing versions per original path: ranked below a concurrent,
-    // content-differing version by the winner rule.
+    // content-differing version by the winner rule. A record a revert
+    // discarded and whose vector was re-issued still lost whatever it lost
+    // before, and a copy made from it has its name (§8.3), so it counts.
     let mut expected: BTreeMap<RelPath, Vec<Entry>> = BTreeMap::new();
-    for versions in sim.versions().values() {
+    for (path, current) in sim.versions() {
+        let mut versions = current.clone();
+        versions.extend(sim.superseded().get(path).into_iter().flatten().cloned());
         for (i, a) in versions.iter().enumerate() {
             for b in &versions[i + 1..] {
                 if a.version.compare(&b.version) != delocal_engine::Relation::Concurrent
