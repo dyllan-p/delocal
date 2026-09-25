@@ -249,10 +249,10 @@ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
 
 /// I4: every conflict copy present is the copy of a version that lost at
 /// its path, with that version's content. The name carries the loser's
-/// mtime and author, so for files one copy path names one losing version;
-/// directories and symlinks carry no mtime (§7.1), and several losing
-/// versions by one author share a name, so the copy must match one of
-/// them. A copy the simulated user edited afterwards (a mass modify picks
+/// mtime (to the second) and author, so several losing versions can share
+/// a name: directories and symlinks carry no mtime (§7.1), edits by one
+/// author can fall in the same second, and a vector a revert discarded can
+/// be issued again with other content. The copy must match one of them. A copy the simulated user edited afterwards (a mass modify picks
 /// any file) keeps the name check but not the content check: it is the
 /// user's file from then on.
 fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
@@ -284,8 +284,15 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
                     continue; // a losing tombstone has no file to copy
                 }
                 if let Some(name) = conflict_copy_name(loser) {
+                    // Keyed by vector and content (§14.1): after a revert
+                    // removes a never-announced record, the same vector can
+                    // be issued again with other content (the re-issue I7
+                    // exempts), and both losers may share a copy name.
                     let losers = expected.entry(name).or_default();
-                    if !losers.iter().any(|l| l.version == loser.version) {
+                    if !losers
+                        .iter()
+                        .any(|l| l.version == loser.version && l.same_content(loser))
+                    {
                         losers.push(loser.clone());
                     }
                 }
