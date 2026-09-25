@@ -1337,9 +1337,6 @@ impl Sim {
             }
         };
         node.engine = Some(engine);
-        node.next_scan_at = self
-            .clock
-            .plus_nanos(self.rng.random_range(NANOS..10 * NANOS));
         // Restoring may have changed want states (transient ones return to
         // wanted); the persisted want table must follow.
         if let Some(state) = node.engine.as_ref().and_then(|e| e.folder(folder)) {
@@ -1348,6 +1345,14 @@ impl Sim {
                 .iter()
                 .map(|w| (w.path().clone(), w.clone()))
                 .collect();
+        }
+        // §7.3: a full scan runs at daemon start, so at every restart; a
+        // queued `revert` waits for it (§8.3). A node restarted while
+        // offline scans as soon as it is back.
+        if node.alive() {
+            self.full_scan(id, true)?;
+        } else {
+            node.next_scan_at = self.clock;
         }
         let peers: Vec<NodeId> = self.order.iter().copied().filter(|p| *p != id).collect();
         for p in peers {
