@@ -1667,7 +1667,8 @@ impl FolderState {
                         source: own,
                         seq_high: 0,
                         sources: BTreeSet::new(),
-                        excluded: BTreeSet::new(),
+                        excluded: BTreeMap::new(),
+                        strikes: BTreeMap::new(),
                         mismatches: 0,
                         fetched: false,
                         restoring: false,
@@ -1697,7 +1698,8 @@ impl FolderState {
                     source: own,
                     seq_high: 0,
                     sources: others.clone(),
-                    excluded: BTreeSet::new(),
+                    excluded: BTreeMap::new(),
+                    strikes: BTreeMap::new(),
                     mismatches: 0,
                     fetched: false,
                     restoring: true,
@@ -1804,7 +1806,7 @@ impl FolderState {
     ) -> Fetched {
         let own = self.index.own();
         let unrecoverable = {
-            let want = self.wants.fetched(path, version, report);
+            let want = self.wants.fetched(now, path, version, report);
             want.is_some_and(|w| {
                 w.restoring
                     && report == FetchReport::NotAvailable
@@ -5005,7 +5007,7 @@ mod tests {
                     prop_assert!(!w.in_flight(), "nothing left in flight when the host has answered everything");
                     match w.state {
                         WantState::NoSource => prop_assert!(
-                            a_tier.is_none() || !w.sources.contains(&node(1)) || w.excluded.contains(&node(1)),
+                            a_tier.is_none() || !w.sources.contains(&node(1)) || w.excluded.contains_key(&node(1)),
                             "no source only when the announcer moved on or served bad content"
                         ),
                         WantState::Deferred { need } => {

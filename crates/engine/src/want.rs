@@ -18,9 +18,11 @@
 //! is excluded from that want, and a second mismatch from a second source
 //! gives the want up. Both are temporary: the excluded source reconnecting,
 //! any source announcing the wanted content at the path, or the index at
-//! the path changing (which re-derives the want afresh) releases them,
-//! since a corrupted transfer is usually transient and the only source
-//! excluded for good would strand the file.
+//! the path changing (which re-derives the want afresh) releases them, and
+//! each exclusion also expires on a backoff, one minute after its mismatch,
+//! doubling on each repeat for the same want and source, up to an hour. A
+//! corrupted transfer is usually transient, and the only source excluded
+//! for good would strand the file.
 //!
 //! **Ordering gate** (§7.5): a create or modify commits only after every
 //! ancestor directory's create in the list has committed; a directory
@@ -46,7 +48,9 @@ use crate::entry::{ContentHash, Entry, Kind, Observed};
 use crate::id::{BatchId, NodeId};
 use crate::path::RelPath;
 use crate::rules::Rules;
-use crate::time::{COMMIT_DEADLINE_NANOS, FETCH_STALL_NANOS, Timestamp};
+use crate::time::{
+    COMMIT_DEADLINE_NANOS, EXCLUSION_CAP_NANOS, EXCLUSION_NANOS, FETCH_STALL_NANOS, Timestamp,
+};
 use crate::version::Version;
 
 /// How a peer is currently reached (§6.4). Ordered best first.
@@ -91,9 +95,10 @@ pub enum WantState {
     Fetching { from: NodeId, deadline: Timestamp },
     /// The host is committing; overdue at `deadline`.
     Committing { deadline: Timestamp },
-    /// Two hash mismatches from two sources. Released like an exclusion
-    /// (§7.5): when an excluded source reconnects, a source announces the
-    /// wanted content at the path, or the index at the path changes.
+    /// Two sources excluded for hash mismatches. Released as soon as fewer
+    /// than two are (§7.5): an exclusion expiring, an excluded source
+    /// reconnecting, a source announcing the wanted content at the path, or
+    /// the index at the path changing.
     GaveUp,
 }
 
@@ -137,13 +142,15 @@ pub struct Want {
     /// moved on and is removed (step 3); announcing the content again puts
     /// it back, since it now says it holds it.
     pub sources: BTreeSet<NodeId>,
-    /// Sources that served a hash mismatch: not asked again for this want
-    /// until the exclusion is released (§7.5), by the source reconnecting,
-    /// by any source announcing the wanted content at the path, or by the
-    /// index at the path changing.
-    pub excluded: BTreeSet<NodeId>,
-    /// Mismatches since the last release: one per excluded source, so two
-    /// give the want up.
+    /// Sources that served a hash mismatch, each with the time its
+    /// exclusion expires (§7.5). Not asked again for this want until then,
+    /// or until the source reconnects, any source announces the wanted
+    /// content at the path, or the index at the path changes.
+    pub excluded: BTreeMap<NodeId, Timestamp>,
+    /// Hash mismatches each source has served for this want, kept across
+    /// releases so the backoff doubles when the same source fails again.
+    pub strikes: BTreeMap<NodeId, u32>,
+    /// Sources excluded right now: two give the want up.
     pub mismatches: u8,
     /// Content has been fetched and verified; only the commit remains.
     pub fetched: bool,
@@ -220,7 +227,8 @@ impl Want {
             source,
             seq_high,
             sources,
-            excluded: BTreeSet::new(),
+            excluded: BTreeMap::new(),
+            strikes: BTreeMap::new(),
             mismatches: 0,
             fetched: false,
             restoring: false,
@@ -407,7 +415,7 @@ impl WantList {
         let paths: Vec<RelPath> = self
             .wants
             .iter()
-            .filter(|(_, w)| w.excluded.contains(&peer))
+            .filter(|(_, w)| w.excluded.contains_key(&peer))
             .map(|(p, _)| p.clone())
             .collect();
         for path in paths {
@@ -416,8 +424,9 @@ impl WantList {
     }
 
     /// Release what hash mismatches left on the want at `path` (§7.5):
-    /// `Some(peer)` lifts that source's exclusion, `None` lifts every
-    /// exclusion. The mismatch count follows the exclusions that remain,
+    /// `Some(peer)` lifts that source's exclusion (it reconnected, or its
+    /// backoff ran out), `None` lifts every exclusion. Strikes are kept, so
+    /// a repeat from the same source waits twice as long. The mismatch count follows the exclusions that remain,
     /// and a want that gave up is wanted again once fewer than two do, so
     /// `dispatch` considers it on its next pass.
     fn release(&mut self, path: &RelPath, only: Option<NodeId>) {
@@ -425,7 +434,7 @@ impl WantList {
             return;
         };
         let lifted = match only {
-            Some(peer) => want.excluded.remove(&peer),
+            Some(peer) => want.excluded.remove(&peer).is_some(),
             None => {
                 let any = !want.excluded.is_empty();
                 want.excluded.clear();
@@ -496,9 +505,11 @@ impl WantList {
         }
     }
 
-    /// The host reports on a fetch (§7.5 steps 3 and 4).
+    /// The host reports on a fetch (§7.5 steps 3 and 4). A mismatch
+    /// excludes the source until `now` plus its backoff.
     pub fn fetched(
         &mut self,
+        now: Timestamp,
         path: &RelPath,
         version: &Version,
         outcome: FetchReport,
@@ -524,10 +535,15 @@ impl WantList {
                 want.state = WantState::Wanted;
             }
             FetchReport::HashMismatch => {
+                // A report that no longer names the source it came from (the
+                // fetch was reassigned after a stall) excludes nobody.
                 if let Some(from) = from {
-                    want.excluded.insert(from);
+                    let strikes = want.strikes.entry(from).or_insert(0);
+                    *strikes = strikes.saturating_add(1);
+                    want.excluded
+                        .insert(from, now.plus_nanos(exclusion_backoff(*strikes)));
                 }
-                want.mismatches = want.mismatches.saturating_add(1);
+                want.mismatches = u8::try_from(want.excluded.len()).unwrap_or(u8::MAX);
                 want.state = if want.mismatches >= 2 {
                     WantState::GaveUp
                 } else {
@@ -553,9 +569,24 @@ impl WantList {
         }
     }
 
-    /// Deadlines that have passed return the want to `Wanted` (§7.5); the
-    /// source is not excluded, the stall may have been ours.
+    /// Exclusions whose backoff has run out are released (§7.5), and
+    /// deadlines that have passed return the want to `Wanted`; a stalled
+    /// source is not excluded, the stall may have been ours. Returns the
+    /// paths whose deadline passed.
     pub fn expire(&mut self, now: Timestamp) -> Vec<RelPath> {
+        let released: Vec<(RelPath, NodeId)> = self
+            .wants
+            .iter()
+            .flat_map(|(path, w)| {
+                w.excluded
+                    .iter()
+                    .filter(|(_, until)| **until <= now)
+                    .map(move |(node, _)| (path.clone(), *node))
+            })
+            .collect();
+        for (path, node) in released {
+            self.release(&path, Some(node));
+        }
         let overdue: Vec<RelPath> = self
             .wants
             .iter()
@@ -586,17 +617,20 @@ impl WantList {
         }
     }
 
-    /// The earliest fetch or commit deadline, for the engine's wake-up.
+    /// The earliest fetch or commit deadline or exclusion expiry, for the
+    /// engine's wake-up.
     pub fn next_deadline(&self) -> Option<Timestamp> {
-        self.wants
+        let deadlines = self.wants.values().filter_map(|w| match w.state {
+            WantState::Fetching { deadline, .. } | WantState::Committing { deadline } => {
+                Some(deadline)
+            }
+            _ => None,
+        });
+        let expiries = self
+            .wants
             .values()
-            .filter_map(|w| match w.state {
-                WantState::Fetching { deadline, .. } | WantState::Committing { deadline } => {
-                    Some(deadline)
-                }
-                _ => None,
-            })
-            .min()
+            .flat_map(|w| w.excluded.values().copied());
+        deadlines.chain(expiries).min()
     }
 
     /// True if committing `path` must wait (§7.5 ordering): a create with an
@@ -623,7 +657,7 @@ impl WantList {
         let mut candidates: Vec<(Tier, NodeId)> = want
             .sources
             .iter()
-            .filter(|n| !want.excluded.contains(n))
+            .filter(|n| !want.excluded.contains_key(n))
             .filter_map(|n| peers.get(n).map(|t| (*t, *n)))
             .collect();
         if candidates.is_empty() {
@@ -789,6 +823,15 @@ pub enum FetchReport {
     HashMismatch,
 }
 
+/// How long a source stays excluded after its `strikes`-th mismatch for
+/// one want (§7.5): a minute, doubling on each repeat, up to an hour.
+fn exclusion_backoff(strikes: u32) -> i64 {
+    let doublings = strikes.saturating_sub(1).min(16);
+    EXCLUSION_NANOS
+        .saturating_mul(1i64 << doublings)
+        .min(EXCLUSION_CAP_NANOS)
+}
+
 enum Selection {
     /// Allowed sources, best first. Never empty.
     Sources(Vec<(Tier, NodeId)>),
@@ -904,7 +947,7 @@ mod tests {
         let peers = peers(&[(2, Tier::Direct), (3, Tier::Direct)]);
         let steps = l.dispatch(t(0), &Rules::default(), &peers);
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
-        l.fetched(&p("f"), &version, FetchReport::NotAvailable);
+        l.fetched(t(0), &p("f"), &version, FetchReport::NotAvailable);
         assert!(l.dispatch(t(1), &Rules::default(), &peers).is_empty());
         assert_eq!(l.get(&p("f")).unwrap().state, WantState::NoSource);
         assert!(
@@ -920,7 +963,7 @@ mod tests {
         );
         // A mismatch excludes it; announcing the content again releases
         // that too (§7.5: exclusions are temporary).
-        l.fetched(&p("f"), &version, FetchReport::HashMismatch);
+        l.fetched(t(0), &p("f"), &version, FetchReport::HashMismatch);
         assert!(l.dispatch(t(3), &Rules::default(), &peers).is_empty());
         assert_eq!(l.get(&p("f")).unwrap().state, WantState::NoSource);
         l.note_announced(&p("f"), &hash_of(&version), node(2));
@@ -975,6 +1018,7 @@ mod tests {
         );
         // NotAvailable from 3: 4 is next; a mismatch from 4 leaves 2; a second mismatch gives up.
         l.fetched(
+            t(0),
             &p("f"),
             &entry("f", Kind::File, 10, 2, false).version,
             FetchReport::NotAvailable,
@@ -986,6 +1030,7 @@ mod tests {
         );
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(4)));
         l.fetched(
+            t(0),
             &p("f"),
             &entry("f", Kind::File, 10, 2, false).version,
             FetchReport::HashMismatch,
@@ -997,6 +1042,7 @@ mod tests {
         );
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
         l.fetched(
+            t(0),
             &p("f"),
             &entry("f", Kind::File, 10, 2, false).version,
             FetchReport::HashMismatch,
@@ -1022,10 +1068,10 @@ mod tests {
         let lan = peers(&[(3, Tier::Lan), (4, Tier::Lan)]);
         let steps = l.dispatch(t(0), &Rules::default(), &lan);
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(3)));
-        l.fetched(&p("f"), &v, FetchReport::HashMismatch);
+        l.fetched(t(0), &p("f"), &v, FetchReport::HashMismatch);
         let steps = l.dispatch(t(1), &Rules::default(), &lan);
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(4)));
-        l.fetched(&p("f"), &v, FetchReport::HashMismatch);
+        l.fetched(t(0), &p("f"), &v, FetchReport::HashMismatch);
         assert_eq!(l.get(&p("f")).unwrap().state, WantState::GaveUp);
 
         l.reconnected(node(2));
@@ -1034,7 +1080,10 @@ mod tests {
         l.reconnected(node(4));
         let w = l.get(&p("f")).unwrap();
         assert_eq!(w.state, WantState::Wanted);
-        assert_eq!(w.excluded, [node(3)].into_iter().collect());
+        assert_eq!(
+            w.excluded.keys().copied().collect::<Vec<_>>(),
+            vec![node(3)]
+        );
         assert_eq!(w.mismatches, 1);
         let steps = l.dispatch(t(2), &Rules::default(), &lan);
         assert!(
@@ -1053,7 +1102,7 @@ mod tests {
         let lan = peers(&[(2, Tier::Lan)]);
         let steps = l.dispatch(t(0), &Rules::default(), &lan);
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
-        l.fetched(&p("f"), &v, FetchReport::HashMismatch);
+        l.fetched(t(0), &p("f"), &v, FetchReport::HashMismatch);
         assert!(l.dispatch(t(1), &Rules::default(), &lan).is_empty());
         assert_eq!(
             l.get(&p("f")).unwrap().state,
@@ -1069,6 +1118,66 @@ mod tests {
         assert!(w.excluded.is_empty());
         assert_eq!(w.mismatches, 0);
         let steps = l.dispatch(t(3), &Rules::default(), &lan);
+        assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
+    }
+
+    /// §7.5: an exclusion expires by itself, with no event at all, a
+    /// minute after the mismatch, and the engine is told when to wake for
+    /// it. The same source failing again for the same want waits twice as
+    /// long each time, up to an hour, and is never released a second early.
+    #[test]
+    fn an_exclusion_expires_on_a_backoff_that_doubles_per_source() {
+        let v = entry("f", Kind::File, 10, 2, false).version;
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        let lan = peers(&[(2, Tier::Lan)]);
+        let mut now = 0;
+        let waits = [60, 120, 240, 480, 960, 1920, 3600, 3600];
+        for (strike, wait) in (1u32..).zip(waits) {
+            let steps = l.dispatch(t(now), &Rules::default(), &lan);
+            assert!(
+                matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)),
+                "strike {strike}"
+            );
+            l.fetched(t(now), &p("f"), &v, FetchReport::HashMismatch);
+            assert_eq!(l.get(&p("f")).unwrap().strikes[&node(2)], strike);
+            assert_eq!(l.next_deadline(), Some(t(now + wait)));
+
+            l.expire(t(now + wait - 1));
+            assert!(
+                l.dispatch(t(now + wait - 1), &Rules::default(), &lan)
+                    .is_empty()
+            );
+            l.expire(t(now + wait));
+            assert!(l.get(&p("f")).unwrap().excluded.is_empty());
+            now += wait;
+        }
+    }
+
+    /// §7.5: a want gives up with two sources excluded, and is wanted again
+    /// as soon as the first of the two exclusions expires.
+    #[test]
+    fn a_give_up_expires_with_its_first_exclusion() {
+        let v = entry("f", Kind::File, 10, 2, false).version;
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        l.note_announced(&p("f"), &hash_of(&v), node(3));
+        let lan = peers(&[(2, Tier::Lan), (3, Tier::Lan)]);
+        let steps = l.dispatch(t(0), &Rules::default(), &lan);
+        assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
+        l.fetched(t(0), &p("f"), &v, FetchReport::HashMismatch);
+        let steps = l.dispatch(t(10), &Rules::default(), &lan);
+        assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(3)));
+        l.fetched(t(10), &p("f"), &v, FetchReport::HashMismatch);
+        assert_eq!(l.get(&p("f")).unwrap().state, WantState::GaveUp);
+        assert_eq!(l.next_deadline(), Some(t(60)));
+
+        l.expire(t(60));
+        let w = l.get(&p("f")).unwrap();
+        assert_eq!(w.state, WantState::Wanted);
+        assert_eq!(
+            w.excluded.keys().copied().collect::<Vec<_>>(),
+            vec![node(3)]
+        );
+        let steps = l.dispatch(t(60), &Rules::default(), &lan);
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
     }
 
@@ -1140,6 +1249,7 @@ mod tests {
         );
         // A fetch finishing frees a slot.
         l.fetched(
+            t(0),
             &p("a"),
             &entry("a", Kind::File, 1, 2, false).version,
             FetchReport::Ok,
@@ -1160,6 +1270,7 @@ mod tests {
             ("old", Kind::Dir, 0, ApplyMode::Direct, true),
         ]);
         l.fetched(
+            t(0),
             &p("d/inner"),
             &entry("d/inner", Kind::File, 1, 2, false).version,
             FetchReport::Ok,
@@ -1199,7 +1310,7 @@ mod tests {
         let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
         let v = entry("f", Kind::File, 10, 2, false).version;
         l.dispatch(t(0), &Rules::default(), &peers(&[(2, Tier::Lan)]));
-        l.fetched(&p("f"), &v, FetchReport::Ok);
+        l.fetched(t(0), &p("f"), &v, FetchReport::Ok);
         let steps = l.dispatch(t(1), &Rules::default(), &peers(&[(2, Tier::Lan)]));
         assert!(
             matches!(&steps[0], WantStep::Commit(_)),
@@ -1238,7 +1349,7 @@ mod tests {
             "a stall does not exclude the source"
         );
         // A late Ok is still taken.
-        l.fetched(&p("f"), &v, FetchReport::Ok);
+        l.fetched(t(0), &p("f"), &v, FetchReport::Ok);
         assert!(l.get(&p("f")).unwrap().fetched);
         let steps = l.dispatch(t(111), &Rules::default(), &peers(&[(2, Tier::Lan)]));
         assert!(matches!(&steps[0], WantStep::Commit(_)));

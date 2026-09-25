@@ -24,6 +24,14 @@ pub const FETCH_STALL_NANOS: i64 = 60 * NANOS_PER_SECOND;
 /// A commit not reported within this long is overdue (§7.5).
 pub const COMMIT_DEADLINE_NANOS: i64 = 30 * NANOS_PER_SECOND;
 
+/// A source excluded for a hash mismatch, or a want given up, is released
+/// this long after the mismatch, doubling on each repeat for the same want
+/// and source (§7.5)...
+pub const EXCLUSION_NANOS: i64 = 60 * NANOS_PER_SECOND;
+
+/// ...up to this long.
+pub const EXCLUSION_CAP_NANOS: i64 = 60 * 60 * NANOS_PER_SECOND;
+
 /// A point in time as nanoseconds since the Unix epoch, supplied by the host.
 ///
 /// The same representation as `mtime_ns` on entries, so the two compare
