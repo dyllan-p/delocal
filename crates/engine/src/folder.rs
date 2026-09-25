@@ -102,6 +102,12 @@ pub struct Deferred {
     pub source: NodeId,
     pub seq_high: u64,
     pub reason: DeferredReason,
+    /// Carries the path's restoring mark (§8.3) if the want deferred here
+    /// carried it and its commit found the path occupied: the entry it was
+    /// committing. A bracket end that does not see the path wants that
+    /// entry again as it stands, and an occupant matching it is its
+    /// landing.
+    pub restoring: Option<Entry>,
 }
 
 /// A paused folder (§8.1): the sender pre-check tripped.
@@ -219,6 +225,9 @@ impl Window {
 pub struct Scanned {
     pub change: Option<LocalChange>,
     pub status: Option<FolderStatus>,
+    /// The restored record, adopted with a new `seq`, when the report
+    /// showed that a revert's refetch had landed (§8.3, §13).
+    pub landed: Option<IndexRecord>,
 }
 
 /// What a due tick did (§7.4, §8.1).
@@ -513,8 +522,12 @@ impl FolderState {
 
     /// The host reported `state` at `path` (§7.3), inside or outside a
     /// bracket. Reports for a path in flight are ignored; so is `Absent`
-    /// for a `revert`-made want (§8.3). A change at an observable wanted
-    /// path re-classifies the want.
+    /// at a path carrying the restoring mark (§8.3), where absence is the
+    /// trash move. A change at an observable wanted path re-classifies the
+    /// want. At a marked path, an occupant clears the mark: one that
+    /// matches the restored record leaves the index as it is and is the
+    /// landing of a refetch whose report was lost (§13); anything else is
+    /// a local change like any other.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
         if let Some(seen) = &mut self.scan {
             seen.insert(path.clone());
@@ -522,30 +535,162 @@ impl FolderState {
         if self.wants.in_flight(&path) {
             return Scanned::default();
         }
-        if state == ScanState::Absent && self.wants.restoring(&path) {
+        let marked = self.marked(&path);
+        if state == ScanState::Absent && marked {
             return Scanned::default();
+        }
+        if state == ScanState::Unchanged && self.index.live(&path).is_none() {
+            return Scanned {
+                change: None,
+                status: Some(FolderStatus::UnchangedUnknownPath { path }),
+                landed: None,
+            };
+        }
+        // An occupant at a marked path clears the mark. It is looked at
+        // before the index is: one matching what a carrier was committing
+        // is that commit's landing, not a local change.
+        let mut unmarked = None;
+        if marked {
+            let occupant = match &state {
+                ScanState::Observed(observed) => Some(observed.clone().normalised()),
+                ScanState::Unchanged => self.index.live(&path).map(|r| r.entry.observed()),
+                ScanState::Absent => None,
+            };
+            if let Some(occupant) = occupant
+                && let Some(landed) = self.land(now, &path, &occupant)
+            {
+                self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
+                return Scanned {
+                    change: None,
+                    status: None,
+                    landed: Some(landed),
+                };
+            }
+            unmarked = self.unmark(&path);
         }
         let change = match state {
             ScanState::Observed(observed) => self.index.observe(path.clone(), observed),
             ScanState::Absent => self.index.observe_absent(&path, now.as_unix_nanos()),
-            ScanState::Unchanged => {
-                if self.index.live(&path).is_none() {
-                    return Scanned {
-                        change: None,
-                        status: Some(FolderStatus::UnchangedUnknownPath { path }),
-                    };
-                }
-                None
-            }
+            ScanState::Unchanged => None,
         };
         if change.is_some() {
             self.touched(now);
-            self.reclassify_want(now, &path);
+        }
+        // The want that carried the mark is re-derived as an ordinary one
+        // against whatever the observation left in the index; so is any
+        // want when the observation changed it.
+        match unmarked {
+            Some(old) => self.rederive(now, old),
+            None if change.is_some() => self.reclassify_want(now, &path),
+            None => {}
         }
         self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
         Scanned {
             change,
             status: None,
+            landed: None,
+        }
+    }
+
+    /// True if `path` carries the restoring mark (§8.3): a want or a
+    /// deferred entry there holds it, whatever state the want is in.
+    fn marked(&self, path: &RelPath) -> bool {
+        self.wants.restoring(path)
+            || self
+                .deferred
+                .get(path)
+                .is_some_and(|list| list.iter().any(|d| d.restoring.is_some()))
+    }
+
+    /// The members other than this machine: a want at a marked path asks
+    /// every one of them (§8.3).
+    fn others(&self) -> BTreeSet<NodeId> {
+        let own = self.index.own();
+        self.members.iter().copied().filter(|m| *m != own).collect()
+    }
+
+    /// An observation at a marked path found `occupant`. If it matches
+    /// what the path's want or a deferred carrier was committing, that
+    /// commit landed and a crash took its report (§13): the observation
+    /// counts as the landing, so the entry is adopted with a new `seq` and
+    /// announced, exactly as `Applied Ok` would have done (§8.3). The mark
+    /// is cleared; the want that carried it is re-derived against the
+    /// landed record (dropped if it was the one that landed), and the
+    /// caller re-classifies the deferred entries. `None` if nothing
+    /// matches.
+    fn land(&mut self, now: Timestamp, path: &RelPath, occupant: &Observed) -> Option<IndexRecord> {
+        let record = self.index.live(path)?.entry.version.clone();
+        let want = self
+            .wants
+            .get(path)
+            .filter(|w| w.restoring)
+            .map(|w| w.entry.clone());
+        let carried = self
+            .deferred
+            .get(path)
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d.restoring.clone());
+        let landed = want.into_iter().chain(carried).find(|e| {
+            !e.deleted
+                && e.version.dominates_or_equals(&record)
+                && e.observed().normalised() == *occupant
+        })?;
+        let old = self.unmark(path);
+        let adopted = self.index.adopt(landed)?.clone();
+        self.touched(now);
+        if let Some(old) = old {
+            self.rederive(now, old);
+        }
+        Some(adopted)
+    }
+
+    /// Clear the path's restoring mark: the deferred carriers become
+    /// ordinary deferred entries, and the want that carried it, if any, is
+    /// taken off the list and returned for the caller to re-derive once
+    /// the index says what is there.
+    fn unmark(&mut self, path: &RelPath) -> Option<Want> {
+        self.clear_carriers(path);
+        if self.wants.restoring(path) {
+            self.wants.remove(path)
+        } else {
+            None
+        }
+    }
+
+    /// The deferred entries at `path` stop carrying the mark: the disk now
+    /// holds what the record says.
+    fn clear_carriers(&mut self, path: &RelPath) {
+        if let Some(list) = self.deferred.get_mut(path) {
+            for d in list.iter_mut() {
+                d.restoring = None;
+            }
+        }
+    }
+
+    /// A marked path's deferred carriers, wanted again as they stand, with
+    /// the mark and without re-classification (§8.3): classified against
+    /// the record they would be found caught up and dropped, while the
+    /// disk still holds nothing.
+    fn rewant_carriers(&mut self, path: &RelPath) {
+        let Some(list) = self.deferred.remove(path) else {
+            return;
+        };
+        let (carriers, rest): (Vec<Deferred>, Vec<Deferred>) =
+            list.into_iter().partition(|d| d.restoring.is_some());
+        if !rest.is_empty() {
+            self.deferred.insert(path.clone(), rest);
+        }
+        for d in carriers {
+            let Some(entry) = d.restoring else {
+                continue;
+            };
+            let item = ApplyItem::Apply {
+                entry,
+                mode: ApplyMode::Fetch,
+                conflict: None,
+            };
+            self.want_as(item, d.entry, d.batch, d.source, d.seq_high, true);
         }
     }
 
@@ -748,10 +893,37 @@ impl FolderState {
         source: NodeId,
         seq_high: u64,
     ) {
-        if let Some(item) = self
-            .wants
-            .insert(item, received.clone(), batch, source, seq_high)
-        {
+        let marked = self.marked(item.path());
+        self.want_as(item, received, batch, source, seq_high, marked);
+    }
+
+    /// [`Self::want`], with the path's mark given. At a marked path this
+    /// machine holds neither version (§8.3, §7.6): the entry, already
+    /// compared by vector with the record, is applied the way a holder of
+    /// neither applies it, with its content always written, no conflict
+    /// copy, the mark carried, and every member asked.
+    fn want_as(
+        &mut self,
+        item: ApplyItem,
+        received: Entry,
+        batch: BatchId,
+        source: NodeId,
+        seq_high: u64,
+        marked: bool,
+    ) {
+        let (item, others) = if marked {
+            (neither_holder(item), Some(self.others()))
+        } else {
+            (item, None)
+        };
+        if let Some(item) = self.wants.insert(
+            item,
+            received.clone(),
+            batch,
+            source,
+            seq_high,
+            others.as_ref(),
+        ) {
             self.deferred
                 .entry(item.path().clone())
                 .or_default()
@@ -761,6 +933,7 @@ impl FolderState {
                     source,
                     seq_high,
                     reason: DeferredReason::ChangedUnderneath,
+                    restoring: None,
                 });
         }
     }
@@ -793,15 +966,17 @@ impl FolderState {
     }
 
     /// A full scan ended: every live record it did not report is gone
-    /// (§7.3), except paths in flight and paths being restored by `revert`.
-    /// Returns the tombstones, or `Err` if no bracket was open.
+    /// (§7.3), except paths in flight and paths carrying the restoring
+    /// mark, whatever state the want that carries it is in, or whether a
+    /// deferred entry carries it instead (§8.3). Returns the tombstones,
+    /// or `Err` if no bracket was open.
     pub fn scan_finished(&mut self, now: Timestamp) -> Result<Vec<LocalChange>, FolderStatus> {
         let seen = self.scan.take().ok_or(FolderStatus::ScanNotOpen)?;
         let gone: Vec<RelPath> = self
             .index
             .live_records()
             .map(|r| r.entry.path.clone())
-            .filter(|p| !seen.contains(p) && !self.wants.in_flight(p) && !self.wants.restoring(p))
+            .filter(|p| !seen.contains(p) && !self.wants.in_flight(p) && !self.marked(p))
             .collect();
         let mut changes = Vec::new();
         for path in &gone {
@@ -826,6 +1001,22 @@ impl FolderState {
             .collect();
         for path in &unseen {
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+        }
+        // At a marked path absence is the normal state, so a bracket that
+        // did not see it is the observation its deferred carriers wait
+        // for: they are wanted again (§8.3).
+        let carried: Vec<RelPath> = self
+            .deferred
+            .iter()
+            .filter(|(p, list)| {
+                !seen.contains(*p)
+                    && !self.wants.in_flight(p)
+                    && list.iter().any(|d| d.restoring.is_some())
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in &carried {
+            self.rewant_carriers(path);
         }
         if !changes.is_empty() {
             self.touched(now);
@@ -1034,6 +1225,7 @@ impl FolderState {
                         source: batch.source,
                         seq_high: batch.seq_high,
                         reason: DeferredReason::Frozen,
+                        restoring: None,
                     });
                 frozen += 1;
             } else {
@@ -1339,6 +1531,7 @@ impl FolderState {
             };
         }
         self.wants.remove(path);
+        self.clear_carriers(path);
         let change = self
             .index
             .observe_absent_unrecoverable(path, now.as_unix_nanos());
@@ -1499,6 +1692,10 @@ impl FolderState {
                     // than a fetch that would land over it.
                     self.reclassify_want(now, &copy_path);
                 }
+                // The disk now holds what the record says: whatever mark a
+                // deferred entry carried here is gone with the fact it
+                // recorded (§8.3).
+                self.clear_carriers(path);
                 self.reconsider(now, path, DeferredReason::ChangedUnderneath);
                 written
             }
@@ -1512,16 +1709,16 @@ impl FolderState {
     /// Keep a want's received entry in the deferred set until the next
     /// observation of its path (§7.5 step 6); it is classified again then.
     fn defer_changed_underneath(&mut self, want: Want) {
-        self.deferred
-            .entry(want.path().clone())
-            .or_default()
-            .push(Deferred {
-                entry: want.received,
-                batch: want.batch,
-                source: want.source,
-                seq_high: want.seq_high,
-                reason: DeferredReason::ChangedUnderneath,
-            });
+        let path = want.path().clone();
+        let restoring = want.restoring.then_some(want.entry);
+        self.deferred.entry(path).or_default().push(Deferred {
+            entry: want.received,
+            batch: want.batch,
+            source: want.source,
+            seq_high: want.seq_high,
+            reason: DeferredReason::ChangedUnderneath,
+            restoring,
+        });
     }
 
     /// Take a committed remote entry into the index and open the window so
@@ -1531,6 +1728,25 @@ impl FolderState {
         let record = self.index.adopt(entry)?.clone();
         self.touched(now);
         Some(record)
+    }
+}
+
+/// An item as a machine holding neither version applies it (§7.6, §8.3):
+/// the content is always written, a fetch for a file or symlink and a
+/// direct write for a directory or tombstone, since there is nothing on
+/// disk for a metadata-only or index-only apply to adjust; and no conflict
+/// copy, since there is no local file to displace.
+fn neither_holder(item: ApplyItem) -> ApplyItem {
+    let ApplyItem::Apply { entry, .. } = item;
+    let mode = if entry.deleted || entry.kind == Kind::Dir {
+        ApplyMode::Direct
+    } else {
+        ApplyMode::Fetch
+    };
+    ApplyItem::Apply {
+        entry,
+        mode,
+        conflict: None,
     }
 }
 
@@ -3140,6 +3356,264 @@ mod tests {
         assert!(b.wants().get(&p("f01")).is_none(), "cancelled");
         assert!(b.wants().get(&p("f00")).is_some());
         assert_eq!(b.index().get(&p("f01")).unwrap().entry.hash, hash(9));
+    }
+
+    /// A reverted path whose refetch commit found the path occupied: the
+    /// restoring want is deferred and its entry carries the mark. The
+    /// write went to the trash-restored record at `f00`.
+    fn deferred_restoring_entry() -> (FolderState, IndexRecord) {
+        let (_, mut b) = a_and_b(
+            1,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(10.0), p("f00"), file(5, 5));
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        let restored = b.index().get(&p("f00")).unwrap().clone();
+        let v = restored.entry.version.clone();
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.fetched(t(14.0), &p("f00"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
+        assert!(
+            b.applied(t(15.0), &p("f00"), &v, ApplyOutcome::ChangedUnderneath)
+                .is_empty()
+        );
+        assert!(b.wants().is_empty());
+        let deferred: Vec<&Deferred> = b.deferred().collect();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(
+            deferred[0].restoring.as_ref(),
+            Some(&restored.entry),
+            "the entry carries the mark and what it was committing"
+        );
+        (b, restored)
+    }
+
+    /// A and B hold two files A made; B's user edits both, B pauses and
+    /// reverts, so both paths carry the restoring mark with the restored
+    /// records wanted back. The rules go back to the defaults so the
+    /// batches that follow meet no brake.
+    fn marked_after_revert() -> (FolderState, FolderState) {
+        let (a, mut b) = a_and_b(
+            2,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(10.0), p("f00"), file(5, 5));
+        b.scanned(t(10.0), p("f01"), file(6, 6));
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        b.rules_changed(Rules::default());
+        assert_eq!(b.wants().len(), 2);
+        assert!(b.wants().iter().all(|w| w.restoring));
+        (a, b)
+    }
+
+    /// A touches f00 (same content, new mtime) and announces it to B.
+    fn touched_by_a(a: &mut FolderState, b: &mut FolderState) -> Entry {
+        a.scanned(t(20.0), p("f00"), file(1, 50));
+        let batch = a.form_batches(t(22.0), bid(7)).remove(0);
+        assert_eq!(b.receive(t(22.0), &batch).decision, Decision::Accepted);
+        batch.entries[0].clone()
+    }
+
+    /// §8.3: the mark belongs to the path, whatever carries it. With the
+    /// restoring want deferred, the path absent at a bracket end is still
+    /// the trash move: not tombstoned, and the entry keeps the mark. So is
+    /// a watcher's `Absent` outside a bracket.
+    #[test]
+    fn a_deferred_restoring_entry_keeps_its_path_out_of_the_deletion_pass() {
+        let (mut b, restored) = deferred_restoring_entry();
+        assert_eq!(
+            b.scanned(t(19.0), p("f00"), ScanState::Absent),
+            Scanned::default()
+        );
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(b.deferred().all(|d| d.restoring.is_some()));
+        b.scan_started();
+        assert!(
+            b.scan_finished(t(20.0)).unwrap().is_empty(),
+            "the path is not tombstoned"
+        );
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(b.index().unannounced().is_empty(), "nothing to announce");
+    }
+
+    /// §8.3, fix 1: at a marked path B holds neither version. A touch that
+    /// B would otherwise apply as metadata-only is fetched, and a
+    /// concurrent version that wins over the restored record is fetched
+    /// with no conflict copy, since there is no local file to displace.
+    /// Both carry the mark, and both commits expect the path to be absent.
+    #[test]
+    fn entries_at_a_marked_path_are_applied_as_by_a_holder_of_neither() {
+        let (mut a, mut b) = marked_after_revert();
+        let touch = touched_by_a(&mut a, &mut b);
+        let mut c = folder_with(Rules::default(), 3, "charlie");
+        c.scanned(t(20.0), p("f01"), file(8, 80));
+        let concurrent = c.form_batches(t(22.0), bid(8)).remove(0);
+        assert_eq!(b.receive(t(22.0), &concurrent).decision, Decision::Accepted);
+        let everyone: BTreeSet<NodeId> = [node(1), node(3)].into_iter().collect();
+        let w00 = b.wants().get(&p("f00")).unwrap().clone();
+        assert_eq!(w00.entry, touch);
+        assert_eq!(w00.mode, ApplyMode::Fetch, "not metadata-only");
+        assert!(w00.restoring && w00.conflict.is_none());
+        assert!(w00.sources.is_superset(&everyone));
+        let w01 = b.wants().get(&p("f01")).unwrap().clone();
+        assert_eq!(w01.entry.hash, hash(8), "C's version wins on stamp");
+        assert!(w01.entry.version.dominates(&concurrent.entries[0].version));
+        assert_eq!(w01.mode, ApplyMode::Fetch);
+        assert!(w01.restoring && w01.conflict.is_none(), "no conflict copy");
+        b.dispatch(t(23.0), &lan(&[1, 3]));
+        for w in [&w00, &w01] {
+            b.fetched(t(24.0), w.path(), w.version(), FetchReport::Ok);
+        }
+        let (steps, _) = b.dispatch(t(24.0), &lan(&[1, 3]));
+        for path in [p("f00"), p("f01")] {
+            assert!(
+                steps.iter().any(|s| matches!(s, HostStep::Write { path: sp, expected: None, displace: Displace::Trash, .. } if *sp == path)),
+                "{path} is written over absence: {steps:?}"
+            );
+        }
+    }
+
+    /// §8.3, fix 2: every want at a marked path asks every member, not only
+    /// those that announced it, and step 4 settles it once all refuse.
+    #[test]
+    fn a_want_at_a_marked_path_asks_every_member_and_settles_when_all_refuse() {
+        let (mut a, mut b) = marked_after_revert();
+        touched_by_a(&mut a, &mut b);
+        let want = b.wants().get(&p("f00")).unwrap().clone();
+        assert!(
+            want.sources.contains(&node(3)),
+            "C never announced it and is asked all the same"
+        );
+        let (steps, _) = b.dispatch(t(23.0), &lan(&[1]));
+        assert!(steps.iter().any(|s| matches!(s, HostStep::Fetch { path, from, .. } if path == &p("f00") && *from == node(1))));
+        let out = b.fetched(
+            t(24.0),
+            &p("f00"),
+            want.version(),
+            FetchReport::NotAvailable,
+        );
+        assert_eq!(out.unrecoverable, None, "C has not been asked");
+        let (steps, _) = b.dispatch(t(25.0), &lan(&[1, 3]));
+        assert!(steps.iter().any(|s| matches!(s, HostStep::Fetch { path, from, .. } if path == &p("f00") && *from == node(3))));
+        let out = b.fetched(
+            t(26.0),
+            &p("f00"),
+            want.version(),
+            FetchReport::NotAvailable,
+        );
+        let tombstone = out.unrecoverable.expect("every member refused");
+        assert!(tombstone.record.entry.deleted);
+        assert!(b.wants().get(&p("f00")).is_none());
+    }
+
+    /// §8.3, fix 3: at a marked path absence is the normal state, so a
+    /// bracket end that does not see the path is what a deferred carrier
+    /// waits for. It is wanted again as it stands, with the mark, not
+    /// re-classified (the record would call it caught up).
+    #[test]
+    fn a_bracket_end_wants_a_deferred_carrier_again_as_it_stands() {
+        let (mut b, restored) = deferred_restoring_entry();
+        b.scan_started();
+        assert!(b.scan_finished(t(20.0)).unwrap().is_empty());
+        assert_eq!(b.deferred().count(), 0);
+        let want = b.wants().get(&p("f00")).unwrap().clone();
+        assert_eq!(want.entry, restored.entry);
+        assert!(want.restoring && want.conflict.is_none());
+        assert_eq!(want.mode, ApplyMode::Fetch);
+        assert!(want.sources.contains(&node(1)) && want.sources.contains(&node(3)));
+        let v = want.version().clone();
+        b.dispatch(t(21.0), &lan(&[1]));
+        b.fetched(t(22.0), &p("f00"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(22.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
+        let written = b.applied(t(23.0), &p("f00"), &v, ApplyOutcome::Ok);
+        assert!(written[0].seq > restored.seq, "the landing is announced");
+    }
+
+    /// §8.3, fix 4: a later version replaced the restoring want, inherited
+    /// the mark, and crashed after its rename; the retry found it there and
+    /// was deferred. The occupant matches what that carrier was committing,
+    /// not the restored record, and lands the same way.
+    #[test]
+    fn an_occupant_matching_a_later_carrier_is_its_landing() {
+        let (mut a, mut b) = marked_after_revert();
+        let touch = touched_by_a(&mut a, &mut b);
+        let restored = b.index().get(&p("f00")).unwrap().clone();
+        let v = touch.version.clone();
+        b.dispatch(t(23.0), &lan(&[1]));
+        b.fetched(t(24.0), &p("f00"), &v, FetchReport::Ok);
+        b.dispatch(t(24.0), &lan(&[1]));
+        assert!(
+            b.applied(t(25.0), &p("f00"), &v, ApplyOutcome::ChangedUnderneath)
+                .is_empty()
+        );
+        assert_eq!(
+            b.deferred()
+                .find(|d| d.entry.path == p("f00"))
+                .and_then(|d| d.restoring.as_ref()),
+            Some(&touch)
+        );
+        let out = b.scanned(t(26.0), p("f00"), file(1, 50));
+        assert_eq!(out.change, None, "not a local change");
+        let landed = out.landed.expect("the landing");
+        assert_eq!(landed.entry, touch);
+        assert!(landed.seq > restored.seq);
+        assert!(b.deferred().all(|d| d.entry.path != p("f00")));
+        assert!(b.wants().get(&p("f00")).is_none());
+        let sent = b.form_batches(t(28.0), bid(9)).remove(0);
+        assert!(sent.entries.contains(&touch), "announced");
+    }
+
+    /// §8.3, §13: the refetch's rename landed and a crash took its report.
+    /// The occupant matches the restored record, so the scan sees no
+    /// change; the mark makes that observation the landing, adopted with a
+    /// new `seq` and announced at the next tick.
+    #[test]
+    fn an_occupant_matching_the_restored_record_is_the_landing() {
+        let (mut b, restored) = deferred_restoring_entry();
+        let out = b.scanned(t(20.0), p("f00"), ScanState::Unchanged);
+        assert_eq!(out.change, None, "no local change");
+        let landed = out.landed.expect("the landing");
+        assert_eq!(landed.entry, restored.entry, "the restored record");
+        assert!(landed.seq > restored.seq, "with a new seq");
+        assert_eq!(b.deferred().count(), 0, "the mark is cleared");
+        assert!(b.wants().is_empty());
+        let sent = b.form_batches(t(22.0), bid(6)).remove(0);
+        assert_eq!(sent.entries, vec![restored.entry], "announced");
+    }
+
+    /// §8.3: an occupant that differs from the restored record clears the
+    /// mark as a local change, announced as one.
+    #[test]
+    fn an_occupant_that_differs_is_a_local_change() {
+        let (mut b, restored) = deferred_restoring_entry();
+        let out = b.scanned(t(20.0), p("f00"), file(9, 9));
+        let change = out.change.expect("a local change");
+        assert_eq!(out.landed, None);
+        assert!(
+            change
+                .record
+                .entry
+                .version
+                .dominates(&restored.entry.version)
+        );
+        assert_eq!(change.record.entry.hash, hash(9));
+        assert_eq!(b.deferred().count(), 0, "the mark is cleared");
+        assert!(
+            b.wants().is_empty(),
+            "the local change supersedes the refetch"
+        );
     }
 
     #[test]

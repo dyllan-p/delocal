@@ -130,7 +130,10 @@ pub struct Want {
     pub mismatches: u8,
     /// Content has been fetched and verified; only the commit remains.
     pub fetched: bool,
-    /// Made by `revert` (§8.3): `Absent` observations are the trash move.
+    /// Carries the path's restoring mark (§8.3): made by `revert`, or
+    /// inherited from the restoring want this one replaced. While the mark
+    /// stands, absence at the path is the trash move and the commit
+    /// expects the path to be absent.
     pub restoring: bool,
     /// Members that answered `NotAvailable`. For a restoring want, whose
     /// sources are every other member, the members not in here are the ones
@@ -249,9 +252,20 @@ impl WantList {
         self.wants.get(path).is_some_and(Want::in_flight)
     }
 
-    /// True if the path has a `revert`-made want (§8.3).
+    /// True if the want at `path` carries the restoring mark (§8.3).
     pub fn restoring(&self, path: &RelPath) -> bool {
         self.wants.get(path).is_some_and(|w| w.restoring)
+    }
+
+    /// The path's restoring mark was cleared by an observation (§8.3): the
+    /// want at `path` carries on as an ordinary one.
+    pub fn clear_restoring(&mut self, path: &RelPath) {
+        if let Some(want) = self.wants.get_mut(path)
+            && want.restoring
+        {
+            want.restoring = false;
+            self.note(path);
+        }
     }
 
     /// Number of fetches in progress.
@@ -296,23 +310,31 @@ impl WantList {
         batch: BatchId,
         source: NodeId,
         seq_high: u64,
+        marked: Option<&BTreeSet<NodeId>>,
     ) -> Option<ApplyItem> {
         let path = item.path().clone();
         let incoming = item.incoming().version.clone();
-        let mut restoring = false;
+        let mut restoring = marked.is_some();
         if let Some(existing) = self.wants.get_mut(&path) {
             if incoming == *existing.version() {
                 existing.sources.insert(source);
+                if let Some(others) = marked {
+                    existing.restoring = true;
+                    existing.sources.extend(others.iter().copied());
+                }
                 self.note(&path);
                 return None;
             }
             if !incoming.dominates(existing.version()) {
                 return Some(item);
             }
-            restoring = existing.restoring;
+            restoring |= existing.restoring;
         }
         let mut want = Want::from_item(item, received, batch, source, seq_high);
         want.restoring = restoring;
+        if let Some(others) = marked {
+            want.sources.extend(others.iter().copied());
+        }
         self.wants.insert(path.clone(), want);
         self.note(&path);
         None
@@ -762,6 +784,7 @@ mod tests {
                     bid(1),
                     node(2),
                     1,
+                    None
                 )
                 .is_none()
             );
@@ -1077,7 +1100,8 @@ mod tests {
                 e.clone(),
                 bid(1),
                 node(2),
-                1
+                1,
+                None
             )
             .is_none()
         );
@@ -1091,7 +1115,8 @@ mod tests {
                 e.clone(),
                 bid(2),
                 node(3),
-                1
+                1,
+                None
             )
             .is_none()
         );
@@ -1108,7 +1133,8 @@ mod tests {
                 newer.clone(),
                 bid(3),
                 node(2),
-                2
+                2,
+                None
             )
             .is_none()
         );
@@ -1126,7 +1152,8 @@ mod tests {
                 other,
                 bid(4),
                 node(5),
-                1
+                1,
+                None
             )
             .is_some(),
             "concurrent: refused"

@@ -362,6 +362,9 @@ impl Engine {
                             record: change.record,
                         });
                     }
+                    if let Some(record) = scanned.landed {
+                        out.push(Action::IndexChanged { folder, record });
+                    }
                     if let Some(status) = scanned.status {
                         out.push(Action::StatusChanged { folder, status });
                     }
