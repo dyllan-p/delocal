@@ -288,6 +288,11 @@ pub struct Sim {
     announced: BTreeSet<ContentHash>,
     /// Every distinct version ever recorded at each path on any node (I3, I4).
     versions: BTreeMap<RelPath, Vec<Entry>>,
+    /// Records a revert discarded whose vector was later reached again and
+    /// replaced them in `versions` (§8.3). They lost conflicts before they
+    /// were discarded, and a copy made from one keeps its name, so I4 still
+    /// counts them as losing versions.
+    superseded: BTreeMap<RelPath, Vec<Entry>>,
     log: blake3::Hasher,
 }
 
@@ -369,6 +374,7 @@ impl Sim {
             stats: Stats::default(),
             announced: BTreeSet::new(),
             versions: BTreeMap::new(),
+            superseded: BTreeMap::new(),
             log: blake3::Hasher::new(),
         };
         // Engines join the folder, then every pair connects.
@@ -998,6 +1004,12 @@ impl Sim {
                                         existing.deleted
                                     ),
                                 ));
+                            }
+                            if existing != record.entry {
+                                self.superseded
+                                    .entry(path.clone())
+                                    .or_default()
+                                    .push(existing);
                             }
                             if let Some(list) = self.versions.get_mut(&path) {
                                 list[at] = record.entry.clone();
@@ -2127,6 +2139,12 @@ impl Sim {
 
     pub(crate) fn versions(&self) -> &BTreeMap<RelPath, Vec<Entry>> {
         &self.versions
+    }
+
+    /// Records a revert discarded and a later write replaced in
+    /// [`Sim::versions`]; still losing versions for I4.
+    pub(crate) fn superseded(&self) -> &BTreeMap<RelPath, Vec<Entry>> {
+        &self.superseded
     }
 
     pub(crate) fn failure(&self, invariant: &str, detail: String) -> Failure {
