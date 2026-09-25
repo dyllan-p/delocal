@@ -93,8 +93,11 @@ pub enum WantState {
     NoSource,
     /// The host is fetching from `from`; stalls at `deadline`.
     Fetching { from: NodeId, deadline: Timestamp },
-    /// The host is committing; overdue at `deadline`.
-    Committing { deadline: Timestamp },
+    /// The host is committing. The commit holds the path until the host
+    /// reports it or the process restarts (§7.5): at `deadline` it is
+    /// overdue, which raises a warning once (`overdue`) and releases
+    /// nothing.
+    Committing { deadline: Timestamp, overdue: bool },
     /// Two sources excluded for hash mismatches. Released as soon as fewer
     /// than two are (§7.5): an exclusion expiring, an excluded source
     /// reconnecting, a source announcing the wanted content at the path, or
@@ -347,10 +350,12 @@ impl WantList {
     /// it resolved to (§7.5). A want that replaces a restoring one is
     /// restoring too: the file `revert` moved to trash is still there until
     /// a refetch lands at the path, whichever want brings it (§8.3 step 2).
-    /// A reset is never replaced: until the host reports it, the file may
-    /// still carry its old mtime and exec bit or already the record's, so
-    /// no commit guard could say which to expect. A newer version is
-    /// refused too, and waits for the reset like any deferred entry.
+    /// At most one commit is in flight per path (§7.5): a want whose
+    /// commit the host is performing, or a reset, is never replaced. The
+    /// commit may already have landed, and replacing the want would drop
+    /// its report and leave the landed file to reappear at the next scan as
+    /// a spurious local change. A newer version is refused and waits for
+    /// the report like any deferred entry.
     pub fn insert(
         &mut self,
         item: ApplyItem,
@@ -373,7 +378,7 @@ impl WantList {
                 self.note(&path);
                 return None;
             }
-            if !incoming.dominates(existing.version()) || existing.reset.is_some() {
+            if !incoming.dominates(existing.version()) || existing.committing() {
                 return Some(item);
             }
             restoring |= existing.restoring;
@@ -570,11 +575,11 @@ impl WantList {
         }
     }
 
-    /// Exclusions whose backoff has run out are released (§7.5), and
-    /// deadlines that have passed return the want to `Wanted`; a stalled
-    /// source is not excluded, the stall may have been ours. Returns the
-    /// paths whose deadline passed.
-    pub fn expire(&mut self, now: Timestamp) -> Vec<RelPath> {
+    /// Exclusions whose backoff has run out are released, a fetch whose
+    /// stall deadline has passed returns to `Wanted` (the source is not
+    /// excluded, the stall may have been ours), and a commit past its
+    /// deadline becomes overdue but keeps its path (§7.5).
+    pub fn expire(&mut self, now: Timestamp) -> Expired {
         let released: Vec<(RelPath, NodeId)> = self
             .wants
             .iter()
@@ -588,21 +593,37 @@ impl WantList {
         for (path, node) in released {
             self.release(&path, Some(node));
         }
-        let overdue: Vec<RelPath> = self
-            .wants
-            .iter()
-            .filter(|(_, w)| match w.state {
-                WantState::Fetching { deadline, .. } | WantState::Committing { deadline } => {
-                    deadline <= now
+        let mut expired = Expired::default();
+        for (path, want) in &self.wants {
+            match want.state {
+                WantState::Fetching { deadline, .. } if deadline <= now => {
+                    expired.stalled.push(path.clone());
                 }
-                _ => false,
-            })
-            .map(|(p, _)| p.clone())
-            .collect();
-        for path in &overdue {
+                WantState::Committing {
+                    deadline,
+                    overdue: false,
+                } if deadline <= now => expired.overdue.push(path.clone()),
+                _ => {}
+            }
+        }
+        for path in &expired.stalled {
             self.set_state(path, WantState::Wanted);
         }
-        overdue
+        for path in &expired.overdue {
+            if let Some(want) = self.wants.get(path) {
+                let WantState::Committing { deadline, .. } = want.state else {
+                    continue;
+                };
+                self.set_state(
+                    path,
+                    WantState::Committing {
+                        deadline,
+                        overdue: true,
+                    },
+                );
+            }
+        }
+        expired
     }
 
     /// A peer went away: fetches from it are over.
@@ -622,9 +643,11 @@ impl WantList {
     /// engine's wake-up.
     pub fn next_deadline(&self) -> Option<Timestamp> {
         let deadlines = self.wants.values().filter_map(|w| match w.state {
-            WantState::Fetching { deadline, .. } | WantState::Committing { deadline } => {
-                Some(deadline)
-            }
+            WantState::Fetching { deadline, .. }
+            | WantState::Committing {
+                deadline,
+                overdue: false,
+            } => Some(deadline),
             _ => None,
         });
         let expiries = self
@@ -809,6 +832,7 @@ impl WantList {
                 &path,
                 WantState::Committing {
                     deadline: now.plus_nanos(COMMIT_DEADLINE_NANOS),
+                    overdue: false,
                 },
             );
         }
@@ -822,6 +846,14 @@ pub enum FetchReport {
     Ok,
     NotAvailable,
     HashMismatch,
+}
+
+/// What [`WantList::expire`] found: fetches that stalled and are wanted
+/// again, and commits that became overdue and still hold their paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Expired {
+    pub stalled: Vec<RelPath>,
+    pub overdue: Vec<RelPath>,
 }
 
 /// How long a source stays excluded after its `strikes`-th mismatch for
@@ -1342,8 +1374,8 @@ mod tests {
         assert_eq!(l.next_deadline(), Some(t(60)));
         l.progress(t(50), &p("f"), &v);
         assert_eq!(l.next_deadline(), Some(t(110)));
-        assert!(l.expire(t(109)).is_empty());
-        assert_eq!(l.expire(t(110)), vec![p("f")]);
+        assert!(l.expire(t(109)).stalled.is_empty());
+        assert_eq!(l.expire(t(110)).stalled, vec![p("f")]);
         assert_eq!(l.get(&p("f")).unwrap().state, WantState::Wanted);
         assert!(
             l.get(&p("f")).unwrap().excluded.is_empty(),
@@ -1355,6 +1387,23 @@ mod tests {
         let steps = l.dispatch(t(111), &Rules::default(), &peers(&[(2, Tier::Lan)]));
         assert!(matches!(&steps[0], WantStep::Commit(_)));
         assert_eq!(l.next_deadline(), Some(t(141)));
+        // §7.5: an overdue commit warns once and keeps its path; only its
+        // report or a restart releases it.
+        let expired = l.expire(t(141));
+        assert_eq!(expired.overdue, vec![p("f")]);
+        assert!(expired.stalled.is_empty());
+        assert_eq!(
+            l.get(&p("f")).unwrap().state,
+            WantState::Committing {
+                deadline: t(141),
+                overdue: true
+            }
+        );
+        assert!(l.in_flight(&p("f")));
+        assert_eq!(l.next_deadline(), None, "no second warning");
+        assert_eq!(l.expire(t(1000)), Expired::default());
+        l.restarted();
+        assert_eq!(l.get(&p("f")).unwrap().state, WantState::Wanted);
     }
 
     #[test]

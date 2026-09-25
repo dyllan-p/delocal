@@ -679,10 +679,17 @@ impl Engine {
             let Some(folder) = self.folders.get_mut(&id) else {
                 continue;
             };
-            for path in folder.expire(now) {
+            let expired = folder.expire(now);
+            for path in expired.stalled {
                 out.push(Action::StatusChanged {
                     folder: id,
                     status: FolderStatus::Stalled { path },
+                });
+            }
+            for path in expired.overdue {
+                out.push(Action::StatusChanged {
+                    folder: id,
+                    status: FolderStatus::CommitOverdue { path },
                 });
             }
             let (catchup, spent) = folder.catchup_batches(now, fresh.successor(used));
