@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 27 · 25 September 2026 · Status: **for review** · Changes from draft 26: `deny` and `revert` act only on a settled folder and are queued otherwise (§8.3); a crash after a displacing commit followed by `revert` (§13); I2's exemption for the user's own changes follows content wherever sync put it (§14.1).
+> Draft 28 · 25 September 2026 · Status: **for review** · Changes from draft 27: a settled folder has no scan bracket open; `revert` undoes a deny it discards by returning the held item it consumed (§8.3).
+>
+> Changes from draft 26: `deny` and `revert` act only on a settled folder and are queued otherwise (§8.3); a crash after a displacing commit followed by `revert` (§13); I2's exemption for the user's own changes follows content wherever sync put it (§14.1).
 >
 > Changes from draft 25: everything that makes the disk hold what the record says clears the restoring mark (§8.3).
 >
@@ -457,7 +459,9 @@ Approving on one machine does not approve on others in v1 (§3.2).
 
 `revert` is only meaningful on a paused sender. On other machines it is a no-op with an explanatory message.
 
-**`deny` and `revert` act only on a settled folder.** Both write or discard this machine's own local state, so they can only be right about it when its records describe its disk. A `deny` waits while the folder is paused (its bump would join the pending batch, and a `revert` would then discard the user's decision about a peer's batch along with the damage), and while any path of its held item carries the restoring mark (the bump would announce content this machine cannot serve, §7.1) or has a commit in flight. A `revert` waits while any commit in the folder is in flight and, after a restart, until the startup full scan (§7.3) has finished, since a crash can leave files the engine has not been told about (a conflict copy whose report was lost, §13) and a `revert` that ran without them would let them survive and spread as new adds. A waiting decision is **queued**, persisted with the folder state, shown by `status` with what it is waiting for, and run as soon as the condition clears. `approve` is never queued: it applies incoming entries and writes nothing of this machine's own.
+**`deny` and `revert` act only on a settled folder.** Both write or discard this machine's own local state, so they can only be right about it when its records describe its disk. A `deny` waits while the folder is paused (its bump would join the pending batch, and a `revert` would then discard the user's decision about a peer's batch along with the damage), and while any path of its held item carries the restoring mark (the bump would announce content this machine cannot serve, §7.1) or has a commit in flight. A `revert` waits while any commit in the folder is in flight and, after a restart, until the startup full scan (§7.3) has finished, since a crash can leave files the engine has not been told about (a conflict copy whose report was lost, §13) and a `revert` that ran without them would let them survive and spread as new adds. Neither runs while a scan bracket is open: a decision taken mid-scan would change records the bracket is part-way through comparing. A waiting decision is **queued**, persisted with the folder state, shown by `status` with what it is waiting for, and run as soon as the condition clears. `approve` is never queued: it applies incoming entries and writes nothing of this machine's own.
+
+A `deny` can still run on an unpaused folder whose window then pauses on other local changes, so its bumps land in the pending batch. `revert` then treats the deny like every other unannounced local action: it **undoes it**. The held item the deny consumed returns to quarantine, with the entries it held, and waits for a new decision; `status` says it came back. It must not be announced separately instead: the bumps' `seq` is above the other withheld records, and a batch carrying only them would move peers' watermarks past those records (§7.4).
 
 ### 8.4 Trash
 
