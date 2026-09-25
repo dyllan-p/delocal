@@ -107,8 +107,23 @@ impl Quarantine {
             .unwrap_or_default()
     }
 
-    /// Hold a new item with its entries.
+    /// Hold an item with its entries (§8.2). A batch id names one review
+    /// item: if an item with this id is already held, the entries join it
+    /// instead of replacing it. Entries re-admitted from the deferred set
+    /// keep the id of the batch they arrived in, and `revert` returns a
+    /// withdrawn item under its own id, so the same id can come back while
+    /// an item holds it. Replacing that item would drop its entries while
+    /// the version index still names them under the id; `release` would
+    /// then leave those versions behind, and a later version dominating one
+    /// of them would join an item that no longer exists and be lost.
     pub fn hold(&mut self, item: HeldItem) {
+        if self.items.contains_key(&item.batch) {
+            let batch = item.batch;
+            for entry in item.entries.into_values() {
+                self.join(batch, entry);
+            }
+            return;
+        }
         for entry in item.entries.values() {
             self.record(&entry.path, entry.version.clone(), entry.stamp, item.batch);
         }
@@ -267,6 +282,54 @@ mod tests {
         q.reinstate(withdrawn);
         assert_eq!(q, before);
         assert_eq!(q.versions_at(&p("a")).len(), 2, "the joiner too");
+    }
+
+    /// §8.2: a batch id names one review item. Holding under an id that
+    /// already has an item joins it: both sets of entries stay held, and
+    /// releasing the item releases every version, leaving nothing in the
+    /// version index for a later version to match.
+    #[test]
+    fn holding_under_an_existing_id_joins_the_item() {
+        let mut q = Quarantine::default();
+        q.hold(item(1, vec![entry("a", v(&[(2, 1)]))]));
+        q.hold(item(1, vec![entry("b", v(&[(2, 2)]))]));
+        assert_eq!(q.len(), 1);
+        let held = q.get(batch(1)).unwrap();
+        assert_eq!(held.entries.keys().collect::<Vec<_>>(), [&p("a"), &p("b")]);
+        assert_eq!(q.versions_at(&p("a")), vec![v(&[(2, 1)])]);
+
+        let released = q.release(batch(1)).unwrap();
+        assert_eq!(released.entries.len(), 2);
+        assert!(q.versions_at(&p("a")).is_empty());
+        assert!(q.versions_at(&p("b")).is_empty());
+        assert_eq!(q.matching(&entry("a", v(&[(2, 5)]))), None);
+    }
+
+    /// §8.2, §8.3, seed 90745: `deny` withdrew an item, entries re-admitted
+    /// from the deferred set were held again under the same batch id, and
+    /// `revert` then returned the withdrawn item. It joins the item held
+    /// meanwhile, and releasing it releases both.
+    #[test]
+    fn an_item_returned_by_revert_joins_the_item_holding_its_id() {
+        let mut q = Quarantine::default();
+        q.hold(item(1, vec![entry("d1/f10", v(&[(2, 4), (3, 1)]))]));
+        let withdrawn = q.withdraw(batch(1)).unwrap();
+        q.hold(item(1, vec![entry("f0", v(&[(4, 1)]))]));
+        q.reinstate(withdrawn);
+        let held = q.get(batch(1)).unwrap();
+        assert_eq!(
+            held.entries.keys().collect::<Vec<_>>(),
+            [&p("d1/f10"), &p("f0")]
+        );
+        assert_eq!(
+            q.matching(&entry("d1/f10", v(&[(2, 8), (3, 9)]))),
+            Some(batch(1)),
+            "a later version at d1/f10 joins an item that exists"
+        );
+
+        q.release(batch(1)).unwrap();
+        assert!(q.versions_at(&p("d1/f10")).is_empty());
+        assert!(q.versions_at(&p("f0")).is_empty());
     }
 
     #[test]
