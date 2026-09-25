@@ -44,6 +44,13 @@
 //! becomes a tombstone dated then (§7.3). `ScanAborted` drops the bracket
 //! and announces nothing.
 //!
+//! **Revert** (§8.3). Every pending path gets back the record peers last
+//! saw. The current file goes to trash and the restored live entry is
+//! wanted again under the restoring mark, unless the file already holds
+//! the restored content (its pending change was a touch, a chmod or a
+//! deny's bump): then it stays, and a reset sets its mtime and exec bit
+//! back to the record where they differ.
+//!
 //! **Settled decisions** (§8.3). `deny` and `revert` write or discard this
 //! machine's own local state, so they run only on a settled folder. A `deny`
 //! waits while the folder is paused or any path of its held item carries the
@@ -250,11 +257,14 @@ pub enum FolderStatus {
     Unpaused { batch: BatchId },
     /// `deny` bumped this many paths over the quarantined versions.
     Denied { batch: BatchId, paths: usize },
-    /// `revert` undid the pending changes (§8.3).
+    /// `revert` undid the pending changes (§8.3): `trashed` files moved
+    /// aside, `refetch` restored entries wanted again, and `kept` files
+    /// that already held the restored content left in place.
     Reverted {
         batch: BatchId,
         trashed: usize,
         refetch: usize,
+        kept: usize,
     },
     /// `revert` on a folder that is not paused: a no-op (§8.3).
     NotPaused,
@@ -382,6 +392,9 @@ pub struct RevertOutcome {
     pub trash: Vec<RelPath>,
     /// Restored live entries wanted again.
     pub refetch: usize,
+    /// Paths whose file already held the restored content and stays; a
+    /// reset sets each one's mtime and exec bit back where they differ.
+    pub kept: usize,
     /// Held items back in quarantine because the revert discarded the
     /// bumps of the deny that consumed them (§8.3), with their path counts.
     pub returned: Vec<(BatchId, usize)>,
@@ -1603,14 +1616,17 @@ impl FolderState {
 
     /// `revert` (§8.3) on a paused folder: discard the pending changes,
     /// restore every path's announced record, move the current files to
-    /// trash, and want the restored live entries again as `restoring`.
-    /// `None` if the folder is not paused.
+    /// trash, and want the restored live entries again as `restoring`. A
+    /// file that already holds the restored content (same kind and hash)
+    /// stays where it is, unmarked, and a reset sets its mtime and exec bit
+    /// back where they differ. `None` if the folder is not paused.
     pub fn revert(&mut self, now: Timestamp) -> Option<RevertOutcome> {
         let paused = self.paused.take()?;
         let own = self.index.own();
         let others: BTreeSet<NodeId> = self.members.iter().copied().filter(|m| *m != own).collect();
         let mut trash = Vec::new();
         let mut refetch = 0;
+        let mut kept = 0;
         let reverted = self.index.revert_pending();
         // The pending set held every unannounced deny's bumps, so each of
         // those denies is undone with the rest: its held item returns.
@@ -1627,21 +1643,56 @@ impl FolderState {
             .filter_map(|r| self.wants.remove(&r.path))
             .collect();
         for reverted in &reverted {
-            if reverted.current.as_ref().is_some_and(|e| !e.deleted) {
+            let current = reverted.current.as_ref().filter(|e| !e.deleted);
+            let restored = reverted
+                .restored
+                .as_ref()
+                .map(|r| &r.entry)
+                .filter(|e| !e.deleted);
+            // The pending change left the content alone: the file is what
+            // peers announced, so trashing and refetching it would only
+            // bring the same bytes back (§8.3 step 2).
+            if let (Some(current), Some(restored)) = (current, restored)
+                && current.kind == restored.kind
+                && current.hash == restored.hash
+            {
+                kept += 1;
+                // Only a file carries an mtime and an exec bit (§7.1); a
+                // directory or symlink already is what the record says.
+                if restored.kind == Kind::File && current.observed() != restored.observed() {
+                    self.wants.insert_reverted(Want {
+                        entry: restored.clone(),
+                        received: restored.clone(),
+                        mode: ApplyMode::MetadataOnly,
+                        conflict: None,
+                        batch: paused.batch,
+                        source: own,
+                        seq_high: 0,
+                        sources: BTreeSet::new(),
+                        excluded: BTreeSet::new(),
+                        mismatches: 0,
+                        fetched: false,
+                        restoring: false,
+                        answered: BTreeSet::new(),
+                        reset: Some(current.observed()),
+                        state: WantState::Wanted,
+                    });
+                }
+                continue;
+            }
+            if current.is_some() {
                 trash.push(reverted.path.clone());
             }
-            if let Some(record) = &reverted.restored
-                && !record.entry.deleted
-            {
-                let mode = if record.entry.kind == Kind::Dir {
+            if let Some(restored) = restored {
+                let mode = if restored.kind == Kind::Dir {
                     ApplyMode::Direct
                 } else {
                     ApplyMode::Fetch
                 };
                 refetch += 1;
-                self.wants.insert_restoring(Want {
-                    entry: record.entry.clone(),
-                    received: record.entry.clone(),
+                self.wants.insert_reverted(Want {
+                    entry: restored.clone(),
+                    received: restored.clone(),
                     mode,
                     conflict: None,
                     batch: paused.batch,
@@ -1653,6 +1704,7 @@ impl FolderState {
                     fetched: false,
                     restoring: true,
                     answered: BTreeSet::new(),
+                    reset: None,
                     state: WantState::Wanted,
                 });
             }
@@ -1667,6 +1719,7 @@ impl FolderState {
             reverted,
             trash,
             refetch,
+            kept,
             returned,
         })
     }
@@ -1835,14 +1888,17 @@ impl FolderState {
                 WantStep::Commit(want) => {
                     let want = *want;
                     let path = want.path().clone();
-                    // A restoring want is refetching what `revert` moved to
-                    // trash (§8.3 step 2): until it lands, the index
-                    // deliberately disagrees with the disk, so the guard
-                    // expects the path to be absent, not the restored shape.
-                    let expected = if want.restoring {
-                        None
-                    } else {
-                        self.expected(&path)
+                    // Two wants made by `revert` (§8.3 step 2) commit while
+                    // the index deliberately disagrees with the disk. A
+                    // restoring want refetches what revert moved to trash, so
+                    // its guard expects the path to be absent; a reset sets a
+                    // kept file back to the restored record, so its guard
+                    // expects the file as last observed. Neither expects the
+                    // restored shape.
+                    let expected = match &want.reset {
+                        Some(last_observed) => Some(last_observed.clone()),
+                        None if want.restoring => None,
+                        None => self.expected(&path),
                     };
                     host.push(match want.mode {
                         ApplyMode::MetadataOnly => HostStep::SetMeta {
@@ -1894,7 +1950,8 @@ impl FolderState {
     /// conflict copy, the displaced file is recorded at the conflict path
     /// as this machine's local add (§7.6). On `ChangedUnderneath` the entry
     /// is kept in the deferred set until the path is observed again. Either
-    /// way the want ends. Returns every record written, in order; empty if
+    /// way the want ends. A reset writes nothing to the index either way
+    /// (§8.3 step 2). Returns every record written, in order; empty if
     /// nothing matched or the commit did not happen.
     pub fn applied(
         &mut self,
@@ -1909,6 +1966,17 @@ impl FolderState {
         let Some(want) = self.wants.remove(path) else {
             return Vec::new();
         };
+        if want.reset.is_some() {
+            // The record is the one revert restored and keeps its `seq`, so
+            // a reset adopts and announces nothing. Once it has landed the
+            // disk says what the record says, and entries deferred at the
+            // path are classified against it; if the file changed
+            // underneath, they wait for the next observation instead.
+            if outcome == ApplyOutcome::Ok {
+                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+            }
+            return Vec::new();
+        }
         match outcome {
             ApplyOutcome::Ok => {
                 let Some(record) = self.adopt(now, want.entry.clone()) else {
@@ -3506,6 +3574,247 @@ mod tests {
         assert!(!b.index().get(&p("f00")).unwrap().entry.deleted);
     }
 
+    /// What the scanner sees of a file whose content is `hash(h)`.
+    fn stat(h: u8, mtime_ns: i64, exec: bool) -> Observed {
+        Observed {
+            kind: Kind::File,
+            size: 10,
+            mtime_ns,
+            exec,
+            hash: hash(h),
+        }
+    }
+
+    /// §8.3 step 2: a `git checkout` of another branch rewrites eight files
+    /// and pauses the folder; checking the first branch out again puts the
+    /// announced content back with new mtimes, so every pending change is
+    /// now a touch. (A touch alone never pauses a folder, §8.1; it is caught
+    /// in a batch that paused for something else.) `revert` restores every
+    /// record, keeps every file, and sets each mtime back with a `SetMeta`
+    /// guarded by the file as last observed: nothing is trashed, fetched or
+    /// marked, and the landed resets announce nothing.
+    #[test]
+    fn a_revert_of_a_mass_touch_sets_mtimes_back_and_fetches_nothing() {
+        let (_, mut b) = a_and_b(10, tight());
+        let announced: Vec<IndexRecord> = b.index().records().cloned().collect();
+        for i in 0..8 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), file(9, 10));
+        }
+        assert!(matches!(
+            b.tick(t(12.0), bid(5)),
+            Ticked::Paused { first: true, .. }
+        ));
+        for i in 0..8 {
+            b.scanned(t(13.0), p(&format!("f{i:02}")), file(1, 13));
+        }
+        assert!(
+            b.index().pending().all(|(r, _)| r.entry.is_metadata_only()),
+            "the checkout back leaves only touches pending"
+        );
+
+        let out = b.revert(t(14.0)).unwrap();
+        assert!(out.trash.is_empty(), "no file moves to trash");
+        assert_eq!((out.refetch, out.kept), (0, 8));
+        let records: Vec<IndexRecord> = b.index().records().cloned().collect();
+        assert_eq!(
+            records, announced,
+            "every record back exactly, seq included"
+        );
+        assert!(b.wants().iter().all(|w| !w.restoring), "no restoring mark");
+        assert!(b.in_flight(&p("f00")), "a reset is a commit in flight");
+
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1, 3]));
+        let resets: Vec<HostStep> = (0..8)
+            .map(|i| HostStep::SetMeta {
+                path: p(&format!("f{i:02}")),
+                expected: Some(stat(1, 13, false)),
+                mtime_ns: 1,
+                exec: false,
+            })
+            .collect();
+        assert_eq!(steps, resets, "a SetMeta per file and nothing else");
+        for i in 0..8 {
+            let path = p(&format!("f{i:02}"));
+            let v = b.wants().get(&path).unwrap().version().clone();
+            assert!(
+                b.applied(t(15.0), &path, &v, ApplyOutcome::Ok).is_empty(),
+                "a reset adopts nothing"
+            );
+        }
+        assert!(b.wants().is_empty());
+        let records: Vec<IndexRecord> = b.index().records().cloned().collect();
+        assert_eq!(records, announced);
+        assert!(b.index().unannounced().is_empty(), "nothing to announce");
+        assert_eq!(b.due(), None);
+    }
+
+    /// §8.3 step 2, the case #49 left open: a deny whose bumps a later pause
+    /// put in the pending batch changed no content, so `revert` keeps the
+    /// files at its paths, trashing, fetching and marking none of them,
+    /// while it returns the held item. The bumps left mtime and exec alone,
+    /// so there is nothing to set back either. The returned item can be
+    /// denied again at once, against the very files it would keep, and the
+    /// new bumps give A its files back.
+    #[test]
+    fn a_denys_bump_paths_keep_their_files_through_revert_for_the_next_deny() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..4 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let dels = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert!(matches!(
+            b.receive(t(12.0), &dels).decision,
+            Decision::Held { .. }
+        ));
+        assert_eq!(b.deny(t(13.0), bid(3)).unwrap().len(), 4);
+        for i in 6..10 {
+            b.scanned(t(14.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
+
+        let out = b.revert(t(17.0)).unwrap();
+        assert_eq!(out.returned, vec![(bid(3), 4)]);
+        assert!(out.trash.is_empty(), "f06 to f09 are gone; f00 to f03 stay");
+        assert_eq!(
+            (out.refetch, out.kept),
+            (4, 4),
+            "only the deleted files are fetched again"
+        );
+        for i in 0..4 {
+            let path = p(&format!("f{i:02}"));
+            assert!(b.wants().get(&path).is_none(), "nothing to fetch or set");
+            assert!(!b.in_flight(&path));
+            assert_eq!(b.index().live(&path).unwrap().entry.hash, hash(1));
+        }
+
+        let deny = UserDecision::Deny { batch: bid(3) };
+        assert_eq!(
+            b.request(deny),
+            Requested::Run,
+            "no mark and no commit at the held paths"
+        );
+        let held: BTreeMap<RelPath, Vec<Version>> = (0..4)
+            .map(|i| p(&format!("f{i:02}")))
+            .map(|path| (path.clone(), b.quarantine().versions_at(&path)))
+            .collect();
+        assert!(
+            held.values().all(|vs| !vs.is_empty()),
+            "A's tombstones are back"
+        );
+        let changes = b.deny(t(18.0), bid(3)).unwrap();
+        assert_eq!(changes.len(), 4);
+        for c in &changes {
+            let e = &c.record.entry;
+            assert!(!e.deleted && e.hash == hash(1), "B's kept copies win");
+            for q in &held[&e.path] {
+                assert!(e.version.dominates(q));
+            }
+        }
+        let bumps = b.form_batches(t(20.0), bid(6)).remove(0);
+        let r = a.receive(t(20.0), &bumps);
+        assert_eq!(r.decision, Decision::Accepted);
+        let back: Vec<&RelPath> = r
+            .set
+            .items
+            .iter()
+            .filter(|i| i.mode() == ApplyMode::Fetch)
+            .map(|i| i.path())
+            .collect();
+        assert_eq!(back, [&p("f00"), &p("f01"), &p("f02"), &p("f03")]);
+    }
+
+    /// B's user chmods f09 and deletes f00 to f03; B pauses and reverts.
+    /// Returns A, B, f09's announced record and the reset's version.
+    fn chmodded_then_reverted() -> (FolderState, FolderState, IndexRecord, Version) {
+        let (a, mut b) = a_and_b(10, tight());
+        let f09 = b.index().get(&p("f09")).unwrap().clone();
+        b.scanned(t(10.0), p("f09"), ScanState::Observed(stat(1, 1, true)));
+        for i in 0..4 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(13.0)).unwrap();
+        assert!(out.trash.is_empty());
+        assert_eq!((out.refetch, out.kept), (4, 1));
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        (a, b, f09, v)
+    }
+
+    /// §8.3 step 2: a chmod changes neither content nor mtime, so `revert`
+    /// keeps the file, and a `SetMeta` guarded by the file as last observed
+    /// clears the exec bit again. The reset lands without writing the index.
+    #[test]
+    fn a_chmod_only_path_is_restored_with_set_meta() {
+        let (_, mut b, f09, v) = chmodded_then_reverted();
+        assert_eq!(b.index().get(&p("f09")), Some(&f09), "restored exactly");
+        assert!(!b.wants().get(&p("f09")).unwrap().restoring);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1, 3]));
+        let at_f09: Vec<&HostStep> = steps
+            .iter()
+            .filter(|s| match s {
+                HostStep::Fetch { path, .. }
+                | HostStep::Write { path, .. }
+                | HostStep::Remove { path, .. }
+                | HostStep::SetMeta { path, .. } => path == &p("f09"),
+            })
+            .collect();
+        assert_eq!(
+            at_f09,
+            [&HostStep::SetMeta {
+                path: p("f09"),
+                expected: Some(stat(1, 1, true)),
+                mtime_ns: f09.entry.mtime_ns,
+                exec: false,
+            }]
+        );
+        assert!(
+            b.applied(t(14.0), &p("f09"), &v, ApplyOutcome::Ok)
+                .is_empty()
+        );
+        assert!(b.wants().get(&p("f09")).is_none());
+        assert_eq!(
+            b.index().get(&p("f09")),
+            Some(&f09),
+            "seq kept: not announced"
+        );
+    }
+
+    /// §8.3 step 2, §7.5 step 6: a kept file the user edits before its reset
+    /// is committed fails the guard. The reset ends without writing the
+    /// index, and the next observation is a local change against the
+    /// restored record like any other.
+    #[test]
+    fn a_reset_whose_file_changed_underneath_leaves_the_edit_to_the_scan() {
+        let (_, mut b) = a_and_b(10, tight());
+        b.scanned(t(10.0), p("f09"), file(1, 10));
+        for i in 0..4 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        let restored = b.index().get(&p("f09")).unwrap().clone();
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        b.dispatch(t(13.0), &lan(&[1, 3]));
+
+        let written = b.applied(t(14.0), &p("f09"), &v, ApplyOutcome::ChangedUnderneath);
+        assert!(written.is_empty());
+        assert!(b.wants().get(&p("f09")).is_none());
+        assert_eq!(b.deferred().count(), 0, "a reset carries no incoming entry");
+        assert_eq!(b.index().get(&p("f09")), Some(&restored));
+        let change = b
+            .scanned(t(15.0), p("f09"), file(8, 15))
+            .change
+            .expect("the edit is a local change");
+        assert!(
+            change
+                .record
+                .entry
+                .version
+                .dominates(&restored.entry.version)
+        );
+        assert_eq!(change.record.entry.prev_hash, hash(1));
+    }
+
     /// §8.3: neither decision runs while a scan bracket is open, since it
     /// would change records the bracket is part-way through comparing.
     #[test]
@@ -4475,8 +4784,10 @@ mod tests {
 
         /// §8.3: after revert on a paused folder no path has an unannounced
         /// change, every record is back as announced (seq included) or gone
-        /// if peers never saw it, one trash move per live current file, and
-        /// every restored live entry is in flight.
+        /// if peers never saw it, one trash move per live current file that
+        /// does not hold the restored content, every other restored live
+        /// entry is wanted again, and a kept file is reset only where its
+        /// mtime or exec bit differs from the record.
         #[test]
         fn revert_leaves_nothing_pending(
             n in 2usize..8,
@@ -4499,20 +4810,45 @@ mod tests {
             prop_assume!(summary.destructive() >= 1);
             let paused = matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { first: true, .. });
             prop_assert!(paused);
-            let live_now: BTreeSet<RelPath> = b.index().pending_paths().filter(|p| b.index().live(p).is_some()).cloned().collect();
+            // Content as it stands at each pending path, before the revert.
+            let current: BTreeMap<RelPath, Entry> = b
+                .index()
+                .pending_paths()
+                .filter_map(|p| b.index().live(p).map(|r| (p.clone(), r.entry.clone())))
+                .collect();
+            let holds_announced = |path: &RelPath| {
+                current.get(path).zip(announced.get(path)).is_some_and(|(c, a)| {
+                    !a.entry.deleted && c.kind == a.entry.kind && c.hash == a.entry.hash
+                })
+            };
             let pending: Vec<RelPath> = b.index().pending_paths().cloned().collect();
             let out = b.revert(t(13.0)).unwrap();
-            prop_assert_eq!(out.trash.iter().cloned().collect::<BTreeSet<_>>(), live_now);
+            let trashed: BTreeSet<RelPath> =
+                current.keys().filter(|p| !holds_announced(p)).cloned().collect();
+            prop_assert_eq!(out.trash.iter().cloned().collect::<BTreeSet<_>>(), trashed);
             prop_assert_eq!(b.index().pending_count(), 0);
             prop_assert!(b.paused().is_none());
             prop_assert!(b.index().unannounced().is_empty());
             let mut refetch = 0;
+            let mut kept = 0;
             for path in &pending {
                 match announced.get(path) {
                     Some(record) => {
                         prop_assert_eq!(b.index().get(path), Some(record));
-                        if !record.entry.deleted {
+                        if holds_announced(path) {
+                            kept += 1;
+                            let want = b.wants().get(path);
+                            let differs = current[path].observed() != record.entry.observed();
+                            prop_assert_eq!(want.is_some(), differs);
+                            if let Some(want) = want {
+                                prop_assert!(!want.restoring);
+                                prop_assert_eq!(want.mode, ApplyMode::MetadataOnly);
+                                prop_assert_eq!(want.reset.as_ref(), Some(&current[path].observed()));
+                                prop_assert!(b.in_flight(path));
+                            }
+                        } else if !record.entry.deleted {
                             refetch += 1;
+                            prop_assert!(b.wants().restoring(path));
                             prop_assert!(b.in_flight(path));
                         }
                     }
@@ -4520,6 +4856,7 @@ mod tests {
                 }
             }
             prop_assert_eq!(out.refetch, refetch);
+            prop_assert_eq!(out.kept, kept);
             let all: BTreeMap<RelPath, IndexRecord> =
                 b.index().records().map(|r| (r.entry.path.clone(), r.clone())).collect();
             prop_assert_eq!(all, announced);

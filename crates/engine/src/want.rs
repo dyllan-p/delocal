@@ -23,7 +23,9 @@
 //! *fetching* or *committing* is in flight; *deferred*, *without source* and
 //! *given up* are observable, because they can last for days. A want made
 //! by `revert` (§8.3) is `restoring`: an `Absent` observation is the trash
-//! move and is ignored in every state.
+//! move and is ignored in every state. A want `revert` makes at a path
+//! whose file already holds the restored content is a `reset`: it sets the
+//! file's mtime and exec bit back to the record, which is already in place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -31,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{ApplyItem, ApplyMode};
 use crate::conflict::ConflictCopy;
-use crate::entry::{ContentHash, Entry, Kind};
+use crate::entry::{ContentHash, Entry, Kind, Observed};
 use crate::id::{BatchId, NodeId};
 use crate::path::RelPath;
 use crate::rules::Rules;
@@ -140,6 +142,15 @@ pub struct Want {
     /// `status` names as not yet asked; once every member is in here the
     /// content exists nowhere and the deletion stands (§8.3 step 4).
     pub answered: BTreeSet<NodeId>,
+    /// Made by `revert` at a path whose file already holds the restored
+    /// record's content, its pending change having been only a touch, a
+    /// chmod or a deny's bump (§8.3 step 2): the file as last observed.
+    /// The record is already the restored one, so this want only sets the
+    /// file's mtime and exec bit back to it (`entry`, metadata only), and
+    /// its guard expects this shape rather than the record's. Nothing is
+    /// adopted when it lands: the restored record keeps its `seq` and is
+    /// not announced again.
+    pub reset: Option<Observed>,
     pub state: WantState,
 }
 
@@ -199,6 +210,7 @@ impl Want {
             fetched: false,
             restoring: false,
             answered: BTreeSet::new(),
+            reset: None,
             state: WantState::Wanted,
         }
     }
@@ -354,8 +366,9 @@ impl WantList {
         }
     }
 
-    /// A want made by `revert` (§8.3): fetch the restored entry again.
-    pub fn insert_restoring(&mut self, want: Want) {
+    /// A want made by `revert` (§8.3 step 2): a restoring want that fetches
+    /// the restored entry again, or a reset that sets a kept file back to it.
+    pub fn insert_reverted(&mut self, want: Want) {
         let path = want.path().clone();
         self.wants.insert(path.clone(), want);
         self.note(&path);

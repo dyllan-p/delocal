@@ -889,6 +889,7 @@ fn decide(
                         batch: reverted.batch,
                         trashed: reverted.trash.len(),
                         refetch: reverted.refetch,
+                        kept: reverted.kept,
                     },
                 });
                 for (batch, paths) in reverted.returned {
@@ -2194,7 +2195,8 @@ mod tests {
                 status: FolderStatus::Reverted {
                     batch: fresh(3),
                     trashed: 1,
-                    refetch: 8
+                    refetch: 8,
+                    kept: 0
                 }
             }
         );
