@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 25 · 25 September 2026 · Status: **for review** · Changes from draft 24: at a path carrying the restoring mark this machine holds neither version, which settles how wants there are applied, sourced, re-wanted and landed (§8.3).
+> Draft 26 · 25 September 2026 · Status: **for review** · Changes from draft 25: everything that makes the disk hold what the record says clears the restoring mark (§8.3).
+>
+> Changes from draft 24: at a path carrying the restoring mark this machine holds neither version, which settles how wants there are applied, sourced, re-wanted and landed (§8.3).
 >
 > Changes from draft 23: the restoring mark is cleared only by an observation of an occupant, and an occupant matching the restored record counts as the landing (§8.3, §13).
 >
@@ -444,7 +446,8 @@ Approving on one machine does not approve on others in v1 (§3.2).
    - Every entry arriving at the path is compared by vector with the record as usual (dominated and equal versions are dropped), but applied the way a machine holding neither applies it: its content is always written (a fetch for a file or symlink, a direct write for a directory or tombstone; never a metadata-only or index-only apply, since there is nothing on disk to adjust), no conflict copy is made, and the commit expects the path to be absent. Every want at the path carries the mark.
    - Every want at the path asks every member, and resolves under step 4 once all have refused.
    - `Absent` observations are ignored and the scan bracket's deletion pass skips the path, whatever state its want is in. Absence is the normal state here, so a bracket end that does not see the path is the observation a deferred carrier waits for: the carrier is wanted again, with the mark, without re-classification (which would find the record caught up and drop it).
-   - The first observation of an occupant clears the mark. If the occupant matches what the path's want or deferred carrier was committing, that commit has landed and its report was lost (a crash after the rename, §13), so the observation **counts as the landing**: that entry is adopted with a new `seq` and announced, exactly as `Applied Ok` would have done. Anything else is a local change and is announced as one.
+   - The first observation of an occupant clears the mark. If the occupant matches what the path's want or deferred carrier was committing, that commit has landed and its report was lost (a crash after the rename, §13), so the observation **counts as the landing**: that entry is adopted with a new `seq` and announced, exactly as `Applied Ok` would have done. An occupant that matches the restored record but no carrier also clears the mark and leaves the index as it is; the path's want is then re-derived as an ordinary want. Anything else is a local change and is announced as one.
+   - Whatever makes the disk hold what the record says clears the mark on every carrier at the path: a commit reported `Applied Ok`, a tombstone written under step 4, or a matching occupant as above.
 
    Two things follow from "announced means can serve" (§7.1). While the file is in the trash this machine answers `NotAvailable` for it, and a peer that asked during that window goes without source. And the **restoration itself is not announced** (its record keeps the old `seq`), but the **landing of the refetch is**: it is a commit like any other and adopts the record with a new `seq`, exactly as §7.1 says for a fetched file renamed into place. That announcement is what tells the refused peers that this machine can serve the content again; §7.5's rule that a source announcing the wanted content becomes a source again does the rest, with no retry timer and no new reply.
 3. Adds that were part of the pending batch are also moved to trash **[decision]** — in the destructive scenarios (encryption, a script writing junk) they are the debris.
