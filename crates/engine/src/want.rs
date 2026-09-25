@@ -25,7 +25,8 @@
 //! by `revert` (§8.3) is `restoring`: an `Absent` observation is the trash
 //! move and is ignored in every state. A want `revert` makes at a path
 //! whose file already holds the restored content is a `reset`: it sets the
-//! file's mtime and exec bit back to the record, which is already in place.
+//! file's mtime and exec bit back to the record, which is already in place,
+//! and anything arriving at the path waits until it has been reported.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -214,6 +215,14 @@ impl Want {
             state: WantState::Wanted,
         }
     }
+
+    /// True if a commit for this want is in flight (§8.3's settled folder):
+    /// the host is committing it, or it is a reset, which is a commit from
+    /// the moment `revert` orders it, since the disk is about to change
+    /// under the restored record.
+    pub fn committing(&self) -> bool {
+        matches!(self.state, WantState::Committing { .. }) || self.reset.is_some()
+    }
 }
 
 /// What the host should be asked to do for a want, decided by
@@ -315,6 +324,10 @@ impl WantList {
     /// it resolved to (§7.5). A want that replaces a restoring one is
     /// restoring too: the file `revert` moved to trash is still there until
     /// a refetch lands at the path, whichever want brings it (§8.3 step 2).
+    /// A reset is never replaced: until the host reports it, the file may
+    /// still carry its old mtime and exec bit or already the record's, so
+    /// no commit guard could say which to expect. A newer version is
+    /// refused too, and waits for the reset like any deferred entry.
     pub fn insert(
         &mut self,
         item: ApplyItem,
@@ -337,7 +350,7 @@ impl WantList {
                 self.note(&path);
                 return None;
             }
-            if !incoming.dominates(existing.version()) {
+            if !incoming.dominates(existing.version()) || existing.reset.is_some() {
                 return Some(item);
             }
             restoring |= existing.restoring;
