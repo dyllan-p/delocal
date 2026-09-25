@@ -1564,7 +1564,7 @@ impl FolderState {
                 }
                 self.wants
                     .iter()
-                    .find(|w| matches!(w.state, WantState::Committing { .. }))
+                    .find(|w| w.committing())
                     .map(|w| WaitReason::Committing {
                         path: w.path().clone(),
                     })
@@ -1572,11 +1572,9 @@ impl FolderState {
         }
     }
 
-    /// True if the host is committing the want at `path`.
+    /// True if a commit is in flight at `path` (see [`Want::committing`]).
     fn committing(&self, path: &RelPath) -> bool {
-        self.wants
-            .get(path)
-            .is_some_and(|w| matches!(w.state, WantState::Committing { .. }))
+        self.wants.get(path).is_some_and(Want::committing)
     }
 
     /// `deny <batch>` (§8.2): this machine's copies win. Every quarantined
@@ -3777,6 +3775,85 @@ mod tests {
             Some(&f09),
             "seq kept: not announced"
         );
+    }
+
+    /// §8.3 step 2, §7.5 step 6: a version of a kept path that arrives
+    /// while its reset is in flight waits for it. Until the host reports
+    /// the reset the file may carry either mtime and exec bit, so no guard
+    /// could say which to expect; once it has landed, the version is
+    /// applied against the restored record as usual.
+    #[test]
+    fn a_version_arriving_during_a_reset_waits_for_it() {
+        let (mut a, mut b, f09, v) = chmodded_then_reverted();
+        b.dispatch(t(13.0), &lan(&[1, 3]));
+        a.scanned(t(14.0), p("f09"), file(7, 14));
+        let edit = a.form_batches(t(16.0), bid(6)).remove(0);
+        assert_eq!(b.receive(t(16.0), &edit).decision, Decision::Accepted);
+        assert_eq!(
+            b.wants().get(&p("f09")).unwrap().version(),
+            &v,
+            "the reset stays"
+        );
+        assert_eq!(b.deferred().filter(|d| d.entry.path == p("f09")).count(), 1);
+
+        assert!(
+            b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok)
+                .is_empty()
+        );
+        let want = b.wants().get(&p("f09")).unwrap();
+        assert_eq!(want.entry.hash, hash(7), "A's edit, wanted now");
+        assert!(want.reset.is_none() && !want.restoring);
+        let v = want.version().clone();
+        b.dispatch(t(17.0), &lan(&[1, 3]));
+        b.fetched(t(18.0), &p("f09"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(18.0), &lan(&[1, 3]));
+        assert!(
+            steps.iter().any(|s| matches!(s,
+                HostStep::Write { path, expected: Some(e), .. }
+                    if path == &p("f09") && *e == f09.entry.observed())),
+            "the edit's guard expects the restored record: {steps:?}"
+        );
+    }
+
+    /// §8.3: a reset is a commit in flight from the moment `revert` orders
+    /// it, not only once the host has it. A deny queued behind the pause,
+    /// whose held item names a kept path, would otherwise run in the same
+    /// settle as the revert, before the reset reached the host; it waits
+    /// for the reset to be reported instead of bumping a record whose file
+    /// is about to change.
+    #[test]
+    fn a_deny_queued_behind_the_pause_waits_for_a_reset_at_a_held_path() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 6..10 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let dels = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert!(matches!(
+            b.receive(t(12.0), &dels).decision,
+            Decision::Held { .. }
+        ));
+        b.scanned(t(13.0), p("f09"), ScanState::Observed(stat(1, 1, true)));
+        for i in 0..4 {
+            b.scanned(t(13.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(15.0), bid(5)), Ticked::Paused { .. }));
+        let deny = UserDecision::Deny { batch: bid(3) };
+        assert!(matches!(b.request(deny), Requested::Queued(_)));
+
+        b.revert(t(16.0)).unwrap();
+        assert_eq!(
+            b.next_queued(),
+            Some(Next::Waiting(FolderStatus::Waiting {
+                decision: deny,
+                reason: WaitReason::Committing { path: p("f09") },
+            })),
+            "the reset at f09 has not reached the host yet"
+        );
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        b.dispatch(t(16.0), &lan(&[1, 3]));
+        assert_eq!(b.next_queued(), None);
+        b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok);
+        assert_eq!(b.next_queued(), Some(Next::Run(deny)));
     }
 
     /// §8.3 step 2, §7.5 step 6: a kept file the user edits before its reset
