@@ -1,11 +1,12 @@
 # CI for delocal (DESIGN.md §15 Phase 0).
 #
-# Four jobs:
+# Four checks:
 #   lint      fmt, clippy with warnings denied, and the engine boundary check
 #   test      cargo test on Linux and macOS
 #   build     release binaries for the four targets; Linux ones must be static
 #   simulate  the §14.1 simulator: the pinned regression seeds and a random
-#             sweep over 1,000 seeds, both required (the nightly runs 100,000)
+#             sweep over 1,000 seeds split across four runners, all required
+#             (the nightly runs 100,000)
 #
 # The toolchain comes from rust-toolchain.toml. `rustup toolchain install`
 # with no arguments reads that file and installs the pinned version with its
@@ -170,18 +171,21 @@ jobs:
           path: target/${{ matrix.target }}/release/delocal
           if-no-files-found: error
 
-  # DESIGN.md §14.1: 1,000 seeds per push in a dedicated job with its own
-  # timeout. The SEEDS variable is what the nightly workflow overrides. The
-  # pinned regression seeds (§14.4) must pass. The random sweep was advisory
-  # (continue-on-error) until it first passed clean at 1,000 seeds, and is
-  # required from that PR on: any failing seed fails the job. `--keep-going`
-  # runs every seed and lists the failures by invariant before it exits.
-  simulate:
-    name: simulate
+  # DESIGN.md §14.1: 1,000 seeds per push with their own timeout, and the
+  # pinned regression seeds (§14.4), all required. The simulator runs one
+  # seed at a time on one core, so on one runner the 1,000 took about
+  # fifteen minutes. They are split across four runners of 250 seeds each,
+  # the pinned seeds run beside them on a fifth, and `simulate`, the check
+  # the ruleset on main requires, passes only when all five have. SEEDS is
+  # the total over all shards; it is what the nightly workflow overrides.
+  # The random sweep was advisory (continue-on-error) until it first passed
+  # clean at 1,000 seeds, and is required from that PR on. `--keep-going`
+  # runs every seed in a shard and lists the failures by invariant before
+  # it exits.
+  simulate-pinned:
+    name: simulate (pinned seeds)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      SEEDS: 1000
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -193,5 +197,54 @@ jobs:
       - name: Pinned regression seeds
         run: cargo test --release --locked -p delocal-sim -- 'regressions::'
 
+  simulate-sweep:
+    name: simulate (sweep ${{ matrix.shard }} of ${{ strategy.job-total }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SEEDS: 1000
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # The shards build the same binary under the same cache key. Only the
+      # first saves it, so they do not race to upload identical caches.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: simulate
+          save-if: ${{ strategy.job-index == 0 }}
+
+      # This shard's share of seeds 0..SEEDS. `job-index` counts shards from
+      # 0 and `job-total` is how many there are, so the matrix above is the
+      # only place the number of shards is written.
       - name: Random sweep
-        run: cargo run --release --locked -p delocal-sim -- --seeds "$SEEDS" --keep-going
+        env:
+          SHARD: ${{ strategy.job-index }}
+          SHARDS: ${{ strategy.job-total }}
+        run: |
+          set -euo pipefail
+          start=$(( SEEDS * SHARD / SHARDS ))
+          end=$(( SEEDS * (SHARD + 1) / SHARDS ))
+          cargo run --release --locked -p delocal-sim -- --seeds "$(( end - start ))" --start "$start" --keep-going
+
+  simulate:
+    name: simulate
+    needs: [simulate-pinned, simulate-sweep]
+    # A job whose `needs` failed is skipped unless it asks to run anyway, and
+    # a skipped job satisfies a required check. Without `always()` a failing
+    # seed would leave `simulate` skipped and the PR mergeable.
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Pinned seeds and every shard passed
+        env:
+          PINNED: ${{ needs.simulate-pinned.result }}
+          SWEEP: ${{ needs.simulate-sweep.result }}
+        run: |
+          echo "pinned seeds: $PINNED; sweep: $SWEEP"
+          test "$PINNED" = success && test "$SWEEP" = success
