@@ -173,6 +173,10 @@ struct Node {
     synced: Vec<(ContentHash, RelPath, Timestamp)>,
     /// When this node's own user last edited or deleted each path (I2).
     local_edit_at: BTreeMap<RelPath, Timestamp>,
+    /// The highest `seq` this node's index has written. Every write takes a
+    /// new one except `revert`'s, which puts records back with theirs
+    /// (§8.3), so an `IndexChanged` at or below it is a revert's.
+    max_seq: u64,
     paused: bool,
 }
 
@@ -255,9 +259,6 @@ pub struct Sim {
     nodes: BTreeMap<NodeId, Node>,
     /// Node ids in creation order, for `Step` indices.
     order: Vec<NodeId>,
-    /// The node whose `revert` is being processed, while it is: the records
-    /// it restores are what peers hold, not content that landed (I2).
-    reverting: Option<NodeId>,
     /// When (in events) each node last reverted each path (§8.3), and the
     /// record the revert put back there (`None` if it removed the record). A
     /// revert discards every version the node wrote at the path since its
@@ -328,6 +329,7 @@ impl Sim {
                 sent: BTreeMap::new(),
                 synced: Vec::new(),
                 local_edit_at: BTreeMap::new(),
+                max_seq: 0,
                 paused: false,
             };
             nodes.insert(id, node);
@@ -356,7 +358,6 @@ impl Sim {
             links,
             messages: Vec::new(),
             msg_seq: 0,
-            reverting: None,
             reverted_at: BTreeMap::new(),
             seen_at: BTreeMap::new(),
             approved: BTreeSet::new(),
@@ -1023,7 +1024,18 @@ impl Sim {
                     }
                 }
                 let now = self.clock;
+                let events = self.stats.events;
+                let mut restored = None;
                 if let Some(n) = self.nodes.get_mut(&id) {
+                    // A record put back by `revert` keeps its old `seq`
+                    // (§8.3); the revert runs whenever the folder settles,
+                    // not necessarily at the user's step, so it is known by
+                    // this. It restores what peers hold and lands nothing.
+                    let reverted = record.seq <= n.max_seq;
+                    n.max_seq = n.max_seq.max(record.seq);
+                    if reverted {
+                        restored = Some(record.entry.version.clone());
+                    }
                     // Content arrived only if the record's hash is new at the
                     // path: a metadata-only apply (§7.5) adopts a version of
                     // what the node already holds and lands no bytes.
@@ -1038,7 +1050,7 @@ impl Sim {
                         && !record.entry.deleted
                         && record.entry.kind != Kind::Dir
                         && landed
-                        && self.reverting != Some(id)
+                        && !reverted
                     {
                         n.synced
                             .push((record.entry.hash, record.entry.path.clone(), now));
@@ -1047,11 +1059,17 @@ impl Sim {
                         .records
                         .insert(record.entry.path.clone(), record);
                 }
+                if let Some(version) = restored {
+                    self.reverted_at.insert((id, path), (events, Some(version)));
+                }
             }
             Action::IndexRemoved { path, .. } => {
+                // Only `revert` removes a record: a path peers never saw.
                 if let Some(n) = self.nodes.get_mut(&id) {
                     n.persisted.records.remove(&path);
                 }
+                self.reverted_at
+                    .insert((id, path), (self.stats.events, None));
             }
             Action::WantChanged { path, want, .. } => {
                 if let Some(n) = self.nodes.get_mut(&id) {
@@ -1072,9 +1090,15 @@ impl Sim {
                     }
                 }
                 FolderStatus::Unpaused { .. } | FolderStatus::Reverted { .. } => {
+                    if matches!(status, FolderStatus::Reverted { .. }) {
+                        self.stats.reverts += 1;
+                    }
                     if let Some(n) = self.nodes.get_mut(&id) {
                         n.paused = false;
                     }
+                }
+                FolderStatus::Denied { .. } => {
+                    self.stats.denials += 1;
                 }
                 FolderStatus::WinnerFallback { count } => {
                     return Err(self.fail(
@@ -2011,32 +2035,17 @@ impl Sim {
                     self.feed(id, Event::Approve { folder, batch })?;
                 }
             }
+            // `deny` and `revert` may be queued until the folder settles
+            // (§8.3); their effects are tracked from the actions whenever
+            // they run (see `act`).
             UserAction::DenyAll => {
                 for batch in held {
-                    self.stats.denials += 1;
                     self.feed(id, Event::Deny { folder, batch })?;
                 }
             }
             UserAction::Revert => {
                 if paused.is_some() {
-                    self.stats.reverts += 1;
-                    let pending: Vec<RelPath> = f.index().pending_paths().cloned().collect();
-                    let at = self.stats.events;
-                    // §8.3 puts the announced records back and re-fetches
-                    // them; no content lands, so these writes are not
-                    // adoptions for I2.
-                    self.reverting = Some(id);
-                    let fed = self.feed(id, Event::Revert { folder });
-                    self.reverting = None;
-                    fed?;
-                    for path in pending {
-                        let restored = self
-                            .engine(id)
-                            .and_then(|e| e.folder(folder))
-                            .and_then(|f| f.index().get(&path))
-                            .map(|r| r.entry.version.clone());
-                        self.reverted_at.insert((id, path), (at, restored));
-                    }
+                    self.feed(id, Event::Revert { folder })?;
                 }
             }
             UserAction::Rules {
