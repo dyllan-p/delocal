@@ -169,6 +169,7 @@ struct Node {
     /// Every version this node has ever sent in a batch, per path.
     sent: BTreeMap<RelPath, Vec<Version>>,
     /// Content this node adopted through sync, with the path and when (I2).
+    /// An entry follows its content when sync moves it to a conflict copy.
     synced: Vec<(ContentHash, RelPath, Timestamp)>,
     /// When this node's own user last edited or deleted each path (I2).
     local_edit_at: BTreeMap<RelPath, Timestamp>,
@@ -1474,6 +1475,7 @@ impl Sim {
         version: &Version,
         action: &Action,
     ) -> (ApplyOutcome, Vec<RelPath>) {
+        let now = self.clock;
         let Some(node) = self.nodes.get_mut(&id) else {
             return (ApplyOutcome::ChangedUnderneath, Vec::new());
         };
@@ -1540,6 +1542,7 @@ impl Sim {
                     match displace {
                         Displace::Trash => trash_file(node, existing),
                         Displace::ConflictCopy(target) => {
+                            follow(node, path, target, existing.hash(), now);
                             node.fs.insert(target.clone(), existing);
                         }
                     }
@@ -1571,6 +1574,7 @@ impl Sim {
                     match displace {
                         Displace::Trash => trash_file(node, existing),
                         Displace::ConflictCopy(target) => {
+                            follow(node, path, target, existing.hash(), now);
                             node.fs.insert(target.clone(), existing);
                         }
                     }
@@ -2167,6 +2171,19 @@ fn expected_matches(file: Option<&File>, expected: Option<&Observed>) -> bool {
         (None, None) => true,
         (Some(f), Some(e)) => e.unchanged_by_stat(&f.observed()),
         _ => false,
+    }
+}
+
+/// Sync moved the file with `hash` from `from` to the conflict-copy path
+/// `to` (§7.6). The node's adoptions of that content follow it there, dated
+/// now, so that its user's later edit or deletion of the copy counts as the
+/// user's own change and not as sync's loss (I2, §14.1).
+fn follow(node: &mut Node, from: &RelPath, to: &RelPath, hash: ContentHash, now: Timestamp) {
+    for (h, path, at) in &mut node.synced {
+        if *h == hash && path == from {
+            *path = to.clone();
+            *at = now;
+        }
     }
 }
 

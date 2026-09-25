@@ -166,7 +166,10 @@ fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
 ///   or in N's trash (the hashes of everything sync moved aside).
 /// - **Exemption:** N's own user edited, deleted or created the path after
 ///   the adoption (the simulator's `local_edit_at`), which §8.6 does not
-///   protect; a user's `rm` does not go through sync's trash.
+///   protect; a user's `rm` does not go through sync's trash. The path is
+///   wherever sync put the content: when a commit moves it to a conflict
+///   copy (§7.6), the adoption moves with it, dated at the move, so the
+///   user deleting or rewriting the copy is the user's own change too.
 ///
 /// Content a node announced but nobody fetched before the author replaced
 /// it is not an adoption anywhere and so is not covered, by design.
