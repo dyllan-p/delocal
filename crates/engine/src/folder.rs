@@ -48,7 +48,8 @@
 //! machine's own local state, so they run only on a settled folder. A `deny`
 //! waits while the folder is paused or any path of its held item carries the
 //! restoring mark or has a commit in flight; a `revert` waits while any
-//! commit is in flight and, after a restart, until a full scan has finished.
+//! commit is in flight and, after a restart, until a full scan has finished;
+//! neither runs while a scan bracket is open.
 //! A waiting decision is queued here, persisted with the rest of the state,
 //! and taken by [`FolderState::next_queued`] once its condition clears, or
 //! dropped once its held item or pause is gone. `approve` is never queued.
@@ -160,6 +161,9 @@ pub enum WaitReason {
     /// The folder restarted and no full scan has finished since: a crash may
     /// have left files the engine has not been told about (§13).
     StartupScan,
+    /// A scan bracket is open: the decision would change records the
+    /// bracket is part-way through comparing.
+    ScanOpen,
 }
 
 /// A decision in the queue, with what it last waited for.
@@ -1508,6 +1512,9 @@ impl FolderState {
                         batch: paused.batch,
                     });
                 }
+                if self.scan.is_some() {
+                    return Some(WaitReason::ScanOpen);
+                }
                 self.quarantine.get(batch)?.entries.keys().find_map(|path| {
                     if self.marked(path) {
                         Some(WaitReason::Restoring { path: path.clone() })
@@ -1521,6 +1528,9 @@ impl FolderState {
             UserDecision::Revert { .. } => {
                 if self.startup_scan {
                     return Some(WaitReason::StartupScan);
+                }
+                if self.scan.is_some() {
+                    return Some(WaitReason::ScanOpen);
                 }
                 self.wants
                     .iter()
@@ -3401,6 +3411,42 @@ mod tests {
             Some(Next::Dropped(FolderStatus::Dropped { decision: revert }))
         );
         assert!(b.queued().is_empty());
+    }
+
+    /// §8.3: neither decision runs while a scan bracket is open, since it
+    /// would change records the bracket is part-way through comparing.
+    #[test]
+    fn decisions_wait_while_a_scan_bracket_is_open() {
+        let (_, mut b, paused) = held_then_paused_on_the_same_paths();
+        b.scan_started();
+        let revert = UserDecision::Revert { batch: paused };
+        assert_eq!(
+            b.request(revert),
+            Requested::Queued(FolderStatus::Waiting {
+                decision: revert,
+                reason: WaitReason::ScanOpen,
+            })
+        );
+        assert_eq!(b.next_queued(), None);
+        b.scan_finished(t(16.0)).unwrap();
+        assert_eq!(b.next_queued(), Some(Next::Run(revert)));
+        b.revert(t(16.0)).unwrap();
+        commit_all(&mut b, t(17.0));
+        b.scan_started();
+        let deny = UserDecision::Deny { batch: bid(3) };
+        assert_eq!(
+            b.request(deny),
+            Requested::Queued(FolderStatus::Waiting {
+                decision: deny,
+                reason: WaitReason::ScanOpen,
+            })
+        );
+        b.scan_aborted().unwrap();
+        assert_eq!(
+            b.next_queued(),
+            Some(Next::Run(deny)),
+            "an aborted bracket is closed too"
+        );
     }
 
     /// §8.3, §7.5: at a marked path an occupant counts whatever state the
