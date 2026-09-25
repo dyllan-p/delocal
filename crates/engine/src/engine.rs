@@ -1632,6 +1632,220 @@ mod tests {
         }
     }
 
+    /// §8.3 step 2: the restoration is not announced, the landing is. E
+    /// announces three files; A and B want them but have not fetched yet.
+    /// E's user deletes all three, E pauses and reverts, and while the files
+    /// are in the trash A and B ask E, are refused, and go without source.
+    /// E's refetch lands (the host serves it from the trash); the landing is
+    /// a commit, adopted with a new `seq` and announced at the next tick, so
+    /// A and B see E hold the content again, fetch it and converge.
+    #[test]
+    fn a_restores_landing_is_announced_and_refused_peers_fetch_again() {
+        let mut a = engine(1, "alpha");
+        let mut b = engine(2, "bravo");
+        let mut e = engine(3, "echo");
+        for x in [&mut a, &mut b, &mut e] {
+            join_with(x, tight(), &[1, 2, 3]);
+        }
+        connect(&mut a, &mut b);
+        connect(&mut a, &mut e);
+        connect(&mut b, &mut e);
+        let paths: Vec<RelPath> = (0..3).map(|i| p(&format!("f{i}"))).collect();
+        for path in &paths {
+            e.handle(
+                t(1.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: path.clone(),
+                    state: file(1, 1),
+                },
+            );
+        }
+        let out = e.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        let mut engines = BTreeMap::from([(node(1), a), (node(2), b), (node(3), e)]);
+        let rest = deliver(t(3.0), node(3), out, &mut engines);
+        let fetches_by =
+            |rest: &[(NodeId, Action)], who: NodeId| -> Vec<(RelPath, Version, NodeId)> {
+                rest.iter()
+                    .filter_map(|(w, a)| match a {
+                        Action::Fetch {
+                            path,
+                            version,
+                            from,
+                            ..
+                        } if *w == who => Some((path.clone(), version.clone(), *from)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+        let first_a = fetches_by(&rest, node(1));
+        let first_b = fetches_by(&rest, node(2));
+        assert_eq!((first_a.len(), first_b.len()), (3, 3), "A and B ask E");
+        // E's user deletes all three; E pauses on the deletes and reverts.
+        let e = engines.get_mut(&node(3)).unwrap();
+        for path in &paths {
+            e.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: path.clone(),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        let out = e.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(2),
+            },
+        );
+        assert!(
+            statuses(&out)
+                .iter()
+                .any(|s| matches!(s, FolderStatus::Paused { .. }))
+        );
+        let out = e.handle(t(13.0), Event::Revert { folder: folder() });
+        let restoring: Vec<(RelPath, Version, NodeId)> = out
+            .iter()
+            .filter_map(|a| match a {
+                Action::Fetch {
+                    path,
+                    version,
+                    from,
+                    ..
+                } => Some((path.clone(), version.clone(), *from)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(restoring.len(), 3, "the restoring wants ask a member");
+        // The restoration itself is not announced.
+        let out = e.handle(
+            t(14.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        assert!(sends(&out).is_empty(), "nothing to announce: {out:?}");
+        // Meanwhile A and B are refused: E's files are in the trash.
+        for (who, fetches) in [(node(1), &first_a), (node(2), &first_b)] {
+            let x = engines.get_mut(&who).unwrap();
+            for (path, version, from) in fetches {
+                assert_eq!(*from, node(3));
+                x.handle(
+                    t(15.0),
+                    Event::Fetched {
+                        folder: folder(),
+                        path: path.clone(),
+                        hash: hash(1),
+                        version: version.clone(),
+                        outcome: FetchReport::NotAvailable,
+                    },
+                );
+            }
+            let f = x.folder(folder()).unwrap();
+            assert!(
+                f.wants()
+                    .iter()
+                    .all(|w| w.state == WantState::NoSource && w.sources.is_empty()),
+                "without source after E refused"
+            );
+        }
+        // E's refetch lands: the host serves it from the trash.
+        let e = engines.get_mut(&node(3)).unwrap();
+        let seq_before = e.folder(folder()).unwrap().index().announced_seq();
+        for (path, version, _) in &restoring {
+            let out = e.handle(
+                t(16.0),
+                Event::Fetched {
+                    folder: folder(),
+                    path: path.clone(),
+                    hash: hash(1),
+                    version: version.clone(),
+                    outcome: FetchReport::Ok,
+                },
+            );
+            assert!(out.iter().any(
+                |a| matches!(a, Action::Write { path: wp, expected: None, .. } if wp == path)
+            ));
+            let out = e.handle(
+                t(17.0),
+                Event::Applied {
+                    folder: folder(),
+                    path: path.clone(),
+                    version: version.clone(),
+                    outcome: ApplyOutcome::Ok,
+                },
+            );
+            assert!(
+                matches!(&out[0], Action::IndexChanged { record, .. } if record.entry.path == *path && record.seq > seq_before),
+                "the landing is adopted with a new seq: {out:?}"
+            );
+        }
+        // The landing is announced at the next tick; A and B see E hold the
+        // content again and fetch it from E.
+        let out = e.handle(
+            t(20.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        let announced: Vec<(NodeId, usize)> = sends(&out)
+            .iter()
+            .filter_map(|(to, o)| match o {
+                Outbound::Batch(batch) => Some((*to, batch.entries.len())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(announced, [(node(1), 3), (node(2), 3)]);
+        let rest = deliver(t(20.0), node(3), out, &mut engines);
+        for who in [node(1), node(2)] {
+            let fetches = fetches_by(&rest, who);
+            assert_eq!(fetches.len(), 3, "{who:?} asks again");
+            let x = engines.get_mut(&who).unwrap();
+            for (path, version, from) in fetches {
+                assert_eq!(from, node(3));
+                x.handle(
+                    t(21.0),
+                    Event::Fetched {
+                        folder: folder(),
+                        path: path.clone(),
+                        hash: hash(1),
+                        version: version.clone(),
+                        outcome: FetchReport::Ok,
+                    },
+                );
+                x.handle(
+                    t(22.0),
+                    Event::Applied {
+                        folder: folder(),
+                        path,
+                        version,
+                        outcome: ApplyOutcome::Ok,
+                    },
+                );
+            }
+        }
+        // Converged: every member holds E's records.
+        let e_index = engines[&node(3)].folder(folder()).unwrap().index().clone();
+        for who in [node(1), node(2)] {
+            let f = engines[&who].folder(folder()).unwrap();
+            assert!(f.wants().is_empty());
+            for path in &paths {
+                let mine = &f.index().get(path).unwrap().entry;
+                let theirs = &e_index.get(path).unwrap().entry;
+                assert_eq!(
+                    (&mine.version, mine.hash, mine.deleted),
+                    (&theirs.version, theirs.hash, theirs.deleted)
+                );
+            }
+        }
+    }
+
     fn two_with_ten_files() -> BTreeMap<NodeId, Engine> {
         let mut a = engine(1, "alpha");
         let mut b = engine(2, "bravo");
