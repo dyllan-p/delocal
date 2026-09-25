@@ -78,7 +78,7 @@ use crate::quarantine::{HeldItem, Quarantine, Withdrawn};
 use crate::rules::Rules;
 use crate::time::{DEBOUNCE_NANOS, Timestamp, WINDOW_NANOS};
 use crate::version::Version;
-use crate::want::{FetchReport, Tier, Want, WantList, WantState, WantStep};
+use crate::want::{Expired, FetchReport, Tier, Want, WantList, WantState, WantStep};
 
 /// What the host reports for one path (§7.3). `Unchanged` is the fast path:
 /// size and mtime matched the record the host holds, so no hash was
@@ -291,8 +291,13 @@ pub enum FolderStatus {
     /// `NotAvailable`, so the deletion stands and the record is a tombstone
     /// again (§8.3 step 4).
     Unrecoverable { path: RelPath },
-    /// A fetch or commit deadline passed; the want is wanted again (§7.5).
+    /// A fetch made no progress before its deadline; the want is wanted
+    /// again and reselects (§7.5).
     Stalled { path: RelPath },
+    /// A commit was not reported within its deadline (§7.5). A warning
+    /// only: the commit holds its path until the host reports it or the
+    /// process restarts.
+    CommitOverdue { path: RelPath },
 }
 
 /// An open batch window (§7.4).
@@ -1256,8 +1261,9 @@ impl FolderState {
         }
     }
 
-    /// Deadlines that have passed return their wants to *wanted* (§7.5).
-    pub fn expire(&mut self, now: Timestamp) -> Vec<RelPath> {
+    /// At `now` (§7.5): expired exclusions are released, stalled fetches are
+    /// wanted again, and commits past their deadline become overdue.
+    pub fn expire(&mut self, now: Timestamp) -> Expired {
         self.wants.expire(now)
     }
 
@@ -3800,6 +3806,41 @@ mod tests {
         assert!(landed.seq > f09.seq, "under a new seq");
     }
 
+    /// §7.5: at most one commit is in flight per path. A version arriving
+    /// while the host commits an earlier one waits for that commit's report
+    /// instead of replacing the want: the report is not dropped, the landed
+    /// file is adopted rather than rescanned as a local change, and the
+    /// newer version is then wanted over it.
+    #[test]
+    fn a_version_arriving_during_a_commit_waits_for_its_report() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        let first = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert_eq!(b.receive(t(12.0), &first).decision, Decision::Accepted);
+        let v1 = b.wants().get(&p("n")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("n"), &v1, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { .. }));
+
+        a.scanned(t(14.0), p("n"), file(8, 14));
+        let second = a.form_batches(t(16.0), bid(4)).remove(0);
+        assert_eq!(b.receive(t(16.0), &second).decision, Decision::Accepted);
+        assert_eq!(
+            b.wants().get(&p("n")).unwrap().version(),
+            &v1,
+            "the commit keeps its path"
+        );
+        assert_eq!(b.deferred().filter(|d| d.entry.path == p("n")).count(), 1);
+
+        let written = b.applied(t(17.0), &p("n"), &v1, ApplyOutcome::Ok);
+        assert_eq!(written.len(), 1, "the first version is adopted");
+        assert_eq!(b.index().get(&p("n")).unwrap().entry.version, v1);
+        let want = b.wants().get(&p("n")).unwrap();
+        assert_eq!(want.entry.hash, hash(8), "the second version, wanted now");
+        assert!(want.version().dominates(&v1));
+    }
+
     /// §8.3 step 2, §7.5 step 6: a version of a kept path that arrives
     /// while its reset is in flight waits for it. Until the host reports
     /// the reset the file may carry either mtime and exec bit, so no guard
@@ -5117,15 +5158,15 @@ mod tests {
             for gap in gaps {
                 let before = now;
                 now = now.plus_nanos(gap * NANOS_PER_SECOND);
-                let overdue = b.expire(now);
+                let expired = b.expire(now);
                 if gap >= 60 {
-                    prop_assert_eq!(overdue, vec![p("n")]);
+                    prop_assert_eq!(expired.stalled, vec![p("n")]);
                     prop_assert_eq!(b.wants().get(&p("n")).unwrap().state, WantState::Wanted);
-                    prop_assert!(b.expire(before.plus_nanos(60 * NANOS_PER_SECOND - 1)).is_empty());
+                    prop_assert!(b.expire(before.plus_nanos(60 * NANOS_PER_SECOND - 1)).stalled.is_empty());
                     expired_at = Some(now);
                     break;
                 }
-                prop_assert!(overdue.is_empty(), "progress every {gap} s keeps it alive");
+                prop_assert!(expired.stalled.is_empty(), "progress every {gap} s keeps it alive");
                 b.progress(now, &p("n"), &v);
             }
             if let Some(now) = expired_at {
