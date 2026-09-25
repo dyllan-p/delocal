@@ -36,7 +36,7 @@
 //! move and is ignored in every state. A want `revert` makes at a path
 //! whose file already holds the restored content is a `reset`: it sets the
 //! file's mtime and exec bit back to the record, which is already in place,
-//! and anything arriving at the path waits until it has been reported.
+//! and its landing is announced like any other.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -169,9 +169,10 @@ pub struct Want {
     /// chmod or a deny's bump (§8.3 step 2): the file as last observed.
     /// The record is already the restored one, so this want only sets the
     /// file's mtime and exec bit back to it (`entry`, metadata only), and
-    /// its guard expects this shape rather than the record's. Nothing is
-    /// adopted when it lands: the restored record keeps its `seq` and is
-    /// not announced again.
+    /// its guard expects this shape rather than the record's. When it
+    /// lands, the record is adopted with a new `seq` and announced like any
+    /// landing (§7.1), since peers refused while it was pending need to
+    /// hear that this machine can serve the file again.
     pub reset: Option<Observed>,
     pub state: WantState,
 }

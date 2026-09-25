@@ -1984,15 +1984,19 @@ impl FolderState {
             return Vec::new();
         };
         if want.reset.is_some() {
-            // The record is the one revert restored and keeps its `seq`, so
-            // a reset adopts and announces nothing. Once it has landed the
-            // disk says what the record says, and entries deferred at the
-            // path are classified against it; if the file changed
+            // The record is the one revert restored. Once the reset has
+            // landed the disk says what the record says, and the landing is
+            // announced like any other (§7.1, §8.3): until now this machine
+            // answered `NotAvailable` for the file, and the announcement is
+            // what tells a refused peer to ask again. Entries deferred at
+            // the path are then classified against it; if the file changed
             // underneath, they wait for the next observation instead.
-            if outcome == ApplyOutcome::Ok {
-                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+            if outcome != ApplyOutcome::Ok {
+                return Vec::new();
             }
-            return Vec::new();
+            let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
+            self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+            return written;
         }
         match outcome {
             ApplyOutcome::Ok => {
@@ -3609,7 +3613,8 @@ mod tests {
     /// in a batch that paused for something else.) `revert` restores every
     /// record, keeps every file, and sets each mtime back with a `SetMeta`
     /// guarded by the file as last observed: nothing is trashed, fetched or
-    /// marked, and the landed resets announce nothing.
+    /// marked. Each landed reset is announced (§7.1): the same record under
+    /// a new `seq`, which peers holding it drop as equal.
     #[test]
     fn a_revert_of_a_mass_touch_sets_mtimes_back_and_fetches_nothing() {
         let (_, mut b) = a_and_b(10, tight());
@@ -3650,19 +3655,22 @@ mod tests {
             })
             .collect();
         assert_eq!(steps, resets, "a SetMeta per file and nothing else");
-        for i in 0..8 {
+        for (i, before) in announced.iter().take(8).enumerate() {
             let path = p(&format!("f{i:02}"));
             let v = b.wants().get(&path).unwrap().version().clone();
-            assert!(
-                b.applied(t(15.0), &path, &v, ApplyOutcome::Ok).is_empty(),
-                "a reset adopts nothing"
-            );
+            let written = b.applied(t(15.0), &path, &v, ApplyOutcome::Ok);
+            assert_eq!(written.len(), 1, "the landing is announced");
+            assert_eq!(written[0].entry, before.entry);
+            assert!(written[0].seq > before.seq);
         }
         assert!(b.wants().is_empty());
-        let records: Vec<IndexRecord> = b.index().records().cloned().collect();
-        assert_eq!(records, announced);
-        assert!(b.index().unannounced().is_empty(), "nothing to announce");
-        assert_eq!(b.due(), None);
+        let entries: Vec<&Entry> = b.index().records().map(|r| &r.entry).collect();
+        assert_eq!(
+            entries,
+            announced.iter().map(|r| &r.entry).collect::<Vec<_>>()
+        );
+        assert_eq!(b.index().unannounced().len(), 8);
+        assert!(b.due().is_some(), "the window is open");
     }
 
     /// §8.3 step 2, the case #49 left open: a deny whose bumps a later pause
@@ -3784,16 +3792,12 @@ mod tests {
                 exec: false,
             }]
         );
-        assert!(
-            b.applied(t(14.0), &p("f09"), &v, ApplyOutcome::Ok)
-                .is_empty()
-        );
+        let written = b.applied(t(14.0), &p("f09"), &v, ApplyOutcome::Ok);
         assert!(b.wants().get(&p("f09")).is_none());
-        assert_eq!(
-            b.index().get(&p("f09")),
-            Some(&f09),
-            "seq kept: not announced"
-        );
+        assert_eq!(written.len(), 1, "the landing is announced (§7.1)");
+        let landed = b.index().get(&p("f09")).unwrap();
+        assert_eq!(landed.entry, f09.entry, "the restored record");
+        assert!(landed.seq > f09.seq, "under a new seq");
     }
 
     /// §8.3 step 2, §7.5 step 6: a version of a kept path that arrives
@@ -3815,9 +3819,10 @@ mod tests {
         );
         assert_eq!(b.deferred().filter(|d| d.entry.path == p("f09")).count(), 1);
 
-        assert!(
-            b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok)
-                .is_empty()
+        assert_eq!(
+            b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok).len(),
+            1,
+            "the reset's landing"
         );
         let want = b.wants().get(&p("f09")).unwrap();
         assert_eq!(want.entry.hash, hash(7), "A's edit, wanted now");
