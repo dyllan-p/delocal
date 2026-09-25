@@ -280,17 +280,18 @@ impl Engine {
         }
     }
 
-    /// Rebuild an engine from persisted folder state after a restart (§11
-    /// "persistence contract", §13). The folder state is the unit of
-    /// restart: index, pending set, watermarks, peer seqs and acks,
+    /// Rebuild an engine from persisted folder state after a restart at
+    /// `now` (§11 "persistence contract", §13). The folder state is the
+    /// unit of restart: index, pending set, watermarks, peer seqs and acks,
     /// quarantine, wants, paused state and deferred entries all come back
     /// as they were. Peers are not restored; they reconnect and exchange
     /// `have_up_to`. Wants in transient states return to *wanted*, since
-    /// the host's in-flight operations died with the process.
-    pub fn restore(config: NodeConfig, folders: Vec<FolderState>) -> Self {
+    /// the host's in-flight operations died with the process, and a folder
+    /// with unannounced records reopens its batch window at `now`.
+    pub fn restore(config: NodeConfig, folders: Vec<FolderState>, now: Timestamp) -> Self {
         let mut engine = Self::new(config);
         for mut folder in folders {
-            folder.restarted();
+            folder.restarted(now);
             engine.folders.insert(folder.id(), folder);
         }
         engine
@@ -2284,7 +2285,7 @@ mod tests {
         // B crashes after the rename: the file is on disk, the report is
         // lost, and the process comes back with the persisted state.
         let snapshot = b.folder(folder()).unwrap().clone();
-        let restored = Engine::restore(b.config().clone(), vec![snapshot]);
+        let restored = Engine::restore(b.config().clone(), vec![snapshot], t(13.0));
         engines.insert(node(2), restored);
         let b = engines.get_mut(&node(2)).unwrap();
         let out = b.handle(
@@ -2654,7 +2655,7 @@ mod tests {
         assert!(!out.iter().any(|a| matches!(a, Action::IndexChanged { .. })));
 
         let state = b.folder(folder()).unwrap().clone();
-        let mut b = Engine::restore(b.config().clone(), vec![state]);
+        let mut b = Engine::restore(b.config().clone(), vec![state], t(17.0));
         assert_eq!(b.folder(folder()).unwrap().queued().len(), 1, "persisted");
         let out = b.handle(
             t(20.0),
@@ -2946,7 +2947,7 @@ mod tests {
             WantState::Fetching { .. }
         ));
         // The process dies and comes back with the persisted folder state.
-        let mut restored = Engine::restore(b.config().clone(), vec![before.clone()]);
+        let mut restored = Engine::restore(b.config().clone(), vec![before.clone()], t(19.0));
         let f = restored.folder(folder()).unwrap();
         assert_eq!(f.index(), before.index());
         assert_eq!(
@@ -2968,6 +2969,80 @@ mod tests {
         assert!(out.iter().any(
             |a| matches!(a, Action::Fetch { path, from, .. } if path == &p("n") && *from == node(1))
         ));
+    }
+
+    /// §11: a crash between writing a record and sending it loses the
+    /// window, not the record. The restored folder reopens the window at
+    /// the restart, so the next tick announces what was written before.
+    #[test]
+    fn a_restart_reopens_the_window_for_unannounced_records() {
+        let mut a = engine(1, "a");
+        let mut b = engine(2, "b");
+        join(&mut a, &[1, 2]);
+        connect(&mut a, &mut b);
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("doc.txt"),
+                state: file(1, 5),
+            },
+        );
+        let snapshot = a.folder(folder()).unwrap().clone();
+        assert!(snapshot.window().is_some());
+
+        let mut a = Engine::restore(a.config().clone(), vec![snapshot], t(20.0));
+        assert_eq!(a.folder(folder()).unwrap().due(), Some(t(22.0)));
+        let out = a.handle(
+            t(20.0),
+            Event::PeerConnected {
+                peer: node(2),
+                tier: Tier::Lan,
+            },
+        );
+        assert!(out.contains(&Action::WakeAt(t(22.0))));
+        let out = a.handle(
+            t(22.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        let sent = sends(&out);
+        assert_eq!(sent.len(), 1);
+        let Outbound::Batch(batch) = sent[0].1 else {
+            panic!()
+        };
+        assert_eq!(batch.entries.len(), 1);
+        assert_eq!(batch.entries[0].path, p("doc.txt"));
+    }
+
+    /// §11: a folder whose records were all announced comes back with no
+    /// window and asks for no wake-up.
+    #[test]
+    fn a_restart_with_everything_announced_opens_no_window() {
+        let mut a = engine(1, "a");
+        let mut b = engine(2, "b");
+        join(&mut a, &[1, 2]);
+        connect(&mut a, &mut b);
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("doc.txt"),
+                state: file(1, 5),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        assert_eq!(sends(&out).len(), 1);
+        let snapshot = a.folder(folder()).unwrap().clone();
+        let a = Engine::restore(a.config().clone(), vec![snapshot], t(20.0));
+        assert_eq!(a.folder(folder()).unwrap().window(), None);
+        assert_eq!(a.folder(folder()).unwrap().due(), None);
     }
 
     #[test]

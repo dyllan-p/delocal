@@ -1847,14 +1847,25 @@ impl FolderState {
         self.wants.restore(want);
     }
 
-    /// The process restarted with this state (§11, §13): every want the
-    /// host was fetching or committing is wanted again, the open scan
-    /// bracket is gone, and peers will announce themselves afresh.
-    pub fn restarted(&mut self) {
+    /// The process restarted with this state at `now` (§11, §13): every
+    /// want the host was fetching or committing is wanted again, the open
+    /// scan bracket is gone, and peers will announce themselves afresh. A
+    /// folder with records written but not yet announced reopens its batch
+    /// window as if they had just been written: the window died with the
+    /// process, and without it they would wait for some later write.
+    pub fn restarted(&mut self, now: Timestamp) {
         self.wants.restarted();
         self.scan = None;
         self.catchup.clear();
         self.window = None;
+        if self
+            .index
+            .records_since(self.index.announced_seq())
+            .next()
+            .is_some()
+        {
+            self.touched(now);
+        }
         // A crash may have left files the index does not know about (a
         // commit's rename whose report was lost, §13); `revert` waits for
         // the startup scan to report them (§8.3).
@@ -3465,7 +3476,7 @@ mod tests {
         let revert = UserDecision::Revert {
             batch: b.paused().unwrap().batch,
         };
-        b.restarted();
+        b.restarted(t(12.5));
         assert!(b.startup_scan_pending());
         assert_eq!(
             b.request(revert),
@@ -3496,7 +3507,7 @@ mod tests {
     #[test]
     fn queued_decisions_are_dropped_once_their_item_or_pause_is_gone() {
         let (_, mut b, paused) = held_then_paused_on_the_same_paths();
-        b.restarted();
+        b.restarted(t(20.0));
         let deny = UserDecision::Deny { batch: bid(3) };
         let revert = UserDecision::Revert { batch: paused };
         assert!(matches!(b.request(deny), Requested::Queued(_)));
