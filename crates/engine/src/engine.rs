@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::batch::{ApplySet, Batch, BatchDecision, BatchRole, Decision};
 use crate::entry::{ContentHash, Entry, Observed};
 use crate::folder::{
-    ApplyOutcome, Approved, Displace, FolderState, FolderStatus, HostStep, ScanState, Ticked,
+    ApplyOutcome, Approved, Displace, FolderState, FolderStatus, HostStep, Next, Requested,
+    ScanState, Ticked, UserDecision,
 };
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
@@ -158,7 +159,9 @@ pub enum Event {
         outcome: ApplyOutcome,
     },
 
-    /// User commands (§8.2, §8.3). PR 5.
+    /// User commands (§8.2, §8.3). PR 5. `approve` runs at once; `deny`
+    /// and `revert` run at once on a settled folder and are queued
+    /// otherwise, reported as `Waiting`, and run when it settles (§8.3).
     Approve {
         folder: FolderId,
         batch: BatchId,
@@ -514,51 +517,31 @@ impl Engine {
                 None => out.push(unknown_folder(folder)),
             },
             Event::Deny { folder, batch } => match self.folders.get_mut(&folder) {
-                Some(f) => match f.deny(now, batch) {
-                    Some(changes) => {
-                        let paths = changes.len();
-                        out.extend(changes.into_iter().map(|c| Action::IndexChanged {
-                            folder,
-                            record: c.record,
-                        }));
-                        out.push(Action::StatusChanged {
-                            folder,
-                            status: FolderStatus::Denied { batch, paths },
-                        });
+                Some(f) if f.quarantine().get(batch).is_some() => {
+                    let decision = UserDecision::Deny { batch };
+                    match f.request(decision) {
+                        Requested::Run => decide(f, folder, now, decision, &mut out),
+                        Requested::Queued(status) => {
+                            out.push(Action::StatusChanged { folder, status });
+                        }
                     }
-                    None => out.push(Action::StatusChanged {
-                        folder,
-                        status: FolderStatus::UnknownBatch { batch },
-                    }),
-                },
+                }
+                Some(_) => out.push(Action::StatusChanged {
+                    folder,
+                    status: FolderStatus::UnknownBatch { batch },
+                }),
                 None => out.push(unknown_folder(folder)),
             },
             Event::Revert { folder } => match self.folders.get_mut(&folder) {
-                Some(f) => match f.revert(now) {
-                    Some(reverted) => {
-                        for write in reverted.reverted {
-                            out.push(match write.restored {
-                                Some(record) => Action::IndexChanged { folder, record },
-                                None => Action::IndexRemoved {
-                                    folder,
-                                    path: write.path,
-                                },
-                            });
+                Some(f) => match f.paused().map(|p| p.batch) {
+                    Some(batch) => {
+                        let decision = UserDecision::Revert { batch };
+                        match f.request(decision) {
+                            Requested::Run => decide(f, folder, now, decision, &mut out),
+                            Requested::Queued(status) => {
+                                out.push(Action::StatusChanged { folder, status });
+                            }
                         }
-                        for path in &reverted.trash {
-                            out.push(Action::MoveToTrash {
-                                folder,
-                                path: path.clone(),
-                            });
-                        }
-                        out.push(Action::StatusChanged {
-                            folder,
-                            status: FolderStatus::Reverted {
-                                batch: reverted.batch,
-                                trashed: reverted.trash.len(),
-                                refetch: reverted.refetch,
-                            },
-                        });
                     }
                     None => out.push(Action::StatusChanged {
                         folder,
@@ -568,9 +551,34 @@ impl Engine {
                 None => out.push(unknown_folder(folder)),
             },
         }
+        self.settle(now, &mut out);
         self.pump(now, &mut out);
         self.schedule(&mut out);
         out
+    }
+
+    /// Run every queued decision whose folder has settled, and report the
+    /// ones dropped or now waiting for something else (§8.3). This runs
+    /// after every event rather than after chosen ones, so a decision runs
+    /// as soon as its condition clears, whichever event cleared it: a
+    /// commit reported, a deadline returning a commit to *wanted*, a scan
+    /// finishing, an unpause, a mark cleared by a landing or by step 4. It
+    /// runs before the want-list is driven, so no host operation this
+    /// event starts can be in flight under the decision.
+    fn settle(&mut self, now: Timestamp, out: &mut Vec<Action>) {
+        for (id, folder) in &mut self.folders {
+            while let Some(next) = folder.next_queued() {
+                match next {
+                    Next::Run(decision) => decide(folder, *id, now, decision, out),
+                    Next::Dropped(status) | Next::Waiting(status) => {
+                        out.push(Action::StatusChanged {
+                            folder: *id,
+                            status,
+                        });
+                    }
+                }
+            }
+        }
     }
 
     /// Drive every folder's want-list (§7.5): emit fetches and commits,
@@ -827,6 +835,68 @@ impl Engine {
                 }
             }
         }
+    }
+}
+
+/// Run `decision` on `f` now (§8.2, §8.3) and report what it did: the
+/// index writes, trash moves and status. Called for a decision asked for on
+/// a settled folder and for a queued one whose condition has cleared.
+fn decide(
+    f: &mut FolderState,
+    folder: FolderId,
+    now: Timestamp,
+    decision: UserDecision,
+    out: &mut Vec<Action>,
+) {
+    match decision {
+        UserDecision::Deny { batch } => match f.deny(now, batch) {
+            Some(changes) => {
+                let paths = changes.len();
+                out.extend(changes.into_iter().map(|c| Action::IndexChanged {
+                    folder,
+                    record: c.record,
+                }));
+                out.push(Action::StatusChanged {
+                    folder,
+                    status: FolderStatus::Denied { batch, paths },
+                });
+            }
+            None => out.push(Action::StatusChanged {
+                folder,
+                status: FolderStatus::UnknownBatch { batch },
+            }),
+        },
+        UserDecision::Revert { .. } => match f.revert(now) {
+            Some(reverted) => {
+                for write in reverted.reverted {
+                    out.push(match write.restored {
+                        Some(record) => Action::IndexChanged { folder, record },
+                        None => Action::IndexRemoved {
+                            folder,
+                            path: write.path,
+                        },
+                    });
+                }
+                for path in &reverted.trash {
+                    out.push(Action::MoveToTrash {
+                        folder,
+                        path: path.clone(),
+                    });
+                }
+                out.push(Action::StatusChanged {
+                    folder,
+                    status: FolderStatus::Reverted {
+                        batch: reverted.batch,
+                        trashed: reverted.trash.len(),
+                        refetch: reverted.refetch,
+                    },
+                });
+            }
+            None => out.push(Action::StatusChanged {
+                folder,
+                status: FolderStatus::NotPaused,
+            }),
+        },
     }
 }
 
@@ -2501,6 +2571,97 @@ mod tests {
         )));
         let a = engines[&node(1)].folder(folder()).unwrap();
         assert_eq!(a.wants().len(), 8, "A fetches its files back");
+    }
+
+    /// §8.3 through the engine: a `deny` asked for on a paused folder is
+    /// reported as waiting and nothing is written; the queue survives a
+    /// restart with the folder state; and the deny runs by itself, in the
+    /// same event, once `approve` has unpaused the folder.
+    #[test]
+    fn a_queued_deny_survives_a_restart_and_runs_when_the_folder_settles() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        for i in 0..8 {
+            a.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Approve {
+                folder: folder(),
+                batch: fresh(3),
+            },
+        );
+        deliver(t(12.0), node(1), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        assert_eq!(b.folder(folder()).unwrap().quarantine().len(), 1);
+        // B's own user deletes three files and B pauses.
+        for i in 7..10 {
+            b.handle(
+                t(13.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        b.handle(
+            t(15.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        let paused = b.folder(folder()).unwrap().paused().unwrap().batch;
+        let out = b.handle(
+            t(16.0),
+            Event::Deny {
+                folder: folder(),
+                batch: fresh(3),
+            },
+        );
+        let deny = UserDecision::Deny { batch: fresh(3) };
+        assert_eq!(
+            statuses(&out),
+            [&FolderStatus::Waiting {
+                decision: deny,
+                reason: crate::folder::WaitReason::Paused { batch: paused },
+            }]
+        );
+        assert!(!out.iter().any(|a| matches!(a, Action::IndexChanged { .. })));
+
+        let state = b.folder(folder()).unwrap().clone();
+        let mut b = Engine::restore(b.config().clone(), vec![state]);
+        assert_eq!(b.folder(folder()).unwrap().queued().len(), 1, "persisted");
+        let out = b.handle(
+            t(20.0),
+            Event::Approve {
+                folder: folder(),
+                batch: paused,
+            },
+        );
+        let st = statuses(&out);
+        assert!(matches!(st[0], FolderStatus::Unpaused { .. }));
+        assert!(matches!(
+            st[1],
+            FolderStatus::Denied {
+                batch,
+                paths: 8
+            } if *batch == fresh(3)
+        ));
+        assert!(b.folder(folder()).unwrap().queued().is_empty());
     }
 
     #[test]
