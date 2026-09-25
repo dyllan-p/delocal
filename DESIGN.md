@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 26 · 25 September 2026 · Status: **for review** · Changes from draft 25: everything that makes the disk hold what the record says clears the restoring mark (§8.3).
+> Draft 27 · 25 September 2026 · Status: **for review** · Changes from draft 26: `deny` and `revert` act only on a settled folder and are queued otherwise (§8.3); a crash after a displacing commit followed by `revert` (§13); I2's exemption for the user's own changes follows content wherever sync put it (§14.1).
+>
+> Changes from draft 25: everything that makes the disk hold what the record says clears the restoring mark (§8.3).
 >
 > Changes from draft 24: at a path carrying the restoring mark this machine holds neither version, which settles how wants there are applied, sourced, re-wanted and landed (§8.3).
 >
@@ -455,6 +457,8 @@ Approving on one machine does not approve on others in v1 (§3.2).
 
 `revert` is only meaningful on a paused sender. On other machines it is a no-op with an explanatory message.
 
+**`deny` and `revert` act only on a settled folder.** Both write or discard this machine's own local state, so they can only be right about it when its records describe its disk. A `deny` waits while the folder is paused (its bump would join the pending batch, and a `revert` would then discard the user's decision about a peer's batch along with the damage), and while any path of its held item carries the restoring mark (the bump would announce content this machine cannot serve, §7.1) or has a commit in flight. A `revert` waits while any commit in the folder is in flight and, after a restart, until the startup full scan (§7.3) has finished, since a crash can leave files the engine has not been told about (a conflict copy whose report was lost, §13) and a `revert` that ran without them would let them survive and spread as new adds. A waiting decision is **queued**, persisted with the folder state, shown by `status` with what it is waiting for, and run as soon as the condition clears. `approve` is never queued: it applies incoming entries and writes nothing of this machine's own.
+
 ### 8.4 Trash
 
 Location: `<folder>/.delocal/trash/YYYY-MM-DD/<relative path>`; name collisions within a day get a `~1`, `~2` suffix. Living inside the folder means every move is a same-filesystem rename: instant, no copy, no extra disk pressure until pruning.
@@ -675,6 +679,7 @@ Protocol version is a single integer, bumped on any incompatible change. Two mac
 | Permission denied on a path | Skip, count, show in `status`. Never fatal. |
 | Crash during transfer | Temp file resumes from offset on restart; verified by hash. |
 | Crash after a commit's rename but before its report reached the engine | Next scan sees a "new local change" with content matching a known version → merges by identical-content rule. On a path restored by `revert` the index already matches the landed file, so the scan sees no change; the restoring mark makes that observation the landing instead (§8.3). |
+| Crash after a displacing commit (§7.6) but before its report, then `revert` | The displaced copy is on disk and not in the index. `revert` waits for the startup scan (§8.3), which records the copy as a local add in the pending batch, and `revert` then trashes it with the rest. |
 | Peer offers a version it no longer has | `NotAvailable`; try another source; otherwise wait. |
 | Protocol mismatch | Refuse politely; `status` shows who needs `delocal update`. |
 | Case collision on macOS | Neither applied; `status` names the pair. |
@@ -703,7 +708,7 @@ Invariants checked at the end of every run and at random quiescent points:
 | # | Invariant |
 |---|---|
 | I1 | **Convergence.** When all nodes are connected and quiescent, every member has the identical set of paths, kinds, hashes and exec bits (excluding `.delocal/`). |
-| I2 | **No loss.** Every content hash that was ever **announced** (appeared in a batch some node sent) exists at the end in some node's folder or trash. Content overwritten locally before it was ever announced is not protected, by design (§8.6). |
+| I2 | **No loss.** Every content hash that was ever **announced** (appeared in a batch some node sent) exists at the end in some node's folder or trash. Content overwritten locally before it was ever announced is not protected, by design (§8.6). Nor is content that sync put in place and this machine's user then deleted or rewrote, **wherever sync put it**, a conflict-copy path included: that is the user's own change. |
 | I3 | **No resurrection.** A path deleted on a connected node and not concurrently modified is absent on every node after convergence. |
 | I4 | **Bounded conflicts.** A losing version is a version that `winner` (§7.6) ranks below a concurrent version with different content at the same path. Every conflict copy present at the end has the deterministic name of some losing version at that path and that version's content, and there is exactly one copy path per losing version, never one per node. Two different losing versions may legitimately have identical content. |
 | I5 | **Brake.** No batch that trips H1/H2 is ever applied without an explicit approve step in the simulation. |
