@@ -557,30 +557,36 @@ impl FolderState {
         let Some(old) = self.wants.remove(path) else {
             return;
         };
-        let classified = batch::classify(&self.index, &old.entry);
+        self.rederive(now, old);
+    }
+
+    /// Re-derive a want taken off the list from the entry it received
+    /// (§7.5), against the index as it now stands. What it resolved to is
+    /// not classified again: a conflict's `M` folds in the local version it
+    /// was resolved against, which an ordinary local change dominates (so
+    /// the result is the same) but `revert` discards (so it would not be).
+    /// Members that announced the old content still hold it, so they stay
+    /// sources if the re-derived want has the same content.
+    fn rederive(&mut self, now: Timestamp, old: Want) {
+        let path = old.path().clone();
+        let classified = batch::classify(&self.index, &old.received);
         if classified.fallback {
             self.winner_fallbacks += 1;
         }
         if let Some(item) = classified.item {
-            let same = item.incoming().version == old.entry.version;
-            // A want keeps only what it is to end up with; for a conflict
-            // that is `M`, the nearest thing to the entry as received.
-            let raw = old.entry.clone();
             self.admit(
                 now,
                 vec![Candidate {
                     item,
-                    raw,
+                    raw: old.received.clone(),
                     batch: old.batch,
                     source: old.source,
                     seq_high: old.seq_high,
                 }],
                 true,
             );
-            if same {
-                for src in old.sources {
-                    self.wants.note_announced(path, &old.entry.hash, src);
-                }
+            for src in old.sources {
+                self.wants.note_announced(&path, &old.entry.hash, src);
             }
         }
     }
@@ -681,7 +687,10 @@ impl FolderState {
                 }
                 Verdict::Pass => {
                     for item in set.items {
-                        self.want(item, batch, source, seq_high);
+                        let received = raws
+                            .remove(item.path())
+                            .unwrap_or_else(|| item.incoming().clone());
+                        self.want(item, received, batch, source, seq_high);
                     }
                 }
             }
@@ -731,13 +740,23 @@ impl FolderState {
 
     /// Put an accepted item in the want-list, or defer it if it is
     /// concurrent with or older than the version already wanted there.
-    fn want(&mut self, item: ApplyItem, batch: BatchId, source: NodeId, seq_high: u64) {
-        if let Some(item) = self.wants.insert(item, batch, source, seq_high) {
+    fn want(
+        &mut self,
+        item: ApplyItem,
+        received: Entry,
+        batch: BatchId,
+        source: NodeId,
+        seq_high: u64,
+    ) {
+        if let Some(item) = self
+            .wants
+            .insert(item, received.clone(), batch, source, seq_high)
+        {
             self.deferred
                 .entry(item.path().clone())
                 .or_default()
                 .push(Deferred {
-                    entry: item.incoming().clone(),
+                    entry: received,
                     batch,
                     source,
                     seq_high,
@@ -1056,7 +1075,11 @@ impl FolderState {
             }
             Verdict::Pass => {
                 for item in set.items.clone() {
-                    self.want(item, batch.id, batch.source, batch.seq_high);
+                    let received = raw
+                        .get(item.path())
+                        .map(|e| (*e).clone())
+                        .unwrap_or_else(|| item.incoming().clone());
+                    self.want(item, received, batch.id, batch.source, batch.seq_high);
                 }
                 Received {
                     set,
@@ -1171,6 +1194,13 @@ impl FolderState {
         let mut trash = Vec::new();
         let mut refetch = 0;
         let reverted = self.index.revert_pending();
+        // Wants at reverted paths were resolved against records that are
+        // now discarded; they are re-derived from their received entries
+        // below, after the restoring wants are in place (§8.3 step 2).
+        let stale: Vec<Want> = reverted
+            .iter()
+            .filter_map(|r| self.wants.remove(&r.path))
+            .collect();
         for reverted in &reverted {
             if reverted.current.as_ref().is_some_and(|e| !e.deleted) {
                 trash.push(reverted.path.clone());
@@ -1186,6 +1216,7 @@ impl FolderState {
                 refetch += 1;
                 self.wants.insert_restoring(Want {
                     entry: record.entry.clone(),
+                    received: record.entry.clone(),
                     mode,
                     conflict: None,
                     batch: paused.batch,
@@ -1202,6 +1233,9 @@ impl FolderState {
             }
         }
         self.window = None;
+        for old in stale {
+            self.rederive(now, old);
+        }
         self.unfreeze(now);
         Some(RevertOutcome {
             batch: paused.batch,
@@ -1475,14 +1509,14 @@ impl FolderState {
         }
     }
 
-    /// Keep a want's entry in the deferred set until the next observation of
-    /// its path (§7.5 step 6).
+    /// Keep a want's received entry in the deferred set until the next
+    /// observation of its path (§7.5 step 6); it is classified again then.
     fn defer_changed_underneath(&mut self, want: Want) {
         self.deferred
             .entry(want.path().clone())
             .or_default()
             .push(Deferred {
-                entry: want.entry,
+                entry: want.received,
                 batch: want.batch,
                 source: want.source,
                 seq_high: want.seq_high,
@@ -3024,6 +3058,51 @@ mod tests {
             sent.entries
                 .iter()
                 .any(|e| e.path == p("big") && e.hash == hash(9))
+        );
+    }
+
+    /// §7.5: a want is re-classified from the entry it received, not from
+    /// what it resolved to. For an ordinary local change the two agree,
+    /// because the new local version dominates the one the old `M` folded
+    /// in; this pins that agreement so the change is behaviour-preserving
+    /// where `revert` is not involved.
+    #[test]
+    fn an_ordinary_local_change_rederives_the_same_want_from_the_received_entry() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("f00"), file(7, 70)); // stamp 70: A's edit wins
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let received = batch.entries[0].clone();
+        assert_eq!(b.wants().get(&p("f00")).unwrap().received, received);
+        // No peer connected: the want is without source, so observable.
+        let nobody = BTreeMap::new();
+        b.dispatch(t(12.0), &nobody);
+        assert!(!b.in_flight(&p("f00")));
+        // A local edit makes the want a conflict's M with A's content.
+        b.scanned(t(13.0), p("f00"), file(9, 9));
+        let old = b.wants().get(&p("f00")).unwrap().clone();
+        assert_eq!(old.entry.hash, hash(7));
+        assert!(old.conflict.is_some());
+        assert_eq!(old.received, received, "the received entry is kept");
+        // A second local edit: re-classifying the received entry and
+        // re-classifying the old M give the same want.
+        b.dispatch(t(13.0), &nobody);
+        assert!(!b.in_flight(&p("f00")));
+        b.scanned(t(14.0), p("f00"), file(8, 10));
+        let via_resolved = batch::classify(b.index(), &old.entry).item.unwrap();
+        let ApplyItem::Apply {
+            entry,
+            mode,
+            conflict,
+        } = via_resolved;
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert_eq!(want.entry, entry);
+        assert_eq!(want.mode, mode);
+        assert_eq!(want.conflict, conflict);
+        assert_eq!(want.received, received);
+        assert!(
+            want.sources.contains(&node(1)),
+            "A announced the content M still has"
         );
     }
 

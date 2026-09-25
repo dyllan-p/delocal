@@ -1922,6 +1922,269 @@ mod tests {
         assert!(sends(&out).is_empty(), "nothing to announce after revert");
     }
 
+    /// §8.3: revert re-derives the wants at reverted paths from their
+    /// received entries. The sequence the simulator found: a crash after
+    /// the rename leaves a fetched file the index never learnt of; the
+    /// folder pauses on other changes; the next scan makes the file a local
+    /// add, so the newer remote version already wanted becomes a conflict's
+    /// `M` folding that add in; a still newer version is deferred behind
+    /// `M`; `revert` discards the add. `M` described a merge that could
+    /// never happen and content no peer held. The received entry
+    /// re-classifies to a plain add, the version kept while paused is
+    /// re-admitted at unpause, dominates and replaces it, and its content
+    /// is fetched.
+    #[test]
+    fn revert_rederives_a_conflict_want_and_the_newer_version_is_fetched() {
+        let mut engines = two_with_ten_files();
+        // A adds n; B fetches it and the rename lands.
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        let rest = deliver(t(12.0), node(1), out, &mut engines);
+        let fetch_of = |rest: &[(NodeId, Action)], h: ContentHash| {
+            rest.iter().find_map(|(who, a)| match a {
+                Action::Fetch {
+                    path,
+                    version,
+                    hash: got,
+                    from,
+                    ..
+                } if *who == node(2) && path == &p("n") && *got == h => {
+                    Some((version.clone(), *from))
+                }
+                _ => None,
+            })
+        };
+        let tagged = |out: Vec<Action>| -> Vec<(NodeId, Action)> {
+            out.into_iter().map(|a| (node(2), a)).collect()
+        };
+        let (v1, _) = fetch_of(&rest, hash(7)).unwrap();
+        let b = engines.get_mut(&node(2)).unwrap();
+        let out = b.handle(
+            t(13.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                hash: hash(7),
+                version: v1.clone(),
+                outcome: FetchReport::Ok,
+            },
+        );
+        assert!(out.iter().any(|a| matches!(a, Action::Write { .. })));
+        // B crashes after the rename: the file is on disk, the report is
+        // lost, and the process comes back with the persisted state.
+        let snapshot = b.folder(folder()).unwrap().clone();
+        let restored = Engine::restore(b.config().clone(), vec![snapshot]);
+        engines.insert(node(2), restored);
+        let b = engines.get_mut(&node(2)).unwrap();
+        let out = b.handle(
+            t(20.0),
+            Event::PeerConnected {
+                peer: node(1),
+                tier: Tier::Lan,
+            },
+        );
+        assert!(
+            fetch_of(&tagged(out.clone()), hash(7)).is_some(),
+            "asked again"
+        );
+        deliver(t(20.0), node(2), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        b.handle(
+            t(21.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                hash: hash(7),
+                version: v1,
+                outcome: FetchReport::NotAvailable,
+            },
+        );
+        // A edits n (stamp 70): B wants v2, and A has moved on again, so
+        // the want is without source and the path observable.
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(22.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(8, 70),
+            },
+        );
+        let out = a.handle(
+            t(24.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        let rest = deliver(t(24.0), node(1), out, &mut engines);
+        let (v2, _) = fetch_of(&rest, hash(8)).unwrap();
+        let b = engines.get_mut(&node(2)).unwrap();
+        b.handle(
+            t(25.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                hash: hash(8),
+                version: v2.clone(),
+                outcome: FetchReport::NotAvailable,
+            },
+        );
+        // The watcher reports three deletes; B pauses at the tick.
+        for i in 0..3 {
+            b.handle(
+                t(26.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Absent,
+                },
+            );
+        }
+        let out = b.handle(
+            t(28.0),
+            Event::Tick {
+                fresh_batch_id: fresh(5),
+            },
+        );
+        assert!(
+            statuses(&out)
+                .iter()
+                .any(|s| matches!(s, FolderStatus::Paused { .. }))
+        );
+        // The next full scan finds the file the crash left: a local add
+        // while paused, concurrent with v2, so the want becomes M with A's
+        // content.
+        b.handle(t(30.0), Event::ScanStarted { folder: folder() });
+        b.handle(
+            t(30.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        for i in 3..10 {
+            b.handle(
+                t(30.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: p(&format!("f{i:02}")),
+                    state: ScanState::Unchanged,
+                },
+            );
+        }
+        b.handle(t(30.0), Event::ScanFinished { folder: folder() });
+        let m = b
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .get(&p("n"))
+            .unwrap()
+            .clone();
+        assert!(m.entry.version.dominates(&v2), "M folds the local add in");
+        assert_eq!(m.entry.hash, hash(8));
+        assert!(m.conflict.is_some());
+        assert_eq!(m.received, {
+            let mut e = m.entry.clone();
+            e.version = v2.clone();
+            e
+        });
+        // A edits n once more; v3 is kept while paused, behind M.
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(32.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(9, 80),
+            },
+        );
+        let out = a.handle(
+            t(34.0),
+            Event::Tick {
+                fresh_batch_id: fresh(6),
+            },
+        );
+        let rest = deliver(t(34.0), node(1), out, &mut engines);
+        assert!(fetch_of(&rest, hash(9)).is_none(), "deferred, not wanted");
+        let v3 = engines[&node(1)]
+            .folder(folder())
+            .unwrap()
+            .index()
+            .get(&p("n"))
+            .unwrap()
+            .entry
+            .version
+            .clone();
+        let b = engines.get_mut(&node(2)).unwrap();
+        let f = b.folder(folder()).unwrap();
+        assert_eq!(f.wants().get(&p("n")).unwrap().entry, m.entry);
+        assert_eq!(f.deferred().filter(|d| d.entry.path == p("n")).count(), 1);
+        // Revert: the add peers never saw is removed and trashed; the want
+        // is re-derived from v2 as received, a plain add; the version kept
+        // while paused is re-admitted at unpause, dominates it, replaces
+        // it, and its content is fetched from A. Had M stayed, v3 would
+        // have been re-deferred as concurrent with it.
+        let out = b.handle(t(36.0), Event::Revert { folder: folder() });
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::IndexRemoved { path, .. } if path == &p("n")))
+        );
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::MoveToTrash { path, .. } if path == &p("n")))
+        );
+        let (wanted, from) = fetch_of(&tagged(out), hash(9)).expect("v3's content is fetched");
+        assert_eq!((wanted, from), (v3.clone(), node(1)));
+        let f = b.folder(folder()).unwrap();
+        let want = f.wants().get(&p("n")).unwrap();
+        assert_eq!(want.version(), &v3);
+        assert!(want.conflict.is_none(), "nothing local to displace");
+        assert!(!want.restoring, "no announced record was restored at n");
+        assert_eq!(f.deferred().count(), 0);
+        let out = b.handle(
+            t(39.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                hash: hash(9),
+                version: v3.clone(),
+                outcome: FetchReport::Ok,
+            },
+        );
+        assert!(
+            out.iter().any(
+                |a| matches!(a, Action::Write { path, expected: None, .. } if path == &p("n"))
+            )
+        );
+        let out = b.handle(
+            t(40.0),
+            Event::Applied {
+                folder: folder(),
+                path: p("n"),
+                version: v3.clone(),
+                outcome: ApplyOutcome::Ok,
+            },
+        );
+        assert!(
+            matches!(&out[0], Action::IndexChanged { record, .. } if record.entry.hash == hash(9) && record.entry.version == v3)
+        );
+        assert!(b.folder(folder()).unwrap().wants().get(&p("n")).is_none());
+    }
+
     #[test]
     fn deny_sends_bumps_and_rule_changes_only_report() {
         let mut engines = two_with_ten_files();
