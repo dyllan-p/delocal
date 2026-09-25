@@ -1,5 +1,10 @@
-# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds, a slice of them
-# with fetch corruption on, and an issue for the first failure.
+# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds, the last tenth
+# of them with fetch corruption on, sharded across twenty jobs.
+#
+# The simulator runs one seed at a time on one core, and 100,000 seeds take
+# about a day that way. A job on a GitHub-hosted runner is stopped after six
+# hours, so the seeds are split into twenty shards of 5,000, each well
+# inside that limit, running side by side.
 
 name: Nightly simulation
 
@@ -14,7 +19,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -23,49 +27,63 @@ env:
 
 jobs:
   simulate:
-    name: simulate (nightly)
+    name: simulate (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
     # Pinned like the CI jobs; see ci.yml.
     runs-on: ubuntu-24.04
-    timeout-minutes: 720
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
         run: rustup toolchain install
+      # The shards build the same binary under the same cache key. Only the
+      # first saves it, so they do not race to upload identical caches.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: simulate
+          save-if: ${{ strategy.job-index == 0 }}
 
       - name: Build
         run: cargo build --release --locked -p delocal-sim
 
-      # Nine tenths of the seeds with the defaults, one tenth with fetch
-      # corruption on, so the HashMismatch path is exercised every night.
+      # This shard's share of seeds 0..SEEDS, worked out as in ci.yml. The
+      # first nine tenths of the range run with the default knobs and the
+      # last tenth with fetch corruption on, so the HashMismatch path is
+      # exercised every night; a shard whose range crosses that line runs
+      # both parts. `--keep-going` runs every seed in both parts, so one
+      # failure cannot hide another. The log starts with the shard's number
+      # and ends with "shard done" only if every part ran to the end.
       - name: Simulate
-        id: sim
+        env:
+          SHARD: ${{ strategy.job-index }}
+          SHARDS: ${{ strategy.job-total }}
         run: |
           set -uo pipefail
           main=$(( SEEDS * 9 / 10 ))
-          corrupt=$(( SEEDS - main ))
-          ./target/release/delocal-sim --seeds "$main" 2>&1 | tee sim.log
-          status=${PIPESTATUS[0]}
-          if [ "$status" -eq 0 ]; then
-            ./target/release/delocal-sim --seeds "$corrupt" --start "$main" --corruption 0.05 2>&1 | tee -a sim.log
-            status=${PIPESTATUS[0]}
+          start=$(( SEEDS * SHARD / SHARDS ))
+          end=$(( SEEDS * (SHARD + 1) / SHARDS ))
+          echo "shard $(( SHARD + 1 )) of $SHARDS: seeds $start..$end" > sim.log
+          status=0
+          if [ "$start" -lt "$main" ]; then
+            to=$(( end < main ? end : main ))
+            ./target/release/delocal-sim --seeds "$(( to - start ))" --start "$start" --keep-going 2>&1 | tee -a sim.log
+            [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
           fi
+          if [ "$end" -gt "$main" ]; then
+            from=$(( start > main ? start : main ))
+            ./target/release/delocal-sim --seeds "$(( end - from ))" --start "$from" --corruption 0.05 --keep-going 2>&1 | tee -a sim.log
+            [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
+          fi
+          echo "shard done" >> sim.log
           exit "$status"
 
-      - name: Open an issue for the failure
-        if: failure() && steps.sim.outcome == 'failure'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          title="Nightly simulation failed: $(grep -m1 '^FAILED' sim.log | cut -c1-120)"
-          {
-            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo
-            echo '```'
-            sed -n '/^seed .* failed/,$p' sim.log | head -200
-            echo '```'
-          } > body.md
-          gh issue create --title "$title" --body-file body.md --label simulator
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sim-log-${{ matrix.shard }}
+          path: sim.log
+          if-no-files-found: warn
