@@ -87,3 +87,128 @@ jobs:
           name: sim-log-${{ matrix.shard }}
           path: sim.log
           if-no-files-found: warn
+
+  # One issue per failing night, listing every failing seed from every
+  # shard, plus any shard that did not finish (a build failure, a timeout or
+  # a crash), since its seeds may be missing from the list. `!cancelled()`
+  # runs this when shards failed but not when someone cancels the run.
+  report:
+    name: report
+    needs: simulate
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      # A night where no shard got as far as writing a log has nothing to
+      # download; the report says so instead of failing here.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          pattern: sim-log-*
+          path: logs
+
+      - name: Open one issue for every failing seed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          logs=(logs/*/sim.log)
+          main=$(( SEEDS * 9 / 10 ))
+
+          # Every failing seed from every shard, in seed order.
+          cat "${logs[@]}" /dev/null | { grep -E '^seed [0-9]+ failed' || true; } | sort -k2,2n > failures.txt
+          failed=$(wc -l < failures.txt)
+
+          # The shard count is on the first line of every log. A shard with
+          # no log, or a log without "shard done", did not finish.
+          total=0
+          for f in "${logs[@]}"; do
+            total=$(sed -n '1s/^shard [0-9]* of \([0-9]*\):.*/\1/p' "$f")
+            break
+          done
+          total=${total:-0}
+          unfinished=()
+          for i in $(seq 1 "$total"); do
+            f=logs/sim-log-$i/sim.log
+            if [ ! -f "$f" ] || ! grep -qx 'shard done' "$f"; then
+              unfinished+=("$i")
+            fi
+          done
+
+          if [ "$failed" -eq 0 ] && [ "${#unfinished[@]}" -eq 0 ] && [ "$total" -gt 0 ]; then
+            echo "All $SEEDS seeds passed."
+            exit 0
+          fi
+
+          counts=$(sed -E 's/^seed [0-9]+ failed \(([^)]*)\).*/\1/' failures.txt | sort | uniq -c | sort -rn)
+          title="Nightly simulation: $failed of $SEEDS seeds failed"
+          if [ -n "$counts" ]; then
+            title="$title ($(echo "$counts" | awk '{n=$1; $1=""; sub(/^ /, ""); printf "%s%s %d", (NR > 1 ? ", " : ""), $0, n}'))"
+          fi
+          if [ "$total" -eq 0 ]; then
+            title="$title; no shard left a log"
+          elif [ "${#unfinished[@]}" -gt 0 ]; then
+            title="$title; ${#unfinished[@]} of $total shards did not finish"
+          fi
+
+          {
+            echo "Run: $RUN_URL"
+            echo "Commit: $GITHUB_SHA"
+            echo
+            echo "$failed of $SEEDS seeds failed. Seeds 0 to $(( main - 1 )) ran with the default knobs, seeds $main to $(( SEEDS - 1 )) with \`--corruption 0.05\`."
+            if [ -n "$counts" ]; then
+              echo
+              echo '| Invariant | Seeds |'
+              echo '|---|---|'
+              echo "$counts" | awk '{n=$1; $1=""; sub(/^ /, ""); printf "| %s | %d |\n", $0, n}'
+            fi
+            if [ "$total" -eq 0 ]; then
+              echo
+              echo "No shard left a log: the build or the setup failed everywhere."
+            elif [ "${#unfinished[@]}" -gt 0 ]; then
+              echo
+              echo "Shards that did not finish, whose seeds may be missing below: ${unfinished[*]}."
+            fi
+            if [ "$failed" -gt 0 ]; then
+              echo
+              echo 'Reproduce one seed with the knobs of its slice:'
+              echo '```'
+              { grep -h '^reproduce one:' "${logs[@]}" || true; } | sed 's/^reproduce one: //' | LC_ALL=C sort -u
+              echo '```'
+            fi
+          } > body.md
+
+          # GitHub caps an issue body at 65,536 characters. Every failing
+          # seed number is listed first, by invariant, which fits about
+          # 8,000 seeds; the full lines follow and stop short of the cap,
+          # pointing at the logs for the rest.
+          if [ "$failed" -gt 0 ]; then
+            {
+              echo
+              echo 'Failing seeds by invariant:'
+              echo
+              sed -E 's/^seed ([0-9]+) failed \(([^)]*)\).*/\2\t\1/' failures.txt | LC_ALL=C sort -t "$(printf '\t')" -k1,1 -k2,2n | awk -F'\t' -v budget=50000 '
+                $1 != inv { if (inv != "") print ""; inv = $1; printf "- %s:", inv; used += length(inv) + 4 }
+                { used += length($2) + 1; if (used > budget) { cut++; next } printf " %s", $2 }
+                END { print ""; if (cut) printf "\n... and %d more; every seed is in the sim-log artifacts of the run\n", cut }'
+            } >> body.md
+            budget=$(( 60000 - $(wc -c < body.md) ))
+            {
+              echo
+              echo '<details><summary>Every failing seed in full</summary>'
+              echo
+              echo '```'
+              cut -c1-300 failures.txt | awk -v budget="$budget" '
+                { used += length($0) + 1; if (used > budget) { cut++; next } print }
+                END { if (cut) printf "... and %d more; every seed is in the sim-log artifacts of the run\n", cut }'
+              echo '```'
+              echo '</details>'
+            } >> body.md
+          fi
+
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "${title:0:250}" --body-file body.md --label simulator
