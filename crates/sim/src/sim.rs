@@ -219,6 +219,10 @@ enum Op {
         version: Version,
         action: Box<Action>,
         done_at: Timestamp,
+        /// It fell due while its node was offline. Offline stands for a
+        /// suspended machine, whose disk operations finish when it resumes:
+        /// the host reports every commit or restarts (§7.5).
+        suspended: bool,
     },
 }
 
@@ -236,6 +240,9 @@ impl Op {
                 next_progress,
                 ..
             } => (*done_at).min(*next_progress),
+            Self::Commit {
+                suspended: true, ..
+            } => Timestamp::from_unix_nanos(i64::MAX),
             Self::Commit { done_at, .. } => *done_at,
         }
     }
@@ -870,6 +877,7 @@ impl Sim {
                     version: entry.version.clone(),
                     action: Box::new(action),
                     done_at,
+                    suspended: false,
                 });
             }
             Action::Remove { ref path, .. } | Action::SetMeta { ref path, .. } => {
@@ -890,6 +898,7 @@ impl Sim {
                     version,
                     action: Box::new(action),
                     done_at,
+                    suspended: false,
                 });
             }
             Action::MoveToTrash { path, .. } => {
@@ -1266,6 +1275,20 @@ impl Sim {
                 n.wake_at = n.wake_at.map(|t| t.max(clock));
                 n.next_scan_at = n.next_scan_at.max(clock);
             }
+            for op in &mut self.ops {
+                if let Op::Commit {
+                    node,
+                    done_at,
+                    suspended,
+                    ..
+                } = op
+                    && *node == id
+                    && *suspended
+                {
+                    *suspended = false;
+                    *done_at = clock;
+                }
+            }
             for p in peers {
                 self.connect(id, p)?;
             }
@@ -1450,6 +1473,18 @@ impl Sim {
                 action,
                 ..
             } => {
+                // A suspended node's commit waits for it to resume; a crashed
+                // node's is gone, and its restart wants the path again.
+                if self
+                    .nodes
+                    .get(&node)
+                    .is_some_and(|n| n.engine.is_some() && !n.online)
+                {
+                    if let Op::Commit { suspended, .. } = &mut self.ops[pos] {
+                        *suspended = true;
+                    }
+                    return Ok(());
+                }
                 self.ops.remove(pos);
                 if !self.nodes.get(&node).is_some_and(Node::alive) {
                     return Ok(());
