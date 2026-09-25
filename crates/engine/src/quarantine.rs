@@ -6,8 +6,9 @@
 //! sender: the same version from any peer is held, and a version that
 //! dominates a quarantined one joins the same held item. Unrelated paths
 //! are unaffected. `approve` releases an item and re-classifies its entries
-//! against the index as it stands; `deny` releases it after bumping this
-//! machine's versions over every quarantined one (§8.2).
+//! against the index as it stands; `deny` withdraws it after bumping this
+//! machine's versions over every quarantined one (§8.2), and a `revert`
+//! that discards those bumps reinstates it (§8.3).
 
 use std::collections::BTreeMap;
 
@@ -31,6 +32,16 @@ pub struct HeldItem {
     pub reason: HoldReason,
     /// The latest quarantined entry per path, as received.
     pub entries: BTreeMap<RelPath, Entry>,
+}
+
+/// A held item `deny` took out, with every version it held, so that a
+/// `revert` discarding the deny's bumps can put it back as it was (§8.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Withdrawn {
+    pub item: HeldItem,
+    /// The item's quarantined versions per path with their stamps, joiners
+    /// the stored entries do not show included.
+    versions: BTreeMap<RelPath, Vec<(Version, i64)>>,
 }
 
 /// The folder's quarantine: held items and an index of the versions in them.
@@ -138,6 +149,39 @@ impl Quarantine {
         Some(item)
     }
 
+    /// Take an item out for `deny`: like `release`, but keep every version
+    /// it held so that [`Quarantine::reinstate`] can restore it exactly.
+    pub fn withdraw(&mut self, batch: BatchId) -> Option<Withdrawn> {
+        let mut versions = BTreeMap::new();
+        if let Some(item) = self.items.get(&batch) {
+            for path in item.entries.keys() {
+                let held: Vec<(Version, i64)> = self
+                    .versions
+                    .get(path)
+                    .into_iter()
+                    .flatten()
+                    .filter(|(_, _, id)| *id == batch)
+                    .map(|(v, stamp, _)| (v.clone(), *stamp))
+                    .collect();
+                versions.insert(path.clone(), held);
+            }
+        }
+        let item = self.release(batch)?;
+        Some(Withdrawn { item, versions })
+    }
+
+    /// Put a withdrawn item back with every version it held (§8.3). Its
+    /// versions go to the end of each path's arrival order.
+    pub fn reinstate(&mut self, withdrawn: Withdrawn) {
+        let batch = withdrawn.item.batch;
+        for (path, held) in withdrawn.versions {
+            for (version, stamp) in held {
+                self.record(&path, version, stamp, batch);
+            }
+        }
+        self.hold(withdrawn.item);
+    }
+
     fn record(&mut self, path: &RelPath, version: Version, stamp: i64, batch: BatchId) {
         let list = self.versions.entry(path.clone()).or_default();
         if !list.iter().any(|(v, _, id)| *v == version && *id == batch) {
@@ -198,6 +242,31 @@ mod tests {
             reason: HoldReason::Size { bytes: 1 },
             entries: entries.into_iter().map(|e| (e.path.clone(), e)).collect(),
         }
+    }
+
+    /// §8.3: an item `deny` withdrew and `revert` reinstates comes back as
+    /// it was, a concurrent joiner the stored entry does not show included,
+    /// and an item held meanwhile is untouched.
+    #[test]
+    fn a_withdrawn_item_is_reinstated_with_every_version_it_held() {
+        let mut q = Quarantine::default();
+        q.hold(item(
+            1,
+            vec![entry("a", v(&[(2, 3)])), entry("b", v(&[(2, 1)]))],
+        ));
+        assert!(
+            q.join(batch(1), entry("a", v(&[(2, 2), (3, 1)]))),
+            "a concurrent joiner"
+        );
+        q.hold(item(2, vec![entry("c", v(&[(4, 1)]))]));
+        let before = q.clone();
+        let withdrawn = q.withdraw(batch(1)).unwrap();
+        assert_eq!(q.get(batch(1)), None);
+        assert!(q.versions_at(&p("a")).is_empty());
+        assert_eq!(q.withdraw(batch(9)), None);
+        q.reinstate(withdrawn);
+        assert_eq!(q, before);
+        assert_eq!(q.versions_at(&p("a")).len(), 2, "the joiner too");
     }
 
     #[test]

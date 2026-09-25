@@ -53,6 +53,9 @@
 //! A waiting decision is queued here, persisted with the rest of the state,
 //! and taken by [`FolderState::next_queued`] once its condition clears, or
 //! dropped once its held item or pause is gone. `approve` is never queued.
+//! A deny's bumps can still land in a pending batch when the window pauses
+//! on other local changes after it ran; `revert` then undoes the deny too,
+//! and the held item it withdrew goes back to quarantine.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,7 +67,7 @@ use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Reverted};
 use crate::path::RelPath;
-use crate::quarantine::{HeldItem, Quarantine};
+use crate::quarantine::{HeldItem, Quarantine, Withdrawn};
 use crate::rules::Rules;
 use crate::time::{DEBOUNCE_NANOS, Timestamp, WINDOW_NANOS};
 use crate::version::Version;
@@ -263,6 +266,10 @@ pub enum FolderStatus {
     /// A queued decision was dropped: its held item or pause no longer
     /// exists (the user approved it meanwhile, say).
     Dropped { decision: UserDecision },
+    /// `revert` discarded a deny's bumps, so the held item the deny
+    /// consumed is back in quarantine with its entries and waits for a new
+    /// decision (§8.3).
+    Returned { batch: BatchId, paths: usize },
     /// `approve` or `deny` named a batch that is neither held nor paused.
     UnknownBatch { batch: BatchId },
     /// A rule change was evaluated against a held item or the paused batch;
@@ -375,6 +382,9 @@ pub struct RevertOutcome {
     pub trash: Vec<RelPath>,
     /// Restored live entries wanted again.
     pub refetch: usize,
+    /// Held items back in quarantine because the revert discarded the
+    /// bumps of the deny that consumed them (§8.3), with their path counts.
+    pub returned: Vec<(BatchId, usize)>,
 }
 
 /// One thing the host is asked to do for the want-list (§7.5).
@@ -443,6 +453,10 @@ pub struct FolderState {
     /// True from a restart until a full scan finishes: until then the index
     /// may not know every file on disk (§8.3, §13).
     startup_scan: bool,
+    /// The held items consumed by denies whose bumps are not yet announced.
+    /// A `revert` discards unannounced bumps and puts these back (§8.3);
+    /// the next announcement clears them.
+    denied: Vec<Withdrawn>,
     /// Statuses raised outside a direct call's return value (a hold made
     /// while admitting re-classified entries); the engine drains them.
     #[serde(skip)]
@@ -486,6 +500,7 @@ impl FolderState {
             paused: None,
             queued: Vec::new(),
             startup_scan: false,
+            denied: Vec::new(),
             statuses: Vec::new(),
         }
     }
@@ -1162,6 +1177,8 @@ impl FolderState {
             self.index.announced_seq(),
         );
         self.index.mark_announced();
+        // A deny's bumps are announced now; no revert can discard them.
+        self.denied.clear();
         self.window = None;
         batches
     }
@@ -1569,7 +1586,11 @@ impl FolderState {
                     .bump_over(path, &over, over_stamp, now.as_unix_nanos()),
             );
         }
-        self.quarantine.release(batch);
+        // Kept until the bumps are announced: a revert that discards them
+        // undoes the deny and puts the item back (§8.3).
+        if let Some(withdrawn) = self.quarantine.withdraw(batch) {
+            self.denied.push(withdrawn);
+        }
         if !changes.is_empty() {
             self.touched(now);
         }
@@ -1591,6 +1612,13 @@ impl FolderState {
         let mut trash = Vec::new();
         let mut refetch = 0;
         let reverted = self.index.revert_pending();
+        // The pending set held every unannounced deny's bumps, so each of
+        // those denies is undone with the rest: its held item returns.
+        let mut returned = Vec::new();
+        for withdrawn in std::mem::take(&mut self.denied) {
+            returned.push((withdrawn.item.batch, withdrawn.item.entries.len()));
+            self.quarantine.reinstate(withdrawn);
+        }
         // Wants at reverted paths were resolved against records that are
         // now discarded; they are re-derived from their received entries
         // below, after the restoring wants are in place (§8.3 step 2).
@@ -1639,6 +1667,7 @@ impl FolderState {
             reverted,
             trash,
             refetch,
+            returned,
         })
     }
 
@@ -3411,6 +3440,70 @@ mod tests {
             Some(Next::Dropped(FolderStatus::Dropped { decision: revert }))
         );
         assert!(b.queued().is_empty());
+    }
+
+    /// §8.3: a `deny` on an unpaused folder whose window then pauses on
+    /// the user's own local changes: its bumps are in the pending batch, and
+    /// `revert` undoes the deny with the rest. The held item it consumed is
+    /// back in quarantine with its entries, and status says so.
+    #[test]
+    fn a_revert_that_discards_a_denys_bumps_returns_the_held_item() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..4 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let dels = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert!(matches!(
+            b.receive(t(12.0), &dels).decision,
+            Decision::Held { .. }
+        ));
+        let held = b.quarantine().clone();
+        let deny = UserDecision::Deny { batch: bid(3) };
+        assert_eq!(b.request(deny), Requested::Run, "unpaused and settled");
+        assert_eq!(b.deny(t(13.0), bid(3)).unwrap().len(), 4);
+        assert!(b.quarantine().is_empty());
+        // Before the bumps go out, B's user deletes four other files, and
+        // the window they share pauses.
+        for i in 6..10 {
+            b.scanned(t(14.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(17.0)).unwrap();
+        assert_eq!(out.returned, vec![(bid(3), 4)]);
+        assert_eq!(b.quarantine(), &held, "back as it was");
+        for i in 0..4 {
+            let f = &b.index().get(&p(&format!("f{i:02}"))).unwrap().entry;
+            assert!(f.version.dominates(&Version::empty()) && !f.deleted);
+            assert!(
+                b.quarantine()
+                    .versions_at(&f.path)
+                    .iter()
+                    .all(|q| q.dominates(&f.version)),
+                "the bump is gone: the quarantined tombstones dominate the record again"
+            );
+        }
+    }
+
+    /// §8.3: once a deny's bumps are announced it is settled history; a
+    /// later revert restores the announced bumps and returns nothing.
+    #[test]
+    fn a_revert_after_the_denys_bumps_went_out_returns_nothing() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..4 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let dels = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &dels);
+        b.deny(t(13.0), bid(3)).unwrap();
+        assert!(matches!(b.tick(t(16.0), bid(4)), Ticked::Sent(_)));
+        for i in 6..10 {
+            b.scanned(t(17.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(20.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(21.0)).unwrap();
+        assert!(out.returned.is_empty());
+        assert!(b.quarantine().is_empty());
+        assert!(!b.index().get(&p("f00")).unwrap().entry.deleted);
     }
 
     /// §8.3: neither decision runs while a scan bracket is open, since it
