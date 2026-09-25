@@ -1313,6 +1313,7 @@ impl Sim {
     }
 
     fn restart(&mut self, id: NodeId) -> Result<(), Failure> {
+        let now = self.now_for(id);
         let config = self.config_of(id);
         let folder = self.folder;
         let rules = self.rules.clone();
@@ -1322,7 +1323,7 @@ impl Sim {
         };
         node.restart_at = None;
         let engine = match node.persisted.snapshot.clone() {
-            Some(state) => Engine::restore(config, vec![state]),
+            Some(state) => Engine::restore(config, vec![state], now),
             None => {
                 let mut e = Engine::new(config);
                 let _ = e.handle(
