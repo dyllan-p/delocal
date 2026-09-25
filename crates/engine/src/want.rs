@@ -99,6 +99,15 @@ impl WantState {
 pub struct Want {
     /// What to end up with: the incoming entry, or `M` for a conflict.
     pub entry: Entry,
+    /// The entry as it was received, beside what it resolved to (§7.5):
+    /// whenever the record at the path is written, the want is
+    /// re-classified from this against the record as it now stands. A
+    /// conflict's `M` folds in the local version it was resolved against,
+    /// and if `revert` discards that version (§8.3) `M` describes a merge
+    /// that never happened; the received entry still classifies to
+    /// something a peer can serve. For a restoring want it is the restored
+    /// record itself.
+    pub received: Entry,
     pub mode: ApplyMode,
     /// Where the commit displaces the losing local file, if this is a
     /// conflict resolution (§7.6).
@@ -160,7 +169,13 @@ impl Want {
         !self.entry.deleted && self.entry.kind == Kind::Dir
     }
 
-    fn from_item(item: ApplyItem, batch: BatchId, source: NodeId, seq_high: u64) -> Self {
+    fn from_item(
+        item: ApplyItem,
+        received: Entry,
+        batch: BatchId,
+        source: NodeId,
+        seq_high: u64,
+    ) -> Self {
         let ApplyItem::Apply {
             entry,
             mode,
@@ -169,6 +184,7 @@ impl Want {
         let sources = [source, entry.modified_by].into_iter().collect();
         Self {
             entry,
+            received,
             mode,
             conflict,
             batch,
@@ -269,16 +285,21 @@ impl WantList {
     /// An accepted item arrives (§7.4). A want for the same version gains
     /// the source; a dominating version replaces the want; a dominated or
     /// concurrent version is refused and handed back for the caller to
-    /// defer.
+    /// defer. `received` is the entry as it arrived, kept beside the item
+    /// it resolved to (§7.5). A want that replaces a restoring one is
+    /// restoring too: the file `revert` moved to trash is still there until
+    /// a refetch lands at the path, whichever want brings it (§8.3 step 2).
     pub fn insert(
         &mut self,
         item: ApplyItem,
+        received: Entry,
         batch: BatchId,
         source: NodeId,
         seq_high: u64,
     ) -> Option<ApplyItem> {
         let path = item.path().clone();
         let incoming = item.incoming().version.clone();
+        let mut restoring = false;
         if let Some(existing) = self.wants.get_mut(&path) {
             if incoming == *existing.version() {
                 existing.sources.insert(source);
@@ -288,9 +309,11 @@ impl WantList {
             if !incoming.dominates(existing.version()) {
                 return Some(item);
             }
+            restoring = existing.restoring;
         }
-        self.wants
-            .insert(path.clone(), Want::from_item(item, batch, source, seq_high));
+        let mut want = Want::from_item(item, received, batch, source, seq_high);
+        want.restoring = restoring;
+        self.wants.insert(path.clone(), want);
         self.note(&path);
         None
     }
@@ -735,6 +758,7 @@ mod tests {
             assert!(
                 l.insert(
                     item(entry(path, *kind, *size, 2, *deleted), *mode),
+                    entry(path, *kind, *size, 2, *deleted),
                     bid(1),
                     node(2),
                     1,
@@ -1048,16 +1072,28 @@ mod tests {
         let mut l = WantList::default();
         let e = entry("f", Kind::File, 1, 2, false);
         assert!(
-            l.insert(item(e.clone(), ApplyMode::Fetch), bid(1), node(2), 1)
-                .is_none()
+            l.insert(
+                item(e.clone(), ApplyMode::Fetch),
+                e.clone(),
+                bid(1),
+                node(2),
+                1
+            )
+            .is_none()
         );
         assert_eq!(
             l.get(&p("f")).unwrap().sources,
             [node(2)].into_iter().collect()
         );
         assert!(
-            l.insert(item(e.clone(), ApplyMode::Fetch), bid(2), node(3), 1)
-                .is_none()
+            l.insert(
+                item(e.clone(), ApplyMode::Fetch),
+                e.clone(),
+                bid(2),
+                node(3),
+                1
+            )
+            .is_none()
         );
         assert_eq!(
             l.get(&p("f")).unwrap().sources.len(),
@@ -1067,8 +1103,14 @@ mod tests {
         let mut newer = e.clone();
         newer.version = e.version.incremented(node(2));
         assert!(
-            l.insert(item(newer.clone(), ApplyMode::Fetch), bid(3), node(2), 2)
-                .is_none()
+            l.insert(
+                item(newer.clone(), ApplyMode::Fetch),
+                newer.clone(),
+                bid(3),
+                node(2),
+                2
+            )
+            .is_none()
         );
         assert_eq!(
             l.get(&p("f")).unwrap().version(),
@@ -1079,8 +1121,14 @@ mod tests {
         let mut other = e.clone();
         other.version = Version::empty().incremented(node(5));
         assert!(
-            l.insert(item(other, ApplyMode::Fetch), bid(4), node(5), 1)
-                .is_some(),
+            l.insert(
+                item(other.clone(), ApplyMode::Fetch),
+                other,
+                bid(4),
+                node(5),
+                1
+            )
+            .is_some(),
             "concurrent: refused"
         );
         let changes = l.drain_changes();
