@@ -43,6 +43,15 @@
 //! host reports is marked seen; at `ScanFinished` every live record not seen
 //! becomes a tombstone dated then (§7.3). `ScanAborted` drops the bracket
 //! and announces nothing.
+//!
+//! **Settled decisions** (§8.3). `deny` and `revert` write or discard this
+//! machine's own local state, so they run only on a settled folder. A `deny`
+//! waits while the folder is paused or any path of its held item carries the
+//! restoring mark or has a commit in flight; a `revert` waits while any
+//! commit is in flight and, after a restart, until a full scan has finished.
+//! A waiting decision is queued here, persisted with the rest of the state,
+//! and taken by [`FolderState::next_queued`] once its condition clears, or
+//! dropped once its held item or pause is gone. `approve` is never queued.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -125,6 +134,61 @@ pub struct Paused {
     pub would_pass: bool,
 }
 
+/// A user decision that writes or discards this machine's own local state,
+/// and so runs only on a settled folder (§8.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UserDecision {
+    /// `deny <batch>` of a held item (§8.2).
+    Deny { batch: BatchId },
+    /// `revert` of the paused batch `batch` (§8.3).
+    Revert { batch: BatchId },
+}
+
+/// What a queued decision is waiting for (§8.3).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WaitReason {
+    /// The folder is paused: a `deny`'s bump would join the pending batch,
+    /// and a `revert` would discard it with the damage.
+    Paused { batch: BatchId },
+    /// A path of the held item carries the restoring mark: this machine
+    /// holds neither version there, so a bump would announce content it
+    /// cannot serve (§7.1).
+    Restoring { path: RelPath },
+    /// A commit is in flight at `path`: the disk is about to change under
+    /// the record.
+    Committing { path: RelPath },
+    /// The folder restarted and no full scan has finished since: a crash may
+    /// have left files the engine has not been told about (§13).
+    StartupScan,
+}
+
+/// A decision in the queue, with what it last waited for.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Queued {
+    pub decision: UserDecision,
+    pub reason: WaitReason,
+}
+
+/// What asking for a decision did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Requested {
+    /// The folder is settled: run it now.
+    Run,
+    /// Queued (or already queued); report this status.
+    Queued(FolderStatus),
+}
+
+/// What [`FolderState::next_queued`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// This decision's condition cleared; it is off the queue, run it now.
+    Run(UserDecision),
+    /// Its held item or pause no longer exists; it is off the queue.
+    Dropped(FolderStatus),
+    /// A decision still waits, now for a different reason.
+    Waiting(FolderStatus),
+}
+
 /// Where a commit moves the file it displaces (§7.5 step 7).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Displace {
@@ -187,6 +251,14 @@ pub enum FolderStatus {
     },
     /// `revert` on a folder that is not paused: a no-op (§8.3).
     NotPaused,
+    /// `deny` or `revert` is queued until the folder settles (§8.3).
+    Waiting {
+        decision: UserDecision,
+        reason: WaitReason,
+    },
+    /// A queued decision was dropped: its held item or pause no longer
+    /// exists (the user approved it meanwhile, say).
+    Dropped { decision: UserDecision },
     /// `approve` or `deny` named a batch that is neither held nor paused.
     UnknownBatch { batch: BatchId },
     /// A rule change was evaluated against a held item or the paused batch;
@@ -361,6 +433,12 @@ pub struct FolderState {
     winner_fallbacks: u64,
     quarantine: Quarantine,
     paused: Option<Paused>,
+    /// `deny` and `revert` waiting for the folder to settle, in the order
+    /// they were asked for (§8.3).
+    queued: Vec<Queued>,
+    /// True from a restart until a full scan finishes: until then the index
+    /// may not know every file on disk (§8.3, §13).
+    startup_scan: bool,
     /// Statuses raised outside a direct call's return value (a hold made
     /// while admitting re-classified entries); the engine drains them.
     #[serde(skip)]
@@ -402,6 +480,8 @@ impl FolderState {
             winner_fallbacks: 0,
             quarantine: Quarantine::default(),
             paused: None,
+            queued: Vec::new(),
+            startup_scan: false,
             statuses: Vec::new(),
         }
     }
@@ -491,6 +571,16 @@ impl FolderState {
     /// The paused state, if the sender pre-check tripped (§8.1).
     pub fn paused(&self) -> Option<&Paused> {
         self.paused.as_ref()
+    }
+
+    /// Decisions waiting for the folder to settle, in order (§8.3).
+    pub fn queued(&self) -> &[Queued] {
+        &self.queued
+    }
+
+    /// True from a restart until a full scan finishes (§8.3).
+    pub fn startup_scan_pending(&self) -> bool {
+        self.startup_scan
     }
 
     /// True if the path's want is in a short-lived state (§7.5).
@@ -1028,6 +1118,7 @@ impl FolderState {
         if !changes.is_empty() {
             self.touched(now);
         }
+        self.startup_scan = false;
         Ok(changes)
     }
 
@@ -1351,6 +1442,103 @@ impl FolderState {
         }
     }
 
+    /// Ask for `decision` (§8.3). `Run` if the folder is settled for it;
+    /// otherwise it is queued (once) and the `Waiting` status says what for.
+    /// The caller has checked that its held item or pause exists.
+    pub fn request(&mut self, decision: UserDecision) -> Requested {
+        let Some(reason) = self.unsettled(decision) else {
+            self.queued.retain(|q| q.decision != decision);
+            return Requested::Run;
+        };
+        match self.queued.iter_mut().find(|q| q.decision == decision) {
+            Some(q) => q.reason = reason.clone(),
+            None => self.queued.push(Queued {
+                decision,
+                reason: reason.clone(),
+            }),
+        }
+        Requested::Queued(FolderStatus::Waiting { decision, reason })
+    }
+
+    /// The next thing to do about the queue (§8.3), in queue order: a
+    /// decision whose held item or pause is gone is dropped, one whose
+    /// condition cleared is taken off to run, and one whose reason changed
+    /// is reported again. The caller runs a `Run` and asks again until
+    /// `None`.
+    pub fn next_queued(&mut self) -> Option<Next> {
+        for i in 0..self.queued.len() {
+            let decision = self.queued[i].decision;
+            if !self.decision_exists(decision) {
+                self.queued.remove(i);
+                return Some(Next::Dropped(FolderStatus::Dropped { decision }));
+            }
+            match self.unsettled(decision) {
+                None => {
+                    self.queued.remove(i);
+                    return Some(Next::Run(decision));
+                }
+                Some(reason) if reason != self.queued[i].reason => {
+                    self.queued[i].reason = reason.clone();
+                    return Some(Next::Waiting(FolderStatus::Waiting { decision, reason }));
+                }
+                Some(_) => {}
+            }
+        }
+        None
+    }
+
+    /// True if `decision`'s held item, or the pause it would revert, still
+    /// exists.
+    fn decision_exists(&self, decision: UserDecision) -> bool {
+        match decision {
+            UserDecision::Deny { batch } => self.quarantine.get(batch).is_some(),
+            UserDecision::Revert { batch } => {
+                self.paused.as_ref().is_some_and(|p| p.batch == batch)
+            }
+        }
+    }
+
+    /// Why `decision` cannot run yet, or `None` if the folder is settled
+    /// for it (§8.3).
+    fn unsettled(&self, decision: UserDecision) -> Option<WaitReason> {
+        match decision {
+            UserDecision::Deny { batch } => {
+                if let Some(paused) = &self.paused {
+                    return Some(WaitReason::Paused {
+                        batch: paused.batch,
+                    });
+                }
+                self.quarantine.get(batch)?.entries.keys().find_map(|path| {
+                    if self.marked(path) {
+                        Some(WaitReason::Restoring { path: path.clone() })
+                    } else if self.committing(path) {
+                        Some(WaitReason::Committing { path: path.clone() })
+                    } else {
+                        None
+                    }
+                })
+            }
+            UserDecision::Revert { .. } => {
+                if self.startup_scan {
+                    return Some(WaitReason::StartupScan);
+                }
+                self.wants
+                    .iter()
+                    .find(|w| matches!(w.state, WantState::Committing { .. }))
+                    .map(|w| WaitReason::Committing {
+                        path: w.path().clone(),
+                    })
+            }
+        }
+    }
+
+    /// True if the host is committing the want at `path`.
+    fn committing(&self, path: &RelPath) -> bool {
+        self.wants
+            .get(path)
+            .is_some_and(|w| matches!(w.state, WantState::Committing { .. }))
+    }
+
     /// `deny <batch>` (§8.2): this machine's copies win. Every quarantined
     /// path gets a local version that dominates every quarantined version
     /// there, content unchanged; the item is dropped. `None` if unknown.
@@ -1569,6 +1757,10 @@ impl FolderState {
         self.scan = None;
         self.catchup.clear();
         self.window = None;
+        // A crash may have left files the index does not know about (a
+        // commit's rename whose report was lost, §13); `revert` waits for
+        // the startup scan to report them (§8.3).
+        self.startup_scan = true;
     }
 
     /// Decide the next host steps for the want-list (§7.5) and adopt every
@@ -3008,6 +3200,207 @@ mod tests {
         commit_all(&mut b, t(17.0));
         assert!(!b.in_flight(&p("f03")));
         assert_eq!(b.revert(t(18.0)), None);
+    }
+
+    /// B holds A's deletion of f00 to f03 (as `bid(3)`), then B's user
+    /// edits the same four files and B pauses. The rules are tight.
+    fn held_then_paused_on_the_same_paths() -> (FolderState, FolderState, BatchId) {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..4 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let dels = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert!(matches!(
+            b.receive(t(12.0), &dels).decision,
+            Decision::Held { .. }
+        ));
+        for i in 0..4 {
+            b.scanned(t(13.0), p(&format!("f{i:02}")), file(5 + i as u8, 13));
+        }
+        assert!(matches!(b.tick(t(15.0), bid(5)), Ticked::Paused { .. }));
+        let paused = b.paused().unwrap().batch;
+        (a, b, paused)
+    }
+
+    /// §8.3: `deny` acts only on a settled folder. Paused, its bump would
+    /// join the pending batch and a `revert` would discard it along with the
+    /// quarantined versions it folded in, so it waits. The revert then
+    /// restores the four paths, which carry the restoring mark: this machine
+    /// holds neither version there, so the deny keeps waiting, for a new
+    /// reason, until the refetches land. Then it runs over the restored
+    /// records and its bumps go out.
+    #[test]
+    fn a_deny_waits_for_the_pause_and_then_for_the_restoring_mark() {
+        let (_, mut b, paused) = held_then_paused_on_the_same_paths();
+        let deny = UserDecision::Deny { batch: bid(3) };
+        let waiting = Requested::Queued(FolderStatus::Waiting {
+            decision: deny,
+            reason: WaitReason::Paused { batch: paused },
+        });
+        assert_eq!(b.request(deny), waiting);
+        assert_eq!(b.request(deny), waiting, "asked twice");
+        assert_eq!(b.queued().len(), 1, "queued once");
+        assert_eq!(b.next_queued(), None, "still paused");
+
+        b.revert(t(16.0)).unwrap();
+        assert_eq!(
+            b.next_queued(),
+            Some(Next::Waiting(FolderStatus::Waiting {
+                decision: deny,
+                reason: WaitReason::Restoring { path: p("f00") },
+            }))
+        );
+        assert_eq!(b.next_queued(), None, "reported once per reason");
+
+        commit_all(&mut b, t(17.0));
+        assert!(b.wants().is_empty(), "every refetch landed");
+        assert_eq!(b.next_queued(), Some(Next::Run(deny)));
+        assert!(b.queued().is_empty());
+        let changes = b.deny(t(18.0), bid(3)).unwrap();
+        assert_eq!(changes.len(), 4);
+        for c in &changes {
+            assert!(!c.record.entry.deleted, "B's restored copies win");
+            assert_eq!(c.record.entry.hash, hash(1));
+        }
+        let sent = b.form_batches(t(20.0), bid(6));
+        assert!(
+            sent.iter()
+                .flat_map(|batch| &batch.entries)
+                .any(|e| e.path == p("f00") && !e.deleted),
+            "announced, not left in a pending batch for a revert to discard"
+        );
+    }
+
+    /// §8.3: `deny` also waits while a path of its held item has a commit in
+    /// flight, and runs once the commit is reported.
+    #[test]
+    fn a_deny_waits_for_a_commit_in_flight_at_a_held_path() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("f09"), file(7, 10));
+        let edit = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert_eq!(b.receive(t(12.0), &edit).decision, Decision::Accepted);
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("f09"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { .. }));
+        for i in [0, 1, 2, 9] {
+            a.scanned(t(14.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let dels = a.form_batches(t(16.0), bid(4)).remove(0);
+        assert!(matches!(
+            b.receive(t(16.0), &dels).decision,
+            Decision::Held { .. }
+        ));
+        let deny = UserDecision::Deny { batch: bid(4) };
+        assert_eq!(
+            b.request(deny),
+            Requested::Queued(FolderStatus::Waiting {
+                decision: deny,
+                reason: WaitReason::Committing { path: p("f09") },
+            })
+        );
+        assert_eq!(b.next_queued(), None);
+        b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok);
+        assert_eq!(b.next_queued(), Some(Next::Run(deny)));
+    }
+
+    /// §8.3: `revert` waits while any commit in the folder is in flight:
+    /// the disk is about to change under the records it would restore.
+    #[test]
+    fn a_revert_waits_for_a_commit_in_flight() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("f09"), file(7, 10));
+        let edit = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert_eq!(b.receive(t(12.0), &edit).decision, Decision::Accepted);
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("f09"), &v, FetchReport::Ok);
+        b.dispatch(t(13.0), &lan(&[1]));
+        for i in 0..4 {
+            b.scanned(t(14.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
+        let revert = UserDecision::Revert {
+            batch: b.paused().unwrap().batch,
+        };
+        assert_eq!(
+            b.request(revert),
+            Requested::Queued(FolderStatus::Waiting {
+                decision: revert,
+                reason: WaitReason::Committing { path: p("f09") },
+            })
+        );
+        assert_eq!(b.next_queued(), None);
+        b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok);
+        assert_eq!(b.next_queued(), Some(Next::Run(revert)));
+        assert_eq!(b.revert(t(17.0)).unwrap().reverted.len(), 4);
+    }
+
+    /// §8.3, §13: after a restart `revert` waits until a full scan has
+    /// finished (an aborted one does not count), so a file the engine was
+    /// never told about, such as a displaced copy whose commit report a
+    /// crash took, is in the pending batch by then and is trashed with the
+    /// rest instead of surviving as a new add.
+    #[test]
+    fn a_revert_after_a_restart_waits_for_the_startup_scan() {
+        let (_, mut b) = a_and_b(10, tight());
+        for i in 0..4 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        let revert = UserDecision::Revert {
+            batch: b.paused().unwrap().batch,
+        };
+        b.restarted();
+        assert!(b.startup_scan_pending());
+        assert_eq!(
+            b.request(revert),
+            Requested::Queued(FolderStatus::Waiting {
+                decision: revert,
+                reason: WaitReason::StartupScan,
+            })
+        );
+        b.scan_started();
+        b.scan_aborted().unwrap();
+        assert_eq!(b.next_queued(), None, "an aborted scan is not enough");
+        b.scan_started();
+        for i in 4..10 {
+            b.scanned(t(13.0), p(&format!("f{i:02}")), ScanState::Unchanged);
+        }
+        b.scanned(t(13.0), p("f04.conflict-20231114-221300-alpha"), file(8, 8));
+        b.scan_finished(t(13.0)).unwrap();
+        assert!(!b.startup_scan_pending());
+        assert_eq!(b.next_queued(), Some(Next::Run(revert)));
+        let out = b.revert(t(14.0)).unwrap();
+        let copy = p("f04.conflict-20231114-221300-alpha");
+        assert!(out.trash.contains(&copy), "trashed with the rest");
+        assert_eq!(b.index().get(&copy), None, "peers never saw it");
+    }
+
+    /// §8.3: a queued decision whose held item or pause no longer exists is
+    /// dropped with a status; here the user approved both meanwhile.
+    #[test]
+    fn queued_decisions_are_dropped_once_their_item_or_pause_is_gone() {
+        let (_, mut b, paused) = held_then_paused_on_the_same_paths();
+        b.restarted();
+        let deny = UserDecision::Deny { batch: bid(3) };
+        let revert = UserDecision::Revert { batch: paused };
+        assert!(matches!(b.request(deny), Requested::Queued(_)));
+        assert!(matches!(b.request(revert), Requested::Queued(_)));
+        assert_eq!(b.queued().len(), 2);
+        assert!(matches!(b.approve(t(16.0), bid(3)), Approved::Released(_)));
+        assert_eq!(
+            b.next_queued(),
+            Some(Next::Dropped(FolderStatus::Dropped { decision: deny }))
+        );
+        assert_eq!(b.next_queued(), None, "the revert still waits");
+        assert!(matches!(b.approve(t(17.0), paused), Approved::Sent(_)));
+        assert_eq!(
+            b.next_queued(),
+            Some(Next::Dropped(FolderStatus::Dropped { decision: revert }))
+        );
+        assert!(b.queued().is_empty());
     }
 
     /// §8.3, §7.5: at a marked path an occupant counts whatever state the

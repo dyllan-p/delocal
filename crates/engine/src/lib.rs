@@ -49,7 +49,8 @@ pub use engine::{Action, Engine, Event, NodeConfig, Outbound};
 pub use entry::{ContentHash, Entry, Kind, Observed};
 pub use folder::{
     ApplyOutcome, Approved, Deferred, DeferredReason, Displace, Fetched, FolderState, FolderStatus,
-    HostStep, Paused, Received, RevertOutcome, ScanState, Ticked, Window,
+    HostStep, Next, Paused, Queued, Received, Requested, RevertOutcome, ScanState, Ticked,
+    UserDecision, WaitReason, Window,
 };
 pub use id::{BatchId, FolderId, HostName, NodeId};
 pub use index::{ChangeKind, Index, IndexRecord, LocalChange, Reverted};
