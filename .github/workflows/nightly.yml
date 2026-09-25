@@ -24,7 +24,8 @@ env:
 jobs:
   simulate:
     name: simulate (nightly)
-    runs-on: ubuntu-latest
+    # Pinned like the CI jobs; see ci.yml.
+    runs-on: ubuntu-24.04
     timeout-minutes: 720
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

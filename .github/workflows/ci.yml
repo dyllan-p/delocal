@@ -10,6 +10,11 @@
 # The toolchain comes from rust-toolchain.toml. `rustup toolchain install`
 # with no arguments reads that file and installs the pinned version with its
 # components and targets, so CI and a developer's machine use the same one.
+#
+# Linux jobs run on ubuntu-24.04, not ubuntu-latest, for the same reason the
+# toolchain is pinned: `ubuntu-latest` moves to a new image on GitHub's
+# schedule, and a new image should arrive in its own commit, not in the
+# middle of an unrelated PR.
 
 name: CI
 
@@ -35,7 +40,7 @@ env:
 jobs:
   lint:
     name: lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -78,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -100,12 +105,12 @@ jobs:
           # target. The host toolchain (from rust-toolchain.toml) is used;
           # only the linker comes from the image.
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: true
             static: true
             run: true
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
+            os: ubuntu-24.04
             cross: true
             static: true
             run: false
@@ -173,7 +178,7 @@ jobs:
   # runs every seed and lists the failures by invariant before it exits.
   simulate:
     name: simulate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       SEEDS: 1000
