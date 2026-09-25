@@ -35,8 +35,9 @@
 //! **Want-list and in flight** (§7.5). See [`crate::want`]. A path whose
 //! want is in a short-lived state is in flight: observations of it are
 //! ignored and the scan bracket's deletion pass skips it. A `revert`-made
-//! want ignores `Absent` in every state (the trash move, §8.3). A local
-//! change at an observable wanted path re-classifies the want.
+//! want ignores `Absent` in every state (the trash move, §8.3), and at a
+//! path carrying the restoring mark an occupant is looked at in every state
+//! too. A local change at an observable wanted path re-classifies the want.
 //!
 //! **Scan bracket.** Between `ScanStarted` and `ScanFinished` every path the
 //! host reports is marked seen; at `ScanFinished` every live record not seen
@@ -521,10 +522,11 @@ impl FolderState {
     }
 
     /// The host reported `state` at `path` (§7.3), inside or outside a
-    /// bracket. Reports for a path in flight are ignored; so is `Absent`
-    /// at a path carrying the restoring mark (§8.3), where absence is the
-    /// trash move. A change at an observable wanted path re-classifies the
-    /// want. At a marked path, an occupant clears the mark: one that
+    /// bracket. `Absent` at a path carrying the restoring mark (§8.3) is
+    /// ignored, since absence is the trash move there; other reports for a
+    /// path in flight are ignored unless the path is marked. A change at an
+    /// observable wanted path re-classifies the want. At a marked path, an
+    /// occupant clears the mark whatever state the want is in: one that
     /// matches the restored record leaves the index as it is and is the
     /// landing of a refetch whose report was lost (§13); anything else is
     /// a local change like any other.
@@ -532,11 +534,16 @@ impl FolderState {
         if let Some(seen) = &mut self.scan {
             seen.insert(path.clone());
         }
-        if self.wants.in_flight(&path) {
-            return Scanned::default();
-        }
         let marked = self.marked(&path);
         if state == ScanState::Absent && marked {
+            return Scanned::default();
+        }
+        // In flight, an observation is normally the host's own work in
+        // progress. At a marked path the disk holds neither version, so an
+        // occupant is a landing (it matches what the want was committing)
+        // or a local change, and the occupant rules below come first (§8.3,
+        // §7.5's revert exception).
+        if self.wants.in_flight(&path) && !marked {
             return Scanned::default();
         }
         if state == ScanState::Unchanged && self.index.live(&path).is_none() {
@@ -3001,6 +3008,23 @@ mod tests {
         commit_all(&mut b, t(17.0));
         assert!(!b.in_flight(&p("f03")));
         assert_eq!(b.revert(t(18.0)), None);
+    }
+
+    /// §8.3, §7.5: at a marked path an occupant counts whatever state the
+    /// want is in. The restoring wants are *wanted*, so in flight, when the
+    /// user's new file at f01 is observed: a local change that cancels its
+    /// want. At f00 the restored record itself is observed: the landing.
+    #[test]
+    fn an_occupant_at_a_marked_path_counts_while_its_want_is_in_flight() {
+        let (_, mut b) = marked_after_revert();
+        assert!(b.in_flight(&p("f00")) && b.in_flight(&p("f01")));
+        let out = b.scanned(t(16.0), p("f01"), file(9, 9));
+        assert!(out.change.is_some(), "a local change");
+        assert!(b.wants().get(&p("f01")).is_none(), "cancelled");
+        assert_eq!(b.index().get(&p("f01")).unwrap().entry.hash, hash(9));
+        let out = b.scanned(t(16.0), p("f00"), ScanState::Unchanged);
+        assert!(out.landed.is_some(), "the landing");
+        assert!(b.wants().is_empty());
     }
 
     #[test]
