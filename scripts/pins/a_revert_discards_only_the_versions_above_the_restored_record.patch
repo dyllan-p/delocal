@@ -1,0 +1,26 @@
+Makes sim.rs `discarded_since` take every record a node wrote at a path
+before its revert as discarded, the record the revert put back and those
+below it included, as before 878e417. The fix sets aside only the node's
+versions above the restored record, which are the pending ones; the restored
+record was announced and stands (DESIGN.md §8.3, §14.1 I3).
+
+test: delocal-sim regressions::a_revert_discards_only_the_versions_above_the_restored_record
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 4e18586..e87955f 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -2643,12 +2643,7 @@ impl Sim {
+     fn discarded_since(&self, entry: &Entry, seen: u64) -> bool {
+         self.reverted_at
+             .get(&(entry.modified_by, entry.path.clone()))
+-            .is_some_and(|(reverted, restored)| {
+-                *reverted >= seen
+-                    && restored
+-                        .as_ref()
+-                        .is_none_or(|kept| !kept.dominates_or_equals(&entry.version))
+-            })
++            .is_some_and(|(reverted, _)| *reverted >= seen)
+     }
+ 
+     /// True if `entry`, as recorded in the version table, was discarded by

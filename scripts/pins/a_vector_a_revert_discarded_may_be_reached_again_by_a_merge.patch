@@ -1,0 +1,26 @@
+Narrows I7's revert exemption in sim.rs `record` back to the author's own
+re-issue, as before the I7 half of 15d13ea: a write that reaches a vector its
+author's revert discarded is exempt only if the node making it wrote both
+records. The fix exempts any write that reaches such a vector, a merge that
+includes the re-issued counter too, since nobody else ever held the discarded
+record (DESIGN.md §14.1 I7, §8.3). The replacement of the discarded record
+(8d4620d) is left alone.
+
+test: delocal-sim regressions::a_vector_a_revert_discarded_may_be_reached_again_by_a_merge
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 4e18586..55465ab 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -1340,7 +1340,10 @@ impl Sim {
+                         // loser's mtime) are checked against what exists.
+                         let discarded = self.discarded_by_revert(&existing);
+                         if !same || discarded {
+-                            if !same && !discarded {
++                            let reissue = discarded
++                                && record.entry.modified_by == id
++                                && existing.modified_by == id;
++                            if !same && !reissue {
+                                 return Err(self.fail(
+                                     "I7 version identity",
+                                     format!(
