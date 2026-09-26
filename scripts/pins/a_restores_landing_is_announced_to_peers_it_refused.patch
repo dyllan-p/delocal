@@ -1,0 +1,43 @@
+Removes the landing rule from `FolderState::scanned` (f53c1de), which
+leaves `land` unused: an occupant at a marked path that matches what the
+path's want or a deferred carrier was committing is no longer adopted
+with a new `seq`. The mark is cleared and the occupant is observed like
+any file; when it matches the restored record the index is left as it
+is, so a refetch whose report a crash took keeps that record's old
+`seq`, is never announced, and the peers this machine refused before it
+landed never ask again (DESIGN.md §8.3 step 2, §13).
+
+test: delocal-sim regressions::a_restores_landing_is_announced_to_peers_it_refused
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..79d076c 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -910,26 +910,9 @@ impl FolderState {
+                 landed: None,
+             };
+         }
+-        // An occupant at a marked path clears the mark. It is looked at
+-        // before the index is: one matching what a carrier was committing
+-        // is that commit's landing, not a local change.
++        // An occupant at a marked path clears the mark.
+         let mut unmarked = None;
+         if marked {
+-            let occupant = match &state {
+-                ScanState::Observed(observed) => Some(observed.clone().normalised()),
+-                ScanState::Unchanged => self.index.live(&path).map(|r| r.entry.observed()),
+-                ScanState::Absent => None,
+-            };
+-            if let Some(occupant) = occupant
+-                && let Some(landed) = self.land(now, &path, &occupant)
+-            {
+-                self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
+-                return Scanned {
+-                    change: None,
+-                    status: None,
+-                    landed: Some(landed),
+-                };
+-            }
+             unmarked = self.unmark(&path);
+         }
+         let change = match state {

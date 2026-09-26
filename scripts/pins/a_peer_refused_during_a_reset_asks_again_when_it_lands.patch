@@ -1,0 +1,29 @@
+Restores the reset branch of `FolderState::applied` as it was before
+0ae55b1: a reset that lands only re-considers the entries deferred at its
+path and adopts nothing, so the record `revert` restored keeps its old
+`seq` and the landing is never announced. A peer that asked while the
+reset was pending was refused, and it never hears that this machine can
+serve the file again (DESIGN.md §7.1, §8.3 step 2).
+
+test: delocal-sim regressions::a_peer_refused_during_a_reset_asks_again_when_it_lands
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..54e3935 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -2195,12 +2195,10 @@ impl FolderState {
+             // what tells a refused peer to ask again. Entries deferred at
+             // the path are then classified against it; if the file changed
+             // underneath, they wait for the next observation instead.
+-            if outcome != ApplyOutcome::Ok {
+-                return Vec::new();
++            if outcome == ApplyOutcome::Ok {
++                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+             }
+-            let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
+-            self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+-            return written;
++            return Vec::new();
+         }
+         match outcome {
+             ApplyOutcome::Ok => {
