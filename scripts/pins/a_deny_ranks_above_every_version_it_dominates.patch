@@ -1,0 +1,22 @@
+Makes a deny's bump stamp one past the local record's stamp, or 1 with no
+local record, as before 1088173 (§7.1, §8.2): `FolderState::deny` no
+longer passes the largest quarantined stamp at the path to
+`Index::bump_over`. The bump still dominates every quarantined version
+but can rank below one of them, so a node that meets the bump alone and a
+node holding the dominated version rank differently and I7 fails.
+
+test: delocal-sim regressions::a_deny_ranks_above_every_version_it_dominates
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..bd3e68a 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1806,7 +1806,7 @@ impl FolderState {
+         let mut changes = Vec::with_capacity(paths.len());
+         for path in &paths {
+             let over = self.quarantine.versions_at(path);
+-            let over_stamp = self.quarantine.max_stamp_at(path);
++            let over_stamp = None;
+             changes.push(
+                 self.index
+                     .bump_over(path, &over, over_stamp, now.as_unix_nanos()),
