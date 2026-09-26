@@ -465,11 +465,11 @@ impl WantList {
         self.note(&path);
     }
 
-    /// A want persisted by the host comes back after a restart. Transient
-    /// states become `Wanted`, and fetched content is forgotten: a crash
-    /// loses the temp files along with the host's in-flight operations
-    /// (§11), so what was fetched has to be fetched again.
-    pub fn restore(&mut self, mut want: Want) {
+    /// A want comes back after a restart. Transient states become
+    /// `Wanted`, and fetched content is forgotten: a crash loses the temp
+    /// files along with the host's in-flight operations (§11), so what was
+    /// fetched has to be fetched again.
+    fn restore(&mut self, mut want: Want) {
         if matches!(
             want.state,
             WantState::Fetching { .. } | WantState::Committing { .. } | WantState::Blocked

@@ -23,9 +23,9 @@ use delocal_engine::batch::BatchRole;
 use delocal_engine::folder::{ApplyOutcome, Displace, FolderStatus, ScanState};
 use delocal_engine::want::{FetchReport, Tier, Want, WantState};
 use delocal_engine::{
-    Action, BatchId, ContentHash, Deferred, Engine, Entry, Event, FolderId, FolderState, HeldRow,
-    HeldState, HostName, IndexRecord, Kind, NodeConfig, NodeId, Observed, Outbound, Pending,
-    RelPath, Rest, Rules, Timestamp, Version,
+    Action, BatchId, ContentHash, Deferred, Engine, Entry, Event, FolderId, FolderParts,
+    FolderState, HeldRow, HeldState, HostName, IndexRecord, Kind, NodeConfig, NodeId, Observed,
+    Outbound, Pending, RelPath, Rest, Rules, Timestamp, Version,
 };
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -145,7 +145,8 @@ pub fn content_bytes(seed: u8) -> Vec<u8> {
 
 /// What the daemon would have on disk for one node (§11): the folder's
 /// rules, which the host keeps itself, and one table per engine part,
-/// written by the persistence hooks and by nothing else.
+/// written by the persistence hooks and by nothing else. A crashed node
+/// restarts from these and nothing else.
 #[derive(Clone, Debug, Default, Serialize)]
 struct Persisted {
     rules: Rules,
@@ -156,10 +157,25 @@ struct Persisted {
     deferred: BTreeMap<RelPath, Vec<Deferred>>,
     /// `None` until the folder reports its first row, at `FolderJoined`.
     rest: Option<Rest>,
-    snapshot: Option<FolderState>,
 }
 
 impl Persisted {
+    /// The tables as the parts a restart hands the engine; `None` if the
+    /// folder never reported its rest.
+    fn parts(&self, id: FolderId, members: &[NodeId]) -> Option<FolderParts> {
+        Some(FolderParts {
+            id,
+            rules: self.rules.clone(),
+            members: members.iter().copied().collect(),
+            records: self.records.clone(),
+            wants: self.wants.clone(),
+            pending: self.pending.clone(),
+            held: self.held.clone(),
+            deferred: self.deferred.clone(),
+            rest: self.rest.clone()?,
+        })
+    }
+
     /// The first table that differs from the engine's part, if any.
     fn mismatch(&self, state: &FolderState) -> Option<String> {
         let live = state.parts();
@@ -815,10 +831,7 @@ impl Sim {
             return Ok(());
         };
         match node.persisted.mismatch(state) {
-            None => {
-                node.persisted.snapshot = Some(state.clone());
-                Ok(())
-            }
+            None => Ok(()),
             Some(what) => {
                 let detail = format!("{}: {what}", Self::short(id));
                 Err(self.fail("persistence hooks", detail))
@@ -1420,29 +1433,20 @@ impl Sim {
     fn restart(&mut self, id: NodeId) -> Result<(), Failure> {
         let now = self.now_for(id);
         let config = self.config_of(id);
-        let folder = self.folder;
-        let rules = self.rules.clone();
-        let members = self.order.clone();
+        let Some(parts) = self
+            .nodes
+            .get(&id)
+            .and_then(|n| n.persisted.parts(self.folder, &self.order))
+        else {
+            let detail = format!("{}: no rest row to restart from", Self::short(id));
+            return Err(self.fail("persistence hooks", detail));
+        };
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
         };
         node.restart_at = None;
-        let engine = match node.persisted.snapshot.clone() {
-            Some(state) => Engine::restore(config, vec![state.parts()], now),
-            None => {
-                let mut e = Engine::new(config);
-                let _ = e.handle(
-                    self.clock,
-                    Event::FolderJoined {
-                        folder,
-                        rules,
-                        members,
-                    },
-                );
-                e
-            }
-        };
-        node.engine = Some(engine);
+        // §11: the persisted parts and nothing else.
+        node.engine = Some(Engine::restore(config, vec![parts], now));
         // §7.3: a full scan runs at daemon start, so at every restart; a
         // queued `revert` waits for it (§8.3). A node restarted while
         // offline scans as soon as it is back.
