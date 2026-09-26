@@ -330,15 +330,18 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
 /// Why the conflict copy at `path`, holding `live`, is not the copy of a
 /// losing version where it was made (§14.1 I4), or `None` if it is.
 ///
-/// A copy was made either where it is or, if it moved with a displaced
-/// directory, where [`made_at`] maps it. Both places can carry a losing
-/// version named after it, because a name has only the loser's mtime to
-/// the second and its author: in seed 3420 a file moved into `d1`'s copy
+/// A copy was made where it is or, if it moved with a displaced directory,
+/// at some place along the chain [`made_at`] maps it back through: at the
+/// end if the directory it was made in was displaced afterwards, but in
+/// between if it was made inside a directory that was already displaced,
+/// which was then displaced again with it. More than one place can carry a
+/// losing version named after it, because a name has only the loser's mtime
+/// to the second and its author: in seed 3420 a file moved into `d1`'s copy
 /// by the same displacement as `d1/f7`'s conflict copy was scanned there as
 /// an add, lost, and its copy name was the moved copy's path. So the copy
-/// must match a losing version at either place, as it must match one of
-/// several that share a name at one place. The user's edit of the copy at
-/// either place is the user's own.
+/// must match a losing version at some place along the chain, as it must
+/// match one of several that share a name at one place. The user's edit of
+/// the copy at any of those places is the user's own.
 fn copy_failure(
     path: &RelPath,
     live: &Live,
@@ -346,27 +349,24 @@ fn copy_failure(
     displaced: &BTreeMap<RelPath, RelPath>,
     user_edited: &BTreeSet<RelPath>,
 ) -> Option<String> {
-    let made = made_at(path, displaced);
-    let mut places = vec![path];
-    if made != *path {
-        places.push(&made);
-    }
+    let places = made_at(path, displaced);
     let losers: Vec<&Entry> = places
         .iter()
-        .filter_map(|p| expected.get(*p))
+        .filter_map(|p| expected.get(p))
         .flatten()
         .collect();
     if losers.is_empty() {
-        let moved = if made == *path {
+        let moved: Vec<String> = places.iter().skip(1).map(ToString::to_string).collect();
+        let moved = if moved.is_empty() {
             String::new()
         } else {
-            format!(", made at {made},")
+            format!(", mapped back to {},", moved.join(" then "))
         };
         return Some(format!(
             "conflict copy {path}{moved} matches no losing version at its original path"
         ));
     }
-    if places.iter().any(|p| user_edited.contains(*p)) {
+    if places.iter().any(|p| user_edited.contains(p)) {
         return None; // the user's own edit of the copy; the name still checks out
     }
     let same = losers.iter().any(|loser| {
@@ -388,21 +388,25 @@ fn copy_failure(
     ))
 }
 
-/// Where a conflict copy found at `path` was made, if it moved with a
-/// displaced directory (§14.1 I4). `displaced` maps a directory copy's name
-/// to the directory displaced under it. The deepest directory above `path`
-/// that is such a copy is mapped back to the directory that was displaced,
-/// and again, until no directory above the result is one: a directory can
-/// be displaced more than once, and the last displacement is the outermost
+/// Every place a conflict copy found at `path` may have been made, if it
+/// moved with a displaced directory (§14.1 I4): `path` first, then each
+/// place it maps back to. `displaced` maps a directory copy's name to the
+/// directory displaced under it. The deepest directory above `path` that is
+/// such a copy is mapped back to the directory that was displaced, and
+/// again, until no directory above the result is one: a directory can be
+/// displaced more than once, and the last displacement is the outermost
 /// name. Deepest first, because a directory displaced inside a displaced
-/// directory keeps its name only relative to where it was then.
-fn made_at(path: &RelPath, displaced: &BTreeMap<RelPath, RelPath>) -> RelPath {
+/// directory keeps its name only relative to where it was then. Every step
+/// is kept, not only the last, because a copy made inside a directory that
+/// was already displaced was made at a step in between.
+fn made_at(path: &RelPath, displaced: &BTreeMap<RelPath, RelPath>) -> Vec<RelPath> {
+    let mut chain = vec![path.clone()];
     let mut at = path.clone();
     // Each step replaces a directory copy's name with the path it was named
     // after, so a path can only come back if the names form a cycle, which
     // displacement cannot make; the set is a guard, not a rule.
-    let mut seen = BTreeSet::new();
-    while seen.insert(at.clone()) {
+    let mut seen = BTreeSet::from([at.clone()]);
+    loop {
         let mut dir = at.parent();
         let mut next = None;
         while let Some(d) = dir {
@@ -416,11 +420,14 @@ fn made_at(path: &RelPath, displaced: &BTreeMap<RelPath, RelPath>) -> RelPath {
             dir = d.parent();
         }
         match next {
-            Some(n) => at = n,
-            None => break,
+            Some(n) if seen.insert(n.clone()) => {
+                chain.push(n.clone());
+                at = n;
+            }
+            _ => break,
         }
     }
-    at
+    chain
 }
 
 #[cfg(test)]
@@ -471,12 +478,81 @@ mod tests {
             (second.clone(), again.path.clone()),
         ]);
         let found = RelPath::new(format!("{second}/{}", copy.file_name())).unwrap();
-        assert_eq!(made_at(&found, &displaced), copy);
-        // Displaced once, it maps back in one step.
         let once = RelPath::new(format!("{first}/{}", copy.file_name())).unwrap();
-        assert_eq!(made_at(&once, &displaced), copy);
+        assert_eq!(
+            made_at(&found, &displaced),
+            [found.clone(), once.clone(), copy.clone()]
+        );
+        // Displaced once, it maps back in one step.
+        assert_eq!(made_at(&once, &displaced), [once.clone(), copy.clone()]);
         // A copy under no displaced directory is where it was made.
-        assert_eq!(made_at(&copy, &displaced), copy);
+        assert_eq!(made_at(&copy, &displaced), std::slice::from_ref(&copy));
+    }
+
+    /// The shape draft 37 covers: `d1` was displaced to its copy, a file in
+    /// that copy then lost a conflict there and was copied beside itself,
+    /// and the directory copy lost in turn and was displaced again, taking
+    /// the file copy with it. The file copy was made one displacement deep,
+    /// neither where it is found nor where the chain ends, so it must match
+    /// a losing version in between.
+    #[test]
+    fn a_copy_made_in_a_displaced_directory_and_displaced_again_matches_where_it_was_made() {
+        let d1 = loser("d1", Kind::Dir, 0, "n5");
+        let first = conflict_copy_name(&d1).unwrap();
+        let again = loser(first.as_str(), Kind::Dir, 0, "n4");
+        let second = conflict_copy_name(&again).unwrap();
+        // 2023-11-14 22:13:20 UTC, a file inside the displaced directory.
+        let mut f4 = loser(
+            &format!("{first}/f4"),
+            Kind::File,
+            1_700_000_000_000_000_000,
+            "n1",
+        );
+        f4.hash = ContentHash::from_bytes([0xcc; 32]);
+        let made = conflict_copy_name(&f4).unwrap();
+        assert_eq!(
+            made.as_str(),
+            format!("{first}/f4.conflict-20231114-221320-n1")
+        );
+        let found = RelPath::new(format!("{second}/{}", made.file_name())).unwrap();
+
+        let expected = BTreeMap::from([
+            (first.clone(), vec![d1.clone()]),
+            (second.clone(), vec![again.clone()]),
+            (made.clone(), vec![f4.clone()]),
+        ]);
+        let displaced = BTreeMap::from([
+            (first.clone(), d1.path.clone()),
+            (second.clone(), again.path.clone()),
+        ]);
+        // The chain runs through the place the copy was made to a path no
+        // loser is named after.
+        let end = RelPath::new(format!("d1/{}", made.file_name())).unwrap();
+        assert_eq!(
+            made_at(&found, &displaced),
+            [found.clone(), made.clone(), end.clone()]
+        );
+        assert!(!expected.contains_key(&end));
+
+        let none = BTreeSet::new();
+        assert_eq!(
+            copy_failure(&found, &live(&f4), &expected, &displaced, &none),
+            None
+        );
+        // Content that is not the loser's still fails.
+        let mut other = f4.clone();
+        other.hash = ContentHash::from_bytes([0x11; 32]);
+        assert!(copy_failure(&found, &live(&other), &expected, &displaced, &none).is_some());
+        // Unless the user edited the copy where it was made: then it is the
+        // user's file, and only its name is checked.
+        let edited = BTreeSet::from([made.clone()]);
+        assert_eq!(
+            copy_failure(&found, &live(&other), &expected, &displaced, &edited),
+            None
+        );
+        // A copy whose name no loser has anywhere along the chain fails.
+        let stray = RelPath::new(format!("{second}/f9.conflict-20231114-221320-n1")).unwrap();
+        assert!(copy_failure(&stray, &live(&f4), &expected, &displaced, &none).is_some());
     }
 
     fn live(entry: &Entry) -> Live {
