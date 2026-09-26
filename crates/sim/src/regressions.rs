@@ -26,6 +26,26 @@ fn corrupting() -> Knobs {
     }
 }
 
+/// `knobs` without draft 34's simulator models (§14.1): no crash between a
+/// commit's two renames, no group-commit lag, and a displaced directory
+/// leaves its children. Every pin before them was found this way.
+fn before_draft_34(knobs: &Knobs) -> Knobs {
+    Knobs {
+        crash_between_renames: 0.0,
+        group_commit_lag: 0,
+        displace_subtrees: false,
+        ..knobs.clone()
+    }
+}
+
+/// For a pin whose history draft 34's models change so that it no longer
+/// reaches its scenario: replay the history it was found in, which fails
+/// with its fix disabled, and keep the list passing under `knobs` as well.
+fn passes_as_found(seed: u64, knobs: &Knobs, steps: &[Step]) {
+    passes_with(seed, &before_draft_34(knobs), steps);
+    passes_with(seed, knobs, steps);
+}
+
 /// The same content edited on every node at once: the identical-content
 /// merges tie on every field and were counted as rule-5 conflict decisions.
 #[test]
@@ -40,10 +60,12 @@ fn identical_content_everywhere_is_not_a_winner_fallback() {
 }
 
 /// The same directory created on two nodes: the same tie, on directories.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn the_same_directory_created_twice_is_not_a_winner_fallback() {
-    passes(
+    passes_as_found(
         1000,
+        &Knobs::default(),
         &[
             Step::Mkdir { node: 5, dir: 2 },
             Step::Tier {
@@ -169,10 +191,12 @@ fn entries_readmitted_from_the_deferred_set_respect_the_quarantine() {
 /// `revert` put the announced records back and removed never-announced adds
 /// without reporting either, so the persisted index kept the pending
 /// records and a restart would have re-announced the reverted changes.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_revert_reports_every_index_write() {
-    passes(
+    passes_as_found(
         0,
+        &Knobs::default(),
         &[
             Step::Settle { secs: 34 },
             Step::Modify {
@@ -1210,10 +1234,12 @@ fn a_batch_lost_in_flight_is_caught_up() {
 /// scan: the fast path compared size and mtime, and chmod changes neither,
 /// so the index disagreed with the disk about the exec bit forever. The
 /// fast path compares the exec bit now (§7.3).
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_chmod_the_watcher_missed_is_found_by_the_next_scan() {
-    passes(
+    passes_as_found(
         83,
+        &Knobs::default(),
         &[
             Step::Modify {
                 node: 0,
@@ -2817,10 +2843,12 @@ fn a_vector_a_revert_discarded_may_be_reached_again_by_a_merge() {
 /// A node removed a directory, paused on the deletes, and reverted: the
 /// tombstones were discarded unannounced, and I3 took one for a deletion the
 /// mesh had agreed on.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_tombstone_a_revert_discarded_is_not_a_deletion() {
-    passes(
+    passes_as_found(
         176,
+        &Knobs::default(),
         &[
             Step::Modify {
                 node: 1,
@@ -5483,10 +5511,12 @@ fn a_joined_versions_stamp_counts_for_the_deny_bump() {
 /// bracket end tombstoned the path, and everything that later arrived
 /// there stayed deferred (quiescence). A restoring want's commit now
 /// expects the path to be absent (§8.3 step 2).
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_reverts_refetch_expects_the_path_it_trashed_to_be_absent() {
-    passes(
+    passes_as_found(
         650,
+        &Knobs::default(),
         &[
             Step::Heal { a: 2, b: 5 },
             Step::Settle { secs: 19 },
@@ -8871,10 +8901,12 @@ fn a_conflict_copy_its_user_mass_deleted_is_not_lost() {
 }
 
 /// The same, with the copy rewritten by the user's mass modify.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_conflict_copy_its_user_rewrote_is_not_lost() {
-    passes(
+    passes_as_found(
         5665,
+        &Knobs::default(),
         &[
             Step::Heal { a: 3, b: 5 },
             Step::Touch { node: 7, path: 3 },
@@ -9100,10 +9132,12 @@ fn a_conflict_copy_its_user_rewrote_is_not_lost() {
 /// was lost (I1). A deny now waits while the folder is paused, and a
 /// revert that discards a deny returns its held item (§8.3): the pin fails
 /// with both off, and either one alone keeps it.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_deny_on_a_paused_folder_waits_instead_of_joining_the_pending_batch() {
-    passes(
+    passes_as_found(
         12922,
+        &Knobs::default(),
         &[
             Step::Chmod { node: 1, path: 6 },
             Step::Create {
@@ -11243,10 +11277,12 @@ fn a_queued_revert_waits_for_the_startup_scan_to_finish() {
 /// changes with the deny's bumps in the pending batch. The user's revert
 /// discarded them and the quarantine they had consumed (I1). revert now
 /// returns the held item (§8.3). Shrunk before that; fails without it.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_revert_that_discards_a_denys_bumps_returns_its_held_item() {
-    passes(
+    passes_as_found(
         17187,
+        &Knobs::default(),
         &[
             Step::Partition { a: 4, b: 3 },
             Step::Offline { node: 3 },
@@ -13690,9 +13726,10 @@ fn another_lost_conflict_commit_on_a_node_that_then_reverts() {
 /// shrunk to 23 steps: a want gave up after hash mismatches from two
 /// sources and stayed given up while those sources reconnected, so the
 /// file never arrived (§7.5).
+/// Replayed as found: group commit or the crash between renames alone loses its scenario (PR 1b).
 #[test]
 fn a_want_that_gave_up_is_wanted_again() {
-    passes_with(
+    passes_as_found(
         90057,
         &corrupting(),
         &[
@@ -15009,9 +15046,10 @@ fn a_source_excluded_after_one_mismatch_is_asked_again() {
 /// Seed 95175, fetch corruption on, 16 steps: after a revert, the only
 /// source of a want served one corrupted transfer and was never asked again
 /// (§7.5). Shrunk, it needs the expiry as well as draft 31's events.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_mismatch_after_a_revert_does_not_strand_the_file() {
-    passes_with(
+    passes_as_found(
         95175,
         &corrupting(),
         &[
@@ -15074,9 +15112,10 @@ fn a_mismatch_after_a_revert_does_not_strand_the_file() {
 /// the path again, and nothing changed at the path, so none of draft 31's
 /// events released it. Only the expiry does (§7.5, draft 32); this fails
 /// with the expiry disabled.
+/// Replayed as found: group commit or the crash between renames alone loses its scenario (PR 1b).
 #[test]
 fn an_exclusion_expires_for_a_file() {
-    passes_with(
+    passes_as_found(
         94206,
         &corrupting(),
         &[
@@ -15394,9 +15433,10 @@ fn an_exclusion_expires_for_a_file() {
 /// the path again, and nothing changed at the path, so none of draft 31's
 /// events released it. Only the expiry does (§7.5, draft 32); this fails
 /// with the expiry disabled.
+/// Replayed as found: group commit or the crash between renames alone loses its scenario (PR 1b).
 #[test]
 fn an_exclusion_expires_for_a_file_in_a_directory() {
-    passes_with(
+    passes_as_found(
         97955,
         &corrupting(),
         &[
@@ -17177,9 +17217,10 @@ fn an_exclusion_expires_for_a_symlink_conflict_copy() {
 /// the path again, and nothing changed at the path, so none of draft 31's
 /// events released it. Only the expiry does (§7.5, draft 32); this fails
 /// with the expiry disabled.
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn an_exclusion_expires_for_another_file_in_a_directory() {
-    passes_with(
+    passes_as_found(
         99246,
         &corrupting(),
         &[
@@ -19034,10 +19075,12 @@ fn a_peer_refused_during_a_reset_asks_again_when_it_lands() {
 /// the first run and failed once the restart window changed its course, the
 /// same way as 66033: a peer asked for d1/f4 while a reset was pending, was
 /// refused, and heard nothing when the reset landed (§7.1, §8.3).
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_peer_refused_during_another_reset_asks_again() {
-    passes(
+    passes_as_found(
         74284,
+        &Knobs::default(),
         &[
             Step::Touch { node: 5, path: 9 },
             Step::Create {
@@ -20618,10 +20661,12 @@ fn a_version_arriving_during_a_commit_does_not_drop_its_report() {
 /// different targets. Symlinks carry no mtime, so both losing versions have
 /// the same copy name, and I4 kept only the first loser under the shared
 /// vector (§14.1).
+/// Replayed as found: group commit or subtree displacement alone loses its scenario (PR 1b).
 #[test]
 fn two_losers_under_one_reissued_vector_both_count() {
-    passes(
+    passes_as_found(
         10187,
+        &Knobs::default(),
         &[
             Step::Offline { node: 6 },
             Step::Modify {
@@ -21016,10 +21061,12 @@ fn two_losers_under_one_reissued_vector_both_count() {
 /// Seed 15791, default knobs, shrunk to 96 steps: the same shape as
 /// 10187 at d2/f5, a vector issued twice across a revert for two symlink
 /// targets under one copy name (§14.1).
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn two_symlink_losers_under_one_reissued_vector_both_count() {
-    passes(
+    passes_as_found(
         15791,
+        &Knobs::default(),
         &[
             Step::Modify {
                 node: 2,
@@ -21367,9 +21414,10 @@ fn two_symlink_losers_under_one_reissued_vector_both_count() {
 /// deferred set, and then revert returns the denied item into that id. One
 /// item replaced the other, and a later version at d1/f10 joined the
 /// orphaned id and was lost (§8.2).
+/// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_denied_item_returned_into_a_held_id_loses_nothing() {
-    passes_with(
+    passes_as_found(
         90745,
         &corrupting(),
         &[
