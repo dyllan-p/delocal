@@ -23,7 +23,7 @@ use crate::folder::{
     Requested, ScanState, Ticked, UserDecision,
 };
 use crate::id::{BatchId, FolderId, HostName, NodeId};
-use crate::index::IndexRecord;
+use crate::index::{IndexRecord, Pending};
 use crate::parts::Rest;
 use crate::path::RelPath;
 use crate::quarantine::HeldRow;
@@ -251,6 +251,14 @@ pub enum Action {
         folder: FolderId,
         path: RelPath,
         want: Option<Box<Want>>,
+    },
+    /// A path's unannounced local change began, changed or ended;
+    /// persistence hook (§11), one row per path. `None` once the change is
+    /// announced, adopted over or reverted.
+    PendingChanged {
+        folder: FolderId,
+        path: RelPath,
+        row: Option<Pending>,
     },
     /// A held item changed; persistence hook (§11), one row per item.
     /// `None` when it is no longer held.
@@ -601,6 +609,13 @@ impl Engine {
                     rest: Box::new(rest.clone()),
                 });
                 self.rested.insert(*id, rest);
+            }
+            for (path, row) in folder.pending_changes() {
+                out.push(Action::PendingChanged {
+                    folder: *id,
+                    path,
+                    row,
+                });
             }
             for (batch, row) in folder.held_changes() {
                 out.push(Action::HeldChanged {
@@ -1113,6 +1128,7 @@ mod tests {
                 !matches!(
                     a,
                     Action::WantChanged { .. }
+                        | Action::PendingChanged { .. }
                         | Action::HeldChanged { .. }
                         | Action::DeferredChanged { .. }
                         | Action::RestChanged { .. }
