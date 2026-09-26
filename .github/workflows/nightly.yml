@@ -1,11 +1,16 @@
-# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds, the last tenth
-# of them with fetch corruption on, sharded across twenty jobs. Each night
-# starts at a different seed, day of year × 100,000 (see the plan job).
+# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds in three
+# slices (the default knobs, a tenth of the seeds with fetch corruption
+# on, and 4,000 seeds at 2,000 steps instead of 400), sharded across
+# twenty jobs. Each night starts at a different seed, day of year ×
+# 100,000 (see the plan job).
 #
 # The simulator runs one seed at a time on one core, and 100,000 seeds take
 # about a day that way. A job on a GitHub-hosted runner is stopped after six
-# hours, so the seeds are split into twenty shards of 5,000, each well
-# inside that limit, running side by side.
+# hours, so the seeds are split into twenty shards, each well inside that
+# limit, running side by side. Sixteen share the 96,000 seeds at 400 steps,
+# 6,000 each. Four share the 4,000 at 2,000 steps, 1,000 each, because a
+# 2,000-step seed takes about five times as long to run. Twenty is also the
+# most jobs GitHub Free runs at once, so no shard waits for another.
 
 name: Nightly simulation
 
@@ -96,24 +101,37 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p delocal-sim
 
-      # This shard's share of the night's seeds, worked out as in ci.yml:
-      # `from` and `to` count from START. The first nine tenths of the
-      # night run with the default knobs and the last tenth with fetch
-      # corruption on, so the HashMismatch path is exercised every night.
+      # This shard's share of the night's seeds: `from` and `to` count from
+      # START. The night has three slices. The first 86% run with the
+      # default knobs. The next tenth run with fetch corruption on, so the
+      # HashMismatch path is exercised every night. The last 4% run 2,000
+      # steps instead of 400, to reach states a short run never builds up
+      # to. The first SHARDS - LONG_SHARDS shards split the two 400-step
+      # slices between them, as in ci.yml, and the last LONG_SHARDS split
+      # the long-run slice, so every shard does about the same work.
       # `slice` runs the part of this shard that falls in one slice, so a
-      # shard whose range crosses the line runs both parts. `--keep-going`
-      # runs every seed in both parts, so one failure cannot hide another.
+      # shard whose range crosses a line runs both parts. `--keep-going`
+      # runs every seed in every part, so one failure cannot hide another.
       # The log starts with the shard's number and ends with "shard done"
       # only if every part ran to the end.
       - name: Simulate
         env:
           SHARD: ${{ strategy.job-index }}
           SHARDS: ${{ strategy.job-total }}
+          LONG_SHARDS: 4
         run: |
           set -uo pipefail
-          main=$(( SEEDS * 9 / 10 ))
-          from=$(( SEEDS * SHARD / SHARDS ))
-          to=$(( SEEDS * (SHARD + 1) / SHARDS ))
+          corrupt_from=$(( SEEDS * 86 / 100 ))
+          long_from=$(( SEEDS * 96 / 100 ))
+          short=$(( SHARDS - LONG_SHARDS ))
+          if [ "$SHARD" -lt "$short" ]; then
+            from=$(( long_from * SHARD / short ))
+            to=$(( long_from * (SHARD + 1) / short ))
+          else
+            i=$(( SHARD - short ))
+            from=$(( long_from + (SEEDS - long_from) * i / LONG_SHARDS ))
+            to=$(( long_from + (SEEDS - long_from) * (i + 1) / LONG_SHARDS ))
+          fi
           echo "shard $(( SHARD + 1 )) of $SHARDS: seeds $(( START + from ))..$(( START + to ))" > sim.log
           status=0
           # slice LO HI FLAGS...: this shard's seeds from LO up to HI,
@@ -125,8 +143,9 @@ jobs:
             ./target/release/delocal-sim --seeds "$(( hi - lo ))" --start "$(( START + lo ))" "$@" --keep-going 2>&1 | tee -a sim.log
             [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
           }
-          slice 0 "$main"
-          slice "$main" "$SEEDS" --corruption 0.05
+          slice 0 "$corrupt_from"
+          slice "$corrupt_from" "$long_from" --corruption 0.05
+          slice "$long_from" "$SEEDS" --steps 2000
           echo "shard done" >> sim.log
           exit "$status"
 
@@ -171,7 +190,9 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           logs=(logs/*/sim.log)
-          main=$(( SEEDS * 9 / 10 ))
+          # Where the slices start, as in the Simulate step.
+          corrupt_from=$(( SEEDS * 86 / 100 ))
+          long_from=$(( SEEDS * 96 / 100 ))
 
           # Every failing seed from every shard, in seed order.
           cat "${logs[@]}" /dev/null | { grep -E '^seed [0-9]+ failed' || true; } | sort -k2,2n > failures.txt
@@ -214,7 +235,7 @@ jobs:
             echo "Commit: $GITHUB_SHA"
             echo "First seed: $START"
             echo
-            echo "$failed of $SEEDS seeds failed. Seeds $START to $(( START + main - 1 )) ran with the default knobs, seeds $(( START + main )) to $(( START + SEEDS - 1 )) with \`--corruption 0.05\`."
+            echo "$failed of $SEEDS seeds failed. Seeds $START to $(( START + corrupt_from - 1 )) ran with the default knobs, seeds $(( START + corrupt_from )) to $(( START + long_from - 1 )) with \`--corruption 0.05\`, and seeds $(( START + long_from )) to $(( START + SEEDS - 1 )) with \`--steps 2000\`."
             if [ -n "$counts" ]; then
               echo
               echo '| Invariant | Seeds |'
