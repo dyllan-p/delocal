@@ -43,7 +43,7 @@
 //! before it reports; no tolerance is applied to mtime here, the precision
 //! shim being host work too (§7.3).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -95,6 +95,21 @@ pub struct Reverted {
     pub restored: Option<IndexRecord>,
 }
 
+/// One path's unannounced local change: a row of the pending set (§11).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pending {
+    /// The record peers last saw at the path, `None` if they never saw it.
+    /// Fixes the change's kind and `prev_hash`, and is what `revert`
+    /// restores (§7.1, §8.3).
+    pub announced_record: Option<IndexRecord>,
+    /// The change is a tombstone the engine wrote itself because no member
+    /// holds the content (§8.3 step 4). The sender pre-check does not count
+    /// it (§8.1): nothing anywhere can be lost by it, and counting it would
+    /// pause the folder again on the very deletions `revert` just failed to
+    /// undo. Cleared when the user changes the path again before the batch.
+    pub exempt: bool,
+}
+
 /// A local change the index has recorded and the engine will batch (§7.4).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalChange {
@@ -114,17 +129,8 @@ pub struct Index {
     /// What we hold of each remote member's `seq` space (§7.4): the
     /// contiguous watermark and the received ranges above it.
     peer_seq: BTreeMap<NodeId, Watermark>,
-    /// Local changes not yet announced, with the record peers last saw at
-    /// the path (`None` if they never saw it). Fixes the change's kind and
-    /// `prev_hash`, and is what `revert` restores.
-    pending: BTreeMap<RelPath, Option<IndexRecord>>,
-    /// Pending paths whose change is a tombstone the engine wrote itself
-    /// because no member holds the content (§8.3 step 4). The sender
-    /// pre-check does not count them (§8.1): nothing anywhere can be lost by
-    /// them, and counting them would pause the folder again on the very
-    /// deletions `revert` just failed to undo. Cleared with the pending set,
-    /// and dropped for a path the user changes again before the batch.
-    exempt: BTreeSet<RelPath>,
+    /// Local changes not yet announced, by path (see [`Pending`]).
+    pending: BTreeMap<RelPath, Pending>,
     /// `seq` of the newest record in the last batch this machine formed
     /// (§7.4). Records above it, local or adopted, go in the next batch.
     announced_seq: u64,
@@ -171,7 +177,6 @@ impl Index {
             seq: 0,
             peer_seq: BTreeMap::new(),
             pending: BTreeMap::new(),
-            exempt: BTreeSet::new(),
             announced_seq: 0,
             announced_tracked: 0,
         }
@@ -278,7 +283,7 @@ impl Index {
             .records
             .iter()
             .filter_map(|(path, record)| match self.pending.get(path) {
-                Some(kept) => kept.as_ref().filter(announced),
+                Some(kept) => kept.announced_record.as_ref().filter(announced),
                 None => Some(record).filter(announced),
             })
             .filter(|r| r.seq > after)
@@ -326,11 +331,11 @@ impl Index {
     /// Local changes not yet announced, in path order, with the coalesced
     /// kind of each. Batch formation (§7.4) reads this.
     pub fn pending(&self) -> impl Iterator<Item = (&IndexRecord, ChangeKind)> {
-        self.pending.iter().filter_map(|(path, announced)| {
+        self.pending.iter().filter_map(|(path, row)| {
             self.records.get(path).map(|r| {
                 (
                     r,
-                    ChangeKind::between(Self::is_live(announced), !r.entry.deleted),
+                    ChangeKind::between(Self::is_live(&row.announced_record), !r.entry.deleted),
                 )
             })
         })
@@ -358,18 +363,12 @@ impl Index {
 
     /// The coalesced kind of the pending local change at `path`, if any.
     pub fn pending_kind(&self, path: &RelPath) -> Option<ChangeKind> {
-        let announced = self.pending.get(path)?;
+        let row = self.pending.get(path)?;
         let record = self.records.get(path)?;
         Some(ChangeKind::between(
-            Self::is_live(announced),
+            Self::is_live(&row.announced_record),
             !record.entry.deleted,
         ))
-    }
-
-    /// Paths whose pending tombstone is exempt from the sender pre-check
-    /// (§8.1), in path order.
-    pub fn exempt_paths(&self) -> impl Iterator<Item = &RelPath> {
-        self.exempt.iter()
     }
 
     /// Tracked count as of the last announcement (§8.1, sender pre-check).
@@ -394,7 +393,7 @@ impl Index {
             .map(|(path, r)| {
                 // An unrecoverable tombstone travels in the batch like any
                 // record but counts for nothing (§8.1).
-                let kind = if self.exempt.contains(path) {
+                let kind = if self.pending.get(path).is_some_and(|row| row.exempt) {
                     None
                 } else {
                     self.pending_kind(path)
@@ -411,7 +410,6 @@ impl Index {
     /// next batch starts above the current `seq`.
     pub fn mark_announced(&mut self) {
         self.pending.clear();
-        self.exempt.clear();
         self.announced_seq = self.seq;
         self.announced_tracked = self.tracked_count();
     }
@@ -426,7 +424,8 @@ impl Index {
     /// record's hash, else `EMPTY`.
     fn announced_hash(&self, path: &RelPath) -> ContentHash {
         match self.pending.get(path) {
-            Some(announced) => announced
+            Some(row) => row
+                .announced_record
                 .as_ref()
                 .map_or(ContentHash::EMPTY, |r| r.entry.hash),
             None => self
@@ -482,27 +481,6 @@ impl Index {
     /// The scanner found nothing at `path`. If a live entry was there, it
     /// becomes a tombstone (§7.7) dated `at_ns`; otherwise nothing happens.
     pub fn observe_absent(&mut self, path: &RelPath, at_ns: i64) -> Option<LocalChange> {
-        let change = self.observe_absent_inner(path, at_ns)?;
-        self.exempt.remove(path);
-        Some(change)
-    }
-
-    /// The tombstone §8.3 step 4 writes when every member has answered
-    /// `NotAvailable` for a restored record: a local deletion like
-    /// [`Index::observe_absent`], announced like one, but exempt from the
-    /// sender pre-check (§8.1) since no member holds the content it
-    /// removes.
-    pub fn observe_absent_unrecoverable(
-        &mut self,
-        path: &RelPath,
-        at_ns: i64,
-    ) -> Option<LocalChange> {
-        let change = self.observe_absent_inner(path, at_ns)?;
-        self.exempt.insert(path.clone());
-        Some(change)
-    }
-
-    fn observe_absent_inner(&mut self, path: &RelPath, at_ns: i64) -> Option<LocalChange> {
         let previous = self.live(path)?;
         let entry = Entry {
             path: path.clone(),
@@ -519,6 +497,23 @@ impl Index {
             author_host: self.host.clone(),
         };
         Some(self.write(entry))
+    }
+
+    /// The tombstone §8.3 step 4 writes when every member has answered
+    /// `NotAvailable` for a restored record: a local deletion like
+    /// [`Index::observe_absent`], announced like one, but exempt from the
+    /// sender pre-check (§8.1) since no member holds the content it
+    /// removes.
+    pub fn observe_absent_unrecoverable(
+        &mut self,
+        path: &RelPath,
+        at_ns: i64,
+    ) -> Option<LocalChange> {
+        let change = self.observe_absent(path, at_ns)?;
+        if let Some(row) = self.pending.get_mut(path) {
+            row.exempt = true;
+        }
+        Some(change)
     }
 
     /// The conflict copy of a displaced losing file (§7.6): `loser`'s kind,
@@ -583,10 +578,7 @@ impl Index {
         }
         let seq = self.next_seq();
         let path = entry.path.clone();
-        // The path is no longer pending, so it is no longer exempt either:
-        // the exemption belongs to the pending change it was written for.
         self.pending.remove(&path);
-        self.exempt.remove(&path);
         self.records
             .insert(path.clone(), IndexRecord { entry, seq });
         self.records.get(&path)
@@ -594,15 +586,18 @@ impl Index {
 
     /// Record a local change. If the path has no pending change yet, the
     /// record being replaced is what peers last saw, and is kept for
-    /// `prev_hash`, the change's kind and `revert`.
+    /// `prev_hash`, the change's kind and `revert`. The change is an
+    /// ordinary one, not exempt, whatever the path's pending change was.
     fn write(&mut self, entry: Entry) -> LocalChange {
         let seq = self.next_seq();
         let path = entry.path.clone();
-        // Whatever the user does at the path next is an ordinary change.
-        self.exempt.remove(&path);
         let previous = self.records.get(&path).cloned();
-        let announced = self.pending.entry(path.clone()).or_insert(previous);
-        let kind = ChangeKind::between(Self::is_live(announced), !entry.deleted);
+        let row = self.pending.entry(path.clone()).or_insert(Pending {
+            announced_record: previous,
+            exempt: false,
+        });
+        row.exempt = false;
+        let kind = ChangeKind::between(Self::is_live(&row.announced_record), !entry.deleted);
         let record = IndexRecord { entry, seq };
         self.records.insert(path, record.clone());
         LocalChange { kind, record }
@@ -678,17 +673,16 @@ impl Index {
     /// pending set empties. Returns what happened per path, in path order.
     pub fn revert_pending(&mut self) -> Vec<Reverted> {
         let pending = std::mem::take(&mut self.pending);
-        self.exempt.clear();
         let mut out = Vec::with_capacity(pending.len());
-        for (path, announced) in pending {
+        for (path, row) in pending {
             let current = self.records.remove(&path);
-            if let Some(record) = &announced {
+            if let Some(record) = &row.announced_record {
                 self.records.insert(path.clone(), record.clone());
             }
             out.push(Reverted {
                 path,
                 current: current.map(|r| r.entry),
-                restored: announced,
+                restored: row.announced_record,
             });
         }
         out
@@ -1324,26 +1318,6 @@ mod tests {
             Some(ChangeKind::Delete),
             "the exemption does not survive a revert"
         );
-    }
-
-    /// A version adopted over an unrecoverable tombstone before the next
-    /// batch (a concurrent version won, or the merge did) ends the pending
-    /// change, and the exemption with it: every exempt path is pending.
-    #[test]
-    fn adopting_over_an_unrecoverable_tombstone_ends_the_exemption() {
-        let mut idx = index();
-        idx.observe(p("b"), file(2, 2)).unwrap();
-        idx.mark_announced();
-        let tombstone = idx
-            .observe_absent_unrecoverable(&p("b"), 5)
-            .unwrap()
-            .record
-            .entry;
-        assert_eq!(idx.exempt_paths().collect::<Vec<_>>(), [&p("b")]);
-        let merged = remote("b", 9, tombstone.version.incremented(node(2)));
-        idx.adopt(merged).unwrap();
-        assert!(!idx.is_pending(&p("b")));
-        assert_eq!(idx.exempt_paths().count(), 0);
     }
 
     #[test]
