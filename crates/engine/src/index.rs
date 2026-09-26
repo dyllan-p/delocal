@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::{ContentHash, Entry, Kind, Observed};
 use crate::id::{HostName, NodeId};
+use crate::parts::Changed;
 use crate::path::RelPath;
 use crate::version::Version;
 
@@ -131,6 +132,9 @@ pub struct Index {
     peer_seq: BTreeMap<NodeId, Watermark>,
     /// Local changes not yet announced, by path (see [`Pending`]).
     pending: BTreeMap<RelPath, Pending>,
+    /// Pending rows that changed since the last drain (§11).
+    #[serde(skip)]
+    pending_changed: Changed<RelPath>,
     /// `seq` of the newest record in the last batch this machine formed
     /// (§7.4). Records above it, local or adopted, go in the next batch.
     announced_seq: u64,
@@ -177,6 +181,7 @@ impl Index {
             seq: 0,
             peer_seq: BTreeMap::new(),
             pending: BTreeMap::new(),
+            pending_changed: Changed::default(),
             announced_seq: 0,
             announced_tracked: 0,
         }
@@ -362,6 +367,21 @@ impl Index {
         self.pending.keys()
     }
 
+    /// Pending rows that changed since the last call, each as it stands
+    /// (`None` once the path's change is announced, adopted over or
+    /// reverted), in path order: the `PendingChanged` persistence hook
+    /// (§11).
+    pub fn pending_changes(&mut self) -> Vec<(RelPath, Option<Pending>)> {
+        self.pending_changed
+            .take()
+            .into_iter()
+            .map(|path| {
+                let row = self.pending.get(&path).cloned();
+                (path, row)
+            })
+            .collect()
+    }
+
     /// Number of paths with an unannounced local change.
     pub fn pending_count(&self) -> usize {
         self.pending.len()
@@ -415,6 +435,9 @@ impl Index {
     /// Later changes start a new step from the announced version, and the
     /// next batch starts above the current `seq`.
     pub fn mark_announced(&mut self) {
+        for path in self.pending.keys() {
+            self.pending_changed.note(path);
+        }
         self.pending.clear();
         self.announced_seq = self.seq;
         self.announced_tracked = self.tracked_count();
@@ -518,6 +541,7 @@ impl Index {
         let change = self.observe_absent(path, at_ns)?;
         if let Some(row) = self.pending.get_mut(path) {
             row.exempt = true;
+            self.pending_changed.note(path);
         }
         Some(change)
     }
@@ -584,7 +608,9 @@ impl Index {
         }
         let seq = self.next_seq();
         let path = entry.path.clone();
-        self.pending.remove(&path);
+        if self.pending.remove(&path).is_some() {
+            self.pending_changed.note(&path);
+        }
         self.records
             .insert(path.clone(), IndexRecord { entry, seq });
         self.records.get(&path)
@@ -598,6 +624,7 @@ impl Index {
         let seq = self.next_seq();
         let path = entry.path.clone();
         let previous = self.records.get(&path).cloned();
+        self.pending_changed.note(&path);
         let row = self.pending.entry(path.clone()).or_insert(Pending {
             announced_record: previous,
             exempt: false,
@@ -681,6 +708,7 @@ impl Index {
         let pending = std::mem::take(&mut self.pending);
         let mut out = Vec::with_capacity(pending.len());
         for (path, row) in pending {
+            self.pending_changed.note(&path);
             let current = self.records.remove(&path);
             if let Some(record) = &row.announced_record {
                 self.records.insert(path.clone(), record.clone());
@@ -1324,6 +1352,47 @@ mod tests {
             Some(ChangeKind::Delete),
             "the exemption does not survive a revert"
         );
+    }
+
+    /// §11: every change to the pending set reports the row as it stands,
+    /// once, and a row that ends reports `None`.
+    #[test]
+    fn pending_rows_are_reported_as_they_change() {
+        let mut idx = index();
+        idx.observe(p("a"), file(1, 1)).unwrap();
+        idx.observe(p("b"), file(2, 2)).unwrap();
+        let rows = idx.pending_changes();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(_, r)| {
+            r.as_ref()
+                .is_some_and(|r| r.announced_record.is_none() && !r.exempt)
+        }));
+        assert!(idx.pending_changes().is_empty(), "reported once");
+
+        idx.mark_announced();
+        assert_eq!(idx.pending_changes(), [(p("a"), None), (p("b"), None)]);
+
+        let announced = idx.get(&p("b")).cloned();
+        idx.observe_absent_unrecoverable(&p("b"), 5).unwrap();
+        assert_eq!(
+            idx.pending_changes(),
+            [(
+                p("b"),
+                Some(Pending {
+                    announced_record: announced.clone(),
+                    exempt: true
+                })
+            )]
+        );
+        let tombstone = idx.get(&p("b")).unwrap().entry.version.clone();
+        idx.adopt(remote("b", 9, tombstone.incremented(node(2))))
+            .unwrap();
+        assert_eq!(idx.pending_changes(), [(p("b"), None)], "adopted over");
+
+        idx.observe(p("a"), file(3, 3)).unwrap();
+        idx.pending_changes();
+        idx.revert_pending();
+        assert_eq!(idx.pending_changes(), [(p("a"), None)], "reverted");
     }
 
     #[test]

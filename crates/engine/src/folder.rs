@@ -72,7 +72,7 @@ use crate::batch::{self, ApplyItem, ApplyMode, ApplySet, Batch, Decision, Summar
 use crate::brake::{self, HoldReason, Verdict};
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
-use crate::index::{Index, IndexRecord, LocalChange, Reverted};
+use crate::index::{Index, IndexRecord, LocalChange, Pending, Reverted};
 use crate::parts::{Changed, Rest};
 use crate::path::RelPath;
 use crate::quarantine::{HeldItem, HeldRow, Quarantine};
@@ -690,6 +690,12 @@ impl FolderState {
             arrivals: self.quarantine.arrivals(),
             winner_fallbacks: self.winner_fallbacks,
         }
+    }
+
+    /// Pending rows that changed since the last call, for the
+    /// `PendingChanged` persistence hook (§11).
+    pub fn pending_changes(&mut self) -> Vec<(RelPath, Option<Pending>)> {
+        self.index.pending_changes()
     }
 
     /// Held items whose row changed since the last call, for the
