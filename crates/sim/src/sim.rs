@@ -48,6 +48,8 @@ const EVENT_BUDGET: usize = 400_000;
 /// makes the same draws in the same order whether the model is on or off,
 /// and a seed's history changes only where the model does something.
 const JOURNAL_STREAM: u64 = 1;
+/// The PRNG stream group commit draws its lags from (§11).
+const GROUP_STREAM: u64 = 2;
 
 /// What a clean run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +84,10 @@ pub struct Stats {
     /// Displacements the commit journal undid: at a restart, or because the
     /// rename after them failed (§7.5).
     pub displacements_undone: u64,
+    /// Crashes that lost an open group of writes (§11).
+    pub groups_lost: u64,
+    /// Effects lost with those groups, never performed.
+    pub effects_lost: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -257,6 +263,13 @@ struct Node {
     /// (§11); `None` while the node runs.
     #[serde(skip)]
     crashed: Option<FolderState>,
+    /// Writes not yet durable and the effects waiting for them (§11).
+    #[serde(skip)]
+    group: Option<Group>,
+    /// With a group-commit lag, the folder as it stood when its last group
+    /// became durable: what a crash now would restart into (§11).
+    #[serde(skip)]
+    durable: Option<FolderState>,
     online: bool,
     restart_at: Option<Timestamp>,
     fs: BTreeMap<RelPath, File>,
@@ -373,6 +386,72 @@ struct JournalRow {
     trash_at: usize,
 }
 
+/// A group of writes on its way to durability, and the effects that wait
+/// for it (§11 group commit).
+struct Group {
+    /// Table writes in the order they were made.
+    writes: Vec<Staged>,
+    /// Effects in the order the engine asked for them.
+    effects: Vec<Held>,
+    /// Events still to join the group before it becomes durable.
+    left: u32,
+}
+
+/// A table write with the clock and event count it was made at, which the
+/// invariant tracking records when the write becomes durable.
+struct Staged {
+    write: TableWrite,
+    at: Timestamp,
+    event: u64,
+}
+
+/// A write to the persisted store (§11).
+enum TableWrite {
+    /// A persistence hook's row.
+    Hook(Box<Action>),
+    /// The folder's rules, which the host keeps itself.
+    Rules(Rules),
+}
+
+/// An effect: something that reaches the disk or the network (§11).
+enum Held {
+    Send {
+        to: NodeId,
+        payload: Outbound,
+    },
+    Fetch {
+        path: RelPath,
+        version: Version,
+        hash: ContentHash,
+        size: u64,
+        from: NodeId,
+    },
+    /// `Write`, `Remove` or `SetMeta`, with the version of the want it
+    /// commits as the engine asked for it.
+    Commit {
+        path: RelPath,
+        version: Version,
+        action: Box<Action>,
+    },
+    MoveToTrash {
+        path: RelPath,
+    },
+}
+
+/// A persistence hook: an action the host writes to its tables (§11).
+fn is_table_write(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::IndexChanged { .. }
+            | Action::IndexRemoved { .. }
+            | Action::WantChanged { .. }
+            | Action::PendingChanged { .. }
+            | Action::HeldChanged { .. }
+            | Action::DeferredChanged { .. }
+            | Action::RestChanged { .. }
+    )
+}
+
 /// What the host did with a commit.
 enum Committed {
     /// Report this outcome to the engine.
@@ -389,6 +468,8 @@ pub struct Sim {
     rng: ChaCha8Rng,
     /// Draws for the crash between two renames, on `JOURNAL_STREAM`.
     journal_rng: ChaCha8Rng,
+    /// Draws for group commit's lags, on `GROUP_STREAM`.
+    group_rng: ChaCha8Rng,
     clock: Timestamp,
     folder: FolderId,
     rules: Rules,
@@ -460,6 +541,8 @@ impl Sim {
                 skew_ns,
                 engine: None,
                 crashed: None,
+                group: None,
+                durable: None,
                 online: true,
                 restart_at: None,
                 fs: BTreeMap::new(),
@@ -491,11 +574,14 @@ impl Sim {
         }
         let mut journal_rng = ChaCha8Rng::seed_from_u64(seed);
         journal_rng.set_stream(JOURNAL_STREAM);
+        let mut group_rng = ChaCha8Rng::seed_from_u64(seed);
+        group_rng.set_stream(GROUP_STREAM);
         let mut sim = Self {
             seed,
             knobs,
             rng,
             journal_rng,
+            group_rng,
             clock,
             folder,
             rules,
@@ -535,6 +621,9 @@ impl Sim {
                     members: ids.clone(),
                 },
             );
+            // Joining a folder is durable before the daemon does anything
+            // else, or a crash could leave it with no rest row at all.
+            let _ = sim.flush(*id);
         }
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
@@ -631,6 +720,12 @@ impl Sim {
             let end = self.clock.plus_nanos(FINAL_ROUND_NANOS);
             self.run_until(end)?;
             if self.quiescent() {
+                // An idle daemon commits what it has written. Only writes
+                // are left (quiescence holds no effects), so this changes
+                // nothing but the tables and what the invariants track.
+                for id in &ids {
+                    self.flush(*id)?;
+                }
                 return Ok(());
             }
             if round + 1 == FINAL_ROUNDS {
@@ -654,6 +749,7 @@ impl Sim {
             };
             n.online
                 && n.restart_at.is_none()
+                && n.group.as_ref().is_none_or(|g| g.effects.is_empty())
                 && f.window().is_none()
                 && f.due().is_none()
                 && f.quarantine().is_empty()
@@ -845,6 +941,14 @@ impl Sim {
     // ---------------------------------------------------------------- engine I/O
 
     /// Hand an event to a node's engine and carry out its actions.
+    ///
+    /// Writes and effects follow §11's group commit. An event that writes
+    /// anything joins the node's open group of writes, or opens one, and the
+    /// group becomes durable a drawn number of events later (when the event
+    /// ends, with `--group-commit-lag 0`). The effects of every event in the
+    /// group, file operations and sends, wait for it and are performed in
+    /// order once it is durable. An event that writes nothing while no group
+    /// is open depends on nothing unwritten, and its effects happen at once.
     fn feed(&mut self, id: NodeId, event: Event) -> Result<(), Failure> {
         let now = self.now_for(id);
         let actions = {
@@ -859,15 +963,86 @@ impl Sim {
         if let Ok(bytes) = postcard::to_stdvec(&actions) {
             self.log.update(&bytes);
         }
+        // Opened before any action is carried out: an event's effects wait
+        // for its writes even when the engine lists the effect first.
+        if actions.iter().any(is_table_write) {
+            self.open_group(id);
+        }
         for action in actions {
             self.act(id, action)?;
         }
-        self.check_persisted(id)
+        self.event_done(id)
     }
 
-    /// After every event, the tables the hooks wrote must be the engine's
-    /// parts (§11): a missing or wrong hook fails at the event that should
-    /// have reported the change, not at some later restart.
+    /// Open a group of writes on `id` unless one is open (§11), and draw how
+    /// many further events it waits for before it becomes durable.
+    fn open_group(&mut self, id: NodeId) {
+        let lag = self.knobs.group_commit_lag;
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        if node.group.is_none() {
+            let left = if lag == 0 {
+                0
+            } else {
+                self.group_rng.random_range(0..=lag)
+            };
+            node.group = Some(Group {
+                writes: Vec::new(),
+                effects: Vec::new(),
+                left,
+            });
+        }
+    }
+
+    /// After an event on `id`: the open group becomes durable if this event
+    /// was its last. With no group open, nothing is waiting to be written,
+    /// so the tables must already be the engine's parts.
+    fn event_done(&mut self, id: NodeId) -> Result<(), Failure> {
+        let durable = match self.nodes.get_mut(&id).map(|n| &mut n.group) {
+            Some(Some(group)) if group.left > 0 => {
+                group.left -= 1;
+                return Ok(());
+            }
+            Some(Some(_)) => true,
+            _ => false,
+        };
+        if durable {
+            self.flush(id)
+        } else {
+            self.check_persisted(id)
+        }
+    }
+
+    /// The open group on `id` becomes durable (§11): its writes reach the
+    /// tables, which must then be the engine's parts, and the effects that
+    /// waited for it are performed in order. With a lag the folder is kept
+    /// as it stands now, for the check at the next restart: a crash before
+    /// the next group is durable restarts from exactly these tables.
+    fn flush(&mut self, id: NodeId) -> Result<(), Failure> {
+        let Some(group) = self.nodes.get_mut(&id).and_then(|n| n.group.take()) else {
+            return Ok(());
+        };
+        for staged in group.writes {
+            self.record(id, staged)?;
+        }
+        self.check_persisted(id)?;
+        if self.knobs.group_commit_lag > 0 {
+            let folder = self.folder;
+            if let Some(n) = self.nodes.get_mut(&id) {
+                n.durable = n.engine.as_ref().and_then(|e| e.folder(folder)).cloned();
+            }
+        }
+        for held in group.effects {
+            self.perform(id, held)?;
+        }
+        Ok(())
+    }
+
+    /// Whenever a group becomes durable, and after every event while none is
+    /// open, the tables the hooks wrote must be the engine's parts (§11): a
+    /// missing or wrong hook fails at the first such point after the event
+    /// that should have reported the change, not at some later restart.
     fn check_persisted(&mut self, id: NodeId) -> Result<(), Failure> {
         let folder = self.folder;
         let Some(node) = self.nodes.get_mut(&id) else {
@@ -940,7 +1115,8 @@ impl Sim {
                     n.wake_at = Some(n.wake_at.map_or(global, |w| w.min(global)));
                 }
             }
-            Action::Send { to, payload } => self.send(id, to, payload)?,
+            // Effects wait for the open group, if any (§11).
+            Action::Send { to, payload } => self.hold(id, Held::Send { to, payload })?,
             Action::Fetch {
                 path,
                 version,
@@ -948,75 +1124,53 @@ impl Sim {
                 size,
                 from,
                 ..
-            } => {
-                self.stats.fetches += 1;
-                let tier = self.link(id, from).map_or(Tier::Relay, |l| l.tier);
-                let per_byte = match tier {
-                    Tier::Lan => 1_000_000,
-                    Tier::Direct => 5_000_000,
-                    Tier::Relay => 20_000_000,
-                };
-                let mut duration = 200_000_000 + size as i64 * per_byte;
-                if self.rng.random_range(0u32..10) == 0 {
-                    // A slow link now and then, so stalls and progress matter.
-                    duration += self.rng.random_range(30 * NANOS..120 * NANOS);
-                }
-                let corrupt =
-                    self.corruption_on && self.rng.random::<f64>() < self.knobs.corruption;
-                self.ops.push(Op::Fetch {
-                    node: id,
-                    from,
+            } => self.hold(
+                id,
+                Held::Fetch {
                     path,
                     version,
                     hash,
-                    done_at: self.clock.plus_nanos(duration),
-                    next_progress: self.clock.plus_nanos(2 * NANOS),
-                    corrupt,
-                });
-            }
+                    size,
+                    from,
+                },
+            )?,
             Action::Write {
                 ref path,
                 ref entry,
                 ..
             } => {
-                let done_at = self
-                    .clock
-                    .plus_nanos(self.rng.random_range(50_000_000..500_000_000));
-                self.ops.push(Op::Commit {
-                    node: id,
-                    path: path.clone(),
-                    version: entry.version.clone(),
-                    action: Box::new(action),
-                    done_at,
-                    suspended: false,
-                });
+                let (path, version) = (path.clone(), entry.version.clone());
+                self.hold(
+                    id,
+                    Held::Commit {
+                        path,
+                        version,
+                        action: Box::new(action),
+                    },
+                )?;
             }
             Action::Remove { ref path, .. } | Action::SetMeta { ref path, .. } => {
+                // The version the commit is for is the want's as the engine
+                // asks for it, not as it stands when the commit is performed.
+                let path = path.clone();
                 let version = self
                     .nodes
                     .get(&id)
                     .and_then(|n| n.engine.as_ref())
                     .and_then(|e| e.folder(self.folder))
-                    .and_then(|f| f.wants().get(path))
+                    .and_then(|f| f.wants().get(&path))
                     .map(|w| w.version().clone())
                     .unwrap_or_default();
-                let done_at = self
-                    .clock
-                    .plus_nanos(self.rng.random_range(50_000_000..500_000_000));
-                self.ops.push(Op::Commit {
-                    node: id,
-                    path: path.clone(),
-                    version,
-                    action: Box::new(action),
-                    done_at,
-                    suspended: false,
-                });
+                self.hold(
+                    id,
+                    Held::Commit {
+                        path,
+                        version,
+                        action: Box::new(action),
+                    },
+                )?;
             }
-            Action::MoveToTrash { path, .. } => {
-                if let Some(n) = self.nodes.get_mut(&id) {
-                    move_to_trash(n, &path);
-                }
-            }
+            Action::MoveToTrash { path, .. } => self.hold(id, Held::MoveToTrash { path })?,
             Action::RecordBatch {
                 batch,
                 role,
@@ -1076,6 +1230,84 @@ impl Sim {
                     self.stats.paused += 1;
                 }
             },
+            // Table writes join the open group, which `feed` opened for any
+            // event that writes.
+            Action::IndexChanged { .. }
+            | Action::IndexRemoved { .. }
+            | Action::WantChanged { .. }
+            | Action::PendingChanged { .. }
+            | Action::HeldChanged { .. }
+            | Action::DeferredChanged { .. }
+            | Action::RestChanged { .. } => {
+                let staged = Staged {
+                    write: TableWrite::Hook(Box::new(action)),
+                    at: self.clock,
+                    event: self.stats.events,
+                };
+                match self.nodes.get_mut(&id).and_then(|n| n.group.as_mut()) {
+                    Some(group) => group.writes.push(staged),
+                    None => self.record(id, staged)?,
+                }
+            }
+            Action::StatusChanged { status, .. } => match status {
+                FolderStatus::Paused { .. } => {
+                    if let Some(n) = self.nodes.get_mut(&id) {
+                        n.paused = true;
+                    }
+                }
+                FolderStatus::Unpaused { .. } | FolderStatus::Reverted { .. } => {
+                    if matches!(status, FolderStatus::Reverted { .. }) {
+                        self.stats.reverts += 1;
+                    }
+                    if let Some(n) = self.nodes.get_mut(&id) {
+                        n.paused = false;
+                    }
+                }
+                FolderStatus::Denied { .. } => {
+                    self.stats.denials += 1;
+                }
+                FolderStatus::WinnerFallback { count } => {
+                    return Err(self.fail(
+                        "winner fallback",
+                        format!(
+                            "{}: rule 5 of the winner rule decided {count} conflict(s)",
+                            Self::short(id)
+                        ),
+                    ));
+                }
+                FolderStatus::Stalled { .. } => self.stats.stalled += 1,
+                FolderStatus::UnchangedUnknownPath { path } => {
+                    return Err(self.fail(
+                        "host bug",
+                        format!("{}: Unchanged reported for {path} which the engine has no live record for", Self::short(id)),
+                    ));
+                }
+                _ => {}
+            },
+        }
+        Ok(())
+    }
+
+    /// A table write reaches the persisted store (§11), and the invariant
+    /// tracking that follows index writes sees it, dated when it was made.
+    /// Only durable writes are recorded: a write a crash lost was never
+    /// seen by anyone, and its effects never happened.
+    fn record(&mut self, id: NodeId, staged: Staged) -> Result<(), Failure> {
+        let Staged {
+            write,
+            at: made_at,
+            event,
+        } = staged;
+        let action = match write {
+            TableWrite::Hook(action) => *action,
+            TableWrite::Rules(rules) => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.persisted.rules = rules;
+                }
+                return Ok(());
+            }
+        };
+        match action {
             Action::IndexChanged { record, .. } => {
                 if record.entry.path.file_name().contains(".conflict-")
                     && record.entry.modified_by == id
@@ -1138,7 +1370,7 @@ impl Sim {
                             // seen now, after the revert that discarded the
                             // old one, or the next revert check would set it
                             // aside too.
-                            let now_ev = self.stats.events;
+                            let now_ev = event;
                             let seen = self.seen_at.entry(path.clone()).or_default();
                             match seen.iter_mut().find(|(v, _)| *v == record.entry.version) {
                                 Some(slot) => slot.1 = now_ev,
@@ -1148,15 +1380,14 @@ impl Sim {
                     }
                     None => {
                         list.push(record.entry.clone());
-                        let now_ev = self.stats.events;
+                        let now_ev = event;
                         self.seen_at
                             .entry(path.clone())
                             .or_default()
                             .push((record.entry.version.clone(), now_ev));
                     }
                 }
-                let now = self.clock;
-                let events = self.stats.events;
+                let now = made_at;
                 let mut restored = None;
                 if let Some(n) = self.nodes.get_mut(&id) {
                     // A record put back by `revert` keeps its old `seq`
@@ -1192,7 +1423,7 @@ impl Sim {
                         .insert(record.entry.path.clone(), record);
                 }
                 if let Some(version) = restored {
-                    self.reverted_at.insert((id, path), (events, Some(version)));
+                    self.reverted_at.insert((id, path), (event, Some(version)));
                 }
             }
             Action::IndexRemoved { path, .. } => {
@@ -1200,8 +1431,7 @@ impl Sim {
                 if let Some(n) = self.nodes.get_mut(&id) {
                     n.persisted.records.remove(&path);
                 }
-                self.reverted_at
-                    .insert((id, path), (self.stats.events, None));
+                self.reverted_at.insert((id, path), (event, None));
             }
             Action::WantChanged { path, want, .. } => {
                 if let Some(n) = self.nodes.get_mut(&id) {
@@ -1248,41 +1478,89 @@ impl Sim {
                     n.persisted.rest = Some(*rest);
                 }
             }
-            Action::StatusChanged { status, .. } => match status {
-                FolderStatus::Paused { .. } => {
-                    if let Some(n) = self.nodes.get_mut(&id) {
-                        n.paused = true;
-                    }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// An effect waits for the open group on `id`, if there is one, and is
+    /// performed once the group is durable; with none open it depends on
+    /// nothing unwritten and is performed now (§11).
+    fn hold(&mut self, id: NodeId, held: Held) -> Result<(), Failure> {
+        match self.nodes.get_mut(&id).and_then(|n| n.group.as_mut()) {
+            Some(group) => {
+                group.effects.push(held);
+                Ok(())
+            }
+            None => self.perform(id, held),
+        }
+    }
+
+    /// Carry out an effect: a message goes on the wire, a fetch or a commit
+    /// starts, a file goes to the trash.
+    fn perform(&mut self, id: NodeId, held: Held) -> Result<(), Failure> {
+        match held {
+            Held::Send { to, payload } => self.send(id, to, payload)?,
+            Held::Fetch {
+                path,
+                version,
+                hash,
+                size,
+                from,
+            } => {
+                // A request cannot go out over a connection that dropped
+                // while the fetch waited for its group; the engine has been
+                // told of the drop and has put the want back.
+                if !self.connected(id, from) {
+                    return Ok(());
                 }
-                FolderStatus::Unpaused { .. } | FolderStatus::Reverted { .. } => {
-                    if matches!(status, FolderStatus::Reverted { .. }) {
-                        self.stats.reverts += 1;
-                    }
-                    if let Some(n) = self.nodes.get_mut(&id) {
-                        n.paused = false;
-                    }
+                self.stats.fetches += 1;
+                let tier = self.link(id, from).map_or(Tier::Relay, |l| l.tier);
+                let per_byte = match tier {
+                    Tier::Lan => 1_000_000,
+                    Tier::Direct => 5_000_000,
+                    Tier::Relay => 20_000_000,
+                };
+                let mut duration = 200_000_000 + size as i64 * per_byte;
+                if self.rng.random_range(0u32..10) == 0 {
+                    // A slow link now and then, so stalls and progress matter.
+                    duration += self.rng.random_range(30 * NANOS..120 * NANOS);
                 }
-                FolderStatus::Denied { .. } => {
-                    self.stats.denials += 1;
+                let corrupt =
+                    self.corruption_on && self.rng.random::<f64>() < self.knobs.corruption;
+                self.ops.push(Op::Fetch {
+                    node: id,
+                    from,
+                    path,
+                    version,
+                    hash,
+                    done_at: self.clock.plus_nanos(duration),
+                    next_progress: self.clock.plus_nanos(2 * NANOS),
+                    corrupt,
+                });
+            }
+            Held::Commit {
+                path,
+                version,
+                action,
+            } => {
+                let done_at = self
+                    .clock
+                    .plus_nanos(self.rng.random_range(50_000_000..500_000_000));
+                self.ops.push(Op::Commit {
+                    node: id,
+                    path,
+                    version,
+                    action,
+                    done_at,
+                    suspended: false,
+                });
+            }
+            Held::MoveToTrash { path } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    move_to_trash(n, &path);
                 }
-                FolderStatus::WinnerFallback { count } => {
-                    return Err(self.fail(
-                        "winner fallback",
-                        format!(
-                            "{}: rule 5 of the winner rule decided {count} conflict(s)",
-                            Self::short(id)
-                        ),
-                    ));
-                }
-                FolderStatus::Stalled { .. } => self.stats.stalled += 1,
-                FolderStatus::UnchangedUnknownPath { path } => {
-                    return Err(self.fail(
-                        "host bug",
-                        format!("{}: Unchanged reported for {path} which the engine has no live record for", Self::short(id)),
-                    ));
-                }
-                _ => {}
-            },
+            }
         }
         Ok(())
     }
@@ -1471,8 +1749,21 @@ impl Sim {
         self.ops
             .retain(|op| op.node() != id && !matches!(op, Op::Fetch { from, .. } if *from == id));
         let folder = self.folder;
+        let lag = self.knobs.group_commit_lag;
         if let Some(n) = self.nodes.get_mut(&id) {
-            n.crashed = n.engine.as_ref().and_then(|e| e.folder(folder)).cloned();
+            // §11: the open group's writes and the effects held for them are
+            // lost together. The check at the restart compares the rebuild
+            // with the folder as it stood when its last group became durable,
+            // since the tables lag the engine by design.
+            if let Some(group) = n.group.take() {
+                self.stats.groups_lost += 1;
+                self.stats.effects_lost += group.effects.len() as u64;
+            }
+            n.crashed = if lag > 0 {
+                n.durable.take()
+            } else {
+                n.engine.as_ref().and_then(|e| e.folder(folder)).cloned()
+            };
             n.engine = None;
             n.temp.clear();
             n.wake_at = None;
@@ -1529,7 +1820,11 @@ impl Sim {
             undo(node, row, clock);
         }
         // §11: the persisted parts and nothing else.
-        node.engine = Some(Engine::restore(config, vec![parts], now));
+        let engine = Engine::restore(config, vec![parts], now);
+        if self.knobs.group_commit_lag > 0 {
+            node.durable = engine.folder(self.folder).cloned();
+        }
+        node.engine = Some(engine);
         // §7.3: a full scan runs at daemon start, so at every restart; a
         // queued `revert` waits for it (§8.3). A node restarted while
         // offline scans as soon as it is back.
@@ -1884,7 +2179,8 @@ impl Sim {
         )
     }
 
-    /// A full scan (§7.3) with the fast path against the persisted records.
+    /// A full scan (§7.3) with the fast path against the index records the
+    /// host has written.
     fn full_scan(&mut self, id: NodeId, may_abort: bool) -> Result<(), Failure> {
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
@@ -1901,10 +2197,7 @@ impl Sim {
             .map(|(path, file)| {
                 // The §7.3 fast path, the same test a real scanner applies to
                 // what stat returns.
-                let fast = node
-                    .persisted
-                    .records
-                    .get(path)
+                let fast = written_record(node, path)
                     .is_some_and(|r| r.entry.unchanged_by_stat(&file.observed()));
                 let state = if fast {
                     ScanState::Unchanged
@@ -2295,10 +2588,16 @@ impl Sim {
                     hold_pct,
                     ..self.rules.clone()
                 };
-                // The host keeps the rules with the folder (§11) and tells
-                // the engine.
-                if let Some(n) = self.nodes.get_mut(&id) {
-                    n.persisted.rules = rules.clone();
+                // The host keeps the rules with the folder (§11), written in
+                // the same group as the engine's writes for the change.
+                self.open_group(id);
+                let staged = Staged {
+                    write: TableWrite::Rules(rules.clone()),
+                    at: self.clock,
+                    event: self.stats.events,
+                };
+                if let Some(group) = self.nodes.get_mut(&id).and_then(|n| n.group.as_mut()) {
+                    group.writes.push(staged);
                 }
                 self.feed(id, Event::RulesChanged { folder, rules })?;
             }
@@ -2463,6 +2762,26 @@ fn follow(node: &mut Node, from: &RelPath, to: &RelPath, hash: ContentHash, now:
             *at = now;
         }
     }
+}
+
+/// The index record the host last wrote at `path`, durable or not. A real
+/// host reads its own uncommitted writes, so its scan's fast path compares
+/// against these (§7.3, §11), not against what a crash would leave.
+fn written_record<'a>(node: &'a Node, path: &RelPath) -> Option<&'a IndexRecord> {
+    let staged = node.group.iter().flat_map(|g| g.writes.iter().rev());
+    for s in staged {
+        let TableWrite::Hook(action) = &s.write else {
+            continue;
+        };
+        match action.as_ref() {
+            Action::IndexChanged { record, .. } if record.entry.path == *path => {
+                return Some(record);
+            }
+            Action::IndexRemoved { path: p, .. } if p == path => return None,
+            _ => {}
+        }
+    }
+    node.persisted.records.get(path)
 }
 
 fn trash_file(node: &mut Node, file: File) {

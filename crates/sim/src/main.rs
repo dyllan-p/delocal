@@ -3,7 +3,7 @@
 //! ```text
 //! delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P]
 //!             [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P]
-//!             [--nodes N] [--keep-going] [--jobs J] [--digests]
+//!             [--group-commit-lag E] [--nodes N] [--keep-going] [--jobs J] [--digests]
 //! ```
 //!
 //! Seeds run on J worker threads, by default one for each core the system
@@ -84,6 +84,11 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--crash-between-renames: {e}"))?;
             }
+            "--group-commit-lag" => {
+                args.knobs.group_commit_lag = value()?
+                    .parse()
+                    .map_err(|e| format!("--group-commit-lag: {e}"))?;
+            }
             "--nodes" => {
                 args.knobs.nodes = Some(value()?.parse().map_err(|e| format!("--nodes: {e}"))?)
             }
@@ -101,7 +106,7 @@ fn parse_args() -> Result<Args, String> {
             "--jobs" => args.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             "--digests" => args.digests = true,
             "--help" | "-h" => {
-                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--nodes N] [--keep-going] [--jobs J] [--digests]".to_owned());
+                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--nodes N] [--keep-going] [--jobs J] [--digests]".to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -264,6 +269,8 @@ fn main() -> ExitCode {
                 totals.events += outcome.stats.events;
                 totals.crashes_between_renames += outcome.stats.crashes_between_renames;
                 totals.displacements_undone += outcome.stats.displacements_undone;
+                totals.groups_lost += outcome.stats.groups_lost;
+                totals.effects_lost += outcome.stats.effects_lost;
                 if args.digests {
                     println!("seed {seed} digest {}", hex(&outcome.fingerprint));
                 }

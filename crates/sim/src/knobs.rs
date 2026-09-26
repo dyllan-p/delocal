@@ -23,6 +23,12 @@ pub struct Knobs {
     /// (§7.5, "Two renames, one commit"). The host's commit journal undoes
     /// the displacement at the restart, before the first scan.
     pub crash_between_renames: f64,
+    /// The most events a group of writes waits for, after the event that
+    /// opened it, before it becomes durable (§11 group commit). The effects
+    /// of the group's events wait with it, and a crash loses both. Each
+    /// group draws its lag from 0 to this; 0 makes every event's writes
+    /// durable when the event ends.
+    pub group_commit_lag: u32,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -35,6 +41,7 @@ impl Default for Knobs {
             delay_ms: (5, 800),
             crash_after_rename: 0.1,
             crash_between_renames: 0.0,
+            group_commit_lag: 0,
             nodes: None,
         }
     }
@@ -44,13 +51,14 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
             self.delay_ms.1,
             self.crash_after_rename,
-            self.crash_between_renames
+            self.crash_between_renames,
+            self.group_commit_lag
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;
