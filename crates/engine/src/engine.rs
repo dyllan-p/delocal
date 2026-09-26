@@ -147,11 +147,6 @@ pub enum Event {
         hash: ContentHash,
         version: Version,
     },
-    /// A want the host persisted comes back after a restart (Phase 2).
-    WantRestored {
-        folder: FolderId,
-        want: Box<Want>,
-    },
     /// The host finished a commit the engine asked for (§7.5). On `Ok` the
     /// index adopts the entry.
     Applied {
@@ -528,10 +523,6 @@ impl Engine {
                 ..
             } => match self.folders.get_mut(&folder) {
                 Some(f) => f.progress(now, &path, &version),
-                None => out.push(unknown_folder(folder)),
-            },
-            Event::WantRestored { folder, want } => match self.folders.get_mut(&folder) {
-                Some(f) => f.restore_want(*want),
                 None => out.push(unknown_folder(folder)),
             },
             Event::Approve { folder, batch } => match self.folders.get_mut(&folder) {

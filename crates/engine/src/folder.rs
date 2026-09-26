@@ -2004,11 +2004,6 @@ impl FolderState {
         self.wants.progress(now, path, version);
     }
 
-    /// A want persisted by the host comes back after a restart (Phase 2).
-    pub fn restore_want(&mut self, want: Want) {
-        self.wants.restore(want);
-    }
-
     /// The process restarted with this state at `now` (§11, §13): every
     /// want the host was fetching or committing is wanted again, the open
     /// scan bracket is gone, and peers will announce themselves afresh. A
@@ -4897,11 +4892,14 @@ mod tests {
         let batch = a.form_batches(t(12.0), bid(3)).remove(0);
         b.receive(t(12.0), &batch);
         b.dispatch(t(12.0), &lan(&[1]));
-        let persisted = b.wants().get(&p("n")).unwrap().clone();
-        assert!(matches!(persisted.state, WantState::Fetching { .. }));
-        // A fresh engine after a restart.
-        let mut c = folder_with(Rules::default(), 2, "bravo");
-        c.restore_want(persisted);
+        let parts = b.parts();
+        assert!(matches!(
+            parts.wants[&p("n")].state,
+            WantState::Fetching { .. }
+        ));
+        // The folder rebuilt from its parts after a restart.
+        let mut c = FolderState::from_parts(parts, node(2), HostName::new("bravo").unwrap());
+        c.restarted(t(20.0));
         assert_eq!(c.wants().get(&p("n")).unwrap().state, WantState::Wanted);
         let (steps, _) = c.dispatch(t(20.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Fetch { path, .. } if path == &p("n")));
