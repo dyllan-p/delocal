@@ -366,6 +366,12 @@ impl Index {
         ))
     }
 
+    /// Paths whose pending tombstone is exempt from the sender pre-check
+    /// (§8.1), in path order.
+    pub fn exempt_paths(&self) -> impl Iterator<Item = &RelPath> {
+        self.exempt.iter()
+    }
+
     /// Tracked count as of the last announcement (§8.1, sender pre-check).
     pub fn announced_tracked(&self) -> usize {
         self.announced_tracked
@@ -577,7 +583,10 @@ impl Index {
         }
         let seq = self.next_seq();
         let path = entry.path.clone();
+        // The path is no longer pending, so it is no longer exempt either:
+        // the exemption belongs to the pending change it was written for.
         self.pending.remove(&path);
+        self.exempt.remove(&path);
         self.records
             .insert(path.clone(), IndexRecord { entry, seq });
         self.records.get(&path)
@@ -1315,6 +1324,26 @@ mod tests {
             Some(ChangeKind::Delete),
             "the exemption does not survive a revert"
         );
+    }
+
+    /// A version adopted over an unrecoverable tombstone before the next
+    /// batch (a concurrent version won, or the merge did) ends the pending
+    /// change, and the exemption with it: every exempt path is pending.
+    #[test]
+    fn adopting_over_an_unrecoverable_tombstone_ends_the_exemption() {
+        let mut idx = index();
+        idx.observe(p("b"), file(2, 2)).unwrap();
+        idx.mark_announced();
+        let tombstone = idx
+            .observe_absent_unrecoverable(&p("b"), 5)
+            .unwrap()
+            .record
+            .entry;
+        assert_eq!(idx.exempt_paths().collect::<Vec<_>>(), [&p("b")]);
+        let merged = remote("b", 9, tombstone.version.incremented(node(2)));
+        idx.adopt(merged).unwrap();
+        assert!(!idx.is_pending(&p("b")));
+        assert_eq!(idx.exempt_paths().count(), 0);
     }
 
     #[test]
