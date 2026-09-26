@@ -1,5 +1,6 @@
 # Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds, the last tenth
-# of them with fetch corruption on, sharded across twenty jobs.
+# of them with fetch corruption on, sharded across twenty jobs. Each night
+# starts at a different seed, day of year × 100,000 (see the plan job).
 #
 # The simulator runs one seed at a time on one core, and 100,000 seeds take
 # about a day that way. A job on a GitHub-hosted runner is stopped after six
@@ -16,6 +17,9 @@ on:
       seeds:
         description: Number of seeds
         default: "100000"
+      start:
+        description: First seed (leave empty for day of year × 100,000)
+        default: ""
 
 permissions:
   contents: read
@@ -26,8 +30,49 @@ env:
   SEEDS: ${{ github.event.inputs.seeds || '100000' }}
 
 jobs:
+  # The night's first seed, worked out once so that every shard and the
+  # report agree on it, even in a run that crosses midnight. Night d of the
+  # year runs seeds d × 100,000 onwards (§14.1), so each night explores
+  # seeds the nightly has not run this year, while the pinned seeds and the
+  # per-push sweep (seeds 0 to 999) keep guarding the old ones. Days count
+  # from 1, so no night repeats Phase 1's seeds 0 to 99,999. A manual run
+  # may name its start, to run a failing night's seeds again after a fix.
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      start: ${{ steps.start.outputs.start }}
+    steps:
+      # A manual run's inputs are checked here, once: bash arithmetic on a
+      # mistyped number can print an error and carry on. `date +%j` pads
+      # the day to three digits, and bash reads a number with a leading
+      # zero as octal, so `10#` says it is decimal. Without it, day 008 is
+      # an error and day 010 is day 8.
+      - name: First seed
+        id: start
+        env:
+          START: ${{ github.event.inputs.start }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SEEDS" =~ ^[1-9][0-9]{0,8}$ ]]; then
+            echo "::error::seeds must be a whole number above 0, not '$SEEDS'"
+            exit 1
+          fi
+          if [ -z "$START" ]; then
+            START=$(( 10#$(date -u +%j) * 100000 ))
+          elif [[ "$START" =~ ^[0-9]{1,15}$ ]]; then
+            START=$(( 10#$START ))
+          else
+            echo "::error::start must be a whole number, not '$START'"
+            exit 1
+          fi
+          echo "seeds $START..$(( START + SEEDS ))"
+          echo "start=$START" >> "$GITHUB_OUTPUT"
+
   simulate:
     name: simulate (shard ${{ matrix.shard }} of ${{ strategy.job-total }})
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +80,8 @@ jobs:
     # Pinned like the CI jobs; see ci.yml.
     runs-on: ubuntu-24.04
     timeout-minutes: 240
+    env:
+      START: ${{ needs.plan.outputs.start }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install pinned toolchain
@@ -49,13 +96,15 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p delocal-sim
 
-      # This shard's share of seeds 0..SEEDS, worked out as in ci.yml. The
-      # first nine tenths of the range run with the default knobs and the
-      # last tenth with fetch corruption on, so the HashMismatch path is
-      # exercised every night; a shard whose range crosses that line runs
-      # both parts. `--keep-going` runs every seed in both parts, so one
-      # failure cannot hide another. The log starts with the shard's number
-      # and ends with "shard done" only if every part ran to the end.
+      # This shard's share of the night's seeds, worked out as in ci.yml:
+      # `from` and `to` count from START. The first nine tenths of the
+      # night run with the default knobs and the last tenth with fetch
+      # corruption on, so the HashMismatch path is exercised every night.
+      # `slice` runs the part of this shard that falls in one slice, so a
+      # shard whose range crosses the line runs both parts. `--keep-going`
+      # runs every seed in both parts, so one failure cannot hide another.
+      # The log starts with the shard's number and ends with "shard done"
+      # only if every part ran to the end.
       - name: Simulate
         env:
           SHARD: ${{ strategy.job-index }}
@@ -63,20 +112,21 @@ jobs:
         run: |
           set -uo pipefail
           main=$(( SEEDS * 9 / 10 ))
-          start=$(( SEEDS * SHARD / SHARDS ))
-          end=$(( SEEDS * (SHARD + 1) / SHARDS ))
-          echo "shard $(( SHARD + 1 )) of $SHARDS: seeds $start..$end" > sim.log
+          from=$(( SEEDS * SHARD / SHARDS ))
+          to=$(( SEEDS * (SHARD + 1) / SHARDS ))
+          echo "shard $(( SHARD + 1 )) of $SHARDS: seeds $(( START + from ))..$(( START + to ))" > sim.log
           status=0
-          if [ "$start" -lt "$main" ]; then
-            to=$(( end < main ? end : main ))
-            ./target/release/delocal-sim --seeds "$(( to - start ))" --start "$start" --keep-going 2>&1 | tee -a sim.log
+          # slice LO HI FLAGS...: this shard's seeds from LO up to HI,
+          # counted from START, run with FLAGS.
+          slice() {
+            local lo=$(( from > $1 ? from : $1 )) hi=$(( to < $2 ? to : $2 ))
+            shift 2
+            [ "$lo" -lt "$hi" ] || return 0
+            ./target/release/delocal-sim --seeds "$(( hi - lo ))" --start "$(( START + lo ))" "$@" --keep-going 2>&1 | tee -a sim.log
             [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
-          fi
-          if [ "$end" -gt "$main" ]; then
-            from=$(( start > main ? start : main ))
-            ./target/release/delocal-sim --seeds "$(( end - from ))" --start "$from" --corruption 0.05 --keep-going 2>&1 | tee -a sim.log
-            [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
-          fi
+          }
+          slice 0 "$main"
+          slice "$main" "$SEEDS" --corruption 0.05
           echo "shard done" >> sim.log
           exit "$status"
 
@@ -91,15 +141,19 @@ jobs:
   # One issue per failing night, listing every failing seed from every
   # shard, plus any shard that did not finish (a build failure, a timeout or
   # a crash), since its seeds may be missing from the list. `!cancelled()`
-  # runs this when shards failed but not when someone cancels the run.
+  # runs this when shards failed but not when someone cancels the run. A
+  # failed plan ran no seeds at all and shows as a failed run; the only
+  # thing that fails it is a mistyped input on a manual run.
   report:
     name: report
-    needs: simulate
-    if: ${{ !cancelled() }}
+    needs: [plan, simulate]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       issues: write
+    env:
+      START: ${{ needs.plan.outputs.start }}
     steps:
       # A night where no shard got as far as writing a log has nothing to
       # download; the report says so instead of failing here.
@@ -140,12 +194,12 @@ jobs:
           done
 
           if [ "$failed" -eq 0 ] && [ "${#unfinished[@]}" -eq 0 ] && [ "$total" -gt 0 ]; then
-            echo "All $SEEDS seeds passed."
+            echo "All $SEEDS seeds from $START passed." | tee -a "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           counts=$(sed -E 's/^seed [0-9]+ failed \(([^)]*)\).*/\1/' failures.txt | sort | uniq -c | sort -rn)
-          title="Nightly simulation: $failed of $SEEDS seeds failed"
+          title="Nightly simulation: $failed of $SEEDS seeds from $START failed"
           if [ -n "$counts" ]; then
             title="$title ($(echo "$counts" | awk '{n=$1; $1=""; sub(/^ /, ""); printf "%s%s %d", (NR > 1 ? ", " : ""), $0, n}'))"
           fi
@@ -158,8 +212,9 @@ jobs:
           {
             echo "Run: $RUN_URL"
             echo "Commit: $GITHUB_SHA"
+            echo "First seed: $START"
             echo
-            echo "$failed of $SEEDS seeds failed. Seeds 0 to $(( main - 1 )) ran with the default knobs, seeds $main to $(( SEEDS - 1 )) with \`--corruption 0.05\`."
+            echo "$failed of $SEEDS seeds failed. Seeds $START to $(( START + main - 1 )) ran with the default knobs, seeds $(( START + main )) to $(( START + SEEDS - 1 )) with \`--corruption 0.05\`."
             if [ -n "$counts" ]; then
               echo
               echo '| Invariant | Seeds |'
@@ -184,8 +239,8 @@ jobs:
 
           # GitHub caps an issue body at 65,536 characters. Every failing
           # seed number is listed first, by invariant, which fits about
-          # 8,000 seeds; the full lines follow and stop short of the cap,
-          # pointing at the logs for the rest.
+          # 5,500 of the nightly's eight-digit seeds; the full lines follow
+          # and stop short of the cap, pointing at the logs for the rest.
           if [ "$failed" -gt 0 ]; then
             {
               echo
