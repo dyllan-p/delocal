@@ -1,0 +1,32 @@
+Takes a batch's seq_high as the receiver's watermark for its sender whether
+or not the batches below it arrived, as before e255bb6 (§7.4): received_range
+ignores seq_low and moves the watermark up to seq_high, so a gap is never
+recorded, the decision and have_up_to acknowledge sequence numbers this
+machine never saw, and the sender never re-sends a batch lost in flight.
+
+test: delocal-sim regressions::a_batch_lost_in_flight_is_caught_up
+
+diff --git a/crates/engine/src/index.rs b/crates/engine/src/index.rs
+index 4029a94..8922651 100644
+--- a/crates/engine/src/index.rs
++++ b/crates/engine/src/index.rs
+@@ -379,17 +379,12 @@ impl Index {
+     /// watermark advances when the range starts at or below it, and then
+     /// absorbs every range that has become contiguous; a range above a gap
+     /// is remembered until the gap fills.
+-    pub fn received_range(&mut self, peer: NodeId, seq_low: u64, seq_high: u64) {
++    pub fn received_range(&mut self, peer: NodeId, _seq_low: u64, seq_high: u64) {
+         let w = self.peer_seq.entry(peer).or_default();
+         if seq_high <= w.contiguous {
+             return;
+         }
+-        if seq_low <= w.contiguous {
+-            w.contiguous = seq_high;
+-        } else {
+-            let high = w.ranges.entry(seq_low).or_insert(seq_high);
+-            *high = (*high).max(seq_high);
+-        }
++        w.contiguous = seq_high;
+         while let Some((&low, &high)) = w.ranges.range(..=w.contiguous).next() {
+             w.ranges.remove(&low);
+             w.contiguous = w.contiguous.max(high);

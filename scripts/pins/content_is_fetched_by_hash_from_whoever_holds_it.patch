@@ -1,0 +1,39 @@
+Makes the simulated host serve fetches by version again, as before 5c20f3d
+(§7.5 steps 2 and 3): a source serves the file at the requested path only if
+its live record there is exactly the wanted version, and no longer serves the
+wanted content from a record of another version or from another path. A
+conflict's merged version M exists nowhere until someone merges, so the
+winner's holders, which hold M's content under an older version, answer
+NotAvailable for it again. The request by hash lives in the host (the engine's
+Fetch action already carries the version, for its report), so this is the
+smallest place to turn it off; the engine half of 5c20f3d, which keys a
+want's sources by content, is left as it is.
+
+test: delocal-sim regressions::content_is_fetched_by_hash_from_whoever_holds_it
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 4e18586..05a0c7d 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -1875,14 +1875,16 @@ impl Sim {
+                 if !self.connected(node, from) {
+                     return Ok(());
+                 }
+-                // §7.5 step 2: the source serves the requested content from
+-                // `path` if its live record there has that hash and the disk
+-                // still matches the record, failing that from any live file
+-                // with that hash, failing that not at all.
++                // The source serves the requested version from `path` if its
++                // live record there is exactly that version and the disk
++                // still matches the record, failing that not at all.
+                 let served = self.nodes.get(&from).and_then(|src| {
+                     let engine = src.engine.as_ref()?;
+                     let index = engine.folder(self.folder)?.index();
+-                    index.locate(&path, &hash).find_map(|at| {
++                    let exact = index
++                        .live(&path)
++                        .is_some_and(|r| r.entry.version == version);
++                    exact.then_some(&path).into_iter().find_map(|at| {
+                         let record = index.live(at)?;
+                         let file = src.fs.get(at)?;
+                         let matches = file.kind == record.entry.kind
