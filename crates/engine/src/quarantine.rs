@@ -9,6 +9,13 @@
 //! against the index as it stands; `deny` withdraws it after bumping this
 //! machine's versions over every quarantined one (§8.2), and a `revert`
 //! that discards those bumps reinstates it (§8.3).
+//!
+//! **Persistence** (§11). The held items are a persisted part, one row per
+//! item: a [`HeldRow`] with the item and every version it holds. Versions
+//! at a path are kept in the order they arrived, across items, because the
+//! earliest matching item is the one a later version joins; each carries
+//! an **arrival number** from a per-folder counter, so a quarantine rebuilt
+//! from its rows keeps that order whatever items the versions belong to.
 
 use std::collections::BTreeMap;
 
@@ -17,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::brake::HoldReason;
 use crate::entry::Entry;
 use crate::id::{BatchId, NodeId};
+use crate::parts::Changed;
 use crate::path::RelPath;
 use crate::time::Timestamp;
 use crate::version::Version;
@@ -34,26 +42,42 @@ pub struct HeldItem {
     pub entries: BTreeMap<RelPath, Entry>,
 }
 
-/// A held item `deny` took out, with every version it held, so that a
-/// `revert` discarding the deny's bumps can put it back as it was (§8.3).
+/// One quarantined version at a path (§8.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Withdrawn {
+pub struct Quarantined {
+    pub version: Version,
+    /// Its stamp, for the stamp of a `deny` bump over it (§7.1).
+    pub stamp: i64,
+    /// Its place in the folder's arrival order (§11).
+    pub arrival: u64,
+}
+
+/// A held item with every version it holds (§11): one row of the held
+/// items. Also what `deny` takes out, so that a `revert` discarding the
+/// deny's bumps can put the item back as it was (§8.3).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeldRow {
     pub item: HeldItem,
-    /// The item's quarantined versions per path with their stamps, joiners
+    /// The item's quarantined versions per path, in arrival order, joiners
     /// the stored entries do not show included.
-    versions: BTreeMap<RelPath, Vec<(Version, i64)>>,
+    pub versions: BTreeMap<RelPath, Vec<Quarantined>>,
 }
 
 /// The folder's quarantine: held items and an index of the versions in them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quarantine {
     items: BTreeMap<BatchId, HeldItem>,
-    /// Every quarantined version per path with its stamp and the item it
-    /// belongs to, in arrival order. Kept apart from the items' entries
-    /// because `join` records a version it does not store: the stored
-    /// entry is the latest per path, and a concurrent joiner is quarantined
-    /// without replacing it.
-    versions: BTreeMap<RelPath, Vec<(Version, i64, BatchId)>>,
+    /// Every quarantined version per path with the item it belongs to, in
+    /// arrival order. Kept apart from the items' entries because `join`
+    /// records a version it does not store: the stored entry is the latest
+    /// per path, and a concurrent joiner is quarantined without replacing
+    /// it.
+    versions: BTreeMap<RelPath, Vec<(BatchId, Quarantined)>>,
+    /// The last arrival number handed out.
+    arrivals: u64,
+    /// Held items whose row changed since the last drain.
+    #[serde(skip)]
+    changed: Changed<BatchId>,
 }
 
 impl Quarantine {
@@ -81,8 +105,8 @@ impl Quarantine {
         self.versions
             .get(&entry.path)?
             .iter()
-            .find(|(v, _, _)| entry.version.dominates_or_equals(v))
-            .map(|(_, _, id)| *id)
+            .find(|(_, q)| entry.version.dominates_or_equals(&q.version))
+            .map(|(id, _)| *id)
     }
 
     /// The largest stamp among the quarantined versions at `path`, `None`
@@ -92,18 +116,14 @@ impl Quarantine {
     /// `versions_at`, not from the stored entries, which lack the joiners
     /// that were concurrent with what an item already held.
     pub fn max_stamp_at(&self, path: &RelPath) -> Option<i64> {
-        self.versions
-            .get(path)?
-            .iter()
-            .map(|(_, stamp, _)| *stamp)
-            .max()
+        self.versions.get(path)?.iter().map(|(_, q)| q.stamp).max()
     }
 
     /// Every quarantined version at `path`, across all items.
     pub fn versions_at(&self, path: &RelPath) -> Vec<Version> {
         self.versions
             .get(path)
-            .map(|v| v.iter().map(|(ver, _, _)| ver.clone()).collect())
+            .map(|v| v.iter().map(|(_, q)| q.version.clone()).collect())
             .unwrap_or_default()
     }
 
@@ -127,6 +147,7 @@ impl Quarantine {
         for entry in item.entries.values() {
             self.record(&entry.path, entry.version.clone(), entry.stamp, item.batch);
         }
+        self.changed.note(&item.batch);
         self.items.insert(item.batch, item);
     }
 
@@ -138,6 +159,7 @@ impl Quarantine {
             return false;
         }
         self.record(&entry.path, entry.version.clone(), entry.stamp, batch);
+        self.changed.note(&batch);
         if let Some(item) = self.items.get_mut(&batch) {
             let replace = item
                 .entries
@@ -153,9 +175,10 @@ impl Quarantine {
     /// Release an item: remove it and every version it held.
     pub fn release(&mut self, batch: BatchId) -> Option<HeldItem> {
         let item = self.items.remove(&batch)?;
+        self.changed.note(&batch);
         for path in item.entries.keys() {
             if let Some(list) = self.versions.get_mut(path) {
-                list.retain(|(_, _, id)| *id != batch);
+                list.retain(|(id, _)| *id != batch);
                 if list.is_empty() {
                     self.versions.remove(path);
                 }
@@ -164,43 +187,76 @@ impl Quarantine {
         Some(item)
     }
 
-    /// Take an item out for `deny`: like `release`, but keep every version
-    /// it held so that [`Quarantine::reinstate`] can restore it exactly.
-    pub fn withdraw(&mut self, batch: BatchId) -> Option<Withdrawn> {
-        let mut versions = BTreeMap::new();
-        if let Some(item) = self.items.get(&batch) {
-            for path in item.entries.keys() {
-                let held: Vec<(Version, i64)> = self
+    /// The item held under `batch` with every version it holds: its row
+    /// (§11).
+    pub fn row(&self, batch: BatchId) -> Option<HeldRow> {
+        let item = self.items.get(&batch)?.clone();
+        let versions = item
+            .entries
+            .keys()
+            .map(|path| {
+                let held: Vec<Quarantined> = self
                     .versions
                     .get(path)
                     .into_iter()
                     .flatten()
-                    .filter(|(_, _, id)| *id == batch)
-                    .map(|(v, stamp, _)| (v.clone(), *stamp))
+                    .filter(|(id, _)| *id == batch)
+                    .map(|(_, q)| q.clone())
                     .collect();
-                versions.insert(path.clone(), held);
-            }
-        }
-        let item = self.release(batch)?;
-        Some(Withdrawn { item, versions })
+                (path.clone(), held)
+            })
+            .collect();
+        Some(HeldRow { item, versions })
+    }
+
+    /// Take an item out for `deny`: like `release`, but keep every version
+    /// it held so that [`Quarantine::reinstate`] can restore it exactly.
+    pub fn withdraw(&mut self, batch: BatchId) -> Option<HeldRow> {
+        let row = self.row(batch)?;
+        self.release(batch)?;
+        Some(row)
     }
 
     /// Put a withdrawn item back with every version it held (§8.3). Its
-    /// versions go to the end of each path's arrival order.
-    pub fn reinstate(&mut self, withdrawn: Withdrawn) {
+    /// versions arrive again, at the end of each path's arrival order.
+    pub fn reinstate(&mut self, withdrawn: HeldRow) {
         let batch = withdrawn.item.batch;
         for (path, held) in withdrawn.versions {
-            for (version, stamp) in held {
-                self.record(&path, version, stamp, batch);
+            for q in held {
+                self.record(&path, q.version, q.stamp, batch);
             }
         }
         self.hold(withdrawn.item);
     }
 
+    /// Held items whose row changed since the last call, each as it stands
+    /// (`None` if it is no longer held), in batch-id order: the
+    /// `HeldChanged` persistence hook (§11).
+    pub fn drain_changes(&mut self) -> Vec<(BatchId, Option<HeldRow>)> {
+        self.changed
+            .take()
+            .into_iter()
+            .map(|batch| (batch, self.row(batch)))
+            .collect()
+    }
+
+    /// Quarantine `version` at `path` for the item `batch`, with the next
+    /// arrival number, unless the item already holds it there.
     fn record(&mut self, path: &RelPath, version: Version, stamp: i64, batch: BatchId) {
         let list = self.versions.entry(path.clone()).or_default();
-        if !list.iter().any(|(v, _, id)| *v == version && *id == batch) {
-            list.push((version, stamp, batch));
+        if !list
+            .iter()
+            .any(|(id, q)| q.version == version && *id == batch)
+        {
+            self.arrivals += 1;
+            list.push((
+                batch,
+                Quarantined {
+                    version,
+                    stamp,
+                    arrival: self.arrivals,
+                },
+            ));
         }
     }
 }
@@ -280,8 +336,20 @@ mod tests {
         assert!(q.versions_at(&p("a")).is_empty());
         assert_eq!(q.withdraw(batch(9)), None);
         q.reinstate(withdrawn);
-        assert_eq!(q, before);
+        for path in ["a", "b", "c"] {
+            assert_eq!(q.versions_at(&p(path)), before.versions_at(&p(path)));
+        }
+        assert_eq!(
+            q.items().collect::<Vec<_>>(),
+            before.items().collect::<Vec<_>>()
+        );
         assert_eq!(q.versions_at(&p("a")).len(), 2, "the joiner too");
+        // The versions arrived again, after everything held before.
+        let arrivals: Vec<u64> = q.row(batch(1)).unwrap().versions[&p("a")]
+            .iter()
+            .map(|q| q.arrival)
+            .collect();
+        assert_eq!(arrivals, [5, 6]);
     }
 
     /// §8.2: a batch id names one review item. Holding under an id that
@@ -424,6 +492,35 @@ mod tests {
         q.release(batch(1));
         assert_eq!(q.versions_at(&p("a")), vec![v(&[(3, 1)])]);
         assert_eq!(q.matching(&entry("a", v(&[(3, 2)]))), Some(batch(2)));
+    }
+
+    /// §11: every change to a held item reports its row once, with every
+    /// version it holds in arrival order, and a released item reports that
+    /// it is gone.
+    #[test]
+    fn held_items_report_their_rows_as_they_change() {
+        let mut q = Quarantine::default();
+        q.hold(item(1, vec![entry("a", v(&[(2, 3)]))]));
+        q.hold(item(2, vec![entry("a", v(&[(3, 1)]))]));
+        q.join(batch(1), entry("a", v(&[(2, 2), (4, 1)])));
+        let changes = q.drain_changes();
+        assert_eq!(
+            changes.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+            [batch(1), batch(2)]
+        );
+        let row = changes[0].1.as_ref().unwrap();
+        let held: Vec<(Version, u64)> = row.versions[&p("a")]
+            .iter()
+            .map(|q| (q.version.clone(), q.arrival))
+            .collect();
+        assert_eq!(
+            held,
+            [(v(&[(2, 3)]), 1), (v(&[(2, 2), (4, 1)]), 3)],
+            "the joiner too, after the other item's version"
+        );
+        assert!(q.drain_changes().is_empty());
+        q.release(batch(2));
+        assert_eq!(q.drain_changes(), [(batch(2), None)]);
     }
 
     #[test]

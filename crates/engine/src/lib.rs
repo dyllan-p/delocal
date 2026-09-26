@@ -57,7 +57,7 @@ pub use folder::{
 pub use id::{BatchId, FolderId, HostName, NodeId};
 pub use index::{ChangeKind, Index, IndexRecord, LocalChange, Pending, Reverted};
 pub use path::RelPath;
-pub use quarantine::{HeldItem, Quarantine, Withdrawn};
+pub use quarantine::{HeldItem, HeldRow, Quarantine, Quarantined};
 pub use rules::Rules;
 pub use time::Timestamp;
 pub use version::{Relation, Version};

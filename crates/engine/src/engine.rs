@@ -25,6 +25,7 @@ use crate::folder::{
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
 use crate::path::RelPath;
+use crate::quarantine::HeldRow;
 use crate::rules::Rules;
 use crate::time::Timestamp;
 use crate::version::Version;
@@ -249,6 +250,13 @@ pub enum Action {
         folder: FolderId,
         path: RelPath,
         want: Option<Box<Want>>,
+    },
+    /// A held item changed; persistence hook (§11), one row per item.
+    /// `None` when it is no longer held.
+    HeldChanged {
+        folder: FolderId,
+        batch: BatchId,
+        row: Option<Box<HeldRow>>,
     },
     /// The entries deferred at a path changed; persistence hook (§11), one
     /// row per path. `None` when nothing waits there any more.
@@ -577,6 +585,13 @@ impl Engine {
     /// not matter, only that it is there.
     fn persist(&mut self, out: &mut Vec<Action>) {
         for (id, folder) in &mut self.folders {
+            for (batch, row) in folder.held_changes() {
+                out.push(Action::HeldChanged {
+                    folder: *id,
+                    batch,
+                    row: row.map(Box::new),
+                });
+            }
             for (path, entries) in folder.deferred_changes() {
                 out.push(Action::DeferredChanged {
                     folder: *id,
@@ -1080,7 +1095,9 @@ mod tests {
             .filter(|a| {
                 !matches!(
                     a,
-                    Action::WantChanged { .. } | Action::DeferredChanged { .. }
+                    Action::WantChanged { .. }
+                        | Action::HeldChanged { .. }
+                        | Action::DeferredChanged { .. }
                 )
             })
             .cloned()
@@ -2599,7 +2616,7 @@ mod tests {
                 ..
             }
         )));
-        assert_eq!(out.last(), Some(&Action::WakeAt(t(16.0))));
+        assert_eq!(core(&out).last(), Some(&Action::WakeAt(t(16.0))));
         let out = b.handle(
             t(16.0),
             Event::Tick {

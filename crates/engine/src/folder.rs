@@ -75,7 +75,7 @@ use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Reverted};
 use crate::parts::Changed;
 use crate::path::RelPath;
-use crate::quarantine::{HeldItem, Quarantine, Withdrawn};
+use crate::quarantine::{HeldItem, HeldRow, Quarantine};
 use crate::rules::Rules;
 use crate::time::{DEBOUNCE_NANOS, Timestamp, WINDOW_NANOS};
 use crate::version::Version;
@@ -556,7 +556,7 @@ pub struct FolderState {
     /// The held items consumed by denies whose bumps are not yet announced.
     /// A `revert` discards unannounced bumps and puts these back (§8.3);
     /// the next announcement clears them.
-    denied: Vec<Withdrawn>,
+    denied: Vec<HeldRow>,
     /// Statuses raised outside a direct call's return value (a hold made
     /// while admitting re-classified entries); the engine drains them.
     #[serde(skip)]
@@ -674,6 +674,12 @@ impl FolderState {
     /// Entries waiting to be classified again, in path then arrival order.
     pub fn deferred(&self) -> impl Iterator<Item = &Deferred> {
         self.deferred.entries()
+    }
+
+    /// Held items whose row changed since the last call, for the
+    /// `HeldChanged` persistence hook (§11).
+    pub fn held_changes(&mut self) -> Vec<(BatchId, Option<HeldRow>)> {
+        self.quarantine.drain_changes()
     }
 
     /// Deferred paths whose entries changed since the last call, for the
@@ -3642,7 +3648,16 @@ mod tests {
         assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
         let out = b.revert(t(17.0)).unwrap();
         assert_eq!(out.returned, vec![(bid(3), 4)]);
-        assert_eq!(b.quarantine(), &held, "back as it was");
+        // Back as it was, its versions arriving again after anything held
+        // meanwhile.
+        assert_eq!(
+            b.quarantine().items().collect::<Vec<_>>(),
+            held.items().collect::<Vec<_>>()
+        );
+        for i in 0..4 {
+            let path = p(&format!("f{i:02}"));
+            assert_eq!(b.quarantine().versions_at(&path), held.versions_at(&path));
+        }
         for i in 0..4 {
             let f = &b.index().get(&p(&format!("f{i:02}"))).unwrap().entry;
             assert!(f.version.dominates(&Version::empty()) && !f.deleted);
