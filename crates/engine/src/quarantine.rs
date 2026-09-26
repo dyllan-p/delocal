@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::brake::HoldReason;
 use crate::entry::Entry;
 use crate::id::{BatchId, NodeId};
-use crate::parts::Changed;
+use crate::parts::{Changed, differs};
 use crate::path::RelPath;
 use crate::time::Timestamp;
 use crate::version::Version;
@@ -151,6 +151,22 @@ impl Quarantine {
             .iter()
             .map(|(at, row)| ((row.item.batch, HeldState::Denied { at: *at }), row.clone()));
         held.chain(denied).collect()
+    }
+
+    /// The first field in which `self` and `other` differ, by name, or
+    /// `None` if they are equal (see [`crate::FolderState::first_difference`]).
+    pub fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        let Self {
+            items,
+            versions,
+            denied,
+            arrivals,
+            changed: _,
+        } = self;
+        differs("quarantine.items", *items == other.items)
+            .or_else(|| differs("quarantine.versions", *versions == other.versions))
+            .or_else(|| differs("quarantine.denied", *denied == other.denied))
+            .or_else(|| differs("quarantine.arrivals", *arrivals == other.arrivals))
     }
 
     /// The last arrival number handed out: part of the small rest (§11).

@@ -74,6 +74,13 @@ pub struct FolderParts {
     pub rest: Rest,
 }
 
+/// `Some(name)` if a field compared unequal: a step of the
+/// `first_difference` diagnostics the simulator's restart check uses to
+/// name what a rebuild from the parts lost (§11).
+pub(crate) fn differs(name: &'static str, same: bool) -> Option<&'static str> {
+    (!same).then_some(name)
+}
+
 /// Keys of a part whose rows changed since the engine last reported them
 /// (§11). Bookkeeping for the persistence hooks, not folder state: it is
 /// not serialised, and two states that differ only here are equal, so a

@@ -73,7 +73,7 @@ use crate::brake::{self, HoldReason, Verdict};
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Pending, Reverted};
-use crate::parts::{Changed, FolderParts, Rest};
+use crate::parts::{Changed, FolderParts, Rest, differs};
 use crate::path::RelPath;
 use crate::quarantine::{HeldItem, HeldRow, HeldState, Quarantine};
 use crate::rules::Rules;
@@ -670,6 +670,53 @@ impl FolderState {
                 .collect(),
             rest: self.rest(),
         }
+    }
+
+    /// The first field in which `self` and `other` differ, by name
+    /// (`index.pending`, say), or `None` if they are equal. The simulator's
+    /// restart check (§11) uses it to say what a rebuild from the parts
+    /// lost. Every field is destructured, so a new one cannot be left out;
+    /// the bookkeeping for the hooks compares equal, as it does in `==`.
+    pub fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        let Self {
+            id,
+            rules,
+            members,
+            index,
+            window,
+            scan,
+            wants,
+            acked,
+            catchup,
+            deferred,
+            winner_fallbacks,
+            quarantine,
+            paused,
+            queued,
+            startup_scan,
+            statuses,
+        } = self;
+        differs("id", *id == other.id)
+            .or_else(|| differs("rules", *rules == other.rules))
+            .or_else(|| differs("members", *members == other.members))
+            .or_else(|| index.first_difference(&other.index))
+            .or_else(|| differs("window", *window == other.window))
+            .or_else(|| differs("scan", *scan == other.scan))
+            .or_else(|| differs("wants", *wants == other.wants))
+            .or_else(|| differs("acked", *acked == other.acked))
+            .or_else(|| differs("catchup", *catchup == other.catchup))
+            .or_else(|| differs("deferred", *deferred == other.deferred))
+            .or_else(|| {
+                differs(
+                    "winner_fallbacks",
+                    *winner_fallbacks == other.winner_fallbacks,
+                )
+            })
+            .or_else(|| quarantine.first_difference(&other.quarantine))
+            .or_else(|| differs("paused", *paused == other.paused))
+            .or_else(|| differs("queued", *queued == other.queued))
+            .or_else(|| differs("startup_scan", *startup_scan == other.startup_scan))
+            .or_else(|| differs("statuses", *statuses == other.statuses))
     }
 
     /// Statuses raised since the last call (see `statuses`).
@@ -2705,15 +2752,27 @@ mod tests {
             WantState::Fetching { .. }
         ));
 
-        let mut rebuilt = FolderState::from_parts(parts, node(2), HostName::new("bravo").unwrap());
-        rebuilt.restarted(t(30.0));
+        let rebuild = |parts: FolderParts| {
+            let mut f = FolderState::from_parts(parts, node(2), HostName::new("bravo").unwrap());
+            f.restarted(t(30.0));
+            // The restart noted every want: bookkeeping for the hooks,
+            // drained before comparing.
+            f.want_changes();
+            f
+        };
         let mut expected = b.clone();
         expected.restarted(t(30.0));
-        // Both lists hold every want, noted by the restart; they are
-        // bookkeeping for the hooks, drained before comparing.
-        rebuilt.want_changes();
         expected.want_changes();
+        let rebuilt = rebuild(parts.clone());
+        assert_eq!(rebuilt.first_difference(&expected), None);
         assert_eq!(rebuilt, expected);
+        // A part left out is named.
+        let mut lossy = parts;
+        lossy.pending.clear();
+        assert_eq!(
+            rebuild(lossy).first_difference(&expected),
+            Some("index.pending")
+        );
     }
 
     #[test]

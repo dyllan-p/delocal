@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::{ContentHash, Entry, Kind, Observed};
 use crate::id::{HostName, NodeId};
-use crate::parts::{Changed, Rest};
+use crate::parts::{Changed, Rest, differs};
 use crate::path::RelPath;
 use crate::version::Version;
 
@@ -208,6 +208,35 @@ impl Index {
             announced_seq: rest.announced_seq,
             announced_tracked: rest.announced_tracked,
         }
+    }
+
+    /// The first field in which `self` and `other` differ, by name, or
+    /// `None` if they are equal (see [`crate::FolderState::first_difference`]).
+    pub fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        let Self {
+            own,
+            host,
+            records,
+            seq,
+            peer_seq,
+            pending,
+            pending_changed: _,
+            announced_seq,
+            announced_tracked,
+        } = self;
+        differs("index.own", *own == other.own)
+            .or_else(|| differs("index.host", *host == other.host))
+            .or_else(|| differs("index.records", *records == other.records))
+            .or_else(|| differs("index.seq", *seq == other.seq))
+            .or_else(|| differs("index.peer_seq", *peer_seq == other.peer_seq))
+            .or_else(|| differs("index.pending", *pending == other.pending))
+            .or_else(|| differs("index.announced_seq", *announced_seq == other.announced_seq))
+            .or_else(|| {
+                differs(
+                    "index.announced_tracked",
+                    *announced_tracked == other.announced_tracked,
+                )
+            })
     }
 
     /// The pending set, by path: a persisted part (§11).
