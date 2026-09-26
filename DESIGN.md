@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 33 · 25 September 2026 · Status: **Phase 1 complete** (100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 32: persistence by part with engine hooks, and group commit with effects after durability (§11); I8 in the invariant table, the nightly rotates its seeds and adds a long-run slice (§14.1); faults injected through a filesystem layer (§14.2, §15).
+> Draft 34 · 26 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 33, from planning Phase 2: the persisted parts are named, the pending set and held items (held or denied) among them, quarantined entries carry an arrival number, and the schema sketch follows the parts (§11); paths a scan cannot inspect are `Skipped`, not tombstoned, tracked paths that become ignored are frozen, names on disk map to index paths, and the root guard covers watcher absences (§7.1, §7.3); a commit journal covers the gap between displacement and rename, and local failures have an outcome, with disk-full pausing a folder's inbound and a case collision deferring the want (§7.5, §7.6, §13); batches also split by bytes (§7.4); the engine's clock is monotonic within a run (§7.8); trash names (§8.4); membership by folder id and the two-daemon setup (§9.1, §14.2); `RequestFile` carries a request id and `CancelRequest` exists (§12); the simulator crashes between the two renames, persists late to model group commit, and moves a displaced directory's children (§14.1); the Tailscale trait is async, polled, and addresses carry a port (§6.1, §6.2, §6.3); Phase 2's definition of done is I2 on real disks (§15).
+>
+> Changes from draft 32: persistence by part with engine hooks, and group commit with effects after durability (§11); I8 in the invariant table, the nightly rotates its seeds and adds a long-run slice (§14.1); faults injected through a filesystem layer (§14.2, §15).
 >
 > Changes from draft 31: exclusions and give-ups also expire on a backoff (§7.5).
 >
@@ -177,12 +179,13 @@ All Tailscale-specific code lives in `crates/delocal/src/tailscale/` behind one 
 
 ```rust
 trait Tailscale {
-    fn self_info(&self) -> Result<SelfInfo>;        // ips, stable id, user, hostname
-    fn peers(&self) -> Result<Vec<Peer>>;           // hostname, ips, stable id, user, online, tags, path info
-    fn whois(&self, ip: IpAddr) -> Result<WhoIs>;   // stable id, user, tags
-    fn watch(&self) -> impl Stream<Item = Event>;   // optional: state changes; else poll
+    async fn self_info(&self) -> Result<SelfInfo>;            // ips, stable id, user, hostname
+    async fn peers(&self) -> Result<Vec<Peer>>;               // hostname, addrs, stable id, user, online, tags, path info
+    async fn whois(&self, addr: SocketAddr) -> Result<WhoIs>; // stable id, user, tags
 }
 ```
+
+The methods are async because the preferred implementation is an HTTP client. A peer's addresses are socket addresses: the real implementation pairs each Tailscale IP with the configured port (§6.3), and the fake used in tests (§14.2) may give every peer its own port, which is how two daemons share one host without `sudo`. `whois` takes the connecting socket address; the LocalAPI accepts `ip:port` **[verify]**, and the fake resolves by port. v1 polls (§6.2); the LocalAPI event stream is a v1.1 item, so the trait has no stream type and needs no crate for one.
 
 Preferred implementation: the **Tailscale LocalAPI**, an HTTP API on a local socket that the `tailscale` CLI itself uses. On Linux the socket is `/var/run/tailscale/tailscaled.sock`. **[verify]** The macOS GUI builds (App Store and standalone) do not expose the socket the same way; they use a localhost port plus a token. Confirm the discovery mechanism during Phase 3.
 
@@ -192,7 +195,7 @@ Fields used: own IPs and user; per peer: hostname, Tailscale IPs, online flag, s
 
 ### 6.2 Discovery
 
-Every 30 seconds, and immediately on a Tailscale state change if the API offers events, delocal fetches the peer list. For each online peer that passes the trust rule:
+Every 30 seconds delocal fetches the peer list (subscribing to LocalAPI events instead is a v1.1 item, §6.1). For each online peer that passes the trust rule:
 
 - If the peer is known to run delocal: connect (subject to §6.3 dial rule).
 - If unknown: TCP-probe the delocal port with a 2 s timeout. Failure backs off (30 s, 1 m, 5 m, cap 5 m) so a tailnet full of non-delocal machines costs nothing noticeable.
@@ -201,7 +204,7 @@ There is no discovery protocol of delocal's own. The tailnet is the directory.
 
 ### 6.3 Transport
 
-- TCP on port **41831** by default **[decision]**, bound to the machine's Tailscale IPs only. Configurable via `rules`, but every machine must use the same port in v1.
+- TCP on port **41831** by default **[decision]**, bound to the machine's Tailscale IPs only. Configurable via `rules`, but every machine must use the same port in v1; only the test fake (§6.1) hands out per-peer ports.
 - Exactly one connection per pair of machines. **Dial rule:** the machine with the lexically smaller node ID dials; the other only listens. If both somehow connect, the connection initiated by the larger ID is dropped.
 - Framing: `u32` big-endian length prefix, then a `postcard`-serialized message (`serde`). Maximum frame 16 MiB; file data is chunked below that.
 - `Hello` is the first message in each direction and carries the protocol version, node ID, hostname and delocal version. Incompatible protocol versions are refused with a `Goodbye{reason}`; `status` shows "update needed on <machine>".
@@ -243,7 +246,7 @@ Per folder, one record per entry the machine knows about, including deleted ones
 
 | Field | Notes |
 |---|---|
-| `path` | Relative, forward slashes, no leading `./`. NFC-normalised **by the host** before it reaches the engine; the engine treats paths as opaque UTF-8 |
+| `path` | Relative, forward slashes, no leading `./`, at most 4,096 bytes. NFC-normalised **by the host** before it reaches the engine (§7.3 says how names on disk map to it); the engine treats paths as opaque UTF-8 |
 | `kind` | `file` / `dir` / `symlink` |
 | `size` | bytes (0 for dir; target length for symlink) |
 | `mtime_ns` | Files only, as observed or received. **0 for directories and symlinks**: a directory's mtime changes whenever a child is created or removed, so syncing it would make every file change ripple into a directory "touch" on every machine, forever; symlink timestamps are not worth the platform differences. For a tombstone, the time the deletion was observed on the machine that made it |
@@ -279,16 +282,19 @@ Wall-clock time never participates in ordering. See §7.8.
 
 ### 7.3 Local change detection
 
-- `notify` watches every folder root recursively. Events are debounced (2 s of quiet per path).
+- `notify` watches every folder root recursively. Events are debounced (2 s of quiet per path). **[verify]** FSEvents coalescing on macOS under `notify-debouncer-full`.
 - A **full scan** runs at daemon start, every hour **[decision]**, and on `delocal scan`. Watchers drop events under load; the scan is the ground truth.
 - Fast path: a file whose `size`, `mtime_ns` **and exec bit** match the index is unchanged; a directory whose kind matches is unchanged; a symlink is unchanged only if its kind **and target** match, because the target is its content and a retarget changes neither size nor anything else the fast path sees (`readlink` is one call). Anything else is hashed. The exec bit is in the fast path because `chmod` changes neither size nor mtime: if its watcher event is dropped, a fast path on size and mtime alone would never notice, and the index would disagree with the disk forever. `stat` returns the mode anyway, so this costs nothing.
 - **A change in mtime alone** (size and hash unchanged) is still a change: it produces a new version with `hash == prev_hash` and propagates, so that every machine holds the same `mtime_ns` for the same version and the conflict tie-break stays deterministic. Receivers apply it as a metadata-only apply (§7.5); it is invisible to the brake (§8.1); and it loses to any real content change in a conflict (§7.6).
-- **mtime precision shim [Phase 2].** Filesystems with coarse timestamps (FAT, exFAT, some network mounts) cannot store the record's `mtime_ns` exactly, so a received file would look touched on the next scan, gain a new version, propagate, and loop forever. After every `Write` or `SetMeta` the host reads back the mtime the filesystem kept; if it differs from the one requested, the host records the pair and reports the requested value to the engine on later scans while the stored value is unchanged. The engine never sees the discrepancy.
+- **mtime precision shim [Phase 2].** Filesystems with coarse timestamps (FAT, exFAT, some network mounts) cannot store the record's `mtime_ns` exactly, so a received file would look touched on the next scan, gain a new version, propagate, and loop forever. After every `Write` or `SetMeta` the host reads back the mtime the filesystem kept; if it differs from the one requested, the host records the pair and reports the requested value to the engine on later scans while the stored value is unchanged. The engine never sees the discrepancy. The pairs are persisted with the folder (`mtime_shim`, §11) and survive a restart; otherwise every restart would touch every received file once and announce it. **[verify]** mtime granularity and read-back on ext4, APFS and tmpfs.
 - **Stability check:** a file is not hashed until its mtime has been unchanged for 2 s, and if it changes during hashing the hash is discarded and retried. This avoids announcing half-written files.
 - Hashing is BLAKE3, parallel across files, streamed for large ones.
 - Always ignored: `.delocal/` at the folder root. User rules: `.delocalignore` at the folder root, gitignore syntax via the `ignore` crate. Default rules shipped for every folder: `.DS_Store`, `._*`, `*.swp`, `*~`, `.#*`, `.Trash*`.
 - Directories are tracked so that empty directories sync. Symlinks are synced as symlinks and never followed. Files that cannot be read (permissions) are skipped and counted in `status`.
-- **Folder root guard:** each folder has a marker `.delocal/folder.json`. If the marker is missing on a scan (the drive was unmounted, the directory was deleted wholesale), the scan aborts, the folder is paused with a clear status message, and **no deletes are announced**. This is the cheapest protection against "unmounted disk → mass delete everywhere" and it is non-negotiable.
+- **Names on disk.** The scan walks the tree and works from the names `readdir` returns; it never asks the filesystem for an index path by name, because a case-insensitive or normalisation-insensitive filesystem answers for a different file. A name becomes an index path by NFC normalisation, and where the two differ the host keeps the pair (`disk_names`, §11) so that commits and the guard address the file the user has. A name that is not valid UTF-8, or two names whose index paths coincide (two normalisation forms on Linux; two casings on a case-sensitive disk for a folder that also lives on macOS), are unobservable: nothing is synced for them, `status` names them, and the user renames one. Received paths are written as they are, which on Linux creates NFC names.
+- **Unobservable paths.** A path a scan bracket cannot inspect is reported as `Skipped`, with the reason, rather than left out: permission denied, an I/O error while reading or hashing, a file whose mtime has not been stable for 2 s, a name from the previous bullet, or a path over 4,096 bytes. The engine keeps whatever record it has, announces nothing for the path, and the bracket's deletion pass leaves it alone; leaving the path out instead would let that pass tombstone a live file, and every peer would then move its copy to the trash. `status` counts skipped paths by reason. Outside a bracket the host simply observes the path again once it can.
+- **Tracked paths that become ignored** (a new rule in `.delocalignore`) are reported `Skipped` from then on: the record stays, no tombstone is announced, and the path is frozen until the rule goes, when the next bracket observes it normally. A rule that hides a file must never read as a deletion. Incoming versions at a path this machine ignores are applied as usual in v1: `.delocalignore` is synced, so the window in which one member ignores what another announces is the propagation lag of the rule itself; refusing them is a v1.1 item.
+- **Folder root guard:** each folder has a marker `.delocal/folder.json`. If the marker is missing on a scan (the drive was unmounted, the directory was deleted wholesale), the scan aborts, the folder is paused with a clear status message, and **no deletes are announced**. This is the cheapest protection against "unmounted disk → mass delete everywhere" and it is non-negotiable. The guard also covers the watcher: before the host forwards an `Absent` observation from it, the host checks that the marker is present, and if it is not the observation is dropped and the folder is treated as after an aborted scan; a removal event for the root itself is the same case. `rm -rf` of the root must not reach the engine as deletions because the watcher was faster than the hourly scan.
 
 ### 7.4 Batches
 
@@ -321,9 +327,9 @@ Otherwise the batch is sent to every connected member of the folder and recorded
 
 The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluated over the apply set. Result: `accepted` (apply set goes into the want-list) or `held` (versions quarantined, §8.2). The receiver replies `BatchDecision { id, decision, seq_high }`, and records the batch in history either way.
 
-**Ordering and acknowledgement.** Entries in a batch are ordered by the sender's `seq`, not by path, and a batch that would exceed 10,000 entries is split on `seq` boundaries, so every batch covers a contiguous range of the sender's `seq` and its `seq_high` is a true watermark. The receiver's `BatchDecision` is the acknowledgement: `Accepted` and `Held` both mean "I have your records up to `seq_high`" (held versions sit in quarantine and are not re-sent). There is no separate ack message. Every batch also carries `seq_low`, the `seq_high` of the sender's previous batch for that folder (0 for the first), so a sender's batches chain. A receiver whose highest contiguous `seq` from that sender is below a batch's `seq_low` has a **gap**: it processes the batch anyway (versions are self-describing, so order does not affect correctness) but acknowledges only the highest contiguous `seq`, tracking received ranges above it until the gap fills. A sender whose batch is acknowledged below its `seq_high` re-sends `records_since(ack)` to that peer at the next tick, exactly as catch-up does. `have_up_to` is the same contiguous watermark. This makes the protocol correct over a transport that loses or reorders messages, rather than relying on TCP's ordering across reconnects. Receivers sort their apply set by path before applying, which is where §7.5's parents-before-children order comes from. The sender's `summary` counts only this machine's own local changes, classified as in §8.1; adopted records it relays are not counted, since they already passed this machine's receiver brake, and every receiver computes its own counts over its own apply set anyway.
+**Ordering and acknowledgement.** Entries in a batch are ordered by the sender's `seq`, not by path, and a batch that would exceed 10,000 entries **or an estimated 4 MiB of encoded entries** (path bytes plus a fixed allowance per entry) is split on `seq` boundaries, so every batch covers a contiguous range of the sender's `seq` and its `seq_high` is a true watermark. The byte bound keeps every batch under §6.3's 16 MiB frame with room to spare; 10,000 long paths alone would not. The receiver's `BatchDecision` is the acknowledgement: `Accepted` and `Held` both mean "I have your records up to `seq_high`" (held versions sit in quarantine and are not re-sent). There is no separate ack message. Every batch also carries `seq_low`, the `seq_high` of the sender's previous batch for that folder (0 for the first), so a sender's batches chain. A receiver whose highest contiguous `seq` from that sender is below a batch's `seq_low` has a **gap**: it processes the batch anyway (versions are self-describing, so order does not affect correctness) but acknowledges only the highest contiguous `seq`, tracking received ranges above it until the gap fills. A sender whose batch is acknowledged below its `seq_high` re-sends `records_since(ack)` to that peer at the next tick, exactly as catch-up does. `have_up_to` is the same contiguous watermark. This makes the protocol correct over a transport that loses or reorders messages, rather than relying on TCP's ordering across reconnects. Receivers sort their apply set by path before applying, which is where §7.5's parents-before-children order comes from. The sender's `summary` counts only this machine's own local changes, classified as in §8.1; adopted records it relays are not counted, since they already passed this machine's receiver brake, and every receiver computes its own counts over its own apply set anyway.
 
-**Catch-up.** When two members connect, each tells the other the highest `seq` of theirs it holds, per folder (`have_up_to` in `FolderMeta`, §12), and each sends every index record with `seq` greater than that, packaged as one or more batches (max 10,000 entries each, split on `seq`). Only **announced** records take part (`seq` at or below the last announced `seq`): unannounced local changes go through the live path and its pre-check, so a paused folder's pending set can never leak through a reconnect. The peer's `have_up_to` **replaces** the sender's memory of acks rather than being combined with it; it is the truth about what the peer holds, and a lower value means the peer lost state and needs the records again. These go through exactly the same brake. A brand-new member receiving the whole folder sees a batch of pure adds, which the count rule ignores (§8.1), so first sync is never held by count; it can still be held by size.
+**Catch-up.** When two members connect, each tells the other the highest `seq` of theirs it holds, per folder (`have_up_to` in `FolderMeta`, §12), and each sends every index record with `seq` greater than that, packaged as one or more batches (split as above). Only **announced** records take part (`seq` at or below the last announced `seq`): unannounced local changes go through the live path and its pre-check, so a paused folder's pending set can never leak through a reconnect. The peer's `have_up_to` **replaces** the sender's memory of acks rather than being combined with it; it is the truth about what the peer holds, and a lower value means the peer lost state and needs the records again. These go through exactly the same brake. A brand-new member receiving the whole folder sees a batch of pure adds, which the count rule ignores (§8.1), so first sync is never held by count; it can still be held by size.
 
 **Why batches and not a live index stream:** every batch is a natural unit for approval, for `history`, for `review` and for `revert`. Syncthing streams index updates continuously and has no such unit, which is why its safety story is weaker. The cost is up to 10 s of latency on a change, which is acceptable.
 
@@ -343,10 +349,14 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 
 **Committing.**
 
-6. Check the target path is still what the index said it was when the decision was made, using **the same predicate as the scan fast path** (§7.3): for a file kind, size, mtime_ns and exec bit; for a symlink kind and target; for a directory kind; or absent. If not, the local file changed underneath us: abort the commit and report `ChangedUnderneath`. This guard applies to every commit the host performs, `SetMeta` included: a metadata-only apply that set the record's mtime on a file the user had edited meanwhile would leave the edit invisible to the fast path (same size, now same mtime) until the file changed again. Anything the fast path would notice, the guard must notice; anything the guard lets through, the fast path will then confirm as unchanged. The same outcome is reported if the commit's displacement target (§7.6) exists when the host gets there. The engine keeps the incoming entry and re-evaluates it against the index after the next observation of that path arrives, which will find a new local version and classify the pair as a conflict (§7.6) or as dominated. The incoming version is never dropped: the sender has already been acknowledged for it and would not send it again.
+6. Check the target path is still what the index said it was when the decision was made, using **the same predicate as the scan fast path** (§7.3): for a file kind, size, mtime_ns and exec bit; for a symlink kind and target; for a directory kind; or absent. If not, the local file changed underneath us: abort the commit and report `ChangedUnderneath`. This guard applies to every commit the host performs, `SetMeta` included: a metadata-only apply that set the record's mtime on a file the user had edited meanwhile would leave the edit invisible to the fast path (same size, now same mtime) until the file changed again. Anything the fast path would notice, the guard must notice; anything the guard lets through, the fast path will then confirm as unchanged. The same outcome is reported if the commit's displacement target (§7.6) exists when the host gets there. On a case-insensitive or normalisation-insensitive filesystem the guard also confirms that the name on disk is the record's exact bytes (through the parent's `readdir`, or the `disk_names` pair of §7.3), since `stat` by name would answer for a differently-cased file; and if a live record exists at another path the filesystem would treat as this name, the commit is not attempted and the host reports `Failed { CaseCollision }` (below). The engine keeps the incoming entry and re-evaluates it against the index after the next observation of that path arrives, which will find a new local version and classify the pair as a conflict (§7.6) or as dominated. The incoming version is never dropped: the sender has already been acknowledged for it and would not send it again.
 7. If a file exists at the target, **move it to trash** (§8.4), or, when the commit resolves a conflict and the existing file is the losing content, to the conflict-copy path (§7.6). Same filesystem, so this is a rename either way. The engine says which in the commit action; the host never chooses.
 8. `rename(tmp, target)`. Ensure parent directories exist (creating them as index entries if they arrived in the same batch).
 9. Update the index record and `fsync` the parent directory.
+
+**Two renames, one commit.** Steps 7 and 8 are two renames, and the path is absent between them. While the daemon runs, the window is covered by the in-flight rule: observations of the path are ignored. A crash inside it is covered by a **commit journal**: before step 7 the host makes durable a row naming the path, where the displaced file goes and which temp file comes in, and it removes the row after step 9. At startup, before the first scan, every open row is **undone**: the displaced file is moved back and the temp file is left for resumption; the engine's commit did not survive the restart (a commit holds its path until the host reports it or the process restarts), so it fetches and commits again. Undoing rather than finishing keeps the rule that a restart never lands a commit the engine has not been told about. If step 8 itself fails, the host undoes step 7 the same way before reporting, so a failed commit leaves the disk as it found it and no failure can read as a local deletion to the next scan. An atomic exchange (`renameat2` with `RENAME_EXCHANGE`, `renamex_np` with `RENAME_SWAP`) would close the window on some filesystems and not others; the journal closes it on all of them, and is boring (§1).
+
+**Local failures.** A commit or a fetch can fail for a reason that is neither `ChangedUnderneath` nor the peer's: the disk is full, an I/O error, a case collision. The host reports `ApplyOutcome::Failed { error }` or `FetchReport::Failed { error }`, with `error` one of `DiskFull`, `Io` and `CaseCollision`. In every case the commit is released and the path leaves in-flight. `Io` returns the want to *wanted* under a local retry backoff on the schedule of the exclusions above (one minute, doubling, capped at an hour), without touching its sources, and `status` warns. `DiskFull` also pauses the folder's **inbound**: every want in the folder is *deferred* with reason `disk full` until the host reports `SpaceRecovered` for the folder, which it checks every 30 s while paused. `CaseCollision` defers the want with reason `collides with <path>`, re-evaluated when the index at either path changes, and `status` names the pair (§7.6).
 
 **Metadata-only applies.** An incoming version that dominates the local one but has identical content (content equality as in §7.6: kind, hash, exec) needs no fetch, no trash and no write. The host sets the file's mtime to the record's `mtime_ns` (files only; directories and symlinks carry no mtime, §7.1, so for them this is an index-only update with no disk action), after the same guard as any other commit (step 6 below) and the index adopts the incoming version, `modified_by` and `author_host`. This is how a conflict's merged version `M` (§7.6) lands on a machine that already holds the winning content, and how `deny` bumps (§8.2) land on machines that hold the same copy. A version that differs only in the exec bit is applied the same way, by changing the bit, with no transfer.
 
@@ -397,7 +407,7 @@ If `author_host` is empty (should not happen, but the format must be total), the
 - **Delete vs modify:** decided by the stamp like everything else. A tombstone's stamp is its predecessor's plus one, so a concurrent edit made after the file's last edit wins and the deletion is dropped; an edit older than that loses, and because the machine holding it displaces it to a conflict copy before applying the tombstone, the edit survives in the folder under the conflict name. A file that someone is editing never vanishes; at worst it is renamed.
 - **Modify vs modify on a directory** cannot happen; directories carry no content.
 - **File vs directory at the same path:** the winner rule decides; the loser is renamed with the conflict suffix. Expected to be vanishingly rare. If the loser is a non-empty directory, displacing it moves its children too: their old records are tombstoned and the moved children appear as adds on the next scan, which may trip the brake on that machine. Known behaviour, accepted; the brake is the safety net.
-- **Case-insensitive filesystems (macOS default):** two index paths that differ only by case cannot both exist. Neither is applied; `status` reports the pair and the user resolves it on a case-sensitive machine. **[decision]** This is the Syncthing approach and is good enough for v1.
+- **Case-insensitive filesystems (macOS default):** two index paths that differ only by case cannot both exist. The host detects the pair at commit time and reports `Failed { CaseCollision }` (§7.5), so the want is deferred and `status` names the pair; on the scan side the file the user has is observed under its real name and the other path keeps its record (§7.3). The user resolves it on a case-sensitive machine. **[decision]** This is the Syncthing approach and is good enough for v1.
 
 ### 7.7 Tombstones
 
@@ -407,7 +417,7 @@ A deleted entry keeps its index record with `deleted = true` and the deletion's 
 
 ### 7.8 Clocks
 
-Wall-clock time is used for exactly four things: local change detection (mtime vs index), seeding the `stamp` of a content change (§7.1), the conflict tie-breaks below the stamp, and preserving mtimes on received files. It never orders events; version vectors do. If a peer's `Hello` timestamp differs from local time by more than 5 minutes, `status` shows a warning, because the tie-break is less trustworthy.
+Wall-clock time is used for exactly four things: local change detection (mtime vs index), seeding the `stamp` of a content change (§7.1), the conflict tie-breaks below the stamp, and preserving mtimes on received files. It never orders events; version vectors do. If a peer's `Hello` timestamp differs from local time by more than 5 minutes, `status` shows a warning, because the tie-break is less trustworthy. The `now` the host hands the engine is the wall clock sampled once at daemon start plus the monotonic time elapsed since, so it reads as Unix nanoseconds but never runs backwards or leaps within a run: the batch window, the stall deadline and the backoffs are safe from a clock adjustment, and a tombstone's `mtime_ns` or a batch's `created_at` is off by at most the drift since start.
 
 ---
 
@@ -437,7 +447,7 @@ Counting only. No content analysis, no entropy heuristics, no attempt to recogni
 
 ### 8.2 Quarantine
 
-When a receiver holds a batch, every incoming entry that produced an apply-set item is written to the `quarantine` table **as received**, not as classified: a conflict's `M` (§7.6) never appears on the wire, and quarantining it instead of the incoming version would let that version through from another peer. Quarantine is by **version**, not by sender:
+When a receiver holds a batch, every incoming entry that produced an apply-set item is quarantined **as received**, not as classified: a conflict's `M` (§7.6) never appears on the wire, and quarantining it instead of the incoming version would let that version through from another peer. Quarantine is by **version**, not by sender:
 
 - The same version offered later by any other member is still held.
 - Any version that **dominates** a quarantined version (the source kept editing after the event) is also quarantined, and joins the same review item.
@@ -476,7 +486,7 @@ A `deny` can still run on an unpaused folder whose window then pauses on other l
 
 ### 8.4 Trash
 
-Location: `<folder>/.delocal/trash/YYYY-MM-DD/<relative path>`; name collisions within a day get a `~1`, `~2` suffix. Living inside the folder means every move is a same-filesystem rename: instant, no copy, no extra disk pressure until pruning.
+Location: `<folder>/.delocal/trash/YYYY-MM-DD/<relative path>`, the day in local time: the trash is one machine's, browsed by its user, and pruning uses the recorded `trashed_at`, not the name. Name collisions within a day get a `~1`, `~2` suffix before the extension, split as §7.6 splits conflict names, so `report.xlsx` becomes `report~1.xlsx`. Living inside the folder means every move is a same-filesystem rename: instant, no copy, no extra disk pressure until pruning.
 
 What goes in: every file delocal is about to overwrite or delete because of a **remote** change, plus files moved aside by `revert`. Nothing else — delocal never sees a local edit until it has already happened, and it is not a backup.
 
@@ -512,7 +522,7 @@ Member { path: LocalPath, mode: Mode, joined_at }
 Mode = TwoWay                  // v1. Reserved: SendOnly, ReceiveOnly, Archive
 ```
 
-Folder metadata is itself synced between members (a small, separately-versioned record), so `share` on one machine is visible everywhere.
+Folder metadata is itself synced between members (a small, separately-versioned record), so `share` on one machine is visible everywhere. A trusted peer whose `FolderMeta` (§12) names a folder id this machine holds is a member of that folder: ids are random, so a shared id is a shared folder. Phase 2 relies on this alone (§14.2); `share` and `add` (§9.2) are how an id comes to be shared.
 
 ### 9.2 Default membership: every machine, same path
 
@@ -642,26 +652,36 @@ logs/            rotating, 7 days
 **SQLite schema (sketch):**
 
 ```sql
-folders        (id, name, created_by, rules_json, meta_version,
-                announced_seq, announced_tracked, paused_json)     -- per-folder engine state that is small
-pending        (folder, path, announced_record_json)              -- the record peers last saw, per unannounced path (§7.1)
-acks           (folder, node, acked_seq)                          -- highest of our seq each peer acknowledged (§7.4)
-deferred       (folder, path, entries_json)                       -- incoming versions waiting on a frozen or changed path (§7.5, §8.1)
+folders        (id, name, created_by, rules_json, meta_version)
+folder_state   (folder, small_rest_json)                                 -- the small rest (above)
 members        (folder, node, path, mode, joined_at)
-entries        (folder, path, kind, size, mtime_ns, exec, hash, version_blob, deleted, modified_by, author_host, seq,
-                PRIMARY KEY (folder, path))
-peer_seq       (folder, node, last_seq)
+entries        (folder, path, kind, size, mtime_ns, exec, hash, prev_hash, stamp, version_blob, deleted,
+                modified_by, author_host, seq, PRIMARY KEY (folder, path))
+pending        (folder, path, announced_record_json, exempt)             -- §7.1, §8.1
+held_items     (folder, id, state, entries_json)                         -- state: held | denied (§8.2, §8.3)
+deferred       (folder, path, entries_json)                              -- §7.5, §8.1
+want           (folder, path, want_json)
 batches        (id, folder, source, created_at, adds, mods, dels, bytes, decision, decided_at)
-batch_entries  (batch, path, kind, version_blob)
-quarantine     (folder, path, version_blob, batch)
-want           (folder, path, version_blob, hash, size, deferred_reason)
-trash          (folder, trashed_path, original_path, trashed_at, size)
+batch_entries  (batch, path, kind, hash, version_blob)
+trash          (folder, trashed_path, original_path, hash, trashed_at, size)
+mtime_shim     (folder, path, requested_ns, stored_ns)                   -- host-owned, §7.3
+disk_names     (folder, path, bytes)                                     -- host-owned, §7.3: names on disk that are not their NFC path
+commit_journal (folder, path, displaced_to, temp_file)                   -- host-owned, §7.5
 machines       (node, hostname, ts_stable_id, ts_user, trusted, last_seen, delocal_version)
 ```
 
 `seq` per (folder, this node) is a monotonically increasing integer, incremented on every local write to `entries`.
 
-**Persistence contract.** The engine's per-folder state (`FolderState`: index, pending set, sequence watermarks, peer seqs and acks, quarantine, wants, paused state, deferred entries) is the unit of restart: the daemon rebuilds it from these tables and hands it to `Engine::restore`. If the folder has unannounced records at that point, the batch window is reopened as if they had just been written, so a crash never strands records that were written but not yet sent. Every write the engine reports is made durable **before any external effect that follows it**: before a file operation it asked for, and before a message it asked to send. The daemon may group the writes of many events into one transaction (an fsync per event would make a bulk import crawl), but it performs none of their effects until that transaction is durable. This ordering is what makes a crash safe: `seq` never rewinds past something a peer was told, and no trash move or rename reaches the disk while the record that explains it does not. A crash loses only in-flight host operations, temp files, and writes whose effects had not yet happened. The engine reports index writes (`IndexChanged`, and `IndexRemoved` for the one case, `revert`, that removes a record) and want changes as actions. Phase 2 adds hooks for the rest, persisted **by part, never as a whole-state blob**: one row per held item (a mass change can hold thousands of entries), one row per deferred path, and one row for the remaining small state (watermarks, acks, paused state, queued decisions). The engine reports which part changed, and the daemon writes that part.
+**Persistence contract.** The engine's per-folder state (`FolderState`: index, pending set, sequence watermarks, peer seqs and acks, quarantine, wants, paused state, deferred entries) is the unit of restart: the daemon rebuilds it from these tables and hands it to `Engine::restore`. If the folder has unannounced records at that point, the batch window is reopened as if they had just been written, so a crash never strands records that were written but not yet sent. Every write the engine reports is made durable **before any external effect that follows it**: before a file operation it asked for, and before a message it asked to send. The daemon may group the writes of many events into one transaction (an fsync per event would make a bulk import crawl), but it performs none of their effects until that transaction is durable. This ordering is what makes a crash safe: `seq` never rewinds past something a peer was told, and no trash move or rename reaches the disk while the record that explains it does not. A crash loses only in-flight host operations, temp files, and writes whose effects had not yet happened. The engine reports every part of the folder state as it changes, and the daemon writes that part, **never a whole-state blob**. The parts:
+
+- the **index**, one row per entry (`IndexChanged`, and `IndexRemoved` for the one case, `revert`, that removes a record);
+- the **wants**, one row per path;
+- the **pending set**, one row per unannounced path, carrying the record peers last saw there (§7.1) and whether its tombstone is exempt from the pre-check (§8.1); a paused mass change holds thousands of these;
+- the **held items**, one row per item, whether it is held or has been consumed by a `deny` that a `revert` could still return (§8.3); the row carries the item's quarantined entries, each with its **arrival number** from a per-folder counter, so that the order in which versions arrived at a path is the same after a restart whatever items they belong to;
+- the **deferred paths**, one row per path;
+- the **small rest**, one row: `seq`, the announced `seq` and tracked count, per-peer watermarks and acks, the paused state, queued decisions, the arrival counter, and the winner-fallback count (§7.6).
+
+The simulator restores a crashed node from these parts and nothing else, so a missing hook fails a seed. Tables the host owns (history, trash, the mtime shim and disk names of §7.3, the commit journal of §7.5, machines) are not engine parts; the host writes them in the same transaction as the engine writes they belong to.
 
 ---
 
@@ -673,10 +693,11 @@ Goodbye       { reason }
 FolderMeta    { folder, name, members, rules, meta_version, have_up_to: u64 }   // have_up_to: highest seq of the recipient's records the sender holds
 Batch         { …§7.4, seq_low: u64, seq_high: u64 }   // contiguous chain per sender per folder
 BatchDecision { batch: BatchId, decision: Accepted | Held { reason }, seq_high: u64 }   // doubles as the ack (§7.4)
-RequestFile   { folder, path, hash: ContentHash, offset: u64 }   // by content, not version (§7.5)
+RequestFile   { req: RequestId, folder, path, hash: ContentHash, offset: u64 }   // by content, not version (§7.5)
 FileData      { req: RequestId, offset: u64, bytes: Vec<u8> }     // 1 MiB chunks
 FileDone      { req: RequestId }
 NotAvailable  { req: RequestId }
+CancelRequest { req: RequestId }   // the requester has moved on (a stall, §7.5): the source stops streaming; data for an unknown req is dropped
 Ping / Pong
 ```
 
@@ -690,14 +711,15 @@ Protocol version is a single integer, bumped on any incompatible change. Two mac
 |---|---|
 | Tailscale not running / logged out | Daemon idles and retries every 10 s. `status`: "waiting for tailscale". |
 | Folder root missing (unmount, wholesale delete) | Root guard (§7.3): pause, warn, announce nothing. |
-| Disk full during transfer | Abort that transfer, pause the folder's inbound, `status` warns. Resume when space frees. |
+| Disk full during a transfer or a commit | `Failed { DiskFull }` (§7.5): the folder's inbound is paused, `status` warns, and wants resume when the host reports space recovered. |
 | Permission denied on a path | Skip, count, show in `status`. Never fatal. |
 | Crash during transfer | Temp file resumes from offset on restart; verified by hash. |
 | Crash after a commit's rename but before its report reached the engine | Next scan sees a "new local change" with content matching a known version → merges by identical-content rule. On a path restored by `revert` the index already matches the landed file, so the scan sees no change; the restoring mark makes that observation the landing instead (§8.3). |
+| Crash after a commit's displacement (§7.5 step 7) but before its rename (step 8) | The commit journal (§7.5) undoes the displacement at startup, before the first scan; the engine fetches and commits again. |
 | Crash after a displacing commit (§7.6) but before its report, then `revert` | The displaced copy is on disk and not in the index. `revert` waits for the startup scan (§8.3), which records the copy as a local add in the pending batch, and `revert` then trashes it with the rest. |
 | Peer offers a version it no longer has | `NotAvailable`; try another source; otherwise wait. |
 | Protocol mismatch | Refuse politely; `status` shows who needs `delocal update`. |
-| Case collision on macOS | Neither applied; `status` names the pair. |
+| Case collision on macOS | `Failed { CaseCollision }` defers the want; `status` names the pair (§7.5, §7.6). |
 | Two machines with the same node ID (restored backup) | Binding check (§5) refuses the second; `status` warns. |
 | Clock skew > 5 min | `status` warning. |
 
@@ -713,7 +735,8 @@ The engine is pure, so it can be driven by an in-memory filesystem and an in-mem
 
 - file create / modify / delete / rename, on random nodes, including the same path on several nodes in the same step
 - network partitions and heals, node offline and returning after arbitrary time
-- node crash: drop all in-flight host operations and temp files, restart from the persisted folder state (§11); a crash may land after a commit's rename but before its report, and the restarted node must recover through its scan
+- node crash: drop all in-flight host operations and temp files, restart from the persisted parts (§11) and nothing else; a crash may land after a commit's rename but before its report, and the restarted node must recover through its scan; it may land between a displacing commit's two renames, which the host's journal undoes at restart (§7.5); and it may lose the last group of writes together with the effects held back for them (§11), modelled by persisting the parts a bounded number of events late
+- a displaced directory takes its children with it, as a real rename does (§7.6)
 - message delay and reordering
 - clock skew per node
 - mass-delete and mass-modify events (to exercise the brake)
@@ -736,6 +759,8 @@ Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `
 ### 14.2 Integration tests
 
 Faults (disk full, I/O errors, a failing rename) are injected through a thin filesystem layer in the daemon, a trait with a real implementation and a fault-injecting wrapper, so they are deterministic, need no privileges, and run the same locally and in CI. Real filesystem in temp dirs, real TCP on loopback, `Tailscale` trait replaced by a fake that reports configurable tiers. Cover: two daemons syncing, watcher + scan agreement, atomic commit under concurrent writes, trash and restore, resume after kill -9 mid-transfer, `.delocalignore`.
+
+Two daemons on one machine are set up by a hidden development command that writes the folder row, this machine's member row and `.delocal/folder.json`, with a folder id passed in and the same for both; the daemon never creates a missing marker, or the root guard would mean nothing. Their fake Tailscale gives each a socket address on `127.0.0.1` with its own port (§6.1), and on connect they exchange `FolderMeta` and become members under §9.1.
 
 ### 14.3 Acceptance
 
@@ -761,7 +786,7 @@ Index, version vectors, batches, apply set, conflicts, tombstones, brake, quaran
 
 ### Phase 2 — Local machinery
 SQLite persistence, scanner, watcher, hashing, ignore rules, atomic commit, trash, root guard. A loopback transport so two daemons on one machine can sync two directories.
-**Done:** two local daemons stay in sync under a 1-hour chaos script (random edits, kill -9, disk-full and I/O-error injection through the filesystem layer, §14.2); trash holds every displaced file.
+**Done:** two local daemons stay in sync under a 1-hour chaos script (random edits, kill -9, disk-full and I/O-error injection through the filesystem layer, §14.2); trash holds every displaced file. That last clause is I2 (§14.1) on real disks: every hash either daemon announced is in a folder or a trash at the end, the harness's own overwrites and deletions excepted, and the two trees match within two minutes of the faults stopping. The harness stays under H1, since there is no `approve` before Phase 4, and a folder that pauses during the run is a failure.
 
 ### Phase 3 — Network
 Tailscale module (LocalAPI + CLI fallback, with recorded fixtures), discovery, transport, dial rule, tiers, size rules, resumable transfers, protocol versioning.
@@ -837,7 +862,7 @@ For the record, so they are not reopened by accident:
 | filesystem watching | `notify`, `notify-debouncer-full` |
 | scanning & ignore rules | `ignore` (wraps `walkdir`) |
 | hashing | `blake3` |
-| database | `rusqlite` (bundled feature) |
+| database | `rusqlite` (bundled feature; **[verify]** the static build under `cross` for aarch64-musl) |
 | serialisation | `serde`, `postcard` (wire), `serde_json` (state files, `--json`) |
 | CLI | `clap` (derive), `console` or `owo-colors`, `indicatif` sparingly |
 | HTTP to LocalAPI over a unix socket | `hyper` + `hyperlocal`, or a minimal hand-rolled HTTP/1.1 client |
