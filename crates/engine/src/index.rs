@@ -292,6 +292,12 @@ impl Index {
         out
     }
 
+    /// What this machine holds of each peer's `seq` space, by peer: part of
+    /// the small rest (§11).
+    pub fn watermarks(&self) -> &BTreeMap<NodeId, Watermark> {
+        &self.peer_seq
+    }
+
     /// The contiguous watermark for `peer`: every `seq` of theirs up to it
     /// has been received, 0 if none. This is what a decision acknowledges
     /// and what `have_up_to` reports (§7.4).

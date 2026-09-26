@@ -73,7 +73,7 @@ use crate::brake::{self, HoldReason, Verdict};
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Reverted};
-use crate::parts::Changed;
+use crate::parts::{Changed, Rest};
 use crate::path::RelPath;
 use crate::quarantine::{HeldItem, HeldRow, Quarantine};
 use crate::rules::Rules;
@@ -674,6 +674,22 @@ impl FolderState {
     /// Entries waiting to be classified again, in path then arrival order.
     pub fn deferred(&self) -> impl Iterator<Item = &Deferred> {
         self.deferred.entries()
+    }
+
+    /// The small rest as it stands, for the `RestChanged` persistence hook
+    /// (§11).
+    pub fn rest(&self) -> Rest {
+        Rest {
+            seq: self.index.seq(),
+            announced_seq: self.index.announced_seq(),
+            announced_tracked: self.index.announced_tracked(),
+            watermarks: self.index.watermarks().clone(),
+            acked: self.acked.clone(),
+            paused: self.paused.clone(),
+            queued: self.queued.clone(),
+            arrivals: self.quarantine.arrivals(),
+            winner_fallbacks: self.winner_fallbacks,
+        }
     }
 
     /// Held items whose row changed since the last call, for the
