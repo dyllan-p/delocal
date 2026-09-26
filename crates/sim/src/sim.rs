@@ -754,6 +754,18 @@ impl Sim {
             .iter()
             .map(|w| (w.path().clone(), w.clone()))
             .collect();
+        // §11 persists the pre-check exemption (§8.1) as a flag on the
+        // pending row, which only holds if no path is exempt without being
+        // pending.
+        let stray = state
+            .index()
+            .exempt_paths()
+            .find(|p| !state.index().is_pending(p))
+            .cloned();
+        if let Some(path) = stray {
+            let detail = format!("{}: {path} is exempt but not pending", Self::short(id));
+            return Err(self.fail("exempt pending", detail));
+        }
         let records_ok = records == node.persisted.records;
         let wants_ok = wants == node.persisted.wants;
         let persisted_records = node.persisted.records.len();
