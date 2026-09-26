@@ -10,12 +10,20 @@
 //! machine's versions over every quarantined one (§8.2), and a `revert`
 //! that discards those bumps reinstates it (§8.3).
 //!
+//! **Denied items.** A `deny` takes its item out of the quarantine, but the
+//! item is kept, as a *denied* item, until the deny's bumps are announced:
+//! a `revert` that discards them undoes the deny and returns the item
+//! (§8.3). Denied items are kept in the order of their denies, and returned
+//! in it.
+//!
 //! **Persistence** (§11). The held items are a persisted part, one row per
-//! item: a [`HeldRow`] with the item and every version it holds. Versions
-//! at a path are kept in the order they arrived, across items, because the
-//! earliest matching item is the one a later version joins; each carries
-//! an **arrival number** from a per-folder counter, so a quarantine rebuilt
+//! item, held or denied: a [`HeldRow`] with the item and every version it
+//! holds, keyed by its batch id and its [`HeldState`]. Versions at a path
+//! are kept in the order they arrived, across items, because the earliest
+//! matching item is the one a later version joins; each carries an
+//! **arrival number** from a per-folder counter, so a quarantine rebuilt
 //! from its rows keeps that order whatever items the versions belong to.
+//! A deny takes the next arrival number too, which orders the denied items.
 
 use std::collections::BTreeMap;
 
@@ -63,6 +71,17 @@ pub struct HeldRow {
     pub versions: BTreeMap<RelPath, Vec<Quarantined>>,
 }
 
+/// Whether a held-items row (§11) is held, or was consumed by a `deny` that
+/// a `revert` could still undo (§8.3). A denied row is also named by the
+/// arrival number its deny took: one batch id can be held again and denied
+/// again before the first deny is announced, and the number keeps the
+/// denies in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum HeldState {
+    Held,
+    Denied { at: u64 },
+}
+
 /// The folder's quarantine: held items and an index of the versions in them.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quarantine {
@@ -73,11 +92,14 @@ pub struct Quarantine {
     /// per path, and a concurrent joiner is quarantined without replacing
     /// it.
     versions: BTreeMap<RelPath, Vec<(BatchId, Quarantined)>>,
+    /// Items consumed by denies whose bumps are not yet announced, by the
+    /// arrival number each deny took, so in the order of the denies.
+    denied: BTreeMap<u64, HeldRow>,
     /// The last arrival number handed out.
     arrivals: u64,
-    /// Held items whose row changed since the last drain.
+    /// Rows that changed since the last drain.
     #[serde(skip)]
-    changed: Changed<BatchId>,
+    changed: Changed<(BatchId, HeldState)>,
 }
 
 impl Quarantine {
@@ -152,7 +174,7 @@ impl Quarantine {
         for entry in item.entries.values() {
             self.record(&entry.path, entry.version.clone(), entry.stamp, item.batch);
         }
-        self.changed.note(&item.batch);
+        self.changed.note(&(item.batch, HeldState::Held));
         self.items.insert(item.batch, item);
     }
 
@@ -164,7 +186,7 @@ impl Quarantine {
             return false;
         }
         self.record(&entry.path, entry.version.clone(), entry.stamp, batch);
-        self.changed.note(&batch);
+        self.changed.note(&(batch, HeldState::Held));
         if let Some(item) = self.items.get_mut(&batch) {
             let replace = item
                 .entries
@@ -180,7 +202,7 @@ impl Quarantine {
     /// Release an item: remove it and every version it held.
     pub fn release(&mut self, batch: BatchId) -> Option<HeldItem> {
         let item = self.items.remove(&batch)?;
-        self.changed.note(&batch);
+        self.changed.note(&(batch, HeldState::Held));
         for path in item.entries.keys() {
             if let Some(list) = self.versions.get_mut(path) {
                 list.retain(|(id, _)| *id != batch);
@@ -214,34 +236,76 @@ impl Quarantine {
         Some(HeldRow { item, versions })
     }
 
-    /// Take an item out for `deny`: like `release`, but keep every version
-    /// it held so that [`Quarantine::reinstate`] can restore it exactly.
-    pub fn withdraw(&mut self, batch: BatchId) -> Option<HeldRow> {
-        let row = self.row(batch)?;
-        self.release(batch)?;
-        Some(row)
+    /// Items consumed by denies not yet announced, in the order of the
+    /// denies.
+    pub fn denied(&self) -> impl Iterator<Item = &HeldRow> {
+        self.denied.values()
     }
 
-    /// Put a withdrawn item back with every version it held (§8.3). Its
-    /// versions arrive again, at the end of each path's arrival order.
-    pub fn reinstate(&mut self, withdrawn: HeldRow) {
-        let batch = withdrawn.item.batch;
-        for (path, held) in withdrawn.versions {
+    /// `deny <batch>` (§8.2): take the item out like `release`, but keep it
+    /// with every version it held as a denied item, so that a `revert`
+    /// discarding the deny's bumps can return it exactly (§8.3). False if
+    /// no item is held under `batch`.
+    pub fn deny(&mut self, batch: BatchId) -> bool {
+        let Some(row) = self.row(batch) else {
+            return false;
+        };
+        self.release(batch);
+        self.arrivals += 1;
+        let at = self.arrivals;
+        self.changed.note(&(batch, HeldState::Denied { at }));
+        self.denied.insert(at, row);
+        true
+    }
+
+    /// The denies' bumps were announced (§7.4): no revert can discard them
+    /// now, so their items are gone for good.
+    pub fn forget_denied(&mut self) {
+        for (at, row) in std::mem::take(&mut self.denied) {
+            self.changed
+                .note(&(row.item.batch, HeldState::Denied { at }));
+        }
+    }
+
+    /// `revert` discarded the denies' bumps, so every denied item is held
+    /// again, in the order of the denies (§8.3). Returns each one's batch id
+    /// and path count, in that order.
+    pub fn return_denied(&mut self) -> Vec<(BatchId, usize)> {
+        let mut returned = Vec::with_capacity(self.denied.len());
+        for (at, row) in std::mem::take(&mut self.denied) {
+            let batch = row.item.batch;
+            self.changed.note(&(batch, HeldState::Denied { at }));
+            returned.push((batch, row.item.entries.len()));
+            self.reinstate(row);
+        }
+        returned
+    }
+
+    /// Put a denied item back with every version it held. Its versions
+    /// arrive again, at the end of each path's arrival order.
+    fn reinstate(&mut self, row: HeldRow) {
+        let batch = row.item.batch;
+        for (path, held) in row.versions {
             for q in held {
                 self.record(&path, q.version, q.stamp, batch);
             }
         }
-        self.hold(withdrawn.item);
+        self.hold(row.item);
     }
 
-    /// Held items whose row changed since the last call, each as it stands
-    /// (`None` if it is no longer held), in batch-id order: the
-    /// `HeldChanged` persistence hook (§11).
-    pub fn drain_changes(&mut self) -> Vec<(BatchId, Option<HeldRow>)> {
+    /// Rows that changed since the last call, each as it stands (`None` if
+    /// it is gone), in key order: the `HeldChanged` persistence hook (§11).
+    pub fn drain_changes(&mut self) -> Vec<(BatchId, HeldState, Option<HeldRow>)> {
         self.changed
             .take()
             .into_iter()
-            .map(|batch| (batch, self.row(batch)))
+            .map(|(batch, state)| {
+                let row = match state {
+                    HeldState::Held => self.row(batch),
+                    HeldState::Denied { at } => self.denied.get(&at).cloned(),
+                };
+                (batch, state, row)
+            })
             .collect()
     }
 
@@ -336,11 +400,11 @@ mod tests {
         );
         q.hold(item(2, vec![entry("c", v(&[(4, 1)]))]));
         let before = q.clone();
-        let withdrawn = q.withdraw(batch(1)).unwrap();
+        assert!(q.deny(batch(1)));
         assert_eq!(q.get(batch(1)), None);
         assert!(q.versions_at(&p("a")).is_empty());
-        assert_eq!(q.withdraw(batch(9)), None);
-        q.reinstate(withdrawn);
+        assert!(!q.deny(batch(9)));
+        assert_eq!(q.return_denied(), [(batch(1), 2)]);
         for path in ["a", "b", "c"] {
             assert_eq!(q.versions_at(&p(path)), before.versions_at(&p(path)));
         }
@@ -349,12 +413,14 @@ mod tests {
             before.items().collect::<Vec<_>>()
         );
         assert_eq!(q.versions_at(&p("a")).len(), 2, "the joiner too");
-        // The versions arrived again, after everything held before.
+        // The versions arrived again, after everything held before and
+        // after the deny, which took arrival 5.
         let arrivals: Vec<u64> = q.row(batch(1)).unwrap().versions[&p("a")]
             .iter()
             .map(|q| q.arrival)
             .collect();
-        assert_eq!(arrivals, [5, 6]);
+        assert_eq!(arrivals, [6, 7]);
+        assert_eq!(q.denied().count(), 0);
     }
 
     /// §8.2: a batch id names one review item. Holding under an id that
@@ -386,9 +452,9 @@ mod tests {
     fn an_item_returned_by_revert_joins_the_item_holding_its_id() {
         let mut q = Quarantine::default();
         q.hold(item(1, vec![entry("d1/f10", v(&[(2, 4), (3, 1)]))]));
-        let withdrawn = q.withdraw(batch(1)).unwrap();
+        assert!(q.deny(batch(1)));
         q.hold(item(1, vec![entry("f0", v(&[(4, 1)]))]));
-        q.reinstate(withdrawn);
+        q.return_denied();
         let held = q.get(batch(1)).unwrap();
         assert_eq!(
             held.entries.keys().collect::<Vec<_>>(),
@@ -510,10 +576,10 @@ mod tests {
         q.join(batch(1), entry("a", v(&[(2, 2), (4, 1)])));
         let changes = q.drain_changes();
         assert_eq!(
-            changes.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
-            [batch(1), batch(2)]
+            changes.iter().map(|(b, s, _)| (*b, *s)).collect::<Vec<_>>(),
+            [(batch(1), HeldState::Held), (batch(2), HeldState::Held)]
         );
-        let row = changes[0].1.as_ref().unwrap();
+        let row = changes[0].2.as_ref().unwrap();
         let held: Vec<(Version, u64)> = row.versions[&p("a")]
             .iter()
             .map(|q| (q.version.clone(), q.arrival))
@@ -525,7 +591,32 @@ mod tests {
         );
         assert!(q.drain_changes().is_empty());
         q.release(batch(2));
-        assert_eq!(q.drain_changes(), [(batch(2), None)]);
+        assert_eq!(q.drain_changes(), [(batch(2), HeldState::Held, None)]);
+
+        // A denied item is a row of its own until the deny is announced,
+        // and a second deny of the same id is another row after it.
+        assert!(q.deny(batch(1)));
+        q.hold(item(1, vec![entry("b", v(&[(2, 1)]))]));
+        assert!(q.deny(batch(1)));
+        let changes = q.drain_changes();
+        let keys: Vec<(BatchId, HeldState)> = changes.iter().map(|(b, s, _)| (*b, *s)).collect();
+        assert_eq!(
+            keys,
+            [
+                (batch(1), HeldState::Held),
+                (batch(1), HeldState::Denied { at: 4 }),
+                (batch(1), HeldState::Denied { at: 6 }),
+            ]
+        );
+        assert!(changes[0].2.is_none() && changes[1].2.is_some() && changes[2].2.is_some());
+        q.forget_denied();
+        assert_eq!(
+            q.drain_changes(),
+            [
+                (batch(1), HeldState::Denied { at: 4 }, None),
+                (batch(1), HeldState::Denied { at: 6 }, None),
+            ]
+        );
     }
 
     #[test]
