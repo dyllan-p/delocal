@@ -1,0 +1,28 @@
+A revert no longer waits after a restart until the startup full scan has
+finished (f6cff50, Queue deny and revert until the folder settles), nor while
+a scan bracket is open (0289804, Wait for an open scan bracket before deny or
+revert): both checks in the revert arm of FolderState::unsettled are removed.
+The pin needs both off, as its doc comment says: the simulator starts a
+restarted node's full scan at once, so either wait alone still holds a queued
+revert until that scan finishes. The deny's open-bracket wait is left as it
+is, since this pin's decision is a revert. DESIGN.md §8.3.
+
+test: delocal-sim regressions::a_queued_revert_waits_for_the_startup_scan_to_finish
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..d62af77 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1771,12 +1771,6 @@ impl FolderState {
+                 })
+             }
+             UserDecision::Revert { .. } => {
+-                if self.startup_scan {
+-                    return Some(WaitReason::StartupScan);
+-                }
+-                if self.scan.is_some() {
+-                    return Some(WaitReason::ScanOpen);
+-                }
+                 self.wants
+                     .iter()
+                     .find(|w| w.committing())
