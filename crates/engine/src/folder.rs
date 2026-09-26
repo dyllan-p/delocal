@@ -75,7 +75,7 @@ use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Pending, Reverted};
 use crate::parts::{Changed, Rest};
 use crate::path::RelPath;
-use crate::quarantine::{HeldItem, HeldRow, Quarantine};
+use crate::quarantine::{HeldItem, HeldRow, HeldState, Quarantine};
 use crate::rules::Rules;
 use crate::time::{DEBOUNCE_NANOS, Timestamp, WINDOW_NANOS};
 use crate::version::Version;
@@ -553,10 +553,6 @@ pub struct FolderState {
     /// True from a restart until a full scan finishes: until then the index
     /// may not know every file on disk (§8.3, §13).
     startup_scan: bool,
-    /// The held items consumed by denies whose bumps are not yet announced.
-    /// A `revert` discards unannounced bumps and puts these back (§8.3);
-    /// the next announcement clears them.
-    denied: Vec<HeldRow>,
     /// Statuses raised outside a direct call's return value (a hold made
     /// while admitting re-classified entries); the engine drains them.
     #[serde(skip)]
@@ -600,7 +596,6 @@ impl FolderState {
             paused: None,
             queued: Vec::new(),
             startup_scan: false,
-            denied: Vec::new(),
             statuses: Vec::new(),
         }
     }
@@ -700,7 +695,7 @@ impl FolderState {
 
     /// Held items whose row changed since the last call, for the
     /// `HeldChanged` persistence hook (§11).
-    pub fn held_changes(&mut self) -> Vec<(BatchId, Option<HeldRow>)> {
+    pub fn held_changes(&mut self) -> Vec<(BatchId, HeldState, Option<HeldRow>)> {
         self.quarantine.drain_changes()
     }
 
@@ -1291,7 +1286,7 @@ impl FolderState {
         );
         self.index.mark_announced();
         // A deny's bumps are announced now; no revert can discard them.
-        self.denied.clear();
+        self.quarantine.forget_denied();
         self.window = None;
         batches
     }
@@ -1700,9 +1695,7 @@ impl FolderState {
         }
         // Kept until the bumps are announced: a revert that discards them
         // undoes the deny and puts the item back (§8.3).
-        if let Some(withdrawn) = self.quarantine.withdraw(batch) {
-            self.denied.push(withdrawn);
-        }
+        self.quarantine.deny(batch);
         if !changes.is_empty() {
             self.touched(now);
         }
@@ -1729,11 +1722,7 @@ impl FolderState {
         let reverted = self.index.revert_pending();
         // The pending set held every unannounced deny's bumps, so each of
         // those denies is undone with the rest: its held item returns.
-        let mut returned = Vec::new();
-        for withdrawn in std::mem::take(&mut self.denied) {
-            returned.push((withdrawn.item.batch, withdrawn.item.entries.len()));
-            self.quarantine.reinstate(withdrawn);
-        }
+        let returned = self.quarantine.return_denied();
         // Wants at reverted paths were resolved against records that are
         // now discarded; they are re-derived from their received entries
         // below, after the restoring wants are in place (§8.3 step 2).

@@ -26,7 +26,7 @@ use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{IndexRecord, Pending};
 use crate::parts::Rest;
 use crate::path::RelPath;
-use crate::quarantine::HeldRow;
+use crate::quarantine::{HeldRow, HeldState};
 use crate::rules::Rules;
 use crate::time::Timestamp;
 use crate::version::Version;
@@ -260,11 +260,14 @@ pub enum Action {
         path: RelPath,
         row: Option<Pending>,
     },
-    /// A held item changed; persistence hook (§11), one row per item.
-    /// `None` when it is no longer held.
+    /// A held item changed, held or denied; persistence hook (§11), one row
+    /// per item, keyed by `batch` and `state`. `None` when the row is gone:
+    /// the item was released or denied, or the deny that consumed it was
+    /// announced or reverted.
     HeldChanged {
         folder: FolderId,
         batch: BatchId,
+        state: HeldState,
         row: Option<Box<HeldRow>>,
     },
     /// The entries deferred at a path changed; persistence hook (§11), one
@@ -617,10 +620,11 @@ impl Engine {
                     row,
                 });
             }
-            for (batch, row) in folder.held_changes() {
+            for (batch, state, row) in folder.held_changes() {
                 out.push(Action::HeldChanged {
                     folder: *id,
                     batch,
+                    state,
                     row: row.map(Box::new),
                 });
             }
