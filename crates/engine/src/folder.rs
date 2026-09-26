@@ -3288,6 +3288,70 @@ mod tests {
     }
 
     #[test]
+    fn a_deferred_entry_whose_version_was_held_meanwhile_joins_the_held_item() {
+        // A edits f00; B accepts it, but the commit finds f00 changed
+        // underneath, so the entry waits in the deferred set. C relays the
+        // same version with eight deletes, and B's brake holds that batch
+        // with f00 in it. When B next observes f00 the entry is admitted
+        // again: its version is quarantined, so it joins C's held item and
+        // is not wanted (§8.2).
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("f00"), file(3, 30));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert_eq!(b.receive(t(12.0), &batch).decision, Decision::Accepted);
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("f00"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { .. }));
+        assert!(
+            b.applied(t(15.0), &p("f00"), &v, ApplyOutcome::ChangedUnderneath)
+                .is_empty()
+        );
+        assert_eq!(b.deferred().count(), 1);
+
+        // C's batch: eight deletes, and A's f00 relayed.
+        let mut c = folder_with(Rules::default(), 3, "charlie");
+        for i in 0..10 {
+            let e = b
+                .index()
+                .get(&p(&format!("f{i:02}")))
+                .unwrap()
+                .entry
+                .clone();
+            c.adopt(t(16.0), e);
+        }
+        c.form_batches(t(16.0), bid(4));
+        for i in 2..10 {
+            c.scanned(t(17.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let mut relay = c.form_batches(t(19.0), bid(5)).remove(0);
+        relay.entries.push(batch.entries[0].clone());
+        relay.seq_high += 1;
+        assert!(b.receive(t(19.0), &relay).held.is_some());
+        assert_eq!(b.quarantine().versions_at(&p("f00")), vec![v.clone()]);
+        b.take_statuses();
+
+        b.scanned(t(20.0), p("f00"), ScanState::Unchanged);
+        assert!(b.deferred().next().is_none(), "admitted again");
+        assert!(b.wants().is_empty(), "held, not wanted");
+        assert!(
+            b.quarantine()
+                .get(bid(5))
+                .unwrap()
+                .entries
+                .contains_key(&p("f00"))
+        );
+        assert_eq!(
+            b.take_statuses(),
+            vec![FolderStatus::JoinedHeld {
+                batch: bid(5),
+                count: 1
+            }]
+        );
+    }
+
+    #[test]
     fn frozen_entries_wait_for_unpause_through_scans_and_commits() {
         // B edits eight files and pauses. A's edit of f00 arrives frozen.
         // Scans of f00, a full scan bracket and a commit elsewhere must not
@@ -3365,6 +3429,47 @@ mod tests {
             other => panic!("expected a release, got {other:?}"),
         }
         assert_eq!(b.wants().len(), 10);
+    }
+
+    #[test]
+    fn a_frozen_entry_of_a_held_batch_is_wanted_only_by_approve() {
+        // B edits seven files and pauses. A's batch edits f00 (frozen on B)
+        // and deletes f07 to f09 (held: three of ten). A scan of f00 while
+        // B is paused leaves the entry frozen (§8.1), and at unpause it
+        // joins its held batch instead of meeting the brake alone, where
+        // one conflict would pass (§8.2): nothing of the batch is wanted
+        // until approve.
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..7 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), file(2, 20));
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        a.scanned(t(13.0), p("f00"), file(3, 30));
+        for i in 7..10 {
+            a.scanned(t(13.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let batch = a.form_batches(t(15.0), bid(6)).remove(0);
+        let r = b.receive(t(15.0), &batch);
+        assert_eq!(r.frozen, 1);
+        assert!(matches!(r.decision, Decision::Held { .. }));
+
+        b.scanned(t(16.0), p("f00"), ScanState::Unchanged);
+        assert_eq!(b.deferred().count(), 1, "still frozen after the scan");
+        assert!(b.wants().is_empty(), "nothing wanted while paused");
+
+        assert!(matches!(b.approve(t(20.0), bid(5)), Approved::Sent(_)));
+        assert!(b.deferred().next().is_none(), "thawed at unpause");
+        assert!(
+            b.wants().is_empty(),
+            "nothing wanted: its batch is under review"
+        );
+        let held = b.quarantine().get(bid(6)).unwrap();
+        assert_eq!(held.entries.len(), 4, "f00 joined the three deletes");
+        match b.approve(t(21.0), bid(6)) {
+            Approved::Released(Some(set)) => assert_eq!(set.items.len(), 4),
+            other => panic!("expected a release, got {other:?}"),
+        }
+        assert!(b.wants().get(&p("f00")).is_some(), "wanted by approve");
     }
 
     #[test]
