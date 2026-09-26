@@ -67,6 +67,11 @@ if a new I/O crate appears in Appendix A.
 - From Phase 1 on, every step is a branch and a pull request against `main`, never a
   direct commit. I review and rebase-merge on GitHub. Open one PR at a time and stop
   after opening it; do not start the next step until I say the PR is merged.
+- After opening a PR, wait for CI with `gh pr checks <number> --watch`, and report only
+  once every required job is green and simulate has taken real time: its pinned and
+  sweep jobs were not skipped and did not finish in seconds, and their logs show the
+  pinned tests and every seed of every shard passing. If a job fails, report that
+  instead: which job, and what its log says.
 
 ## Toolchain
 
