@@ -73,6 +73,7 @@ use crate::brake::{self, HoldReason, Verdict};
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Reverted};
+use crate::parts::Changed;
 use crate::path::RelPath;
 use crate::quarantine::{HeldItem, Quarantine, Withdrawn};
 use crate::rules::Rules;
@@ -129,6 +130,87 @@ pub struct Deferred {
     /// entry again as it stands, and an occupant matching it is its
     /// landing.
     pub restoring: Option<Entry>,
+}
+
+/// The deferred paths (§7.5, §8.1): entries waiting to be classified
+/// again, one row per path in arrival order. A persisted part (§11): every
+/// change is noted, and [`FolderState::deferred_changes`] hands out the
+/// rows that changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DeferredSet {
+    rows: BTreeMap<RelPath, Vec<Deferred>>,
+    #[serde(skip)]
+    changed: Changed<RelPath>,
+}
+
+impl DeferredSet {
+    /// The entries waiting at `path`, in arrival order.
+    fn get(&self, path: &RelPath) -> Option<&[Deferred]> {
+        self.rows.get(path).map(Vec::as_slice)
+    }
+
+    /// Every path with an entry waiting, with its entries, in path order.
+    fn iter(&self) -> impl Iterator<Item = (&RelPath, &[Deferred])> {
+        self.rows.iter().map(|(p, list)| (p, list.as_slice()))
+    }
+
+    /// Every path with an entry waiting, in path order.
+    fn paths(&self) -> impl Iterator<Item = &RelPath> {
+        self.rows.keys()
+    }
+
+    /// Every entry waiting, in path then arrival order.
+    fn entries(&self) -> impl Iterator<Item = &Deferred> {
+        self.rows.values().flatten()
+    }
+
+    /// `d` waits at `path`, after the entries already there.
+    fn push(&mut self, path: RelPath, d: Deferred) {
+        self.changed.note(&path);
+        self.rows.entry(path).or_default().push(d);
+    }
+
+    /// Take out the entries at `path` that satisfy `pred`, in arrival
+    /// order; the rest stay. A path with nothing left has no row.
+    fn take_where(&mut self, path: &RelPath, pred: impl Fn(&Deferred) -> bool) -> Vec<Deferred> {
+        let Some(list) = self.rows.remove(path) else {
+            return Vec::new();
+        };
+        let (take, keep): (Vec<Deferred>, Vec<Deferred>) = list.into_iter().partition(pred);
+        if !take.is_empty() {
+            self.changed.note(path);
+        }
+        if !keep.is_empty() {
+            self.rows.insert(path.clone(), keep);
+        }
+        take
+    }
+
+    /// The entries at `path` stop carrying the restoring mark (§8.3).
+    fn clear_restoring(&mut self, path: &RelPath) {
+        let Some(list) = self.rows.get_mut(path) else {
+            return;
+        };
+        if list.iter().any(|d| d.restoring.is_some()) {
+            for d in list.iter_mut() {
+                d.restoring = None;
+            }
+            self.changed.note(path);
+        }
+    }
+
+    /// The rows that changed since the last call, each as it stands
+    /// (`None` if nothing waits there any more), in path order.
+    fn drain_changes(&mut self) -> Vec<(RelPath, Option<Vec<Deferred>>)> {
+        self.changed
+            .take()
+            .into_iter()
+            .map(|path| {
+                let row = self.rows.get(&path).cloned();
+                (path, row)
+            })
+            .collect()
+    }
 }
 
 /// A paused folder (§8.1): the sender pre-check tripped.
@@ -460,7 +542,7 @@ pub struct FolderState {
     /// Peers whose `have_up_to` arrived and await catch-up at the next tick.
     catchup: BTreeSet<NodeId>,
     /// Entries waiting to be classified again, by path, in arrival order.
-    deferred: BTreeMap<RelPath, Vec<Deferred>>,
+    deferred: DeferredSet,
     /// How many conflicts rule 5 of §7.6 has decided here. Should stay 0.
     winner_fallbacks: u64,
     quarantine: Quarantine,
@@ -512,7 +594,7 @@ impl FolderState {
             wants: WantList::default(),
             acked: BTreeMap::new(),
             catchup: BTreeSet::new(),
-            deferred: BTreeMap::new(),
+            deferred: DeferredSet::default(),
             winner_fallbacks: 0,
             quarantine: Quarantine::default(),
             paused: None,
@@ -591,7 +673,13 @@ impl FolderState {
 
     /// Entries waiting to be classified again, in path then arrival order.
     pub fn deferred(&self) -> impl Iterator<Item = &Deferred> {
-        self.deferred.values().flatten()
+        self.deferred.entries()
+    }
+
+    /// Deferred paths whose entries changed since the last call, for the
+    /// `DeferredChanged` persistence hook (§11).
+    pub fn deferred_changes(&mut self) -> Vec<(RelPath, Option<Vec<Deferred>>)> {
+        self.deferred.drain_changes()
     }
 
     /// Conflicts decided by rule 5 of §7.6 so far. Any value above 0 is a
@@ -795,11 +883,7 @@ impl FolderState {
     /// The deferred entries at `path` stop carrying the mark: the disk now
     /// holds what the record says.
     fn clear_carriers(&mut self, path: &RelPath) {
-        if let Some(list) = self.deferred.get_mut(path) {
-            for d in list.iter_mut() {
-                d.restoring = None;
-            }
-        }
+        self.deferred.clear_restoring(path);
     }
 
     /// A marked path's deferred carriers, wanted again as they stand, with
@@ -807,14 +891,7 @@ impl FolderState {
     /// the record they would be found caught up and dropped, while the
     /// disk still holds nothing.
     fn rewant_carriers(&mut self, path: &RelPath) {
-        let Some(list) = self.deferred.remove(path) else {
-            return;
-        };
-        let (carriers, rest): (Vec<Deferred>, Vec<Deferred>) =
-            list.into_iter().partition(|d| d.restoring.is_some());
-        if !rest.is_empty() {
-            self.deferred.insert(path.clone(), rest);
-        }
+        let carriers = self.deferred.take_where(path, |d| d.restoring.is_some());
         for d in carriers {
             let Some(entry) = d.restoring else {
                 continue;
@@ -983,13 +1060,9 @@ impl FolderState {
     /// `ChangedUnderneath` entries only: a `Frozen` entry waits for the
     /// folder to unpause (§8.1), however often its path is scanned meanwhile.
     fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: DeferredReason) {
-        let Some(list) = self.deferred.remove(path) else {
+        let take = self.deferred.take_where(path, |d| d.reason == reason);
+        if take.is_empty() {
             return;
-        };
-        let (take, keep): (Vec<Deferred>, Vec<Deferred>) =
-            list.into_iter().partition(|d| d.reason == reason);
-        if !keep.is_empty() {
-            self.deferred.insert(path.clone(), keep);
         }
         let candidates = self.classify_deferred(take);
         self.admit(now, candidates, true);
@@ -1058,17 +1131,17 @@ impl FolderState {
             seq_high,
             others.as_ref(),
         ) {
-            self.deferred
-                .entry(item.path().clone())
-                .or_default()
-                .push(Deferred {
+            self.deferred.push(
+                item.path().clone(),
+                Deferred {
                     entry: received,
                     batch,
                     source,
                     seq_high,
                     reason: DeferredReason::ChangedUnderneath,
                     restoring: None,
-                });
+                },
+            );
         }
     }
 
@@ -1076,19 +1149,13 @@ impl FolderState {
     /// admitted together, so a mass change that arrived while paused meets
     /// the brake as the batch it was (§8.1).
     fn unfreeze(&mut self, now: Timestamp) {
-        let paths: Vec<RelPath> = self.deferred.keys().cloned().collect();
+        let paths: Vec<RelPath> = self.deferred.paths().cloned().collect();
         let mut frozen = Vec::new();
         for path in paths {
-            let Some(list) = self.deferred.remove(&path) else {
-                continue;
-            };
-            let (take, keep): (Vec<Deferred>, Vec<Deferred>) = list
-                .into_iter()
-                .partition(|d| d.reason == DeferredReason::Frozen);
-            if !keep.is_empty() {
-                self.deferred.insert(path, keep);
-            }
-            frozen.extend(take);
+            frozen.extend(
+                self.deferred
+                    .take_where(&path, |d| d.reason == DeferredReason::Frozen),
+            );
         }
         let candidates = self.classify_deferred(frozen);
         self.admit(now, candidates, true);
@@ -1127,7 +1194,7 @@ impl FolderState {
         // has just observed it absent (§7.3).
         let unseen: Vec<RelPath> = self
             .deferred
-            .keys()
+            .paths()
             .filter(|p| {
                 !seen.contains(*p) && self.index.live(p).is_none() && !self.wants.in_flight(p)
             })
@@ -1354,17 +1421,17 @@ impl FolderState {
                 self.quarantine.join(held, incoming.clone());
                 joined += 1;
             } else if self.paused.is_some() && self.index.is_pending(item.path()) {
-                self.deferred
-                    .entry(item.path().clone())
-                    .or_default()
-                    .push(Deferred {
+                self.deferred.push(
+                    item.path().clone(),
+                    Deferred {
                         entry: incoming.clone(),
                         batch: batch.id,
                         source: batch.source,
                         seq_high: batch.seq_high,
                         reason: DeferredReason::Frozen,
                         restoring: None,
-                    });
+                    },
+                );
                 frozen += 1;
             } else {
                 kept.push(item);
@@ -2044,14 +2111,17 @@ impl FolderState {
     fn defer_changed_underneath(&mut self, want: Want) {
         let path = want.path().clone();
         let restoring = want.restoring.then_some(want.entry);
-        self.deferred.entry(path).or_default().push(Deferred {
-            entry: want.received,
-            batch: want.batch,
-            source: want.source,
-            seq_high: want.seq_high,
-            reason: DeferredReason::ChangedUnderneath,
-            restoring,
-        });
+        self.deferred.push(
+            path,
+            Deferred {
+                entry: want.received,
+                batch: want.batch,
+                source: want.source,
+                seq_high: want.seq_high,
+                reason: DeferredReason::ChangedUnderneath,
+                restoring,
+            },
+        );
     }
 
     /// Take a committed remote entry into the index and open the window so
@@ -2313,6 +2383,12 @@ mod tests {
         assert!(b.wants().is_empty());
         assert_eq!(b.index().get(&p("x")), None);
         assert_eq!(b.due(), None);
+        // The deferred path is a persisted part (§11): its row is reported.
+        let changes = b.deferred_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, p("x"));
+        assert_eq!(changes[0].1.as_deref().map(<[Deferred]>::len), Some(1));
+        assert!(b.deferred_changes().is_empty(), "reported once");
         let kept: Vec<_> = b.deferred().collect();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].entry, entry);
@@ -2326,6 +2402,7 @@ mod tests {
         // the larger mtime, so A wins and the local file becomes the copy.
         b.scanned(t(6.0), p("x"), file(9, 0));
         assert!(b.deferred().next().is_none());
+        assert_eq!(b.deferred_changes(), [(p("x"), None)], "the row is gone");
         assert_eq!(b.wants().len(), 1);
         let want = b.wants().get(&p("x")).unwrap();
         assert_eq!(

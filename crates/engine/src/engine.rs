@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::batch::{ApplySet, Batch, BatchDecision, BatchRole, Decision};
 use crate::entry::{ContentHash, Entry, Observed};
 use crate::folder::{
-    ApplyOutcome, Approved, Displace, FolderState, FolderStatus, HostStep, Next, Requested,
-    ScanState, Ticked, UserDecision,
+    ApplyOutcome, Approved, Deferred, Displace, FolderState, FolderStatus, HostStep, Next,
+    Requested, ScanState, Ticked, UserDecision,
 };
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
@@ -249,6 +249,13 @@ pub enum Action {
         folder: FolderId,
         path: RelPath,
         want: Option<Box<Want>>,
+    },
+    /// The entries deferred at a path changed; persistence hook (§11), one
+    /// row per path. `None` when nothing waits there any more.
+    DeferredChanged {
+        folder: FolderId,
+        path: RelPath,
+        entries: Option<Vec<Deferred>>,
     },
     /// Something for `status`.
     StatusChanged {
@@ -558,7 +565,26 @@ impl Engine {
         self.settle(now, &mut out);
         self.pump(now, &mut out);
         self.schedule(&mut out);
+        self.persist(&mut out);
         out
+    }
+
+    /// Report the parts this event changed (§11), once per row, as each
+    /// stands at the end of the event. The index and the wants are reported
+    /// as they are written, by `IndexChanged`, `IndexRemoved` and
+    /// `WantChanged`; the other parts here. Everything the event reports
+    /// belongs to one group commit, so where a hook sits in the list does
+    /// not matter, only that it is there.
+    fn persist(&mut self, out: &mut Vec<Action>) {
+        for (id, folder) in &mut self.folders {
+            for (path, entries) in folder.deferred_changes() {
+                out.push(Action::DeferredChanged {
+                    folder: *id,
+                    path,
+                    entries,
+                });
+            }
+        }
     }
 
     /// Run every queued decision whose folder has settled, and report the
@@ -1046,12 +1072,17 @@ mod tests {
         rest
     }
 
-    /// Actions without the `WantChanged` persistence hooks, for tests that
-    /// assert on exact positions.
+    /// Actions without the want and part persistence hooks, for tests
+    /// that assert on exact positions.
     fn core(actions: &[Action]) -> Vec<Action> {
         actions
             .iter()
-            .filter(|a| !matches!(a, Action::WantChanged { .. }))
+            .filter(|a| {
+                !matches!(
+                    a,
+                    Action::WantChanged { .. } | Action::DeferredChanged { .. }
+                )
+            })
             .cloned()
             .collect()
     }

@@ -20,6 +20,7 @@
 //! - [`want`]: the want-list, source selection, deadlines, ordering (§7.5, §6.5)
 //! - [`conflict`]: the winner rule, the merged version `M`, conflict-copy names (§7.6)
 //! - [`folder`]: per-folder state: window, scan bracket, accepted work (§7.3, §7.4)
+//! - [`parts`]: the persisted parts and how their changes are reported (§11)
 //! - [`engine`]: the `Engine`, its `Event`s and `Action`s (§7)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
@@ -33,6 +34,7 @@ pub mod entry;
 pub mod folder;
 pub mod id;
 pub mod index;
+pub mod parts;
 pub mod path;
 pub mod quarantine;
 pub mod rules;
