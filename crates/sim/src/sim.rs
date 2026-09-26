@@ -241,6 +241,10 @@ struct Node {
     skew_ns: i64,
     #[serde(skip)]
     engine: Option<Engine>,
+    /// The folder as it stood when the node crashed, for the restart check
+    /// (§11); `None` while the node runs.
+    #[serde(skip)]
+    crashed: Option<FolderState>,
     online: bool,
     restart_at: Option<Timestamp>,
     fs: BTreeMap<RelPath, File>,
@@ -415,6 +419,7 @@ impl Sim {
                 host,
                 skew_ns,
                 engine: None,
+                crashed: None,
                 online: true,
                 restart_at: None,
                 fs: BTreeMap::new(),
@@ -1166,8 +1171,8 @@ impl Sim {
                     }
                 }
             }
-            // Not kept yet: the simulator persists the parts it restarts
-            // from, which so far are the index and the wants.
+            // The other parts' tables (§11): each hook writes its row, and a
+            // `None` removes it.
             Action::PendingChanged { path, row, .. } => {
                 if let Some(n) = self.nodes.get_mut(&id) {
                     match row {
@@ -1421,7 +1426,9 @@ impl Sim {
         }
         self.ops
             .retain(|op| op.node() != id && !matches!(op, Op::Fetch { from, .. } if *from == id));
+        let folder = self.folder;
         if let Some(n) = self.nodes.get_mut(&id) {
+            n.crashed = n.engine.as_ref().and_then(|e| e.folder(folder)).cloned();
             n.engine = None;
             n.temp.clear();
             n.wake_at = None;
@@ -1441,6 +1448,30 @@ impl Sim {
             let detail = format!("{}: no rest row to restart from", Self::short(id));
             return Err(self.fail("persistence hooks", detail));
         };
+        // §11: the folder rebuilt from the tables must be the folder that
+        // crashed, once both have been through the restart. The per-event
+        // check catches a hook that did not report a change; this catches a
+        // part that `parts()` and `from_parts()` leave out, whether or not
+        // an invariant would notice it was lost.
+        let lost = self
+            .nodes
+            .get_mut(&id)
+            .and_then(|n| n.crashed.take())
+            .map(|crashed| restart_difference(&parts, crashed, &config, now));
+        match lost {
+            Some(None) => {}
+            Some(Some(field)) => {
+                let detail = format!(
+                    "{}: the folder rebuilt from the tables differs from the one that crashed, first in {field}",
+                    Self::short(id)
+                );
+                return Err(self.fail("persistence hooks", detail));
+            }
+            None => {
+                let detail = format!("{}: restarted without having crashed", Self::short(id));
+                return Err(self.fail("persistence hooks", detail));
+            }
+        }
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
         };
@@ -2322,6 +2353,26 @@ fn expected_matches(file: Option<&File>, expected: Option<&Observed>) -> bool {
         (Some(f), Some(e)) => e.unchanged_by_stat(&f.observed()),
         _ => false,
     }
+}
+
+/// Where the folder rebuilt from `parts` first differs from `crashed`, the
+/// folder as it stood at the crash, once both have been through a restart
+/// at `now` (§11); `None` if nowhere.
+fn restart_difference(
+    parts: &FolderParts,
+    mut crashed: FolderState,
+    config: &NodeConfig,
+    now: Timestamp,
+) -> Option<&'static str> {
+    let mut rebuilt =
+        FolderState::from_parts(parts.clone(), config.node_id, config.author_host.clone());
+    rebuilt.restarted(now);
+    crashed.restarted(now);
+    // Both want-lists noted every want the restart touched: bookkeeping for
+    // the hooks, not state, drained before comparing.
+    rebuilt.want_changes();
+    crashed.want_changes();
+    rebuilt.first_difference(&crashed)
 }
 
 /// Sync moved the file with `hash` from `from` to the conflict-copy path
