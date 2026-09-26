@@ -3,6 +3,7 @@
 //! ```text
 //! delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P]
 //!             [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N] [--keep-going]
+//!             [--digests]
 //! ```
 //!
 //! On the first failing seed the step list is delta-debugged down to a
@@ -15,7 +16,9 @@
 //!
 //! Standard output depends only on the arguments, so two runs of the same
 //! seeds can be compared with `cmp`. Progress and wall-clock times go to
-//! standard error.
+//! standard error. `--digests` adds a line per passing seed with its
+//! outcome's fingerprint, the hash I6 compares, which covers every node's
+//! final engine state, filesystem and trash and the whole action log.
 
 // The binary may not unwrap or expect either (CLAUDE.md); errors go to stderr.
 // Failure is large by design; see lib.rs.
@@ -31,6 +34,7 @@ struct Args {
     steps: usize,
     knobs: Knobs,
     keep_going: bool,
+    digests: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -40,6 +44,7 @@ fn parse_args() -> Result<Args, String> {
         steps: 400,
         knobs: Knobs::default(),
         keep_going: false,
+        digests: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -76,8 +81,9 @@ fn parse_args() -> Result<Args, String> {
                 );
             }
             "--keep-going" => args.keep_going = true,
+            "--digests" => args.digests = true,
             "--help" | "-h" => {
-                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N] [--keep-going]".to_owned());
+                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--nodes N] [--keep-going] [--digests]".to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -117,6 +123,10 @@ fn shrink(seed: u64, knobs: &Knobs, steps: &[Step], original: &Failure) -> Failu
     last.unwrap_or_else(|| original.clone())
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -154,6 +164,9 @@ fn main() -> ExitCode {
                 totals.stalled += outcome.stats.stalled;
                 totals.conflict_copies += outcome.stats.conflict_copies;
                 totals.events += outcome.stats.events;
+                if args.digests {
+                    println!("seed {seed} digest {}", hex(&outcome.fingerprint));
+                }
                 if (i + 1) % 100 == 0 {
                     eprintln!("  {} seeds ok ({:.0?})", i + 1, started.elapsed());
                 }
