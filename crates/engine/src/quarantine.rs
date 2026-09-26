@@ -89,6 +89,11 @@ impl Quarantine {
         self.items.len()
     }
 
+    /// The last arrival number handed out: part of the small rest (§11).
+    pub fn arrivals(&self) -> u64 {
+        self.arrivals
+    }
+
     /// Held items in batch-id order.
     pub fn items(&self) -> impl Iterator<Item = &HeldItem> {
         self.items.values()

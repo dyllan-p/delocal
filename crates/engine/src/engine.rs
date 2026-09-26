@@ -24,6 +24,7 @@ use crate::folder::{
 };
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::IndexRecord;
+use crate::parts::Rest;
 use crate::path::RelPath;
 use crate::quarantine::HeldRow;
 use crate::rules::Rules;
@@ -265,6 +266,8 @@ pub enum Action {
         path: RelPath,
         entries: Option<Vec<Deferred>>,
     },
+    /// The small rest changed; persistence hook (§11), one row per folder.
+    RestChanged { folder: FolderId, rest: Box<Rest> },
     /// Something for `status`.
     StatusChanged {
         folder: FolderId,
@@ -280,6 +283,9 @@ pub struct Engine {
     peers: BTreeMap<NodeId, Tier>,
     /// The last `WakeAt` emitted per folder, so it is not repeated.
     woke: BTreeMap<FolderId, Timestamp>,
+    /// The small rest last reported per folder, so it is reported only
+    /// when it changes (§11).
+    rested: BTreeMap<FolderId, Rest>,
     /// The time of the event being handled, for an immediate wake-up.
     now_hint: Timestamp,
 }
@@ -291,6 +297,7 @@ impl Engine {
             folders: BTreeMap::new(),
             peers: BTreeMap::new(),
             woke: BTreeMap::new(),
+            rested: BTreeMap::new(),
             now_hint: Timestamp::default(),
         }
     }
@@ -307,6 +314,7 @@ impl Engine {
         let mut engine = Self::new(config);
         for mut folder in folders {
             folder.restarted(now);
+            engine.rested.insert(folder.id(), folder.rest());
             engine.folders.insert(folder.id(), folder);
         }
         engine
@@ -580,11 +588,20 @@ impl Engine {
     /// Report the parts this event changed (§11), once per row, as each
     /// stands at the end of the event. The index and the wants are reported
     /// as they are written, by `IndexChanged`, `IndexRemoved` and
-    /// `WantChanged`; the other parts here. Everything the event reports
+    /// `WantChanged`; the other parts here, the small rest whenever it
+    /// differs from the one reported last. Everything the event reports
     /// belongs to one group commit, so where a hook sits in the list does
     /// not matter, only that it is there.
     fn persist(&mut self, out: &mut Vec<Action>) {
         for (id, folder) in &mut self.folders {
+            let rest = folder.rest();
+            if self.rested.get(id) != Some(&rest) {
+                out.push(Action::RestChanged {
+                    folder: *id,
+                    rest: Box::new(rest.clone()),
+                });
+                self.rested.insert(*id, rest);
+            }
             for (batch, row) in folder.held_changes() {
                 out.push(Action::HeldChanged {
                     folder: *id,
@@ -1038,7 +1055,7 @@ mod tests {
                 members: members.iter().map(|i| node(*i)).collect(),
             },
         );
-        assert!(out.is_empty());
+        assert!(core(&out).is_empty());
     }
 
     fn connect(a: &mut Engine, b: &mut Engine) {
@@ -1098,6 +1115,7 @@ mod tests {
                     Action::WantChanged { .. }
                         | Action::HeldChanged { .. }
                         | Action::DeferredChanged { .. }
+                        | Action::RestChanged { .. }
                 )
             })
             .cloned()
@@ -1114,6 +1132,64 @@ mod tests {
             .collect()
     }
 
+    /// The small rest of each event, if it reported one (§11).
+    fn rest_of(actions: &[Action]) -> Option<&Rest> {
+        actions.iter().find_map(|a| match a {
+            Action::RestChanged { rest, .. } => Some(&**rest),
+            _ => None,
+        })
+    }
+
+    /// §11: the small rest is reported when it changes and only then.
+    #[test]
+    fn the_small_rest_is_reported_when_it_changes() {
+        let mut a = engine(1, "a");
+        let out = a.handle(
+            t(0.0),
+            Event::FolderJoined {
+                folder: folder(),
+                rules: Rules::default(),
+                members: vec![node(1), node(2)],
+            },
+        );
+        assert_eq!(
+            rest_of(&out),
+            Some(&Rest::default()),
+            "the new folder's row"
+        );
+        let out = a.handle(
+            t(1.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("doc.txt"),
+                state: file(1, 5),
+            },
+        );
+        assert_eq!(
+            rest_of(&out).map(|r| (r.seq, r.announced_seq)),
+            Some((1, 0))
+        );
+        let out = a.handle(
+            t(2.0),
+            Event::PeerTierChanged {
+                peer: node(2),
+                tier: Tier::Relay,
+            },
+        );
+        assert_eq!(rest_of(&out), None, "nothing in it changed");
+        let out = a.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        let rest = rest_of(&out).unwrap();
+        assert_eq!(
+            (rest.seq, rest.announced_seq, rest.announced_tracked),
+            (1, 1, 1)
+        );
+    }
+
     #[test]
     fn scan_then_tick_forms_a_batch_for_connected_members_only() {
         let mut a = engine(1, "a");
@@ -1121,27 +1197,27 @@ mod tests {
         join(&mut a, &[1, 2, 3]); // 3 is a member but never connects
         connect(&mut a, &mut b);
 
-        let out = a.handle(
+        let out = core(&a.handle(
             t(10.0),
             Event::Scanned {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
             },
-        );
+        ));
         assert!(matches!(out[0], Action::IndexChanged { .. }));
         assert_eq!(out[1], Action::WakeAt(t(12.0)));
         assert_eq!(out.len(), 2);
 
         // Another change 1 s later extends the quiet period.
-        let out = a.handle(
+        let out = core(&a.handle(
             t(11.0),
             Event::Scanned {
                 folder: folder(),
                 path: p("other.txt"),
                 state: file(2, 5),
             },
-        );
+        ));
         assert_eq!(out[1], Action::WakeAt(t(13.0)));
 
         // An early tick forms nothing and asks for the wake again, since the
@@ -1165,12 +1241,12 @@ mod tests {
             "1 ns early still re-announces"
         );
 
-        let out = a.handle(
+        let out = core(&a.handle(
             t(13.0),
             Event::Tick {
                 fresh_batch_id: fresh(1),
             },
-        );
+        ));
         let sent = sends(&out);
         assert_eq!(sent.len(), 1, "only the connected member gets it");
         let Outbound::Batch(batch) = sent[0].1 else {
@@ -2129,7 +2205,7 @@ mod tests {
         assert_eq!(batch.id, fresh(3), "sent under the reserved id");
         assert_eq!((batch.summary.dels, batch.summary.mods), (8, 1));
         assert!(matches!(
-            out.last(),
+            core(&out).last(),
             Some(Action::StatusChanged {
                 status: FolderStatus::Unpaused { .. },
                 ..
@@ -3151,7 +3227,7 @@ mod tests {
                 state: ScanState::Unchanged,
             },
         );
-        let out = e.handle(t(7.0), Event::ScanFinished { folder: folder() });
+        let out = core(&e.handle(t(7.0), Event::ScanFinished { folder: folder() }));
         assert!(
             matches!(&out[0], Action::IndexChanged { record, .. } if record.entry.deleted && record.entry.path == p("b"))
         );
