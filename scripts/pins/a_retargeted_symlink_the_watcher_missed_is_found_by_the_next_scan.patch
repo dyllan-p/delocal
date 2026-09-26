@@ -1,0 +1,25 @@
+Lets the scan fast path take a symlink as unchanged when its kind matches
+the index, whatever its target, as before 34b5d6f (§7.3), so a retarget
+whose watcher event was dropped is invisible to every later scan. Only
+Entry::unchanged_by_stat, the fast path's test, changes: the commit guard
+keeps comparing the target.
+
+test: delocal-sim regressions::a_retargeted_symlink_the_watcher_missed_is_found_by_the_next_scan
+
+diff --git a/crates/engine/src/entry.rs b/crates/engine/src/entry.rs
+index 864d5c4..6e38914 100644
+--- a/crates/engine/src/entry.rs
++++ b/crates/engine/src/entry.rs
+@@ -155,7 +155,11 @@ impl Entry {
+     /// [`Observed::unchanged_by_stat`]. A tombstone matches nothing:
+     /// whatever is on disk is new.
+     pub fn unchanged_by_stat(&self, seen: &Observed) -> bool {
+-        !self.deleted && self.observed().unchanged_by_stat(seen)
++        let seen = Observed {
++            hash: self.hash,
++            ..seen.clone()
++        };
++        !self.deleted && self.observed().unchanged_by_stat(&seen)
+     }
+ 
+     /// A metadata-only change (§7.1): the content is what it was before.

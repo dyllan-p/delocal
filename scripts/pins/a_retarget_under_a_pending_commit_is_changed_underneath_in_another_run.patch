@@ -1,0 +1,25 @@
+Lets the simulated host's commit guard pass a symlink whose kind matches
+what the engine expected, whatever its target, as before d12fec3 (§7.5 step
+6), so a retarget between a losing version's record and the commit that
+displaces it goes through. Only that fix's target comparison is undone: the
+guard still compares a file's exec bit, SetMeta is still guarded, and the
+scan fast path is unchanged.
+
+test: delocal-sim regressions::a_retarget_under_a_pending_commit_is_changed_underneath_in_another_run
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 4e18586..53335d7 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -2731,7 +2731,10 @@ fn rel(s: &str) -> RelPath {
+ fn expected_matches(file: Option<&File>, expected: Option<&Observed>) -> bool {
+     match (file, expected) {
+         (None, None) => true,
+-        (Some(f), Some(e)) => e.unchanged_by_stat(&f.observed()),
++        (Some(f), Some(e)) => e.unchanged_by_stat(&Observed {
++            hash: e.hash,
++            ..f.observed()
++        }),
+         _ => false,
+     }
+ }
