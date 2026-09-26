@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 36 · 26 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 35: the commit journal undoes a displacement only into an empty path, and its row goes once the rename is durable (§7.5); I4 accepts a copy where it is or where it maps to (§14.1); a pinned seed must fail with its fix disabled, checked nightly (§14.4).
+> Draft 37 · 26 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 36: I4 accepts a moved copy at any point along its chain of displacements (§14.1); pins and their patches in the repository layout (Appendix B).
+>
+> Changes from draft 35: the commit journal undoes a displacement only into an empty path, and its row goes once the rename is durable (§7.5); I4 accepts a copy where it is or where it maps to (§14.1); a pinned seed must fail with its fix disabled, checked nightly (§14.4).
 >
 > Changes from draft 34: I4 checks a conflict copy that moved with a displaced directory where it was made (§14.1); `scripts/` in the repository layout (Appendix B).
 >
@@ -752,7 +754,7 @@ Invariants checked at the end of every run and at random quiescent points:
 | I1 | **Convergence.** When all nodes are connected and quiescent, every member has the identical set of paths, kinds, hashes and exec bits (excluding `.delocal/`). |
 | I2 | **No loss.** Every content hash that was ever **announced** (appeared in a batch some node sent) exists at the end in some node's folder or trash. Content overwritten locally before it was ever announced is not protected, by design (§8.6). Nor is content that sync put in place and this machine's user then deleted or rewrote, **wherever sync put it**, a conflict-copy path included: that is the user's own change. |
 | I3 | **No resurrection.** A path deleted on a connected node and not concurrently modified is absent on every node after convergence. |
-| I4 | **Bounded conflicts.** A losing version is a version that `winner` (§7.6) ranks below a concurrent version with different content at the same path. Every conflict copy present at the end has the deterministic name of some losing version at that path and that version's content, and there is exactly one copy path per losing version, never one per node. Two different losing versions may legitimately have identical content, and after `revert` removes a never-announced record two losing versions may share a vector (the re-issue I7 exempts), so losers are keyed by vector and content together. A copy that later moved with a displaced directory (§7.6) is checked where it was made: its path is mapped back through each `.conflict-` directory above it to the path of the directory that was displaced, repeating until nothing changes (a directory can be displaced more than once), and the copy must match a losing version where it is or where it maps to: a moved copy can share its new name with a later loser there, which is a real name collision that sync resolves by trashing, not a lost file. Content checks are unchanged, and a user's edit of the copy at either path is the user's own change, as in I2. |
+| I4 | **Bounded conflicts.** A losing version is a version that `winner` (§7.6) ranks below a concurrent version with different content at the same path. Every conflict copy present at the end has the deterministic name of some losing version at that path and that version's content, and there is exactly one copy path per losing version, never one per node. Two different losing versions may legitimately have identical content, and after `revert` removes a never-announced record two losing versions may share a vector (the re-issue I7 exempts), so losers are keyed by vector and content together. A copy that later moved with a displaced directory (§7.6) is checked where it was made: its path is mapped back through each `.conflict-` directory above it to the path of the directory that was displaced, repeating until nothing changes (a directory can be displaced more than once), and the copy must match a losing version at some point along that chain: where it is, where it maps to, or any path in between, since a copy can be made inside a directory that was already displaced and then be displaced again with it: a moved copy can share its new name with a later loser there, which is a real name collision that sync resolves by trashing, not a lost file. Content checks are unchanged, and a user's edit of the copy at either path is the user's own change, as in I2. |
 | I5 | **Brake.** No batch that trips H1/H2 is ever applied without an explicit approve step in the simulation. |
 | I6 | **Determinism.** Same seed → byte-identical outcome. |
 | I7 | **Vector determines content.** On every node, after every index write: two records ever seen at a path with equal vectors have equal kind, hash, exec and deletion state. The one exemption is a machine's own re-issue after `revert`, which reuses a never-announced vector (§8.3). |
@@ -888,7 +890,10 @@ delocal/
   README.md                 install, the not-a-backup warning, five commands
   TESTING.md                acceptance checklist
   install.sh                served at delocal.sh/install
-  scripts/                  developer tooling (mutate.sh: parallel mutation checks); nothing here ships
+  scripts/                  developer tooling; nothing here ships
+    mutate.sh               parallel mutation checks
+    pins.sh                 checks every pinned seed both ways (§14.4)
+    pins/                   one fix-disabling patch per pin, named after it
   crates/
     engine/                 pure sync logic: index, versions, batches, conflicts, brake
     sim/                    deterministic simulator: in-memory host for N engines, seeded PRNG, invariants I1–I6; dev-only, runnable for the nightly
