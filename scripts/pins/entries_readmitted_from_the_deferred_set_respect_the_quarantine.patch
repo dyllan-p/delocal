@@ -1,0 +1,42 @@
+Lets entries re-admitted from the deferred set (an unfreeze, a superseded
+entry, a re-classified want) and approve's entries skip quarantine matching
+and the brake again, as before 3cba684 (§8.1, §8.2): admit() no longer joins
+a candidate whose version is quarantined, or dominates a quarantined one, to
+that held item, and every group passes without the brake being evaluated.
+The rest of admit() stays: a version already wanted still only names a
+source, and 20a7504's rule that an entry of a batch still held joins it. No
+seed fails with this patch (0 to 9,999, and 0 to 499 at 2,000 steps): a
+re-admitted entry keeps its own accepted batch's id, so I5 never matches it,
+and no other invariant sees it. The patch names the rule's unit test.
+
+test: delocal-engine folder::tests::a_deferred_entry_whose_version_was_held_meanwhile_joins_the_held_item
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..ec89487 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1111,11 +1111,6 @@ impl FolderState {
+                     .note_announced(c.item.path(), &entry.hash, c.source);
+                 continue;
+             }
+-            if let Some(held) = self.quarantine.matching(&c.raw) {
+-                self.quarantine.join(held, c.raw);
+-                *joined.entry(held).or_insert(0) += 1;
+-                continue;
+-            }
+             if brake && self.quarantine.get(c.batch).is_some() {
+                 self.quarantine.join(c.batch, c.raw);
+                 *joined.entry(c.batch).or_insert(0) += 1;
+@@ -1149,11 +1144,7 @@ impl FolderState {
+                 fallbacks: 0,
+             };
+             let summary = brake::receiver_summary(&self.index, &set);
+-            let verdict = if brake {
+-                brake::evaluate(&self.rules, &summary, self.index.tracked_count())
+-            } else {
+-                Verdict::Pass
+-            };
++            let verdict = Verdict::Pass;
+             match verdict {
+                 Verdict::Hold(reason) => {
+                     let paths = set.items.len();
