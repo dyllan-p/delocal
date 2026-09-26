@@ -53,7 +53,7 @@ pub use folder::{
     UserDecision, WaitReason, Window,
 };
 pub use id::{BatchId, FolderId, HostName, NodeId};
-pub use index::{ChangeKind, Index, IndexRecord, LocalChange, Reverted};
+pub use index::{ChangeKind, Index, IndexRecord, LocalChange, Pending, Reverted};
 pub use path::RelPath;
 pub use quarantine::{HeldItem, Quarantine, Withdrawn};
 pub use rules::Rules;
