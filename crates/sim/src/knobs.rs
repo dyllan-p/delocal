@@ -29,6 +29,12 @@ pub struct Knobs {
     /// group draws its lag from 0 to this; 0 makes every event's writes
     /// durable when the event ends.
     pub group_commit_lag: u32,
+    /// A displaced directory takes everything under it, as a real rename
+    /// does (§7.6, §14.1): the children's old records are tombstoned by the
+    /// next scan and the moved children appear as adds. Off, only the
+    /// directory's own entry moves, and a non-empty directory cannot be
+    /// displaced to a conflict copy by a delete.
+    pub displace_subtrees: bool,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -42,6 +48,7 @@ impl Default for Knobs {
             crash_after_rename: 0.1,
             crash_between_renames: 0.0,
             group_commit_lag: 0,
+            displace_subtrees: false,
             nodes: None,
         }
     }
@@ -51,14 +58,15 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
             self.delay_ms.1,
             self.crash_after_rename,
             self.crash_between_renames,
-            self.group_commit_lag
+            self.group_commit_lag,
+            self.displace_subtrees
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;

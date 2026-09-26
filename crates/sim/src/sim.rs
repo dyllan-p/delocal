@@ -88,6 +88,8 @@ pub struct Stats {
     pub groups_lost: u64,
     /// Effects lost with those groups, never performed.
     pub effects_lost: u64,
+    /// Non-empty directories displaced with their children (§7.6).
+    pub subtrees_displaced: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -2021,6 +2023,7 @@ impl Sim {
     ) -> (Committed, Vec<RelPath>) {
         let now = self.clock;
         let crash_between = self.knobs.crash_between_renames;
+        let subtrees = self.knobs.displace_subtrees;
         let changed = || Committed::Report(ApplyOutcome::ChangedUnderneath);
         let Some(node) = self.nodes.get_mut(&id) else {
             return (changed(), Vec::new());
@@ -2074,7 +2077,10 @@ impl Sim {
                 // Step 7, behind a journal row made durable first. The row
                 // is this commit's until the rename below removes it: rows
                 // left by a crash were all undone at the restart.
-                if displace_journalled(node, path, displace)
+                if subtrees && has_children(node, path) {
+                    self.stats.subtrees_displaced += 1;
+                }
+                if displace_journalled(node, path, displace, subtrees)
                     && crash_between > 0.0
                     && self.journal_rng.random::<f64>() < crash_between
                 {
@@ -2116,10 +2122,11 @@ impl Sim {
                 ApplyOutcome::Ok
             }
             Action::Remove { displace, .. } => {
-                if let Some(existing) = node.fs.get(path)
-                    && existing.kind == Kind::Dir
-                    && node.fs.keys().any(|p| path.is_ancestor_of(p))
-                {
+                // A directory is removed only when empty (§7.5, "Deletes").
+                // Displaced to a conflict copy it is renamed instead, and a
+                // rename takes its children (§7.6).
+                let renamed = subtrees && matches!(displace, Displace::ConflictCopy(_));
+                if !renamed && has_children(node, path) {
                     return (changed(), created); // not empty
                 }
                 if let Displace::ConflictCopy(target) = displace
@@ -2127,14 +2134,12 @@ impl Sim {
                 {
                     return (changed(), created);
                 }
-                if let Some(existing) = node.fs.remove(path) {
-                    match displace {
-                        Displace::Trash => trash_file(node, existing),
-                        Displace::ConflictCopy(target) => {
-                            follow(node, path, target, existing.hash(), now);
-                            node.fs.insert(target.clone(), existing);
-                        }
-                    }
+                if has_children(node, path) {
+                    self.stats.subtrees_displaced += 1;
+                }
+                let moved = displace_path(node, path, displace, subtrees);
+                if let Displace::ConflictCopy(target) = displace {
+                    follow_moved(node, path, target, &moved, now);
                 }
                 ApplyOutcome::Ok
             }
@@ -2790,33 +2795,66 @@ fn trash_file(node: &mut Node, file: File) {
     }
 }
 
-/// §7.5 step 7 behind the commit journal: make a row durable that names
-/// what is at `path` and where it goes, then move it there with one
-/// rename. False, and no row, if the path is empty.
-fn displace_journalled(node: &mut Node, path: &RelPath, to: &Displace) -> bool {
-    let Some(existing) = node.fs.get(path) else {
-        return false;
-    };
-    let row = JournalRow {
-        path: path.clone(),
-        to: to.clone(),
-        moved: vec![(path.clone(), existing.clone())],
-        trash_at: node.trash.len(),
-    };
-    for (from, _) in &row.moved {
-        let Some(file) = node.fs.remove(from) else {
+/// True if something lies under `path`: it is a non-empty directory.
+fn has_children(node: &Node, path: &RelPath) -> bool {
+    node.fs.keys().any(|p| path.is_ancestor_of(p))
+}
+
+/// §7.5 step 7: move what is at `path` aside, to the trash or to a
+/// conflict-copy path, with one rename. With `subtree`, a directory takes
+/// everything under it, as a real rename does (§7.6); without, only its own
+/// entry moves. Returns what moved, at the paths it had.
+fn displace_path(
+    node: &mut Node,
+    path: &RelPath,
+    to: &Displace,
+    subtree: bool,
+) -> Vec<(RelPath, File)> {
+    let moving: Vec<RelPath> = node
+        .fs
+        .keys()
+        .filter(|p| *p == path || (subtree && path.is_ancestor_of(p)))
+        .cloned()
+        .collect();
+    let mut moved = Vec::new();
+    for from in moving {
+        let at = match to {
+            Displace::Trash => None,
+            Displace::ConflictCopy(target) => match rebase(&from, path, target) {
+                Some(at) => Some(at),
+                None => continue,
+            },
+        };
+        let Some(file) = node.fs.remove(&from) else {
             continue;
         };
-        match to {
-            Displace::Trash => trash_file(node, file),
-            Displace::ConflictCopy(target) => {
-                if let Some(at) = rebase(from, path, target) {
-                    node.fs.insert(at, file);
-                }
+        match at {
+            None => trash_file(node, file.clone()),
+            Some(at) => {
+                node.fs.insert(at, file.clone());
             }
         }
+        moved.push((from, file));
     }
-    node.journal.push(row);
+    moved
+}
+
+/// §7.5 step 7 behind the commit journal: a row that names what is at
+/// `path` and where it goes is made durable, then it moves there with one
+/// rename (the row is written after the move here, which is the same thing
+/// in a step no crash can split). False, and no row, if the path is empty.
+fn displace_journalled(node: &mut Node, path: &RelPath, to: &Displace, subtree: bool) -> bool {
+    if !node.fs.contains_key(path) {
+        return false;
+    }
+    let trash_at = node.trash.len();
+    let moved = displace_path(node, path, to, subtree);
+    node.journal.push(JournalRow {
+        path: path.clone(),
+        to: to.clone(),
+        moved,
+        trash_at,
+    });
     true
 }
 
@@ -2870,14 +2908,24 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
     }
 }
 
-/// The adoptions of content a displacement moved to a conflict-copy path
-/// follow it there (I2; see `follow`).
+/// The adoptions of content a journalled displacement moved to a
+/// conflict-copy path follow it there (I2; see `follow`).
 fn moved_by_sync(node: &mut Node, row: &JournalRow, now: Timestamp) {
-    let Displace::ConflictCopy(target) = &row.to else {
-        return;
-    };
-    for (from, file) in &row.moved {
-        if let Some(to) = rebase(from, &row.path, target) {
+    if let Displace::ConflictCopy(target) = &row.to {
+        follow_moved(node, &row.path, target, &row.moved, now);
+    }
+}
+
+/// `follow` for everything a rename of `path` to `target` moved.
+fn follow_moved(
+    node: &mut Node,
+    path: &RelPath,
+    target: &RelPath,
+    moved: &[(RelPath, File)],
+    now: Timestamp,
+) {
+    for (from, file) in moved {
+        if let Some(to) = rebase(from, path, target) {
             follow(node, from, &to, file.hash(), now);
         }
     }
