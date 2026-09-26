@@ -4,13 +4,14 @@
 # twenty jobs. Each night starts at a different seed, day of year ×
 # 100,000 (see the plan job).
 #
-# The simulator runs one seed at a time on one core, and 100,000 seeds take
-# about a day that way. A job on a GitHub-hosted runner is stopped after six
-# hours, so the seeds are split into twenty shards, each well inside that
-# limit, running side by side. Sixteen share the 96,000 seeds at 400 steps,
-# 6,000 each. Four share the 4,000 at 2,000 steps, 1,000 each, because a
-# 2,000-step seed takes about five times as long to run. Twenty is also the
-# most jobs GitHub Free runs at once, so no shard waits for another.
+# One seed at a time on one core, 100,000 seeds take about a day. The
+# simulator runs a seed on each of a runner's four CPUs, but a job on a
+# GitHub-hosted runner is stopped after six hours, so the seeds are still
+# split into twenty shards, each well inside that limit, running side by
+# side. Sixteen share the 96,000 seeds at 400 steps, 6,000 each. Four
+# share the 4,000 at 2,000 steps, 1,000 each, because a 2,000-step seed
+# takes about five times as long to run. Twenty is also the most jobs
+# GitHub Free runs at once, so no shard waits for another.
 
 name: Nightly simulation
 
