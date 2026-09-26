@@ -677,11 +677,11 @@ machines       (node, hostname, ts_stable_id, ts_user, trusted, last_seen, deloc
 - the **index**, one row per entry (`IndexChanged`, and `IndexRemoved` for the one case, `revert`, that removes a record);
 - the **wants**, one row per path;
 - the **pending set**, one row per unannounced path, carrying the record peers last saw there (§7.1) and whether its tombstone is exempt from the pre-check (§8.1); a paused mass change holds thousands of these;
-- the **held items**, one row per item, whether it is held or has been consumed by a `deny` that a `revert` could still return (§8.3); the row carries the item's quarantined entries, each with its **arrival number** from a per-folder counter, so that the order in which versions arrived at a path is the same after a restart whatever items they belong to;
+- the **held items**, one row per item, whether it is held or has been consumed by a `deny` that a `revert` could still return (§8.3); the row carries every version quarantined for the item, joiners that did not replace its stored entry at a path included, each with its **arrival number** from a per-folder counter, so that the order in which versions arrived at a path is the same after a restart whatever items they belong to. A deny takes the next arrival number and a denied row is keyed by it: one batch id can be held, denied, held again and denied again before either deny is announced, and `revert` returns denied items in the order they were denied;
 - the **deferred paths**, one row per path;
 - the **small rest**, one row: `seq`, the announced `seq` and tracked count, per-peer watermarks and acks, the paused state, queued decisions, the arrival counter, and the winner-fallback count (§7.6).
 
-The simulator restores a crashed node from these parts and nothing else, so a missing hook fails a seed. Tables the host owns (history, trash, the mtime shim and disk names of §7.3, the commit journal of §7.5, machines) are not engine parts; the host writes them in the same transaction as the engine writes they belong to.
+The simulator restores a crashed node from these parts and nothing else, and checks both directions: after every event, that the tables the hooks wrote equal the engine's parts, so a missing hook fails at the event that should have reported it; and at every restart, that the state rebuilt from the tables equals the state that crashed, once both have been through the restart, so a part the engine forgets to include fails too, whether or not any invariant would notice the loss. Tables the host owns (history, trash, the mtime shim and disk names of §7.3, the commit journal of §7.5, machines) are not engine parts; the host writes them in the same transaction as the engine writes they belong to.
 
 ---
 
