@@ -1,0 +1,25 @@
+Takes the stamp out of the winner rule, whose first key it became in
+6c5f832 (§7.1, §7.6), so concurrent versions are ranked by the content
+rules alone again. A tombstone then ranks below the live file it
+replaced, two nodes that merge the same versions in different orders can
+hold the same vector, one deleted and one live, and I7 fails. Stamps are
+still computed and carried; only the comparison goes.
+
+test: delocal-sim regressions::equal_vectors_mean_equal_content_when_deletes_race_an_edit
+
+diff --git a/crates/engine/src/conflict.rs b/crates/engine/src/conflict.rs
+index 390fa53..7644241 100644
+--- a/crates/engine/src/conflict.rs
++++ b/crates/engine/src/conflict.rs
+@@ -80,11 +80,6 @@ pub fn winner(a: &Entry, b: &Entry) -> Winner {
+         }),
+         Equal => None,
+     };
+-    // 1. the larger stamp: strictly increasing along every chain, so an
+-    //    increment ranks above everything in its causal past (§7.6)
+-    if let Some(w) = pick(a.stamp.cmp(&b.stamp), false) {
+-        return w;
+-    }
+     // 2. live beats tombstone
+     if let Some(w) = pick(b.deleted.cmp(&a.deleted), false) {
+         return w;

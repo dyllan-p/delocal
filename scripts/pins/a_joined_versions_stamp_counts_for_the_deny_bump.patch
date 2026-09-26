@@ -1,0 +1,25 @@
+Makes `Quarantine::max_stamp_at` read only the held items' stored entries
+again, as before 9b0a97c (§7.1, §8.2). A concurrent version that joined a
+held item without replacing its stored entry is still folded into the
+deny bump's vector, but its stamp no longer counts for the bump's stamp,
+so the bump can dominate that version and rank below it (I7).
+
+test: delocal-sim regressions::a_joined_versions_stamp_counts_for_the_deny_bump
+
+diff --git a/crates/engine/src/quarantine.rs b/crates/engine/src/quarantine.rs
+index 619b8dd..65a88db 100644
+--- a/crates/engine/src/quarantine.rs
++++ b/crates/engine/src/quarantine.rs
+@@ -201,7 +201,11 @@ impl Quarantine {
+     /// `versions_at`, not from the stored entries, which lack the joiners
+     /// that were concurrent with what an item already held.
+     pub fn max_stamp_at(&self, path: &RelPath) -> Option<i64> {
+-        self.versions.get(path)?.iter().map(|(_, q)| q.stamp).max()
++        self.items
++            .values()
++            .filter_map(|item| item.entries.get(path))
++            .map(|e| e.stamp)
++            .max()
+     }
+ 
+     /// Every quarantined version at `path`, across all items.
