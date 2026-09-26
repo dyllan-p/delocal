@@ -1,0 +1,22 @@
+Makes the version table in sim.rs `record` replace a record under a vector it
+already holds only when kind, hash, exec bit or deletion state differ, as
+before 8d4620d. A re-issue after a revert with the same content but a later
+mtime then keeps the discarded record, and I4 checks the node's conflict-copy
+names against an mtime nobody holds any more (DESIGN.md §14.1 I4 and I7,
+§8.3).
+
+test: delocal-sim regressions::a_reissued_vector_replaces_the_discarded_record_whatever_its_content
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 4e18586..359792b 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -1339,7 +1339,7 @@ impl Sim {
+                         // content, so that conflict-copy names (from the
+                         // loser's mtime) are checked against what exists.
+                         let discarded = self.discarded_by_revert(&existing);
+-                        if !same || discarded {
++                        if !same {
+                             if !same && !discarded {
+                                 return Err(self.fail(
+                                     "I7 version identity",

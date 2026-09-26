@@ -1,0 +1,21 @@
+Lets Index::announced_since in index.rs send the record the pending set kept
+for a path whatever its seq, as before c659b15. Catch-up can then carry a
+record this machine adopted after its last batch and never announced, with a
+seq_high that moves the peer's watermark past the withheld pending records,
+which that peer then never asks for (DESIGN.md §7.4).
+
+test: delocal-sim regressions::catch_up_never_sends_what_this_machine_has_not_announced
+
+diff --git a/crates/engine/src/index.rs b/crates/engine/src/index.rs
+index 4029a94..d26c77a 100644
+--- a/crates/engine/src/index.rs
++++ b/crates/engine/src/index.rs
+@@ -345,7 +345,7 @@ impl Index {
+             .records
+             .iter()
+             .filter_map(|(path, record)| match self.pending.get(path) {
+-                Some(kept) => kept.announced_record.as_ref().filter(announced),
++                Some(kept) => kept.announced_record.as_ref(),
+                 None => Some(record).filter(announced),
+             })
+             .filter(|r| r.seq > after)
