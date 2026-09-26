@@ -1,0 +1,36 @@
+Removes the bracket end's re-want of deferred carriers from
+`FolderState::scan_finished` (f53c1de), which leaves `rewant_carriers`
+unused. A deferred entry that carries the restoring mark at a path the
+scan did not see then waits for an occupant that never comes, since
+absence at a marked path is ignored (DESIGN.md §8.3 step 2, the third
+rule for a marked path).
+
+test: delocal-sim regressions::a_deferred_carrier_at_a_path_that_stays_absent_is_wanted_again
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..36cd6af 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1345,22 +1345,6 @@ impl FolderState {
+         for path in &unseen {
+             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+         }
+-        // At a marked path absence is the normal state, so a bracket that
+-        // did not see it is the observation its deferred carriers wait
+-        // for: they are wanted again (§8.3).
+-        let carried: Vec<RelPath> = self
+-            .deferred
+-            .iter()
+-            .filter(|(p, list)| {
+-                !seen.contains(*p)
+-                    && !self.wants.in_flight(p)
+-                    && list.iter().any(|d| d.restoring.is_some())
+-            })
+-            .map(|(p, _)| p.clone())
+-            .collect();
+-        for path in &carried {
+-            self.rewant_carriers(path);
+-        }
+         if !changes.is_empty() {
+             self.touched(now);
+         }

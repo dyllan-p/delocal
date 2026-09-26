@@ -1,0 +1,38 @@
+Stops `FolderState::revert` from taking the wants at reverted paths off
+the list and re-deriving them from their received entries once the
+restoring wants are in place (the revert half of 34363b1). A want that
+was resolved against the discarded record, such as a conflict's `M`
+that folds in the local version revert throws away, then stays as it
+was, and every version arriving behind it is deferred as concurrent with
+it (DESIGN.md §8.3 step 2, §7.5).
+
+test: delocal-sim regressions::a_want_at_a_reverted_path_is_rederived_from_the_received_entry
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..7960dc3 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1842,13 +1842,6 @@ impl FolderState {
+         // The pending set held every unannounced deny's bumps, so each of
+         // those denies is undone with the rest: its held item returns.
+         let returned = self.quarantine.return_denied();
+-        // Wants at reverted paths were resolved against records that are
+-        // now discarded; they are re-derived from their received entries
+-        // below, after the restoring wants are in place (§8.3 step 2).
+-        let stale: Vec<Want> = reverted
+-            .iter()
+-            .filter_map(|r| self.wants.remove(&r.path))
+-            .collect();
+         for reverted in &reverted {
+             let current = reverted.current.as_ref().filter(|e| !e.deleted);
+             let restored = reverted
+@@ -1919,9 +1912,6 @@ impl FolderState {
+             }
+         }
+         self.window = None;
+-        for old in stale {
+-            self.rederive(now, old);
+-        }
+         self.unfreeze(now);
+         Some(RevertOutcome {
+             batch: paused.batch,
