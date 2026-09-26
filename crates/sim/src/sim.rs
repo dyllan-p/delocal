@@ -8,7 +8,8 @@
 //! `WakeAt` becomes a `Tick` with a fresh id, `Send` becomes a message,
 //! `Fetch` becomes a transfer that completes with `Fetched`, `Write`,
 //! `Remove` and `SetMeta` become commits that complete with `Applied`, and
-//! `IndexChanged` and `WantChanged` are written to the persisted store.
+//! every persistence hook is written to its table in the persisted store
+//! (§11), which after every event must equal the engine's parts.
 //!
 //! Time is discrete-event: the loop always jumps to the earliest pending
 //! thing (a wake, a delivery, an operation, a scan, a restart, a user
@@ -22,8 +23,9 @@ use delocal_engine::batch::BatchRole;
 use delocal_engine::folder::{ApplyOutcome, Displace, FolderStatus, ScanState};
 use delocal_engine::want::{FetchReport, Tier, Want, WantState};
 use delocal_engine::{
-    Action, BatchId, ContentHash, Engine, Entry, Event, FolderId, FolderState, HostName,
-    IndexRecord, Kind, NodeConfig, NodeId, Observed, Outbound, RelPath, Rules, Timestamp, Version,
+    Action, BatchId, ContentHash, Deferred, Engine, Entry, Event, FolderId, FolderState, HeldRow,
+    HeldState, HostName, IndexRecord, Kind, NodeConfig, NodeId, Observed, Outbound, Pending,
+    RelPath, Rest, Rules, Timestamp, Version,
 };
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -141,12 +143,79 @@ pub fn content_bytes(seed: u8) -> Vec<u8> {
     vec![seed; len]
 }
 
-/// What the daemon would have on disk for one node (§11).
+/// What the daemon would have on disk for one node (§11): the folder's
+/// rules, which the host keeps itself, and one table per engine part,
+/// written by the persistence hooks and by nothing else.
 #[derive(Clone, Debug, Default, Serialize)]
 struct Persisted {
+    rules: Rules,
     records: BTreeMap<RelPath, IndexRecord>,
     wants: BTreeMap<RelPath, Want>,
+    pending: BTreeMap<RelPath, Pending>,
+    held: BTreeMap<(BatchId, HeldState), HeldRow>,
+    deferred: BTreeMap<RelPath, Vec<Deferred>>,
+    /// `None` until the folder reports its first row, at `FolderJoined`.
+    rest: Option<Rest>,
     snapshot: Option<FolderState>,
+}
+
+impl Persisted {
+    /// The first table that differs from the engine's part, if any.
+    fn mismatch(&self, state: &FolderState) -> Option<String> {
+        let live = state.parts();
+        let rows = |hook: &str, part: &str, stored: usize, engine: usize| {
+            format!(
+                "{hook} did not reproduce {part}; {stored} rows stored vs {engine} in the engine"
+            )
+        };
+        if live.records != self.records {
+            return Some(rows(
+                "IndexChanged",
+                "the index",
+                self.records.len(),
+                live.records.len(),
+            ));
+        }
+        if live.wants != self.wants {
+            return Some(rows(
+                "WantChanged",
+                "the want-list",
+                self.wants.len(),
+                live.wants.len(),
+            ));
+        }
+        if live.pending != self.pending {
+            return Some(rows(
+                "PendingChanged",
+                "the pending set",
+                self.pending.len(),
+                live.pending.len(),
+            ));
+        }
+        if live.held != self.held {
+            return Some(rows(
+                "HeldChanged",
+                "the held items",
+                self.held.len(),
+                live.held.len(),
+            ));
+        }
+        if live.deferred != self.deferred {
+            return Some(rows(
+                "DeferredChanged",
+                "the deferred paths",
+                self.deferred.len(),
+                live.deferred.len(),
+            ));
+        }
+        if self.rest.as_ref() != Some(&live.rest) {
+            return Some("RestChanged did not reproduce the small rest".to_owned());
+        }
+        if live.rules != self.rules {
+            return Some("the rules the host stored are not the engine's".to_owned());
+        }
+        None
+    }
 }
 
 #[derive(Serialize)]
@@ -387,21 +456,20 @@ impl Sim {
         // Engines join the folder, then every pair connects.
         let ids = sim.order.clone();
         for id in &ids {
-            let config = sim.config_of(*id);
-            let mut engine = Engine::new(config);
-            let _ = engine.handle(
-                sim.now_for(*id),
+            let engine = Engine::new(sim.config_of(*id));
+            if let Some(node) = sim.nodes.get_mut(id) {
+                node.engine = Some(engine);
+                node.persisted.rules = sim.rules.clone();
+            }
+            // Ignore failures during construction: nothing has happened yet.
+            let _ = sim.feed(
+                *id,
                 Event::FolderJoined {
                     folder,
                     rules: sim.rules.clone(),
                     members: ids.clone(),
                 },
             );
-            if let Some(node) = sim.nodes.get_mut(id) {
-                node.engine = Some(engine);
-            }
-            // Ignore failures during construction: nothing has happened yet.
-            let _ = sim.snapshot(*id);
         }
         for (i, a) in ids.iter().enumerate() {
             for b in &ids[i + 1..] {
@@ -729,11 +797,13 @@ impl Sim {
         for action in actions {
             self.act(id, action)?;
         }
-        self.snapshot(id)
+        self.check_persisted(id)
     }
 
-    /// Persist the folder state and check the incremental hooks against it.
-    fn snapshot(&mut self, id: NodeId) -> Result<(), Failure> {
+    /// After every event, the tables the hooks wrote must be the engine's
+    /// parts (§11): a missing or wrong hook fails at the event that should
+    /// have reported the change, not at some later restart.
+    fn check_persisted(&mut self, id: NodeId) -> Result<(), Failure> {
         let folder = self.folder;
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
@@ -744,37 +814,16 @@ impl Sim {
         let Some(state) = engine.folder(folder) else {
             return Ok(());
         };
-        let records: BTreeMap<RelPath, IndexRecord> = state
-            .index()
-            .records()
-            .map(|r| (r.entry.path.clone(), r.clone()))
-            .collect();
-        let wants: BTreeMap<RelPath, Want> = state
-            .wants()
-            .iter()
-            .map(|w| (w.path().clone(), w.clone()))
-            .collect();
-        let records_ok = records == node.persisted.records;
-        let wants_ok = wants == node.persisted.wants;
-        let persisted_records = node.persisted.records.len();
-        if records_ok && wants_ok {
-            node.persisted.snapshot = Some(state.clone());
-            return Ok(());
+        match node.persisted.mismatch(state) {
+            None => {
+                node.persisted.snapshot = Some(state.clone());
+                Ok(())
+            }
+            Some(what) => {
+                let detail = format!("{}: {what}", Self::short(id));
+                Err(self.fail("persistence hooks", detail))
+            }
         }
-        let short = Self::short(id);
-        if !records_ok {
-            return Err(self.fail(
-                "persistence hooks",
-                format!(
-                    "{short}: IndexChanged did not reproduce the index; {persisted_records} persisted vs {} in the engine",
-                    records.len()
-                ),
-            ));
-        }
-        Err(self.fail(
-            "persistence hooks",
-            format!("{short}: WantChanged did not reproduce the want-list"),
-        ))
     }
 
     /// I5 (§14.1): no batch that tripped the brake is applied without an
@@ -1106,10 +1155,37 @@ impl Sim {
             }
             // Not kept yet: the simulator persists the parts it restarts
             // from, which so far are the index and the wants.
-            Action::PendingChanged { .. }
-            | Action::HeldChanged { .. }
-            | Action::DeferredChanged { .. }
-            | Action::RestChanged { .. } => {}
+            Action::PendingChanged { path, row, .. } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    match row {
+                        Some(row) => n.persisted.pending.insert(path, row),
+                        None => n.persisted.pending.remove(&path),
+                    };
+                }
+            }
+            Action::HeldChanged {
+                batch, state, row, ..
+            } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    match row {
+                        Some(row) => n.persisted.held.insert((batch, state), *row),
+                        None => n.persisted.held.remove(&(batch, state)),
+                    };
+                }
+            }
+            Action::DeferredChanged { path, entries, .. } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    match entries {
+                        Some(entries) => n.persisted.deferred.insert(path, entries),
+                        None => n.persisted.deferred.remove(&path),
+                    };
+                }
+            }
+            Action::RestChanged { rest, .. } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.persisted.rest = Some(*rest);
+                }
+            }
             Action::StatusChanged { status, .. } => match status {
                 FolderStatus::Paused { .. } => {
                     if let Some(n) = self.nodes.get_mut(&id) {
@@ -1367,15 +1443,6 @@ impl Sim {
             }
         };
         node.engine = Some(engine);
-        // Restoring may have changed want states (transient ones return to
-        // wanted); the persisted want table must follow.
-        if let Some(state) = node.engine.as_ref().and_then(|e| e.folder(folder)) {
-            node.persisted.wants = state
-                .wants()
-                .iter()
-                .map(|w| (w.path().clone(), w.clone()))
-                .collect();
-        }
         // §7.3: a full scan runs at daemon start, so at every restart; a
         // queued `revert` waits for it (§8.3). A node restarted while
         // offline scans as soon as it is back.
@@ -2116,6 +2183,11 @@ impl Sim {
                     hold_pct,
                     ..self.rules.clone()
                 };
+                // The host keeps the rules with the folder (§11) and tells
+                // the engine.
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.persisted.rules = rules.clone();
+                }
                 self.feed(id, Event::RulesChanged { folder, rules })?;
             }
         }
