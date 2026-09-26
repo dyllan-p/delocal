@@ -1,0 +1,59 @@
+Turns off the two fixes this pin needs disabled together. WantList::restore
+keeps a want's `fetched` flag through a restart again (ccf9d16 added the line
+that clears it), so the restarted node asks the host to commit content whose
+temp file died with the crash (§11); and the end of a full scan no longer
+reconsiders deferred entries at paths it did not see and nothing records
+(ebae00b added that loop), so the entry deferred by that commit's
+ChangedUnderneath failure waits forever at a path no scan reports (§7.3,
+§7.5 step 6). With either fix alone the restarted node recovers.
+
+test: delocal-sim regressions::a_want_fetched_before_a_crash_is_fetched_again
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..e310710 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1331,20 +1331,6 @@ impl FolderState {
+             // caught here: later scans never report a tombstoned path.
+             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+         }
+-        // A deferred entry at a path with no record and no file is in the
+-        // same position: nothing will ever report that path, and the bracket
+-        // has just observed it absent (§7.3).
+-        let unseen: Vec<RelPath> = self
+-            .deferred
+-            .paths()
+-            .filter(|p| {
+-                !seen.contains(*p) && self.index.live(p).is_none() && !self.wants.in_flight(p)
+-            })
+-            .cloned()
+-            .collect();
+-        for path in &unseen {
+-            self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+-        }
+         // At a marked path absence is the normal state, so a bracket that
+         // did not see it is the observation its deferred carriers wait
+         // for: they are wanted again (§8.3).
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+index a48d211..98e057d 100644
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -466,9 +466,7 @@ impl WantList {
+     }
+ 
+     /// A want comes back after a restart. Transient states become
+-    /// `Wanted`, and fetched content is forgotten: a crash loses the temp
+-    /// files along with the host's in-flight operations (§11), so what was
+-    /// fetched has to be fetched again.
++    /// `Wanted`.
+     fn restore(&mut self, mut want: Want) {
+         if matches!(
+             want.state,
+@@ -476,7 +474,6 @@ impl WantList {
+         ) {
+             want.state = WantState::Wanted;
+         }
+-        want.fetched = false;
+         let path = want.path().clone();
+         self.wants.insert(path.clone(), want);
+         self.note(&path);

@@ -1,0 +1,21 @@
+Never asks a member again for a want once it has answered NotAvailable, as
+before 453ad5e, when that answer excluded it for good (§7.5 step 3): source
+selection skips every member in the want's `answered` set, so the member's
+later announcement of the wanted content puts it back among the sources but
+it is still never selected, and a want whose sources all answered that way
+stays without a source.
+
+test: delocal-sim regressions::a_source_that_announces_the_wanted_version_again_is_asked_again
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+index a48d211..ffdb907 100644
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -692,6 +692,7 @@ impl WantList {
+             .sources
+             .iter()
+             .filter(|n| !want.excluded.contains_key(n))
++            .filter(|n| !want.answered.contains(n))
+             .filter_map(|n| peers.get(n).map(|t| (*t, *n)))
+             .collect();
+         if candidates.is_empty() {
