@@ -12,6 +12,10 @@
 # share the 4,000 at 2,000 steps, 1,000 each, because a 2,000-step seed
 # takes about five times as long to run. Twenty is also the most jobs
 # GitHub Free runs at once, so no shard waits for another.
+#
+# Beside the sweep, the pins job checks every pinned seed both ways
+# (§14.4): it passes as it is and fails with its fix disabled. A pin that
+# stops failing no longer guards anything, and its own issue says which.
 
 name: Nightly simulation
 
@@ -289,3 +293,113 @@ jobs:
 
           cat body.md >> "$GITHUB_STEP_SUMMARY"
           gh issue create --repo "$GITHUB_REPOSITORY" --title "${title:0:250}" --body-file body.md --label simulator
+
+  # Draft 36 (§14.4): a pin guards its fix only while its history still
+  # reaches the bug, so every night each pin runs as it is, where it must
+  # pass, and with scripts/pins/<pin>.patch applied, where it must fail
+  # (scripts/pins.sh). It does not need the plan's seeds and runs beside
+  # the shards; the twenty-first job waits for a free runner. The script
+  # prints its table and ends with "N of M pins guard their fix"; the log
+  # ends with "pins done" only if the script got that far.
+  pins:
+    name: pins
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install
+      # The script builds in target directories of its own, outside
+      # ./target, so the cache holds only the downloaded crates.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: pins
+
+      # Two workers of two threads each: a patched build spends most of its
+      # time compiling the simulator's test binary, which uses few threads,
+      # so two builds at once finish sooner than one on all four.
+      - name: Check every pin both ways
+        run: |
+          set -uo pipefail
+          scripts/pins.sh --jobs 2 --out "$RUNNER_TEMP/pins" 2>&1 | tee pins.log
+          status=${PIPESTATUS[0]}
+          cp "$RUNNER_TEMP/pins/summary.md" . 2> /dev/null || true
+          # 0: every pin is valid; 1: some are not. Either way the check ran
+          # to the end. Anything else is a setup error or a signal.
+          if [ "$status" -le 1 ]; then
+            echo "pins done" >> pins.log
+          fi
+          exit "$status"
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pins-log
+          path: |
+            pins.log
+            summary.md
+          if-no-files-found: warn
+
+  # One issue per night on which any pin fails the check, or the check did
+  # not finish, with the table of every pin. Kept apart from the pins job
+  # for the same reason the sweep's report is: the job that builds and runs
+  # the repository's code holds no token that can write.
+  pins-report:
+    name: pins report
+    needs: pins
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: pins-log
+          path: pins
+
+      - name: Open an issue if a pin no longer guards its fix
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # "N of M pins guard their fix." is the script's last line.
+          counts=$({ sed -nE 's/^([0-9]+) of ([0-9]+) pins guard their fix\.$/\1 \2/p' pins/pins.log 2> /dev/null || true; } | tail -1)
+          finished=no
+          if [ -f pins/pins.log ] && grep -qx 'pins done' pins/pins.log && [ -n "$counts" ]; then
+            finished=yes
+          fi
+          if [ "$finished" = yes ]; then
+            read -r good total <<< "$counts"
+            if [ "$good" -eq "$total" ]; then
+              echo "All $total pins guard their fix." | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            title="Nightly pins: $(( total - good )) of $total pins no longer guard their fix"
+          else
+            title="Nightly pins: the check did not finish"
+          fi
+
+          {
+            echo "Run: $RUN_URL"
+            echo "Commit: $GITHUB_SHA"
+            echo
+            if [ "$finished" = yes ]; then
+              echo "A pin is valid only if its test passes as it is and fails with its patch, scripts/pins/<pin>.patch, applied (DESIGN.md §14.4). The invalid ones are in bold. A pin that passes with its patch no longer reaches the bug its fix is for: replace it with a new seed that fails with the patch, or with a unit test next to the fix."
+              echo
+              cat pins/summary.md
+            else
+              echo "The pins job stopped before its table: a build failure, a bad patch header, or a timeout. Its log is in the pins-log artifact of the run, if it got far enough to leave one."
+            fi
+            echo
+            echo 'Reproduce one pin both ways:'
+            echo '```'
+            echo 'scripts/pins.sh <pin>'
+            echo '```'
+          } > body.md
+
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body-file body.md --label simulator
