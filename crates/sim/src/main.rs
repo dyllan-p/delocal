@@ -12,6 +12,10 @@
 //! seeds grouped by invariant and a pass/fail count: what CI's advisory
 //! sweep prints while the random sweep is still red (§14.1). Exit status 1
 //! on any failure either way.
+//!
+//! Standard output depends only on the arguments, so two runs of the same
+//! seeds can be compared with `cmp`. Progress and wall-clock times go to
+//! standard error.
 
 // The binary may not unwrap or expect either (CLAUDE.md); errors go to stderr.
 // Failure is large by design; see lib.rs.
@@ -151,7 +155,7 @@ fn main() -> ExitCode {
                 totals.conflict_copies += outcome.stats.conflict_copies;
                 totals.events += outcome.stats.events;
                 if (i + 1) % 100 == 0 {
-                    println!("  {} seeds ok ({:.0?})", i + 1, started.elapsed());
+                    eprintln!("  {} seeds ok ({:.0?})", i + 1, started.elapsed());
                 }
             }
             Err(first) if args.keep_going => {
@@ -177,21 +181,16 @@ fn main() -> ExitCode {
             }
         }
     }
+    eprintln!("delocal-sim: finished in {:.0?}", started.elapsed());
     let failures: u64 = failed.values().map(|v| v.len() as u64).sum();
     if failures == 0 {
-        println!(
-            "all {} seeds passed in {:.0?}: {:?}",
-            args.seeds,
-            started.elapsed(),
-            totals
-        );
+        println!("all {} seeds passed: {:?}", args.seeds, totals);
         return ExitCode::SUCCESS;
     }
     println!(
-        "{} of {} seeds passed in {:.0?}; {failures} failed:",
+        "{} of {} seeds passed; {failures} failed:",
         args.seeds - failures,
-        args.seeds,
-        started.elapsed()
+        args.seeds
     );
     for (invariant, seeds) in &failed {
         let shown: Vec<String> = seeds.iter().take(20).map(u64::to_string).collect();
