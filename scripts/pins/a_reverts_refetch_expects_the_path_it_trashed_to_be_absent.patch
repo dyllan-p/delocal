@@ -1,0 +1,21 @@
+Removes the arm `None if want.restoring => None` from the guard's
+`expected` in `FolderState::dispatch`, as before 33cf84e, so a restoring
+want's `Write` again expects the shape of the record `revert` restored.
+Revert has just moved that file to trash, so the guard finds the path
+absent and fails, the refetch is deferred as changed underneath, and the
+next bracket end tombstones the path (DESIGN.md §8.3 step 2, §7.5 step 6).
+
+test: delocal-sim regressions::a_reverts_refetch_expects_the_path_it_trashed_to_be_absent
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..721eea7 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -2118,7 +2118,6 @@ impl FolderState {
+                     // restored shape.
+                     let expected = match &want.reset {
+                         Some(last_observed) => Some(last_observed.clone()),
+-                        None if want.restoring => None,
+                         None => self.expected(&path),
+                     };
+                     host.push(match want.mode {

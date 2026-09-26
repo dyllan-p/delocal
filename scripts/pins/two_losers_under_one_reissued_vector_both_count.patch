@@ -1,0 +1,23 @@
+Keys I4's losing versions (invariants.rs `i4_bounded_conflicts`) by vector
+alone again, as before cf000f2. Of two losers that share a vector re-issued
+across a revert with other content, only the first then counts, and the
+second's conflict copy matches no losing version (DESIGN.md §14.1 I4).
+
+test: delocal-sim regressions::two_losers_under_one_reissued_vector_both_count
+
+diff --git a/crates/sim/src/invariants.rs b/crates/sim/src/invariants.rs
+index 4fab526..21f57cc 100644
+--- a/crates/sim/src/invariants.rs
++++ b/crates/sim/src/invariants.rs
+@@ -292,10 +292,7 @@ fn i4_bounded_conflicts(sim: &Sim) -> Result<(), Failure> {
+                     // be issued again with other content (the re-issue I7
+                     // exempts), and both losers may share a copy name.
+                     let losers = expected.entry(name).or_default();
+-                    if !losers
+-                        .iter()
+-                        .any(|l| l.version == loser.version && l.same_content(loser))
+-                    {
++                    if !losers.iter().any(|l| l.version == loser.version) {
+                         losers.push(loser.clone());
+                     }
+                 }

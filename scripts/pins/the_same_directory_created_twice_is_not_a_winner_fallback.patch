@@ -1,0 +1,20 @@
+Counts an identical-content merge that ties all the way down as a rule-5
+fallback of the winner rule again, as before d15e699 (§7.2, §7.6): the
+same directory created on two nodes merges with a full tie, and the
+simulator reports it as a winner-rule fallback.
+
+test: delocal-sim regressions::the_same_directory_created_twice_is_not_a_winner_fallback
+
+diff --git a/crates/engine/src/batch.rs b/crates/engine/src/batch.rs
+index af62a19..cbaf757 100644
+--- a/crates/engine/src/batch.rs
++++ b/crates/engine/src/batch.rs
+@@ -352,7 +352,7 @@ pub fn classify(index: &Index, incoming: &Entry) -> Classified {
+                 } else {
+                     ApplyMode::IndexOnly
+                 };
+-                return apply(merged, mode, None, false);
++                return apply(merged, mode, None, pick.fallback);
+             }
+             let resolution = conflict::resolve(incoming, local);
+             match resolution.winner {

@@ -1,0 +1,37 @@
+Turns off the two rules this pin needs off together; with either one alone it
+passes. The in-flight occupant rule of f566b64 (Look at an occupant of a
+marked path while its want is in flight) is undone: FolderState::scanned again
+ignores every observation of a path whose want is in flight, marked or not, so
+an occupant at a marked path no longer clears the mark while its restoring
+want is wanted, fetching or committing. And a deny no longer waits while a
+path of its held item carries the restoring mark: the Restoring branch of the
+deny arm of FolderState::unsettled, added by f6cff50 (Queue deny and revert
+until the folder settles), is removed. DESIGN.md §8.3, and §7.5's revert
+exception.
+
+test: delocal-sim regressions::a_deny_after_revert_over_an_unobserved_occupant
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..090f2b9 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -900,7 +900,7 @@ impl FolderState {
+         // occupant is a landing (it matches what the want was committing)
+         // or a local change, and the occupant rules below come first (§8.3,
+         // §7.5's revert exception).
+-        if self.wants.in_flight(&path) && !marked {
++        if self.wants.in_flight(&path) {
+             return Scanned::default();
+         }
+         if state == ScanState::Unchanged && self.index.live(&path).is_none() {
+@@ -1761,9 +1761,7 @@ impl FolderState {
+                     return Some(WaitReason::ScanOpen);
+                 }
+                 self.quarantine.get(batch)?.entries.keys().find_map(|path| {
+-                    if self.marked(path) {
+-                        Some(WaitReason::Restoring { path: path.clone() })
+-                    } else if self.committing(path) {
++                    if self.committing(path) {
+                         Some(WaitReason::Committing { path: path.clone() })
+                     } else {
+                         None

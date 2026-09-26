@@ -1,0 +1,38 @@
+Turns off the two rules this pin needs off together; its doc comment says
+either one alone keeps it. A deny no longer waits while the folder is paused:
+the Paused check at the top of the deny arm of FolderState::unsettled, added
+by f6cff50 (Queue deny and revert until the folder settles), is removed. And
+revert no longer returns the held item an unannounced deny consumed: it
+forgets the denied items instead of calling Quarantine::return_denied, so the
+item is dropped as deny's release dropped it before 0a9c82a (Return a held
+item when revert discards the deny that consumed it). Both rules are DESIGN.md
+§8.3's settled folder.
+
+test: delocal-sim regressions::a_deny_on_a_paused_folder_waits_instead_of_joining_the_pending_batch
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..020fb71 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1752,11 +1752,6 @@ impl FolderState {
+     fn unsettled(&self, decision: UserDecision) -> Option<WaitReason> {
+         match decision {
+             UserDecision::Deny { batch } => {
+-                if let Some(paused) = &self.paused {
+-                    return Some(WaitReason::Paused {
+-                        batch: paused.batch,
+-                    });
+-                }
+                 if self.scan.is_some() {
+                     return Some(WaitReason::ScanOpen);
+                 }
+@@ -1841,7 +1836,8 @@ impl FolderState {
+         let reverted = self.index.revert_pending();
+         // The pending set held every unannounced deny's bumps, so each of
+         // those denies is undone with the rest: its held item returns.
+-        let returned = self.quarantine.return_denied();
++        self.quarantine.forget_denied();
++        let returned = Vec::new();
+         // Wants at reverted paths were resolved against records that are
+         // now discarded; they are re-derived from their received entries
+         // below, after the restoring wants are in place (§8.3 step 2).

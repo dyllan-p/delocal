@@ -1,0 +1,27 @@
+Quarantine::hold again replaces an item already held under the same batch id
+instead of joining it: the join that c9f5fbc (Join an item already held under
+a batch id) put at the top of hold is removed, which restores the plain insert
+that came before. An item revert returns into an id held meanwhile then
+replaces the entries held there, while the version index still names them
+under the id. DESIGN.md §8.2, "a batch id names one review item".
+
+test: delocal-sim regressions::a_denied_item_returned_into_a_held_id_loses_nothing
+
+diff --git a/crates/engine/src/quarantine.rs b/crates/engine/src/quarantine.rs
+index 619b8dd..363fce1 100644
+--- a/crates/engine/src/quarantine.rs
++++ b/crates/engine/src/quarantine.rs
+@@ -222,13 +222,6 @@ impl Quarantine {
+     /// then leave those versions behind, and a later version dominating one
+     /// of them would join an item that no longer exists and be lost.
+     pub fn hold(&mut self, item: HeldItem) {
+-        if self.items.contains_key(&item.batch) {
+-            let batch = item.batch;
+-            for entry in item.entries.into_values() {
+-                self.join(batch, entry);
+-            }
+-            return;
+-        }
+         for entry in item.entries.values() {
+             self.record(&entry.path, entry.version.clone(), entry.stamp, item.batch);
+         }

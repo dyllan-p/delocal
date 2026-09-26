@@ -1,7 +1,17 @@
 //! Seeds the simulator found and the engine was fixed for (DESIGN.md
 //! §14.4: every bug gets a simulator step that reproduces it before it is
-//! fixed). Each test pins the seed, the knobs and the minimal step list the
-//! shrinker produced, so the fix is guarded by exactly what found the bug.
+//! fixed). Each test pins a seed, the knobs and the minimal step list the
+//! shrinker produced.
+//!
+//! A pin guards its fix only while its history still reaches the bug, and a
+//! change to the simulator's draws or defaults can quietly move it
+//! elsewhere. So every pin NAME has `scripts/pins/NAME.patch`, which
+//! disables its fix, and is valid only if it fails with that patch applied
+//! and passes without it; `scripts/pins.sh` checks both halves, and the
+//! nightly runs it over every pin (§14.4). A pin that stops failing with its
+//! patch is pinned again at a seed that does, found with the patch applied
+//! at the current knobs and shrunk the same way, or, if no seed reaches the
+//! fix, replaced by the fix's unit test, which its patch then names.
 
 use crate::steps::Step;
 use crate::{Knobs, run_twice};
@@ -1255,7 +1265,11 @@ fn a_chmod_the_watcher_missed_is_found_by_the_next_scan() {
     );
 }
 
-/// Same class as above.
+/// Same class as above, found on a conflict copy. At the current defaults
+/// its history reaches a missed chmod of an ordinary file instead (d2/f11):
+/// with the fix disabled the scan never sees the chmod, the commit guard,
+/// which does compare the exec bit, refuses every commit there, and the run
+/// fails quiescence.
 #[test]
 fn a_missed_chmod_of_a_conflict_copy_is_found_by_the_next_scan() {
     passes(
@@ -11551,7 +11565,9 @@ fn a_revert_that_discards_a_denys_bumps_returns_its_held_item() {
 /// Class B as the 20,000-seed run found it, shrunk before the fixes for
 /// §8.3's settled folder. The restart scan, the in-flight occupant rule and
 /// the I4 ledger each change its course, so it passes with any one of the
-/// new waits disabled; kept as a plain regression.
+/// new waits disabled. At the current defaults it fails I8 at f3 with two
+/// of them disabled together, the in-flight occupant rule and the deny's
+/// wait for the restoring mark, and passes with either one alone.
 #[test]
 fn a_deny_after_revert_over_an_unobserved_occupant() {
     passes(
@@ -21409,11 +21425,13 @@ fn two_symlink_losers_under_one_reissued_vector_both_count() {
 /// its 400 steps. The full seed no longer fails once the exclusion fix
 /// changes its course, so this list was found among its subsets by a
 /// search for one that fails without the fix and passes with it, then
-/// shrunk. It fails as the first run did, on the same node and at d1/f10:
+/// shrunk. It failed as the first run did, on the same node and at d1/f10:
 /// batch 092c0285 is held, denied, held again under the same id from the
 /// deferred set, and then revert returns the denied item into that id. One
 /// item replaced the other, and a later version at d1/f10 joined the
-/// orphaned id and was lost (§8.2).
+/// orphaned id and was lost (§8.2). Since the restart check (§11) it fails
+/// earlier, at a crash where the quarantine rebuilt from the tables differs
+/// from the one that crashed.
 /// Replayed as found: group commit alone loses its scenario (PR 1b).
 #[test]
 fn a_denied_item_returned_into_a_held_id_loses_nothing() {

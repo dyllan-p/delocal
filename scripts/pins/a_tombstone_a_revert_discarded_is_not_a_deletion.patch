@@ -1,0 +1,30 @@
+Lets I3 (invariants.rs `i3_no_resurrection`) count the records their author's
+revert discarded again, on both sides, as before the I3 half of 15d13ea, so a
+pending tombstone the revert threw away unannounced is taken for a deletion
+the mesh agreed on. The fix leaves such records out because nobody else ever
+held them (DESIGN.md §14.1 I3, §8.3).
+
+test: delocal-sim regressions::a_tombstone_a_revert_discarded_is_not_a_deletion
+
+diff --git a/crates/sim/src/invariants.rs b/crates/sim/src/invariants.rs
+index 4fab526..b04a5ab 100644
+--- a/crates/sim/src/invariants.rs
++++ b/crates/sim/src/invariants.rs
+@@ -210,15 +210,8 @@ fn i2_no_loss(sim: &Sim) -> Result<(), Failure> {
+ /// never reached anyone and take no part, on either side.
+ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
+     for (path, versions) in sim.versions() {
+-        // A tombstone its author discarded with `revert` (§8.3) was pending
+-        // and never announced: no deletion happened as far as the mesh is
+-        // concerned, and it contradicts nothing either.
+-        let seen: Vec<&Entry> = versions
+-            .iter()
+-            .filter(|e| !sim.discarded_by_revert(e))
+-            .collect();
+-        for tomb in seen.iter().filter(|e| e.deleted) {
+-            let contradicted = seen.iter().any(|v| {
++        for tomb in versions.iter().filter(|e| e.deleted) {
++            let contradicted = versions.iter().any(|v| {
+                 v.version != tomb.version
+                     && (v.version.dominates(&tomb.version)
+                         || v.version.compare(&tomb.version) == delocal_engine::Relation::Concurrent)
