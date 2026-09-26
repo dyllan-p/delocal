@@ -73,6 +73,18 @@ if a new I/O crate appears in Appendix A.
   pinned tests and every seed of every shard passing. If a job fails, report that
   instead: which job, and what its log says.
 
+## Subagents
+
+- You may spin up subagents for self-contained work that needs little of your context:
+  tracing a seed, surveying code, running sweeps or mutations, checking a claim against
+  the repo. Whether to use any is your call; none is fine.
+- One writer per branch: subagents read, run and report. Only you edit the branch,
+  commit, or use `gh` on the PR. A subagent that needs to change code works in its own
+  scratch worktree; you decide what carries over.
+- A subagent's report is a claim. Reproduce its decisive part yourself (the failing
+  seed, the digest, the cited line) before it goes into a commit or a PR summary.
+- The PR summary says what was delegated and what came back.
+
 ## Toolchain
 
 The toolchain is pinned to an exact version in `rust-toolchain.toml`, not a floating
