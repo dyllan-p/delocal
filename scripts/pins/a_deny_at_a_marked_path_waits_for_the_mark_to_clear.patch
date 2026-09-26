@@ -1,0 +1,23 @@
+A deny no longer waits while a path of its held item carries the restoring
+mark: the Restoring branch of the deny arm of FolderState::unsettled, added by
+f6cff50 (Queue deny and revert until the folder settles), is removed, so only
+a commit in flight at one of its paths still holds the deny. DESIGN.md §8.3,
+"deny and revert act only on a settled folder".
+
+test: delocal-sim regressions::a_deny_at_a_marked_path_waits_for_the_mark_to_clear
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..beeb5db 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1761,9 +1761,7 @@ impl FolderState {
+                     return Some(WaitReason::ScanOpen);
+                 }
+                 self.quarantine.get(batch)?.entries.keys().find_map(|path| {
+-                    if self.marked(path) {
+-                        Some(WaitReason::Restoring { path: path.clone() })
+-                    } else if self.committing(path) {
++                    if self.committing(path) {
+                         Some(WaitReason::Committing { path: path.clone() })
+                     } else {
+                         None
