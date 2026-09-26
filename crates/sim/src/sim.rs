@@ -1106,7 +1106,7 @@ impl Sim {
             }
             // Not kept yet: the simulator persists the parts it restarts
             // from, which so far are the index and the wants.
-            Action::DeferredChanged { .. } => {}
+            Action::HeldChanged { .. } | Action::DeferredChanged { .. } => {}
             Action::StatusChanged { status, .. } => match status {
                 FolderStatus::Paused { .. } => {
                     if let Some(n) = self.nodes.get_mut(&id) {
