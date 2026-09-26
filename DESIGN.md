@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 32 · 25 September 2026 · Status: **for review** · Changes from draft 31: exclusions and give-ups also expire on a backoff (§7.5).
+> Draft 33 · 25 September 2026 · Status: **Phase 1 complete** (100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 32: persistence by part with engine hooks, and group commit with effects after durability (§11); I8 in the invariant table, the nightly rotates its seeds and adds a long-run slice (§14.1); faults injected through a filesystem layer (§14.2, §15).
+>
+> Changes from draft 31: exclusions and give-ups also expire on a backoff (§7.5).
 >
 > Changes from draft 30, from the first 100,000-seed run: every landing is announced (§7.1, §8.3); at most one commit in flight per path, and a commit holds its path until reported (§7.5); exclusions and give-ups share one retry rule (§7.5); a batch id names one review item (§8.2); a restart reopens the batch window (§11); I4 keys losers by vector and content, and the nightly is sharded (§14.1).
 >
@@ -659,7 +661,7 @@ machines       (node, hostname, ts_stable_id, ts_user, trusted, last_seen, deloc
 
 `seq` per (folder, this node) is a monotonically increasing integer, incremented on every local write to `entries`.
 
-**Persistence contract.** The engine's per-folder state (`FolderState`: index, pending set, sequence watermarks, peer seqs and acks, quarantine, wants, paused state, deferred entries) is the unit of restart: the daemon rebuilds it from these tables and hands it to `Engine::restore`. If the folder has unannounced records at that point, the batch window is reopened as if they had just been written, so a crash never strands records that were written but not yet sent. Every write the engine reports is made durable before the daemon feeds the engine its next event, so `seq` never rewinds and a crash loses only in-flight host operations and temp files. The engine reports index writes (`IndexChanged`, and `IndexRemoved` for the one case, `revert`, that removes a record) and want changes as actions today; Phase 2 adds the equivalent hooks for the remaining small state, or derives it from the tables above.
+**Persistence contract.** The engine's per-folder state (`FolderState`: index, pending set, sequence watermarks, peer seqs and acks, quarantine, wants, paused state, deferred entries) is the unit of restart: the daemon rebuilds it from these tables and hands it to `Engine::restore`. If the folder has unannounced records at that point, the batch window is reopened as if they had just been written, so a crash never strands records that were written but not yet sent. Every write the engine reports is made durable **before any external effect that follows it**: before a file operation it asked for, and before a message it asked to send. The daemon may group the writes of many events into one transaction (an fsync per event would make a bulk import crawl), but it performs none of their effects until that transaction is durable. This ordering is what makes a crash safe: `seq` never rewinds past something a peer was told, and no trash move or rename reaches the disk while the record that explains it does not. A crash loses only in-flight host operations, temp files, and writes whose effects had not yet happened. The engine reports index writes (`IndexChanged`, and `IndexRemoved` for the one case, `revert`, that removes a record) and want changes as actions. Phase 2 adds hooks for the rest, persisted **by part, never as a whole-state blob**: one row per held item (a mass change can hold thousands of entries), one row per deferred path, and one row for the remaining small state (watermarks, acks, paused state, queued decisions). The engine reports which part changed, and the daemon writes that part.
 
 ---
 
@@ -727,12 +729,13 @@ Invariants checked at the end of every run and at random quiescent points:
 | I5 | **Brake.** No batch that trips H1/H2 is ever applied without an explicit approve step in the simulation. |
 | I6 | **Determinism.** Same seed → byte-identical outcome. |
 | I7 | **Vector determines content.** On every node, after every index write: two records ever seen at a path with equal vectors have equal kind, hash, exec and deletion state. The one exemption is a machine's own re-issue after `revert`, which reuses a never-announced vector (§8.3). |
+| I8 | **Adopt dominance.** Whenever the host is about to report a commit, the version being committed still dominates or equals the record at its path. It is the release-visible form of `Index::adopt`'s debug assertion: a commit that would land under a record it does not dominate means some rule let the path change beneath a commit in flight. |
 
-Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `simulate` job with its own timeout; a scheduled nightly workflow runs 100,000, sharded across parallel jobs so it fits the runners' time limit, every slice (default knobs and corruption) run to the end with `--keep-going`, and a failure opening one issue that lists every failing seed. A `SEEDS` environment variable controls the count. The pinned regression seeds (§14.4) are always required to pass. The random sweep is advisory (`continue-on-error`) until the first time it passes clean at 1,000 seeds, and a required check from then on; a required check that is red for weeks teaches everyone to ignore it.
+Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `simulate` job with its own timeout; a scheduled nightly workflow runs 100,000, sharded across parallel jobs so it fits the runners' time limit, every slice (default knobs, corruption, and a long-run slice of a few thousand seeds at 2,000 steps) run to the end with `--keep-going`, starting at a different seed each night (day of year × 100,000, printed in the report) so the nightly explores new histories while the pinned seeds and the per-push sweep guard the old ones, and a failure opening one issue that lists every failing seed. A `SEEDS` environment variable controls the count. The pinned regression seeds (§14.4) are always required to pass. The random sweep is advisory (`continue-on-error`) until the first time it passes clean at 1,000 seeds, and a required check from then on; a required check that is red for weeks teaches everyone to ignore it.
 
 ### 14.2 Integration tests
 
-Real filesystem in temp dirs, real TCP on loopback, `Tailscale` trait replaced by a fake that reports configurable tiers. Cover: two daemons syncing, watcher + scan agreement, atomic commit under concurrent writes, trash and restore, resume after kill -9 mid-transfer, `.delocalignore`.
+Faults (disk full, I/O errors, a failing rename) are injected through a thin filesystem layer in the daemon, a trait with a real implementation and a fault-injecting wrapper, so they are deterministic, need no privileges, and run the same locally and in CI. Real filesystem in temp dirs, real TCP on loopback, `Tailscale` trait replaced by a fake that reports configurable tiers. Cover: two daemons syncing, watcher + scan agreement, atomic commit under concurrent writes, trash and restore, resume after kill -9 mid-transfer, `.delocalignore`.
 
 ### 14.3 Acceptance
 
@@ -758,7 +761,7 @@ Index, version vectors, batches, apply set, conflicts, tombstones, brake, quaran
 
 ### Phase 2 — Local machinery
 SQLite persistence, scanner, watcher, hashing, ignore rules, atomic commit, trash, root guard. A loopback transport so two daemons on one machine can sync two directories.
-**Done:** two local daemons stay in sync under a 1-hour chaos script (random edits, kill -9, disk-full injection); trash holds every displaced file.
+**Done:** two local daemons stay in sync under a 1-hour chaos script (random edits, kill -9, disk-full and I/O-error injection through the filesystem layer, §14.2); trash holds every displaced file.
 
 ### Phase 3 — Network
 Tailscale module (LocalAPI + CLI fallback, with recorded fixtures), discovery, transport, dial rule, tiers, size rules, resumable transfers, protocol versioning.
