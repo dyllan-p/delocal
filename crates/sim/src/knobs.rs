@@ -46,9 +46,9 @@ impl Default for Knobs {
             drop_watcher: 0.3,
             delay_ms: (5, 800),
             crash_after_rename: 0.1,
-            crash_between_renames: 0.0,
-            group_commit_lag: 0,
-            displace_subtrees: false,
+            crash_between_renames: 0.05,
+            group_commit_lag: 4,
+            displace_subtrees: true,
             nodes: None,
         }
     }
