@@ -493,6 +493,16 @@ impl WantList {
         }
     }
 
+    /// Rebuild the want-list from its persisted rows (§11), as they were
+    /// written; [`WantList::restarted`] then does what a restart does to
+    /// them. Nothing is noted as changed.
+    pub fn from_wants(wants: impl IntoIterator<Item = Want>) -> Self {
+        Self {
+            wants: wants.into_iter().map(|w| (w.path().clone(), w)).collect(),
+            changed: Vec::new(),
+        }
+    }
+
     /// Drop the want at `path` (committed, superseded or cancelled).
     pub fn remove(&mut self, path: &RelPath) -> Option<Want> {
         let want = self.wants.remove(path);

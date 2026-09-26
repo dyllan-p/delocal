@@ -111,6 +111,48 @@ impl Quarantine {
         self.items.len()
     }
 
+    /// Rebuild a quarantine from its rows and the arrival counter (§11).
+    /// Each path's versions are put back in arrival order, whatever items
+    /// they belong to; nothing is noted as changed.
+    pub fn from_rows(rows: BTreeMap<(BatchId, HeldState), HeldRow>, arrivals: u64) -> Self {
+        let mut q = Self {
+            arrivals,
+            ..Self::default()
+        };
+        for ((batch, state), row) in rows {
+            match state {
+                HeldState::Held => {
+                    for (path, held) in &row.versions {
+                        let list = q.versions.entry(path.clone()).or_default();
+                        list.extend(held.iter().map(|v| (batch, v.clone())));
+                    }
+                    q.items.insert(batch, row.item);
+                }
+                HeldState::Denied { at } => {
+                    q.denied.insert(at, row);
+                }
+            }
+        }
+        for list in q.versions.values_mut() {
+            list.sort_by_key(|(_, v)| v.arrival);
+        }
+        q
+    }
+
+    /// Every row, held and denied, keyed as `HeldChanged` reports them: the
+    /// persisted part (§11).
+    pub fn rows(&self) -> BTreeMap<(BatchId, HeldState), HeldRow> {
+        let held = self
+            .items
+            .keys()
+            .filter_map(|batch| Some(((*batch, HeldState::Held), self.row(*batch)?)));
+        let denied = self
+            .denied
+            .iter()
+            .map(|(at, row)| ((row.item.batch, HeldState::Denied { at: *at }), row.clone()));
+        held.chain(denied).collect()
+    }
+
     /// The last arrival number handed out: part of the small rest (§11).
     pub fn arrivals(&self) -> u64 {
         self.arrivals
@@ -617,6 +659,31 @@ mod tests {
                 (batch(1), HeldState::Denied { at: 6 }, None),
             ]
         );
+    }
+
+    /// §11: rebuilt from its rows, the quarantine is the one that wrote
+    /// them. Each path's versions come back in arrival order across items,
+    /// which here is not batch-id order, so the item a later version joins
+    /// is still the earliest one.
+    #[test]
+    fn a_quarantine_rebuilt_from_its_rows_keeps_the_arrival_order() {
+        let mut q = Quarantine::default();
+        q.hold(item(2, vec![entry("a", v(&[(2, 3)]))]));
+        q.hold(item(
+            1,
+            vec![entry("a", v(&[(3, 1)])), entry("b", v(&[(3, 1)]))],
+        ));
+        q.join(batch(2), entry("b", v(&[(3, 1), (4, 1)])));
+        q.hold(item(3, vec![entry("c", v(&[(4, 1)]))]));
+        assert!(q.deny(batch(3)));
+        let rebuilt = Quarantine::from_rows(q.rows(), q.arrivals());
+        assert_eq!(rebuilt, q);
+        assert_eq!(
+            rebuilt.matching(&entry("a", v(&[(2, 3), (3, 1)]))),
+            Some(batch(2)),
+            "item 2's version at a arrived first"
+        );
+        assert_eq!(rebuilt.denied().count(), 1);
     }
 
     #[test]

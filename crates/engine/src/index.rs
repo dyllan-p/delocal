@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::entry::{ContentHash, Entry, Kind, Observed};
 use crate::id::{HostName, NodeId};
-use crate::parts::Changed;
+use crate::parts::{Changed, Rest};
 use crate::path::RelPath;
 use crate::version::Version;
 
@@ -185,6 +185,34 @@ impl Index {
             announced_seq: 0,
             announced_tracked: 0,
         }
+    }
+
+    /// Rebuild an index from its persisted parts (§11): the records, the
+    /// pending set, and the `seq` counters and watermarks the small rest
+    /// carries. Nothing is noted as changed; the rows are already stored.
+    pub fn from_parts(
+        own: NodeId,
+        host: HostName,
+        records: BTreeMap<RelPath, IndexRecord>,
+        pending: BTreeMap<RelPath, Pending>,
+        rest: &Rest,
+    ) -> Self {
+        Self {
+            own,
+            host,
+            records,
+            seq: rest.seq,
+            peer_seq: rest.watermarks.clone(),
+            pending,
+            pending_changed: Changed::default(),
+            announced_seq: rest.announced_seq,
+            announced_tracked: rest.announced_tracked,
+        }
+    }
+
+    /// The pending set, by path: a persisted part (§11).
+    pub fn pending_rows(&self) -> &BTreeMap<RelPath, Pending> {
+        &self.pending
     }
 
     /// This machine's node ID.

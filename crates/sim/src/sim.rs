@@ -1352,7 +1352,7 @@ impl Sim {
         };
         node.restart_at = None;
         let engine = match node.persisted.snapshot.clone() {
-            Some(state) => Engine::restore(config, vec![state], now),
+            Some(state) => Engine::restore(config, vec![state.parts()], now),
             None => {
                 let mut e = Engine::new(config);
                 let _ = e.handle(
