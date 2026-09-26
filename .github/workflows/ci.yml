@@ -172,9 +172,10 @@ jobs:
           if-no-files-found: error
 
   # DESIGN.md §14.1: 1,000 seeds per push with their own timeout, and the
-  # pinned regression seeds (§14.4), all required. The simulator runs one
-  # seed at a time on one core, so on one runner the 1,000 took about
-  # fifteen minutes. They are split across four runners of 250 seeds each,
+  # pinned regression seeds (§14.4), all required. One seed at a time on
+  # one core, the 1,000 took about fifteen minutes. The simulator runs a
+  # seed on each of a runner's four CPUs (`--jobs` defaults to all of
+  # them), and the seeds are also split across four runners of 250 each,
   # the pinned seeds run beside them on a fifth, and `simulate`, the check
   # the ruleset on main requires, passes only when all five have. SEEDS is
   # the total over all shards; it is what the nightly workflow overrides.
