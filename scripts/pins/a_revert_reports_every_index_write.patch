@@ -1,0 +1,29 @@
+Drops the loop in engine.rs `decide` that reports each index write of a
+revert, IndexChanged for a record put back and IndexRemoved for a pending add
+removed, so revert again reports none of them, as before 61c51bb. That commit
+is the fix: §11 says every write the engine makes is reported before the host
+acts on it, and without the reports the persisted index keeps the pending
+records the revert (§8.3) discarded.
+
+test: delocal-sim regressions::a_revert_reports_every_index_write
+
+diff --git a/crates/engine/src/engine.rs b/crates/engine/src/engine.rs
+index 01954b3..2427b82 100644
+--- a/crates/engine/src/engine.rs
++++ b/crates/engine/src/engine.rs
+@@ -950,15 +950,6 @@ fn decide(
+         },
+         UserDecision::Revert { .. } => match f.revert(now) {
+             Some(reverted) => {
+-                for write in reverted.reverted {
+-                    out.push(match write.restored {
+-                        Some(record) => Action::IndexChanged { folder, record },
+-                        None => Action::IndexRemoved {
+-                            folder,
+-                            path: write.path,
+-                        },
+-                    });
+-                }
+                 for path in &reverted.trash {
+                     out.push(Action::MoveToTrash {
+                         folder,

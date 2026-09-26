@@ -1,0 +1,55 @@
+Restores FolderState::fetched in folder.rs to what it was before cfc8bbf: it
+records the fetch report on the want and returns, and never settles a
+restoring want. Once every member has answered NotAvailable the folder then
+writes no tombstone, and the reverted path stays live in the index and absent
+on disk for good (DESIGN.md §8.3 step 4).
+
+test: delocal-sim regressions::a_reverted_deletion_nobody_can_serve_stands
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..b9a4560 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -2013,36 +2013,13 @@ impl FolderState {
+         version: &Version,
+         report: FetchReport,
+     ) -> Fetched {
+-        let own = self.index.own();
+-        let unrecoverable = {
+-            let want = self.wants.fetched(now, path, version, report);
+-            want.is_some_and(|w| {
+-                w.restoring
+-                    && report == FetchReport::NotAvailable
+-                    && self
+-                        .members
+-                        .iter()
+-                        .all(|m| *m == own || w.answered.contains(m))
+-            })
+-        };
+-        let state = self.wants.get(path).map(|w| w.state);
+-        if !unrecoverable {
+-            return Fetched {
+-                state,
+-                unrecoverable: None,
+-            };
+-        }
+-        self.wants.remove(path);
+-        self.clear_carriers(path);
+-        let change = self
+-            .index
+-            .observe_absent_unrecoverable(path, now.as_unix_nanos());
+-        if change.is_some() {
+-            self.touched(now);
+-        }
++        let state = self
++            .wants
++            .fetched(now, path, version, report)
++            .map(|w| w.state);
+         Fetched {
+-            state: None,
+-            unrecoverable: change,
++            state,
++            unrecoverable: None,
+         }
+     }
+ 

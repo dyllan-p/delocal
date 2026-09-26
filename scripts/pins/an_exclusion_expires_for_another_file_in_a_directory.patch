@@ -1,0 +1,48 @@
+Turns off draft 32's expiry of exclusions (commit 7a62e61, DESIGN.md
+§7.5): `WantList::expire` no longer releases an exclusion whose backoff has
+run out, and `next_deadline` no longer counts its expiry, so the engine asks
+for no wake-up for it. A source excluded after one corrupted transfer is
+then released only by draft 31's events (it reconnecting, a batch
+announcing the wanted content at the path, or the index at the path
+changing), and a want whose only source stays connected and silent waits
+for it to the end of the run.
+
+test: delocal-sim regressions::an_exclusion_expires_for_another_file_in_a_directory
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+index a48d211..497a28d 100644
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -590,19 +590,6 @@ impl WantList {
+     /// excluded, the stall may have been ours), and a commit past its
+     /// deadline becomes overdue but keeps its path (§7.5).
+     pub fn expire(&mut self, now: Timestamp) -> Expired {
+-        let released: Vec<(RelPath, NodeId)> = self
+-            .wants
+-            .iter()
+-            .flat_map(|(path, w)| {
+-                w.excluded
+-                    .iter()
+-                    .filter(|(_, until)| **until <= now)
+-                    .map(move |(node, _)| (path.clone(), *node))
+-            })
+-            .collect();
+-        for (path, node) in released {
+-            self.release(&path, Some(node));
+-        }
+         let mut expired = Expired::default();
+         for (path, want) in &self.wants {
+             match want.state {
+@@ -660,11 +647,7 @@ impl WantList {
+             } => Some(deadline),
+             _ => None,
+         });
+-        let expiries = self
+-            .wants
+-            .values()
+-            .flat_map(|w| w.excluded.values().copied());
+-        deadlines.chain(expiries).min()
++        deadlines.min()
+     }
+ 
+     /// True if committing `path` must wait (§7.5 ordering): a create with an
