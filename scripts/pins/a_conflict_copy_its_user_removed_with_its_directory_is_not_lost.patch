@@ -1,0 +1,30 @@
+Turns off the fix in the simulator's I2 checker (commit 031e7aa, DESIGN.md
+§14.1 I2): `follow` in crates/sim/src/sim.rs no longer moves a node's
+adoption of some content to the conflict-copy path sync displaced it to,
+so the adoption stays at the path and time it was made. The user deleting
+or rewriting the copy is then no longer the user's own change, and I2
+reports it as sync losing the content. The engine is unchanged; only the
+checker's bookkeeping is.
+
+test: delocal-sim regressions::a_conflict_copy_its_user_removed_with_its_directory_is_not_lost
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 4e18586..3d91713 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -2760,14 +2760,7 @@ fn restart_difference(
+ /// `to` (§7.6). The node's adoptions of that content follow it there, dated
+ /// now, so that its user's later edit or deletion of the copy counts as the
+ /// user's own change and not as sync's loss (I2, §14.1).
+-fn follow(node: &mut Node, from: &RelPath, to: &RelPath, hash: ContentHash, now: Timestamp) {
+-    for (h, path, at) in &mut node.synced {
+-        if *h == hash && path == from {
+-            *path = to.clone();
+-            *at = now;
+-        }
+-    }
+-}
++fn follow(_: &mut Node, _: &RelPath, _: &RelPath, _: ContentHash, _: Timestamp) {}
+ 
+ /// The index record the host last wrote at `path`, durable or not. A real
+ /// host reads its own uncommitted writes, so its scan's fast path compares
