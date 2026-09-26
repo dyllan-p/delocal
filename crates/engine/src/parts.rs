@@ -8,14 +8,23 @@
 //! once per event into persistence actions. The small rest is one row,
 //! [`Rest`]; the engine reports it whenever it differs from the one it
 //! reported last.
+//!
+//! [`FolderParts`] is the other direction: every row, as the daemon loads
+//! them at start-up, plus the folder's metadata, which the host keeps. The
+//! folder state is rebuilt from it and nothing else
+//! ([`crate::FolderState::from_parts`], [`crate::Engine::restore`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::folder::{Paused, Queued};
-use crate::id::NodeId;
-use crate::index::Watermark;
+use crate::folder::{Deferred, Paused, Queued};
+use crate::id::{BatchId, FolderId, NodeId};
+use crate::index::{IndexRecord, Pending, Watermark};
+use crate::path::RelPath;
+use crate::quarantine::{HeldRow, HeldState};
+use crate::rules::Rules;
+use crate::want::Want;
 
 /// The small rest (§11): one row per folder, for the engine state that is
 /// kept neither per path nor per held item.
@@ -41,6 +50,28 @@ pub struct Rest {
     /// Conflicts decided by the last step of the winner rule (§7.6); any
     /// count above zero is a bug to find.
     pub winner_fallbacks: u64,
+}
+
+/// A folder as persisted (§11): its metadata, from the host's `folders`
+/// and `members` tables, and every row of every engine part, keyed as the
+/// hooks report them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderParts {
+    pub id: FolderId,
+    pub rules: Rules,
+    pub members: BTreeSet<NodeId>,
+    /// The index, one record per path (`IndexChanged`, `IndexRemoved`).
+    pub records: BTreeMap<RelPath, IndexRecord>,
+    /// The wants, one per path (`WantChanged`).
+    pub wants: BTreeMap<RelPath, Want>,
+    /// The pending set, one row per unannounced path (`PendingChanged`).
+    pub pending: BTreeMap<RelPath, Pending>,
+    /// The held items, held or denied, one row per item (`HeldChanged`).
+    pub held: BTreeMap<(BatchId, HeldState), HeldRow>,
+    /// The deferred paths, one row per path (`DeferredChanged`).
+    pub deferred: BTreeMap<RelPath, Vec<Deferred>>,
+    /// The small rest (`RestChanged`).
+    pub rest: Rest,
 }
 
 /// Keys of a part whose rows changed since the engine last reported them

@@ -73,7 +73,7 @@ use crate::brake::{self, HoldReason, Verdict};
 use crate::entry::{Entry, Kind, Observed};
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{Index, IndexRecord, LocalChange, Pending, Reverted};
-use crate::parts::{Changed, Rest};
+use crate::parts::{Changed, FolderParts, Rest};
 use crate::path::RelPath;
 use crate::quarantine::{HeldItem, HeldRow, HeldState, Quarantine};
 use crate::rules::Rules;
@@ -184,6 +184,14 @@ impl DeferredSet {
             self.rows.insert(path.clone(), keep);
         }
         take
+    }
+
+    /// The set as persisted (§11): its rows, nothing noted as changed.
+    fn from_rows(rows: BTreeMap<RelPath, Vec<Deferred>>) -> Self {
+        Self {
+            rows,
+            changed: Changed::default(),
+        }
     }
 
     /// The entries at `path` stop carrying the restoring mark (§8.3).
@@ -597,6 +605,70 @@ impl FolderState {
             queued: Vec::new(),
             startup_scan: false,
             statuses: Vec::new(),
+        }
+    }
+
+    /// Rebuild a folder from its persisted parts (§11) and nothing else.
+    /// What the parts leave out does not outlive the process: the batch
+    /// window, an open scan bracket and pending catch-up are gone, and
+    /// [`FolderState::restarted`] says what a restart makes of the rest.
+    pub fn from_parts(parts: FolderParts, own: NodeId, host: HostName) -> Self {
+        let FolderParts {
+            id,
+            rules,
+            members,
+            records,
+            wants,
+            pending,
+            held,
+            deferred,
+            rest,
+        } = parts;
+        Self {
+            id,
+            rules,
+            members,
+            index: Index::from_parts(own, host, records, pending, &rest),
+            window: None,
+            scan: None,
+            wants: WantList::from_wants(wants.into_values()),
+            acked: rest.acked,
+            catchup: BTreeSet::new(),
+            deferred: DeferredSet::from_rows(deferred),
+            winner_fallbacks: rest.winner_fallbacks,
+            quarantine: Quarantine::from_rows(held, rest.arrivals),
+            paused: rest.paused,
+            queued: rest.queued,
+            startup_scan: false,
+            statuses: Vec::new(),
+        }
+    }
+
+    /// Every part as it stands, keyed as the hooks report them (§11): what
+    /// the daemon's tables hold once every hook so far has been written.
+    pub fn parts(&self) -> FolderParts {
+        FolderParts {
+            id: self.id,
+            rules: self.rules.clone(),
+            members: self.members.clone(),
+            records: self
+                .index
+                .records()
+                .map(|r| (r.entry.path.clone(), r.clone()))
+                .collect(),
+            wants: self
+                .wants
+                .iter()
+                .map(|w| (w.path().clone(), w.clone()))
+                .collect(),
+            pending: self.index.pending_rows().clone(),
+            held: self.quarantine.rows(),
+            deferred: self
+                .deferred
+                .iter()
+                .map(|(p, list)| (p.clone(), list.to_vec()))
+                .collect(),
+            rest: self.rest(),
         }
     }
 
@@ -2585,6 +2657,68 @@ mod tests {
         assert!(!b.index().peer_has_gap(node(1)));
         a.acknowledged(node(2), 2);
         assert!(!a.wake_now(), "nothing left to catch up");
+    }
+
+    /// §11: a folder rebuilt from its parts is the folder that wrote them,
+    /// once both have been through a restart. The state here has a held
+    /// item and a denied one, pending rows, a frozen entry, a pause, a
+    /// queued decision and wants, one of them mid-fetch.
+    #[test]
+    fn a_folder_rebuilt_from_its_parts_is_the_one_that_wrote_them() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        let files = |r: std::ops::Range<usize>| r.map(|i| p(&format!("f{i:02}")));
+        for path in files(0..4) {
+            a.scanned(t(10.0), path, ScanState::Absent);
+        }
+        let dels = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert!(b.receive(t(12.0), &dels).held.is_some());
+        for path in files(4..7) {
+            a.scanned(t(12.5), path, ScanState::Absent);
+        }
+        let more = a.form_batches(t(13.0), bid(4)).remove(0);
+        assert!(b.receive(t(13.0), &more).held.is_some());
+        // Denied while unpaused; then the window pauses on B's own deletes.
+        assert!(b.deny(t(14.0), bid(3)).is_some());
+        for path in files(7..10) {
+            b.scanned(t(15.0), path, ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(17.0), bid(5)), Ticked::Paused { .. }));
+        // A edits a path pending on B (frozen) and adds a new file (wanted).
+        a.scanned(t(18.0), p("f09"), file(9, 18));
+        a.scanned(t(18.0), p("g"), file(3, 18));
+        let edit = a.form_batches(t(19.0), bid(6)).remove(0);
+        let r = b.receive(t(19.0), &edit);
+        assert_eq!((r.frozen, r.set.items.len()), (1, 1));
+        b.dispatch(t(20.0), &lan(&[1]));
+        let deny = UserDecision::Deny { batch: bid(4) };
+        assert!(matches!(b.request(deny), Requested::Queued(_)));
+
+        let parts = b.parts();
+        assert!(parts.held.contains_key(&(bid(4), HeldState::Held)));
+        assert!(
+            parts
+                .held
+                .keys()
+                .any(|(id, s)| *id == bid(3) && matches!(s, HeldState::Denied { .. }))
+        );
+        assert!(parts.pending.contains_key(&p("f09")));
+        assert!(parts.deferred.contains_key(&p("f09")));
+        assert!(parts.rest.paused.is_some());
+        assert_eq!(parts.rest.queued.len(), 1);
+        assert!(matches!(
+            parts.wants[&p("g")].state,
+            WantState::Fetching { .. }
+        ));
+
+        let mut rebuilt = FolderState::from_parts(parts, node(2), HostName::new("bravo").unwrap());
+        rebuilt.restarted(t(30.0));
+        let mut expected = b.clone();
+        expected.restarted(t(30.0));
+        // Both lists hold every want, noted by the restart; they are
+        // bookkeeping for the hooks, drained before comparing.
+        rebuilt.want_changes();
+        expected.want_changes();
+        assert_eq!(rebuilt, expected);
     }
 
     #[test]

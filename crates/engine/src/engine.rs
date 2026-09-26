@@ -24,7 +24,7 @@ use crate::folder::{
 };
 use crate::id::{BatchId, FolderId, HostName, NodeId};
 use crate::index::{IndexRecord, Pending};
-use crate::parts::Rest;
+use crate::parts::{FolderParts, Rest};
 use crate::path::RelPath;
 use crate::quarantine::{HeldRow, HeldState};
 use crate::rules::Rules;
@@ -313,17 +313,20 @@ impl Engine {
         }
     }
 
-    /// Rebuild an engine from persisted folder state after a restart at
-    /// `now` (§11 "persistence contract", §13). The folder state is the
-    /// unit of restart: index, pending set, watermarks, peer seqs and acks,
-    /// quarantine, wants, paused state and deferred entries all come back
-    /// as they were. Peers are not restored; they reconnect and exchange
-    /// `have_up_to`. Wants in transient states return to *wanted*, since
-    /// the host's in-flight operations died with the process, and a folder
-    /// with unannounced records reopens its batch window at `now`.
-    pub fn restore(config: NodeConfig, folders: Vec<FolderState>, now: Timestamp) -> Self {
+    /// Rebuild an engine after a restart at `now` from each folder's
+    /// persisted parts and nothing else (§11 "persistence contract", §13):
+    /// index, wants, pending set, held items, deferred paths and the small
+    /// rest all come back as their hooks last reported them. Peers are not
+    /// restored; they reconnect and exchange `have_up_to`. Wants in
+    /// transient states return to *wanted*, since the host's in-flight
+    /// operations died with the process, and a folder with unannounced
+    /// records reopens its batch window at `now`.
+    pub fn restore(config: NodeConfig, folders: Vec<FolderParts>, now: Timestamp) -> Self {
         let mut engine = Self::new(config);
-        for mut folder in folders {
+        for parts in folders {
+            let own = engine.config.node_id;
+            let host = engine.config.author_host.clone();
+            let mut folder = FolderState::from_parts(parts, own, host);
             folder.restarted(now);
             engine.rested.insert(folder.id(), folder.rest());
             engine.folders.insert(folder.id(), folder);
@@ -2434,9 +2437,9 @@ mod tests {
         );
         assert!(out.iter().any(|a| matches!(a, Action::Write { .. })));
         // B crashes after the rename: the file is on disk, the report is
-        // lost, and the process comes back with the persisted state.
+        // lost, and the process comes back with its persisted parts.
         let snapshot = b.folder(folder()).unwrap().clone();
-        let restored = Engine::restore(b.config().clone(), vec![snapshot], t(13.0));
+        let restored = Engine::restore(b.config().clone(), vec![snapshot.parts()], t(13.0));
         engines.insert(node(2), restored);
         let b = engines.get_mut(&node(2)).unwrap();
         let out = b.handle(
@@ -2806,7 +2809,7 @@ mod tests {
         assert!(!out.iter().any(|a| matches!(a, Action::IndexChanged { .. })));
 
         let state = b.folder(folder()).unwrap().clone();
-        let mut b = Engine::restore(b.config().clone(), vec![state], t(17.0));
+        let mut b = Engine::restore(b.config().clone(), vec![state.parts()], t(17.0));
         assert_eq!(b.folder(folder()).unwrap().queued().len(), 1, "persisted");
         let out = b.handle(
             t(20.0),
@@ -3097,8 +3100,8 @@ mod tests {
             before.wants().get(&p("n")).unwrap().state,
             WantState::Fetching { .. }
         ));
-        // The process dies and comes back with the persisted folder state.
-        let mut restored = Engine::restore(b.config().clone(), vec![before.clone()], t(19.0));
+        // The process dies and comes back with its persisted parts.
+        let mut restored = Engine::restore(b.config().clone(), vec![before.parts()], t(19.0));
         let f = restored.folder(folder()).unwrap();
         assert_eq!(f.index(), before.index());
         assert_eq!(
@@ -3142,7 +3145,7 @@ mod tests {
         let snapshot = a.folder(folder()).unwrap().clone();
         assert!(snapshot.window().is_some());
 
-        let mut a = Engine::restore(a.config().clone(), vec![snapshot], t(20.0));
+        let mut a = Engine::restore(a.config().clone(), vec![snapshot.parts()], t(20.0));
         assert_eq!(a.folder(folder()).unwrap().due(), Some(t(22.0)));
         let out = a.handle(
             t(20.0),
@@ -3191,7 +3194,7 @@ mod tests {
         );
         assert_eq!(sends(&out).len(), 1);
         let snapshot = a.folder(folder()).unwrap().clone();
-        let a = Engine::restore(a.config().clone(), vec![snapshot], t(20.0));
+        let a = Engine::restore(a.config().clone(), vec![snapshot.parts()], t(20.0));
         assert_eq!(a.folder(folder()).unwrap().window(), None);
         assert_eq!(a.folder(folder()).unwrap().due(), None);
     }
