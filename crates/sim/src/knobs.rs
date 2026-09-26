@@ -18,6 +18,11 @@ pub struct Knobs {
     /// Probability that a completed commit's report is lost to a crash
     /// landing between the rename and `Applied` (§13).
     pub crash_after_rename: f64,
+    /// Probability that a commit which displaces a file crashes between the
+    /// displacement and the rename that puts the new content in place
+    /// (§7.5, "Two renames, one commit"). The host's commit journal undoes
+    /// the displacement at the restart, before the first scan.
+    pub crash_between_renames: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -29,6 +34,7 @@ impl Default for Knobs {
             drop_watcher: 0.3,
             delay_ms: (5, 800),
             crash_after_rename: 0.1,
+            crash_between_renames: 0.0,
             nodes: None,
         }
     }
@@ -38,12 +44,13 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
             self.delay_ms.1,
-            self.crash_after_rename
+            self.crash_after_rename,
+            self.crash_between_renames
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;

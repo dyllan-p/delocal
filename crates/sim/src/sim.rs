@@ -9,7 +9,8 @@
 //! `Fetch` becomes a transfer that completes with `Fetched`, `Write`,
 //! `Remove` and `SetMeta` become commits that complete with `Applied`, and
 //! every persistence hook is written to its table in the persisted store
-//! (§11), which after every event must equal the engine's parts.
+//! (§11), which after every event must equal the engine's parts. A commit
+//! that displaces a file goes through the host's commit journal (§7.5).
 //!
 //! Time is discrete-event: the loop always jumps to the earliest pending
 //! thing (a wake, a delivery, an operation, a scan, a restart, a user
@@ -41,6 +42,12 @@ const FINAL_ROUND_NANOS: i64 = 30 * 60 * NANOS;
 const FINAL_ROUNDS: usize = 12;
 /// Events processed in one `run_until` before the run is declared livelocked.
 const EVENT_BUDGET: usize = 400_000;
+/// The PRNG stream, beside the main one (stream 0), that the crash between
+/// a commit's two renames draws from (§7.5). A model added after the main
+/// stream's draws were fixed takes a stream of its own, so the main stream
+/// makes the same draws in the same order whether the model is on or off,
+/// and a seed's history changes only where the model does something.
+const JOURNAL_STREAM: u64 = 1;
 
 /// What a clean run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,6 +77,11 @@ pub struct Stats {
     pub stalled: u64,
     pub conflict_copies: u64,
     pub events: u64,
+    /// Crashes between a commit's displacement and its rename (§7.5).
+    pub crashes_between_renames: u64,
+    /// Displacements the commit journal undid: at a restart, or because the
+    /// rename after them failed (§7.5).
+    pub displacements_undone: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -254,6 +266,10 @@ struct Node {
     next_scan_at: Timestamp,
     /// Fetched, verified content waiting for its commit, per path.
     temp: BTreeMap<RelPath, (Version, Vec<u8>)>,
+    /// The host's commit journal (§7.5, §11): one row per commit whose
+    /// displacement has happened and whose rename has not. Durable, so a
+    /// row a crash left open is still here at the restart.
+    journal: Vec<JournalRow>,
     // ---- invariant tracking ----
     /// Every version this node has ever sent in a batch, per path.
     sent: BTreeMap<RelPath, Vec<Version>>,
@@ -344,11 +360,35 @@ struct UserDue {
     action: UserAction,
 }
 
+/// A row of the commit journal (§7.5): what a commit moved aside from its
+/// path, and where to. The host makes it durable before the displacement
+/// and removes it once the rename has put the new content in place.
+#[derive(Clone, Debug, Serialize)]
+struct JournalRow {
+    path: RelPath,
+    to: Displace,
+    /// Everything the displacement moved, at the path it had.
+    moved: Vec<(RelPath, File)>,
+    /// Where in the node's trash the moved files start, for `Displace::Trash`.
+    trash_at: usize,
+}
+
+/// What the host did with a commit.
+enum Committed {
+    /// Report this outcome to the engine.
+    Report(ApplyOutcome),
+    /// The node crashed after the displacement and before the rename, with
+    /// the journal row still open (§7.5).
+    CrashedBetweenRenames,
+}
+
 /// The whole simulated world. See the module docs.
 pub struct Sim {
     seed: u64,
     knobs: Knobs,
     rng: ChaCha8Rng,
+    /// Draws for the crash between two renames, on `JOURNAL_STREAM`.
+    journal_rng: ChaCha8Rng,
     clock: Timestamp,
     folder: FolderId,
     rules: Rules,
@@ -428,6 +468,7 @@ impl Sim {
                 wake_at: None,
                 next_scan_at: clock.plus_nanos(rng.random_range(30 * NANOS..600 * NANOS)),
                 temp: BTreeMap::new(),
+                journal: Vec::new(),
                 sent: BTreeMap::new(),
                 synced: Vec::new(),
                 local_edit_at: BTreeMap::new(),
@@ -448,10 +489,13 @@ impl Sim {
                 links.insert(link_key(*a, *b), Link { up: true, tier });
             }
         }
+        let mut journal_rng = ChaCha8Rng::seed_from_u64(seed);
+        journal_rng.set_stream(JOURNAL_STREAM);
         let mut sim = Self {
             seed,
             knobs,
             rng,
+            journal_rng,
             clock,
             folder,
             rules,
@@ -1472,10 +1516,18 @@ impl Sim {
                 return Err(self.fail("persistence hooks", detail));
             }
         }
+        let clock = self.clock;
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
         };
         node.restart_at = None;
+        // §7.5: before the first scan, every row the crash left open in the
+        // commit journal is undone. The temp files died with the process.
+        let rows = std::mem::take(&mut node.journal);
+        self.stats.displacements_undone += rows.len() as u64;
+        for row in rows.into_iter().rev() {
+            undo(node, row, clock);
+        }
         // §11: the persisted parts and nothing else.
         node.engine = Some(Engine::restore(config, vec![parts], now));
         // §7.3: a full scan runs at daemon start, so at every restart; a
@@ -1597,7 +1649,19 @@ impl Sim {
                 if !self.nodes.get(&node).is_some_and(Node::alive) {
                     return Ok(());
                 }
-                let (outcome, created) = self.commit(node, &path, &version, &action);
+                let (committed, created) = self.commit(node, &path, &version, &action);
+                let outcome = match committed {
+                    Committed::Report(outcome) => outcome,
+                    // The process died with the path displaced. Nothing is
+                    // reported and no watcher is left to see the parents the
+                    // host created; the restart undoes the displacement and
+                    // its scan finds the rest (§7.5).
+                    Committed::CrashedBetweenRenames => {
+                        self.stats.crashes_between_renames += 1;
+                        let gap = self.journal_rng.random_range(NANOS..60 * NANOS);
+                        return self.crash(node, gap);
+                    }
+                };
                 // The host's mkdir of missing parents is a filesystem event
                 // like any other: the watcher may report it, the scan will.
                 for dir in created {
@@ -1659,10 +1723,12 @@ impl Sim {
         path: &RelPath,
         version: &Version,
         action: &Action,
-    ) -> (ApplyOutcome, Vec<RelPath>) {
+    ) -> (Committed, Vec<RelPath>) {
         let now = self.clock;
+        let crash_between = self.knobs.crash_between_renames;
+        let changed = || Committed::Report(ApplyOutcome::ChangedUnderneath);
         let Some(node) = self.nodes.get_mut(&id) else {
-            return (ApplyOutcome::ChangedUnderneath, Vec::new());
+            return (changed(), Vec::new());
         };
         // §7.5 step 6: the same guard before every commit, SetMeta included.
         let expected = match action {
@@ -1672,7 +1738,7 @@ impl Sim {
             _ => None,
         };
         if !expected_matches(node.fs.get(path), expected) {
-            return (ApplyOutcome::ChangedUnderneath, Vec::new());
+            return (changed(), Vec::new());
         }
         let mut created = Vec::new();
         if let Action::Write { .. } = action {
@@ -1684,7 +1750,7 @@ impl Sim {
             while let Some(dir) = ancestor {
                 match node.fs.get(&dir) {
                     Some(f) if f.kind == Kind::Dir => break,
-                    Some(_) => return (ApplyOutcome::ChangedUnderneath, Vec::new()),
+                    Some(_) => return (changed(), Vec::new()),
                     None => created.push(dir.clone()),
                 }
                 ancestor = dir.parent();
@@ -1708,8 +1774,21 @@ impl Sim {
                 if let Displace::ConflictCopy(target) = displace
                     && node.fs.contains_key(target)
                 {
-                    return (ApplyOutcome::ChangedUnderneath, created);
+                    return (changed(), created);
                 }
+                // Step 7, behind a journal row made durable first. The row
+                // is this commit's until the rename below removes it: rows
+                // left by a crash were all undone at the restart.
+                if displace_journalled(node, path, displace)
+                    && crash_between > 0.0
+                    && self.journal_rng.random::<f64>() < crash_between
+                {
+                    return (Committed::CrashedBetweenRenames, created);
+                }
+                // Step 8. The rename needs a verified temp file (a directory
+                // is made in place instead); a real host learns there is
+                // none when the rename fails, and undoes step 7 before it
+                // reports, so a failed commit leaves the disk as it was.
                 let content = match entry.kind {
                     Kind::Dir => Some(Vec::new()),
                     _ => match node.temp.get(path) {
@@ -1719,18 +1798,16 @@ impl Sim {
                         _ => None,
                     },
                 };
+                let row = node.journal.pop();
                 let Some(content) = content else {
-                    // No verified temp file: the host cannot commit this.
-                    return (ApplyOutcome::ChangedUnderneath, created);
-                };
-                if let Some(existing) = node.fs.remove(path) {
-                    match displace {
-                        Displace::Trash => trash_file(node, existing),
-                        Displace::ConflictCopy(target) => {
-                            follow(node, path, target, existing.hash(), now);
-                            node.fs.insert(target.clone(), existing);
-                        }
+                    if let Some(row) = row {
+                        self.stats.displacements_undone += 1;
+                        undo(node, row, now);
                     }
+                    return (changed(), created);
+                };
+                if let Some(row) = row {
+                    moved_by_sync(node, &row, now);
                 }
                 node.fs.insert(
                     path.clone(),
@@ -1748,12 +1825,12 @@ impl Sim {
                     && existing.kind == Kind::Dir
                     && node.fs.keys().any(|p| path.is_ancestor_of(p))
                 {
-                    return (ApplyOutcome::ChangedUnderneath, created); // not empty
+                    return (changed(), created); // not empty
                 }
                 if let Displace::ConflictCopy(target) = displace
                     && node.fs.contains_key(target)
                 {
-                    return (ApplyOutcome::ChangedUnderneath, created);
+                    return (changed(), created);
                 }
                 if let Some(existing) = node.fs.remove(path) {
                     match displace {
@@ -1776,7 +1853,7 @@ impl Sim {
             },
             _ => ApplyOutcome::ChangedUnderneath,
         };
-        (outcome, created)
+        (Committed::Report(outcome), created)
     }
 
     // ---------------------------------------------------------------- scanning
@@ -2392,6 +2469,105 @@ fn trash_file(node: &mut Node, file: File) {
     if file.kind != Kind::Dir {
         node.trash.push(file.hash());
     }
+}
+
+/// §7.5 step 7 behind the commit journal: make a row durable that names
+/// what is at `path` and where it goes, then move it there with one
+/// rename. False, and no row, if the path is empty.
+fn displace_journalled(node: &mut Node, path: &RelPath, to: &Displace) -> bool {
+    let Some(existing) = node.fs.get(path) else {
+        return false;
+    };
+    let row = JournalRow {
+        path: path.clone(),
+        to: to.clone(),
+        moved: vec![(path.clone(), existing.clone())],
+        trash_at: node.trash.len(),
+    };
+    for (from, _) in &row.moved {
+        let Some(file) = node.fs.remove(from) else {
+            continue;
+        };
+        match to {
+            Displace::Trash => trash_file(node, file),
+            Displace::ConflictCopy(target) => {
+                if let Some(at) = rebase(from, path, target) {
+                    node.fs.insert(at, file);
+                }
+            }
+        }
+    }
+    node.journal.push(row);
+    true
+}
+
+/// Undo a displacement whose rename never happened (§7.5): what the row
+/// moved aside goes back to its path. A real host renames it back without
+/// replacing anything, so if the path was taken meanwhile (a user can edit
+/// a folder while its daemon is down) whatever moved stays where it went,
+/// in the trash or at the conflict-copy path, and the next scan sees both.
+fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
+    if node.fs.contains_key(&row.path) {
+        moved_by_sync(node, &row, now);
+        return;
+    }
+    match &row.to {
+        Displace::Trash => {
+            let hashes: Vec<ContentHash> = row
+                .moved
+                .iter()
+                .filter(|(_, f)| f.kind != Kind::Dir)
+                .map(|(_, f)| f.hash())
+                .collect();
+            let end = row.trash_at + hashes.len();
+            // Nothing else writes to a node's trash between a displacement
+            // and its undo, so the files are where the row says. Should that
+            // ever not hold, the files stay in the trash rather than be
+            // duplicated.
+            if node.trash.get(row.trash_at..end) != Some(hashes.as_slice()) {
+                return;
+            }
+            node.trash.drain(row.trash_at..end);
+            for (from, file) in row.moved {
+                node.fs.insert(from, file);
+            }
+        }
+        Displace::ConflictCopy(target) => {
+            let under: Vec<RelPath> = node
+                .fs
+                .keys()
+                .filter(|p| *p == target || target.is_ancestor_of(p))
+                .cloned()
+                .collect();
+            for at in under {
+                let Some(back) = rebase(&at, target, &row.path) else {
+                    continue;
+                };
+                if let Some(file) = node.fs.remove(&at) {
+                    node.fs.insert(back, file);
+                }
+            }
+        }
+    }
+}
+
+/// The adoptions of content a displacement moved to a conflict-copy path
+/// follow it there (I2; see `follow`).
+fn moved_by_sync(node: &mut Node, row: &JournalRow, now: Timestamp) {
+    let Displace::ConflictCopy(target) = &row.to else {
+        return;
+    };
+    for (from, file) in &row.moved {
+        if let Some(to) = rebase(from, &row.path, target) {
+            follow(node, from, &to, file.hash(), now);
+        }
+    }
+}
+
+/// `p`, which is `from` or lies under it, after a rename of `from` to `to`.
+fn rebase(p: &RelPath, from: &RelPath, to: &RelPath) -> Option<RelPath> {
+    let rest = p.as_str().strip_prefix(from.as_str())?;
+    RelPath::new(format!("{}{rest}", to.as_str())).ok()
 }
 
 fn move_to_trash(node: &mut Node, path: &RelPath) {
