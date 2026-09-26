@@ -1,0 +1,45 @@
+Makes FolderState::restarted clear the batch window and leave it closed
+again, as before e06de00 (§11): the window lives in memory and dies with the
+process, while the records it was about to announce survive in the index,
+and without the fix they wait for this node's next local write instead of
+going out at the next tick. The `now` argument e06de00 added stays, unused,
+so that no caller changes. No seed in 0 to 9,999 fails with this patch, and
+the one seed at 2,000 steps that does fails indirectly and will not shrink
+below 1,217 steps, so the patch names the rule's unit test.
+
+test: delocal-engine engine::tests::a_restart_reopens_the_window_for_unannounced_records
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..cf045d1 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -2051,25 +2051,14 @@ impl FolderState {
+         self.wants.progress(now, path, version);
+     }
+ 
+-    /// The process restarted with this state at `now` (§11, §13): every
+-    /// want the host was fetching or committing is wanted again, the open
+-    /// scan bracket is gone, and peers will announce themselves afresh. A
+-    /// folder with records written but not yet announced reopens its batch
+-    /// window as if they had just been written: the window died with the
+-    /// process, and without it they would wait for some later write.
+-    pub fn restarted(&mut self, now: Timestamp) {
++    /// The process restarted with this state (§11, §13): every want the
++    /// host was fetching or committing is wanted again, the open scan
++    /// bracket is gone, and peers will announce themselves afresh.
++    pub fn restarted(&mut self, _now: Timestamp) {
+         self.wants.restarted();
+         self.scan = None;
+         self.catchup.clear();
+         self.window = None;
+-        if self
+-            .index
+-            .records_since(self.index.announced_seq())
+-            .next()
+-            .is_some()
+-        {
+-            self.touched(now);
+-        }
+         // A crash may have left files the index does not know about (a
+         // commit's rename whose report was lost, §13); `revert` waits for
+         // the startup scan to report them (§8.3).

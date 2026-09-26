@@ -1,0 +1,26 @@
+A revert no longer waits after a restart until the startup full scan has
+finished: the StartupScan check in the revert arm of FolderState::unsettled,
+added by f6cff50 (Queue deny and revert until the folder settles), is removed.
+It is the rule DESIGN.md §8.3 gives for this pin's case: a crash can leave a
+conflict copy whose commit report was lost, and a revert that ran before the
+scan reported the copy would let it survive and spread as a new add. The
+open-bracket wait of 0289804 stays, so a revert still waits while a scan
+bracket is open. No seed fails with this patch within the search budget, so
+the patch names the rule's unit test.
+
+test: delocal-engine folder::tests::a_revert_after_a_restart_waits_for_the_startup_scan
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..b535e5e 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1771,9 +1771,6 @@ impl FolderState {
+                 })
+             }
+             UserDecision::Revert { .. } => {
+-                if self.startup_scan {
+-                    return Some(WaitReason::StartupScan);
+-                }
+                 if self.scan.is_some() {
+                     return Some(WaitReason::ScanOpen);
+                 }

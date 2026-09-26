@@ -1,0 +1,42 @@
+Disables the two fixes this pin needs off together, both for a frozen entry
+of a batch the brake held for its other paths (§8.1, §8.2). As before
+bd63aa0, reconsider() takes a path's Frozen entries along with the
+ChangedUnderneath ones it is asked for, so a scan or a commit at a frozen
+path thaws its entry while the folder is still paused. As before 20a7504,
+admit() no longer joins an entry whose own batch is still held to that held
+item, so the entry meets the brake alone, passes, and is wanted. No
+invariant sees an entry committed while its batch is held: I5 checks the
+held item, which a frozen entry is never in. The two seeds in 0 to 9,999
+that fail with this patch do so through I4's check of a copy under a
+directory displaced twice, so the patch names the rule's unit test, which
+fails with either fix disabled alone.
+
+test: delocal-engine folder::tests::a_frozen_entry_of_a_held_batch_is_wanted_only_by_approve
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..5c1f44b 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1116,11 +1116,6 @@ impl FolderState {
+                 *joined.entry(held).or_insert(0) += 1;
+                 continue;
+             }
+-            if brake && self.quarantine.get(c.batch).is_some() {
+-                self.quarantine.join(c.batch, c.raw);
+-                *joined.entry(c.batch).or_insert(0) += 1;
+-                continue;
+-            }
+             groups
+                 .entry((c.batch, c.source, c.seq_high))
+                 .or_default()
+@@ -1202,7 +1197,9 @@ impl FolderState {
+     /// `ChangedUnderneath` entries only: a `Frozen` entry waits for the
+     /// folder to unpause (§8.1), however often its path is scanned meanwhile.
+     fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: DeferredReason) {
+-        let take = self.deferred.take_where(path, |d| d.reason == reason);
++        let take = self.deferred.take_where(path, |d| {
++            d.reason == reason || d.reason == DeferredReason::Frozen
++        });
+         if take.is_empty() {
+             return;
+         }

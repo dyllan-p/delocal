@@ -1,0 +1,42 @@
+Puts a relayed copy of a version this machine already wants through
+quarantine matching and the brake again, as receive() did before 6730e55
+(§7.5, §8.1, §8.2): the early skip of an item whose version equals, or is
+dominated by, the want at its path is removed, so the copy counts toward the
+relay batch's brake and is quarantined under it if that batch is held while
+its own fetch goes on. No seed fails with this patch (0 to 9,999, and 0 to
+499 at 2,000 steps): the relayed copy is quarantined under the relay's batch
+while I5 checks the want's own, so no invariant sees it. The patch names the
+rule's unit test.
+
+test: delocal-engine folder::tests::a_version_already_wanted_is_not_rebraked_when_relayed
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index e843412..e0b9eb2 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1541,24 +1541,13 @@ impl FolderState {
+ 
+         let mut joined = 0;
+         let mut frozen = 0;
+-        let mut already_wanted = 0;
++        let already_wanted = 0;
+         let mut kept = Vec::with_capacity(set.items.len());
+         for item in std::mem::take(&mut set.items) {
+             let Some(incoming) = raw.get(item.path()).copied() else {
+                 kept.push(item);
+                 continue;
+             };
+-            // A version this machine already accepted went through the brake
+-            // when it was accepted; another member offering it (or something
+-            // older) only adds a source, and must not be held or quarantined
+-            // while its fetch is under way (§7.5).
+-            if let Some(want) = self.wants.get(item.path())
+-                && (item.incoming().version == *want.version()
+-                    || want.version().dominates(&item.incoming().version))
+-            {
+-                already_wanted += 1;
+-                continue;
+-            }
+             if let Some(held) = self.quarantine.matching(incoming) {
+                 self.quarantine.join(held, incoming.clone());
+                 joined += 1;
