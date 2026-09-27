@@ -6,14 +6,17 @@
 # A pinned seed guards its fix only while its history still reaches the
 # bug, so every pin NAME is stored with scripts/pins/NAME.patch, a patch
 # that disables the fix it guards. The patch starts with a paragraph that
-# says what it disables and one line for each test that guards that fix:
+# says what it disables and one line for each test written to guard that
+# fix:
 #
 #   test: PACKAGE TEST
 #
-# For a pinned seed the first is `delocal-sim regressions::NAME`, and any
-# unit tests of the same fix follow. A pin whose fix no seed reaches is
-# replaced by a unit test next to the fix, and its patch names only unit
-# tests. `git apply` skips the text before the first `diff`.
+# For a pinned seed the first is `delocal-sim regressions::NAME`, and the
+# fix's own unit tests follow: at least one, since every fix has one, and
+# none that the patch merely happens to break, which guard other rules. A
+# pin whose fix no seed reaches is replaced by a unit test next to the fix,
+# and its patch names only unit tests. `git apply` skips the text before
+# the first `diff`.
 #
 # A pin is valid only if each test it names passes at REV (default HEAD)
 # and fails with its patch applied. The script first checks that every
@@ -94,7 +97,7 @@ pinned=$(git -C "$repo" show "$commit:crates/sim/src/regressions.rs" |
 # pin I names tests first[I] to first[I] + count[I] - 1.
 names=() first=() count=() packages=() tests=()
 add() {
-  local name=$1 patch=$pins/$1.patch line package test extra seen=/ seeded=no start=${#tests[@]}
+  local name=$1 patch=$pins/$1.patch line package test extra seen=/ seeded=no units=0 start=${#tests[@]}
   # The name becomes a directory under DIR, removed at the start of a run.
   [[ $name =~ ^[a-z0-9_]+$ ]] || { echo "pin names are lower-case letters, digits and '_': $name" >&2; exit 2; }
   [ -f "$patch" ] || { echo "no patch $patch" >&2; exit 2; }
@@ -108,11 +111,15 @@ add() {
     # from either side, and no patch names another pin's seed.
     case $test in
       regressions::*) [ "$test" = "regressions::$name" ] || { echo "$patch names $test, not regressions::$name" >&2; exit 2; } ;;
+      *) units=$(( units + 1 )) ;;
     esac
     [ "$package $test" != "delocal-sim regressions::$name" ] || seeded=yes
     packages+=("$package") tests+=("$test")
   done < <(sed -n -e '/^diff /q' -e '/^test: /p' "$patch")
   [ "${#tests[@]}" -gt "$start" ] || { echo "$patch needs a 'test: PACKAGE TEST' line" >&2; exit 2; }
+  # Every fix has a unit test of its own, which guards it whether or not a
+  # seed still reaches the bug.
+  [ "$units" -gt 0 ] || { echo "$patch names no unit test of its fix, and every fix has one" >&2; exit 2; }
   # A pin that is still a seed at REV must be checked as one.
   if [ "$seeded" = no ] && grep -qxF "$name" <<< "$pinned"; then
     echo "$patch does not name its pinned seed, delocal-sim regressions::$name" >&2
@@ -421,7 +428,8 @@ total=$(( ${#names[@]} + ${#unguarded[@]} ))
   echo '|---|---|---|---|'
   printf '%s\n' "${rows[@]}"
   echo
-  echo "$checked of ${#tests[@]} named tests checked both ways."
+  seeds=$(printf '%s\n' "${tests[@]}" | grep -c '^regressions::' || true)
+  echo "$checked of ${#tests[@]} named tests checked both ways ($seeds pinned seeds, $(( ${#tests[@]} - seeds )) unit tests)."
   if [ "$unchecked" -gt 0 ]; then
     echo "The check did not finish: $unchecked of $total pins not checked, $invalid invalid, $(( total - unchecked - invalid )) guard their fix."
   else
