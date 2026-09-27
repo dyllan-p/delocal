@@ -5,6 +5,7 @@ versions above the restored record, which are the pending ones; the restored
 record was announced and stands (DESIGN.md §8.3, §14.1 I3).
 
 test: delocal-sim regressions::a_revert_discards_only_the_versions_above_the_restored_record
+test: delocal-sim sim::tests::a_revert_sets_aside_only_the_versions_above_the_record_it_restored
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 index 4e18586..e87955f 100644
