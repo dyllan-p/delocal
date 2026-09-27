@@ -46,11 +46,14 @@ use std::ffi::OsString;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
-pub mod real;
-
 #[cfg(test)]
 mod conformance;
+#[cfg(feature = "faults")]
+pub mod faulty;
+pub mod real;
 
+#[cfg(feature = "faults")]
+pub use faulty::FaultyFs;
 pub use real::RealFs;
 
 /// Every filesystem operation on a folder. See the module docs for which

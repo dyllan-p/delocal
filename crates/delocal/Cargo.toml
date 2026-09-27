@@ -21,9 +21,19 @@ path = "src/main.rs"
 delocal-engine.workspace = true
 filetime.workspace = true
 rustix.workspace = true
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
+
+# `faults` builds FaultyFs (DESIGN.md §14.2), the filesystem layer's
+# fault-injecting wrapper, and the JSON fault spec it reads. Tests and the
+# chaos harness turn it on; the binary users download is built without it,
+# so it cannot inject faults and does not carry the code.
+[features]
+faults = ["dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true
