@@ -9,6 +9,9 @@ item when revert discards the deny that consumed it). Both rules are DESIGN.md
 §8.3's settled folder.
 
 test: delocal-sim regressions::a_deny_on_a_paused_folder_waits_instead_of_joining_the_pending_batch
+test: delocal-engine engine::tests::a_queued_deny_survives_a_restart_and_runs_when_the_folder_settles
+test: delocal-engine folder::tests::a_deny_waits_for_the_pause_and_then_for_the_restoring_mark
+test: delocal-engine folder::tests::a_revert_that_discards_a_denys_bumps_returns_the_held_item
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..020fb71 100644

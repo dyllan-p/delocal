@@ -5,6 +5,7 @@ seq_high that moves the peer's watermark past the withheld pending records,
 which that peer then never asks for (DESIGN.md §7.4).
 
 test: delocal-sim regressions::catch_up_never_sends_what_this_machine_has_not_announced
+test: delocal-engine index::tests::announced_since_never_sends_a_record_this_machine_has_not_announced
 
 diff --git a/crates/engine/src/index.rs b/crates/engine/src/index.rs
 index 4029a94..d26c77a 100644

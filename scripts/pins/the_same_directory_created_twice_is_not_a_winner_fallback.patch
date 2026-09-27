@@ -4,6 +4,7 @@ same directory created on two nodes merges with a full tie, and the
 simulator reports it as a winner-rule fallback.
 
 test: delocal-sim regressions::the_same_directory_created_twice_is_not_a_winner_fallback
+test: delocal-engine batch::tests::an_identical_content_merge_that_ties_everywhere_is_not_a_fallback
 
 diff --git a/crates/engine/src/batch.rs b/crates/engine/src/batch.rs
 index af62a19..cbaf757 100644

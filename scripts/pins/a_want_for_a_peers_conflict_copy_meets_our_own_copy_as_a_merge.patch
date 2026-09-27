@@ -7,6 +7,7 @@ same losing version then keeps fetching and lands over the node's own
 record with a version that does not dominate it, which I8 reports.
 
 test: delocal-sim regressions::a_want_for_a_peers_conflict_copy_meets_our_own_copy_as_a_merge
+test: delocal-engine folder::tests::writing_our_own_conflict_copy_reclassifies_a_want_for_a_peers_copy
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..f963bee 100644

@@ -8,10 +8,12 @@ item, so the entry meets the brake alone, passes, and is wanted. No
 invariant sees an entry committed while its batch is held: I5 checks the
 held item, which a frozen entry is never in. The two seeds in 0 to 9,999
 that fail with this patch do so through I4's check of a copy under a
-directory displaced twice, so the patch names the rule's unit test, which
-fails with either fix disabled alone.
+directory displaced twice, so the patch names unit tests: the one that
+replaced this pin's seed, which fails with either fix disabled alone, and
+bd63aa0's own.
 
 test: delocal-engine folder::tests::a_frozen_entry_of_a_held_batch_is_wanted_only_by_approve
+test: delocal-engine folder::tests::frozen_entries_wait_for_unpause_through_scans_and_commits
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..5c1f44b 100644
