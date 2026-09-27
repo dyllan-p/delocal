@@ -2366,6 +2366,64 @@ mod tests {
         assert!(sends(&out).is_empty(), "nothing to announce after revert");
     }
 
+    /// §11, §8.3 (61c51bb): every index write is reported before the host
+    /// acts on it, and `revert` makes one per pending path: the announced
+    /// record put back, or the record of an add peers never saw removed. A
+    /// host persisting from the hooks would otherwise keep the pending
+    /// records and, after a restart, announce the changes the user reverted.
+    #[test]
+    fn a_revert_reports_every_index_write_it_makes() {
+        let mut engines = two_with_ten_files();
+        let b = engines.get_mut(&node(2)).unwrap();
+        let pending: BTreeSet<RelPath> = (0..8)
+            .map(|i| p(&format!("f{i:02}")))
+            .chain([p("junk")])
+            .collect();
+        for path in &pending {
+            let state = if *path == p("junk") {
+                file(6, 6)
+            } else {
+                ScanState::Absent
+            };
+            b.handle(
+                t(10.0),
+                Event::Scanned {
+                    folder: folder(),
+                    path: path.clone(),
+                    state,
+                },
+            );
+        }
+        b.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        let out = b.handle(t(13.0), Event::Revert { folder: folder() });
+        let index = b.folder(folder()).unwrap().index();
+        let mut reported = BTreeSet::new();
+        for action in &out {
+            match action {
+                Action::IndexChanged { record, .. } => {
+                    assert_eq!(index.get(&record.entry.path), Some(record));
+                    reported.insert(record.entry.path.clone());
+                }
+                Action::IndexRemoved { path, .. } => {
+                    assert_eq!(index.get(path), None);
+                    reported.insert(path.clone());
+                }
+                // The host acts from here on.
+                Action::MoveToTrash { .. } | Action::Fetch { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reported, pending,
+            "every pending path, before the host acts"
+        );
+    }
+
     /// §8.3: revert re-derives the wants at reverted paths from their
     /// received entries. The sequence the simulator found: a crash after
     /// the rename leaves a fetched file the index never learnt of; the
