@@ -432,9 +432,11 @@ fn made_at(path: &RelPath, displaced: &BTreeMap<RelPath, RelPath>) -> Vec<RelPat
 
 #[cfg(test)]
 mod tests {
-    use delocal_engine::{HostName, NodeId, Version};
+    use delocal_engine::{Action, HostName, IndexRecord, NodeId, Version};
 
     use super::*;
+    use crate::knobs::Knobs;
+    use crate::sim::{File, content_bytes};
 
     fn loser(path: &str, kind: Kind, mtime_ns: i64, host: &str) -> Entry {
         Entry {
@@ -611,5 +613,75 @@ mod tests {
         // So does a copy whose name no loser has at either place.
         let stray = RelPath::new(format!("{moved_to}/f9.conflict-20231114-224300-n3")).unwrap();
         assert!(copy_failure(&stray, &live(&first), &expected, &displaced, &none).is_some());
+    }
+
+    /// Two nodes and none of their history: each test builds the history it
+    /// checks with `Sim::scanned` and `Sim::durable`.
+    fn world() -> Sim {
+        Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                ..Knobs::default()
+            },
+        )
+    }
+
+    /// A file holding `content_bytes(content)`, at the run's start.
+    fn file_of(content: u8) -> File {
+        File {
+            kind: Kind::File,
+            content: content_bytes(content),
+            mtime_ns: START_NS,
+            exec: false,
+        }
+    }
+
+    const START_NS: i64 = 1_700_000_000_000_000_000;
+
+    /// The index write of `entry` under `seq`.
+    fn changed(sim: &Sim, entry: Entry, seq: u64) -> Action {
+        Action::IndexChanged {
+            folder: sim.folder_id(),
+            record: IndexRecord { entry, seq },
+        }
+    }
+
+    /// I3 leaves out a tombstone its author's revert discarded (§14.1, §8.3,
+    /// 15d13ea): it was pending and never announced, so as far as the mesh
+    /// is concerned nothing was deleted. Here e deletes b's file and reverts
+    /// before announcing it, and b still has the file. The pin
+    /// `a_tombstone_a_revert_discarded_is_not_a_deletion` guards this only
+    /// while its seed reaches it.
+    #[test]
+    fn a_tombstone_its_authors_revert_discarded_deleted_nothing() {
+        let mut sim = world();
+        let (b, e) = (sim.node_ids()[0], sim.node_ids()[1]);
+        let f = RelPath::new("f").unwrap();
+        sim.scanned(b, f.clone(), file_of(1)).unwrap();
+        let made = sim
+            .engine(b)
+            .and_then(|x| x.folder(sim.folder_id()))
+            .and_then(|x| x.index().live(&f))
+            .map(|r| r.entry.clone())
+            .unwrap();
+        let tombstone = Entry {
+            size: 0,
+            stamp: made.stamp + 1,
+            hash: ContentHash::EMPTY,
+            prev_hash: made.hash,
+            version: made.version.incremented(e),
+            deleted: true,
+            modified_by: e,
+            ..made.clone()
+        };
+        // e holds b's file, deletes it, and reverts: the record it puts back
+        // keeps its old seq.
+        sim.durable(e, changed(&sim, made.clone(), 1), 1).unwrap();
+        sim.durable(e, changed(&sim, tombstone.clone(), 2), 2)
+            .unwrap();
+        sim.durable(e, changed(&sim, made, 1), 3).unwrap();
+        assert!(sim.discarded_by_revert(&tombstone));
+        i3_no_resurrection(&sim).unwrap_or_else(|f| panic!("{f}"));
     }
 }
