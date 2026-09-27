@@ -3771,6 +3771,37 @@ mod tests {
         assert_eq!(b.revert(t(18.0)), None);
     }
 
+    /// §8.3 step 2, §7.5 step 6 (33cf84e): `revert` moves the file to trash
+    /// and puts the announced record back, so until the refetch lands the
+    /// record says the file is there and the disk says nothing is. The
+    /// refetch's guard expects the disk, an absent path, and not the
+    /// restored record: expecting the record, the commit would find nothing,
+    /// fail, and leave the path to be tombstoned. Anything the host does
+    /// find there is a local change, and fails the guard as it should.
+    #[test]
+    fn a_restoring_wants_commit_expects_the_path_to_be_absent() {
+        let (_, mut b) = a_and_b(10, tight());
+        for i in 0..8 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), file(5, 5));
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(13.0)).unwrap();
+        assert_eq!(out.trash.len(), 8, "the edited files go to trash");
+        let f00 = b.wants().get(&p("f00")).unwrap().clone();
+        assert!(f00.restoring);
+        assert!(b.index().live(&p("f00")).is_some(), "the record says live");
+        b.fetched(t(14.0), &p("f00"), f00.version(), FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        let expected: Vec<&Option<Observed>> = steps
+            .iter()
+            .filter_map(|s| match s {
+                HostStep::Write { path, expected, .. } if path == &p("f00") => Some(expected),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(expected, [&None], "the write expects nothing at f00");
+    }
+
     /// B holds A's deletion of f00 to f03 (as `bid(3)`), then B's user
     /// edits the same four files and B pauses. The rules are tight.
     fn held_then_paused_on_the_same_paths() -> (FolderState, FolderState, BatchId) {
