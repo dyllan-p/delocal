@@ -273,10 +273,12 @@ mod tests {
     use std::task::Wake;
     use std::time::Duration;
 
-    use delocal_engine::{Action, HeldState};
+    use delocal_engine::{Action, FolderState, HeldState, HostName, NodeId};
+    use proptest::prelude::*;
     use rusqlite::Connection;
 
     use super::super::HostWrite;
+    use super::super::mirror::{self, Mirror};
     use super::super::sample::*;
     use super::*;
 
@@ -476,5 +478,58 @@ mod tests {
         releaser.join().unwrap();
         drop(writer.close().unwrap());
         assert_eq!(seqs(&open(&dir)), [7]);
+    }
+
+    proptest! {
+        /// §11: random streams of hook actions and host writes, submitted
+        /// through the writer (one at a time, or all at once so that many
+        /// share a transaction) and read back from a reopened file, equal
+        /// the mirror, reader by reader; and the folder state rebuilt from
+        /// the reloaded parts is the one rebuilt from the mirror's.
+        #[test]
+        fn random_streams_through_the_writer_reload_as_the_mirror(
+            stream in mirror::stream(12),
+            one_at_a_time in any::<bool>(),
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("delocal.db");
+            let writer = Store::open(&path).unwrap().writer().unwrap();
+            let mut model = Mirror::default();
+            let mut durables = Vec::new();
+            for ops in &stream {
+                model.apply(ops);
+                let durable = writer.submit(ops.group());
+                if one_at_a_time {
+                    durable.wait().unwrap();
+                }
+                durables.push(durable);
+            }
+            for durable in &durables {
+                durable.wait().unwrap();
+            }
+            drop(writer.close().unwrap());
+
+            let store = Store::open(&path).unwrap();
+            if let Some(difference) = model.difference(&store) {
+                prop_assert!(false, "{}", difference);
+            }
+            let own = NodeId::from_bytes([1; 16]);
+            let host = HostName::new("laptop").unwrap();
+            for folder in model.folder_ids() {
+                match (store.parts(folder).unwrap(), model.parts(folder)) {
+                    (Some(stored), Some(mirrored)) => prop_assert_eq!(
+                        FolderState::from_parts(stored, own, host.clone()),
+                        FolderState::from_parts(mirrored, own, host.clone())
+                    ),
+                    (None, None) => {}
+                    (stored, mirrored) => prop_assert!(
+                        false,
+                        "parts stored: {}, in the mirror: {}",
+                        stored.is_some(),
+                        mirrored.is_some()
+                    ),
+                }
+            }
+        }
     }
 }
