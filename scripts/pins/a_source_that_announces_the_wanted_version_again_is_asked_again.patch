@@ -6,6 +6,7 @@ it is still never selected, and a want whose sources all answered that way
 stays without a source.
 
 test: delocal-sim regressions::a_source_that_announces_the_wanted_version_again_is_asked_again
+test: delocal-engine want::tests::a_source_that_was_not_available_is_a_source_again_when_it_announces
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
 index a48d211..ffdb907 100644

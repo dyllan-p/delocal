@@ -5,6 +5,7 @@ a commit in flight at one of its paths still holds the deny. DESIGN.md §8.3,
 "deny and revert act only on a settled folder".
 
 test: delocal-sim regressions::a_deny_at_a_marked_path_waits_for_the_mark_to_clear
+test: delocal-engine folder::tests::a_deny_waits_for_the_pause_and_then_for_the_restoring_mark
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..beeb5db 100644

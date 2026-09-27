@@ -5,6 +5,7 @@ Entry::unchanged_by_stat, the fast path's test, changes: the commit guard
 keeps comparing the exec bit.
 
 test: delocal-sim regressions::a_chmod_the_watcher_missed_is_found_by_the_next_scan
+test: delocal-engine entry::tests::the_fast_path_compares_kind_size_mtime_exec_and_symlink_target
 
 diff --git a/crates/engine/src/entry.rs b/crates/engine/src/entry.rs
 index 864d5c4..fcd0187 100644

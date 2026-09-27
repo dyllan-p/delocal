@@ -6,6 +6,7 @@ discarded with the pending batch and nothing takes their place. DESIGN.md
 §8.3, the last paragraph.
 
 test: delocal-sim regressions::a_revert_that_discards_a_denys_bumps_returns_its_held_item
+test: delocal-engine folder::tests::a_revert_that_discards_a_denys_bumps_returns_the_held_item
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..abba5ce 100644

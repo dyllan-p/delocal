@@ -7,6 +7,7 @@ was, and every version arriving behind it is deferred as concurrent with
 it (DESIGN.md §8.3 step 2, §7.5).
 
 test: delocal-sim regressions::a_want_at_a_reverted_path_is_rederived_from_the_received_entry
+test: delocal-engine engine::tests::revert_rederives_a_conflict_want_and_the_newer_version_is_fetched
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..7960dc3 100644

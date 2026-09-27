@@ -8,6 +8,8 @@ changing), and a want whose only source stays connected and silent waits
 for it to the end of the run.
 
 test: delocal-sim regressions::an_exclusion_expires_for_a_conflict_copy
+test: delocal-engine want::tests::an_exclusion_expires_on_a_backoff_that_doubles_per_source
+test: delocal-engine want::tests::a_give_up_expires_with_its_first_exclusion
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
 index a48d211..497a28d 100644

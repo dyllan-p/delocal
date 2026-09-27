@@ -6,6 +6,7 @@ without source instead of settling as unrecoverable once every member
 has refused (DESIGN.md §8.3 step 2 and step 4).
 
 test: delocal-sim regressions::a_marked_want_whose_content_exists_nowhere_settles_unrecoverable
+test: delocal-engine folder::tests::a_want_at_a_marked_path_asks_every_member_and_settles_when_all_refuse
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
 index a48d211..b5da8cb 100644

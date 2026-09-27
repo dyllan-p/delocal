@@ -5,6 +5,7 @@ deny bump's vector, but its stamp no longer counts for the bump's stamp,
 so the bump can dominate that version and rank below it (I7).
 
 test: delocal-sim regressions::a_joined_versions_stamp_counts_for_the_deny_bump
+test: delocal-engine quarantine::tests::a_concurrent_joiner_is_recorded_with_its_stamp
 
 diff --git a/crates/engine/src/quarantine.rs b/crates/engine/src/quarantine.rs
 index 619b8dd..65a88db 100644

@@ -10,6 +10,8 @@ until the folder settles), is removed. DESIGN.md §8.3, and §7.5's revert
 exception.
 
 test: delocal-sim regressions::a_deny_after_revert_over_an_unobserved_occupant
+test: delocal-engine folder::tests::an_occupant_at_a_marked_path_counts_while_its_want_is_in_flight
+test: delocal-engine folder::tests::a_deny_waits_for_the_pause_and_then_for_the_restoring_mark
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..090f2b9 100644

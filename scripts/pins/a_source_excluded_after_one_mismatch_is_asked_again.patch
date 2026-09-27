@@ -8,6 +8,9 @@ asks for no wake-up for one. A source excluded after a mismatch, and a want
 that gave up after two, then stay so until the index at the path changes.
 
 test: delocal-sim regressions::a_source_excluded_after_one_mismatch_is_asked_again
+test: delocal-engine want::tests::a_give_up_expires_with_its_first_exclusion
+test: delocal-engine want::tests::an_exclusion_expires_on_a_backoff_that_doubles_per_source
+test: delocal-engine want::tests::an_exclusion_is_released_when_the_wanted_content_is_announced
 
 diff --git a/crates/engine/src/engine.rs b/crates/engine/src/engine.rs
 index 01954b3..e6ca051 100644

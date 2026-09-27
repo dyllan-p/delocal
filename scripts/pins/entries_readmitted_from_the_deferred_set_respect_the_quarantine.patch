@@ -7,9 +7,11 @@ The rest of admit() stays: a version already wanted still only names a
 source, and 20a7504's rule that an entry of a batch still held joins it. No
 seed fails with this patch (0 to 9,999, and 0 to 499 at 2,000 steps): a
 re-admitted entry keeps its own accepted batch's id, so I5 never matches it,
-and no other invariant sees it. The patch names the rule's unit test.
+and no other invariant sees it. The patch names the rule's unit tests:
+3cba684's own and the one that replaced this pin's seed.
 
 test: delocal-engine folder::tests::a_deferred_entry_whose_version_was_held_meanwhile_joins_the_held_item
+test: delocal-engine folder::tests::frozen_edits_meet_the_brake_when_the_folder_unpauses
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..ec89487 100644

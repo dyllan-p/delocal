@@ -2,6 +2,7 @@ Counts an identical-content merge that ties all the way down as a rule-5
 fallback of the winner rule again, as before d15e699 (§7.2, §7.6).
 
 test: delocal-sim regressions::identical_content_everywhere_is_not_a_winner_fallback
+test: delocal-engine batch::tests::an_identical_content_merge_that_ties_everywhere_is_not_a_fallback
 
 diff --git a/crates/engine/src/batch.rs b/crates/engine/src/batch.rs
 index af62a19..cbaf757 100644

@@ -8,6 +8,8 @@ revert until that scan finishes. The deny's open-bracket wait is left as it
 is, since this pin's decision is a revert. DESIGN.md §8.3.
 
 test: delocal-sim regressions::a_queued_revert_waits_for_the_startup_scan_to_finish
+test: delocal-engine folder::tests::a_revert_after_a_restart_waits_for_the_startup_scan
+test: delocal-engine folder::tests::decisions_wait_while_a_scan_bracket_is_open
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..d62af77 100644

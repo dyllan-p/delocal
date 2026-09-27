@@ -6,6 +6,8 @@ hold the same vector, one deleted and one live, and I7 fails. Stamps are
 still computed and carried; only the comparison goes.
 
 test: delocal-sim regressions::equal_vectors_mean_equal_content_when_deletes_race_an_edit
+test: delocal-engine batch::tests::a_tombstone_with_the_larger_stamp_wins_and_displaces_the_edit
+test: delocal-engine conflict::tests::the_winner_has_the_larger_stamp_or_an_equal_one
 
 diff --git a/crates/engine/src/conflict.rs b/crates/engine/src/conflict.rs
 index 390fa53..7644241 100644

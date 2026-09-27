@@ -5,6 +5,8 @@ recorded, the decision and have_up_to acknowledge sequence numbers this
 machine never saw, and the sender never re-sends a batch lost in flight.
 
 test: delocal-sim regressions::a_batch_lost_in_flight_is_caught_up
+test: delocal-engine folder::tests::a_batch_lost_in_flight_is_caught_up_from_the_watermark
+test: delocal-engine index::tests::the_watermark_waits_for_a_gap_to_fill
 
 diff --git a/crates/engine/src/index.rs b/crates/engine/src/index.rs
 index 4029a94..8922651 100644
