@@ -26,12 +26,16 @@
 //!   `{"offset": n}`, for `read` and `write` only: a call that would cross
 //!   byte `n` of the file moves the bytes before it and returns short, and
 //!   any call at or past `n` fails.
-//! - `fail` is `ENOSPC`, `EIO`, `EACCES`, or `EXDEV`, the failing rename:
-//!   the error only a rename gives, when the filesystem will not move the
-//!   entry (a mount point inside the folder, §8.4). `EXDEV` is accepted on
-//!   `rename` only; the other three fail a rename too. A failed call does
-//!   nothing, except that `ENOSPC` on `available_space` reports 0 bytes
-//!   free instead of failing, which is what a full disk looks like there.
+//! - `fail` is `ENOSPC`, `EIO` or `EACCES` on any operation; `EXDEV`, the
+//!   failing rename, on `rename` and `rename_noreplace` only: the error only
+//!   a rename gives, when the filesystem will not move the entry (a mount
+//!   point inside the folder, §8.4); and on `rename_noreplace` only,
+//!   `EEXIST`, as if something had appeared at the target, or `unsupported`,
+//!   as a filesystem that cannot refuse to replace answers
+//!   ([`NoReplaceUnsupported`](crate::fs::NoReplaceUnsupported)). A failed
+//!   call does nothing, except that `ENOSPC` on `available_space` reports 0
+//!   bytes free instead of failing, which is what a full disk looks like
+//!   there.
 //!
 //! Unknown fields are refused, so a misspelt rule is an error, not a rule
 //! that silently never fires.
@@ -75,6 +79,7 @@ pub enum Op {
     OpenAppend,
     SyncDir,
     Rename,
+    RenameNoreplace,
     RemoveFile,
     RemoveDir,
     CreateDir,
@@ -110,24 +115,36 @@ pub enum Fault {
     Eacces,
     #[serde(rename = "EXDEV")]
     Exdev,
+    #[serde(rename = "EEXIST")]
+    Eexist,
+    /// A filesystem that cannot refuse to replace, as `rename_noreplace`
+    /// reports it.
+    #[serde(rename = "unsupported")]
+    Unsupported,
 }
 
 impl Fault {
-    /// The errno. These four have the same numbers on Linux and macOS,
-    /// which both inherit them from Version 7 Unix, so no `libc` is needed.
-    pub fn errno(self) -> i32 {
+    /// The errno, for the faults that are one. These have the same numbers on
+    /// Linux and macOS, which both inherit them from Version 7 Unix, so no
+    /// `libc` is needed.
+    pub fn errno(self) -> Option<i32> {
         match self {
-            Self::Eio => 5,
-            Self::Eacces => 13,
-            Self::Exdev => 18,
-            Self::Enospc => 28,
+            Self::Eio => Some(5),
+            Self::Eacces => Some(13),
+            Self::Eexist => Some(17),
+            Self::Exdev => Some(18),
+            Self::Enospc => Some(28),
+            Self::Unsupported => None,
         }
     }
 
-    /// The error the operating system itself would return, so a caller
-    /// cannot tell an injected fault from a real one.
+    /// The error the real filesystem itself would return, so a caller cannot
+    /// tell an injected fault from a real one.
     pub fn error(self) -> io::Error {
-        io::Error::from_raw_os_error(self.errno())
+        match self.errno() {
+            Some(errno) => io::Error::from_raw_os_error(errno),
+            None => crate::fs::NoReplaceUnsupported.into(),
+        }
     }
 }
 
@@ -195,8 +212,13 @@ impl Spec {
                 }
                 _ => {}
             }
-            if rule.fail == Fault::Exdev && rule.op != Op::Rename {
-                return invalid("EXDEV applies to rename only");
+            let renames = matches!(rule.op, Op::Rename | Op::RenameNoreplace);
+            match rule.fail {
+                Fault::Exdev if !renames => return invalid("EXDEV applies to renames only"),
+                Fault::Eexist | Fault::Unsupported if rule.op != Op::RenameNoreplace => {
+                    return invalid("EEXIST and unsupported apply to rename_noreplace only");
+                }
+                _ => {}
             }
         }
         Ok(())
@@ -255,6 +277,7 @@ mod tests {
             (Op::OpenAppend, "open_append"),
             (Op::SyncDir, "sync_dir"),
             (Op::Rename, "rename"),
+            (Op::RenameNoreplace, "rename_noreplace"),
             (Op::RemoveFile, "remove_file"),
             (Op::RemoveDir, "remove_dir"),
             (Op::CreateDir, "create_dir"),
@@ -296,8 +319,18 @@ mod tests {
         );
         assert_eq!(
             invalid(rule("write", r#"{"call": 1}"#, "EXDEV")),
-            "EXDEV applies to rename only"
+            "EXDEV applies to renames only"
         );
+        for fail in ["EEXIST", "unsupported"] {
+            for op in ["rename", "create_new", "lstat"] {
+                assert_eq!(
+                    invalid(rule(op, r#"{"call": 1}"#, fail)),
+                    "EEXIST and unsupported apply to rename_noreplace only"
+                );
+            }
+            Spec::parse(&rule("rename_noreplace", r#"{"call": 1}"#, fail)).unwrap();
+        }
+        Spec::parse(&rule("rename_noreplace", r#"{"call": 1}"#, "EXDEV")).unwrap();
         // The empty pattern is the root alone.
         Spec::parse(
             r#"{"rules": [{"op": "open_root", "path": "", "at": {"call": 1}, "fail": "EIO"}]}"#,
@@ -326,6 +359,10 @@ mod tests {
         assert_eq!(Fault::Enospc.error().kind(), ErrorKind::StorageFull);
         assert_eq!(Fault::Eacces.error().kind(), ErrorKind::PermissionDenied);
         assert_eq!(Fault::Exdev.error().kind(), ErrorKind::CrossesDevices);
+        assert_eq!(Fault::Eexist.error().kind(), ErrorKind::AlreadyExists);
+        let unsupported = Fault::Unsupported.error();
+        assert_eq!(unsupported.kind(), ErrorKind::Unsupported);
+        assert!(crate::fs::NoReplaceUnsupported::of(&unsupported));
         // EIO has no stable ErrorKind; its message is the same on both.
         assert!(
             Fault::Eio
@@ -333,9 +370,17 @@ mod tests {
                 .to_string()
                 .starts_with("Input/output error")
         );
-        for fault in [Fault::Enospc, Fault::Eio, Fault::Eacces, Fault::Exdev] {
-            assert_eq!(fault.error().raw_os_error(), Some(fault.errno()));
+        for fault in [
+            Fault::Enospc,
+            Fault::Eio,
+            Fault::Eacces,
+            Fault::Exdev,
+            Fault::Eexist,
+        ] {
+            assert_eq!(fault.error().raw_os_error(), fault.errno());
+            assert!(fault.errno().is_some());
         }
+        assert_eq!(Fault::Unsupported.errno(), None);
     }
 
     #[test]

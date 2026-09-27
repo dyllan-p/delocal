@@ -43,7 +43,8 @@
 //! | [`open_append`](Fs::open_append) | §7.5 steps 2 and 3 resuming a temp file; §13 crash during a transfer |
 //! | [`WriteFile::sync`] | §7.5 the data is durable before the rename (step 8) |
 //! | [`sync_dir`](Fs::sync_dir) | §7.5 step 9 the parent directory is durable before the report, and after the displacement of step 7 |
-//! | [`rename`](Fs::rename) | §7.5 steps 7 and 8, the journal's undo, symlinks via a temp, deletes to the trash; §7.6 displacement to the conflict path; §8.4 |
+//! | [`rename_noreplace`](Fs::rename_noreplace) | §7.5 every commit rename: the displacement of step 7 (to the trash, a trash name's `~N`, or §7.6's conflict path), the rename in of step 8 (a symlink's temp included), deletes to the trash, the journal's undo |
+//! | [`rename`](Fs::rename) | §7.5 the fallback for a filesystem that cannot refuse to replace, after a fresh check |
 //! | [`remove_file`](Fs::remove_file) | §7.5 step 4 discarding a temp file whose hash did not match; §7.5 unclaimed `tmp/` files at start; §8.4 pruning |
 //! | [`remove_dir`](Fs::remove_dir) | §7.5 deletes, a directory only when empty; §8.4 pruning a day's empty directory |
 //! | [`create_dir`](Fs::create_dir) | §7.5 step 8 missing parents and directory entries; §8.4 a day's directory; §11 `.delocal/tmp/` and `.delocal/trash/` |
@@ -142,8 +143,18 @@ pub trait Fs: Send + Sync {
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
 
     /// Rename `from` to `to` atomically, replacing a file at `to`. Both must
-    /// be on one filesystem.
+    /// be on one filesystem. §7.5 uses it only where `rename_noreplace` is
+    /// unsupported.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+    /// Rename `from` to `to` atomically if nothing is at `to`, and refuse
+    /// otherwise (§7.5): `renameat2` with `RENAME_NOREPLACE` on Linux,
+    /// `renameatx_np` with `RENAME_EXCL` on macOS. Something at `to`, even
+    /// created a moment before, is `AlreadyExists` (`EEXIST`) and nothing
+    /// moves. A filesystem that cannot refuse to replace is
+    /// [`NoReplaceUnsupported`], and nothing moves either, so the caller can
+    /// fall back to [`rename`](Fs::rename) after a fresh check.
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()>;
 
     /// Remove the file or symlink at `path` (never a symlink's target).
     fn remove_file(&self, path: &Path) -> io::Result<()>;
@@ -283,5 +294,38 @@ impl std::error::Error for NotAFile {}
 impl From<NotAFile> for io::Error {
     fn from(error: NotAFile) -> Self {
         io::Error::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
+/// The filesystem cannot rename without replacing (§7.5): it refused
+/// `RENAME_NOREPLACE` or `RENAME_EXCL`, and nothing was renamed. The commit
+/// path falls back to a plain rename after a fresh check, and `status` notes
+/// the folder as having the narrower guarantee.
+///
+/// It travels inside an `io::Error` of kind `Unsupported`;
+/// [`NoReplaceUnsupported::of`] finds it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NoReplaceUnsupported;
+
+impl NoReplaceUnsupported {
+    /// Whether `error` is a `NoReplaceUnsupported`.
+    pub fn of(error: &io::Error) -> bool {
+        error
+            .get_ref()
+            .is_some_and(|inner| inner.downcast_ref::<Self>().is_some())
+    }
+}
+
+impl fmt::Display for NoReplaceUnsupported {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("this filesystem cannot rename without replacing")
+    }
+}
+
+impl std::error::Error for NoReplaceUnsupported {}
+
+impl From<NoReplaceUnsupported> for io::Error {
+    fn from(error: NoReplaceUnsupported) -> Self {
+        io::Error::new(io::ErrorKind::Unsupported, error)
     }
 }

@@ -277,6 +277,11 @@ impl Fs for FaultyFs {
         self.inner.rename(from, to)
     }
 
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.check(Op::RenameNoreplace, &[from, to])?;
+        self.inner.rename_noreplace(from, to)
+    }
+
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         self.check(Op::RemoveFile, &[path])?;
         self.inner.remove_file(path)
@@ -391,7 +396,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::fs::RealFolder;
+    use crate::fs::{NoReplaceUnsupported, RealFolder};
 
     crate::fs::conformance::conformance_tests!(|root: &Path| {
         FaultyFolder::new(RealFolder::new(root), Spec::default()).unwrap()
@@ -667,6 +672,36 @@ mod tests {
     }
 
     #[test]
+    fn rename_noreplace_takes_eexist_exdev_and_unsupported() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "a").unwrap();
+        let fs = faulty(
+            dir.path(),
+            vec![
+                rule(Op::RenameNoreplace, "b", Trigger::Call(1), Fault::Eexist),
+                rule(Op::RenameNoreplace, "b", Trigger::Call(2), Fault::Exdev),
+                rule(
+                    Op::RenameNoreplace,
+                    "b",
+                    Trigger::Call(3),
+                    Fault::Unsupported,
+                ),
+            ],
+        );
+        let exists = fs.rename_noreplace(p("a"), p("b")).unwrap_err();
+        assert_eq!(exists.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(errno(fs.rename_noreplace(p("a"), p("b"))), Some(18));
+        let unsupported = fs.rename_noreplace(p("a"), p("b")).unwrap_err();
+        assert!(NoReplaceUnsupported::of(&unsupported));
+        assert_eq!(fs.read_dir(p("")).unwrap(), ["a"], "nothing moved");
+        // A plain rename is another operation, and none of these rules is
+        // about it.
+        fs.rename(p("a"), p("c")).unwrap();
+        fs.rename_noreplace(p("c"), p("b")).unwrap();
+        assert_eq!(fs.read_dir(p("")).unwrap(), ["b"]);
+    }
+
+    #[test]
     fn opening_the_root_is_an_operation_and_counts_carry_across_operations() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), "x").unwrap();
@@ -724,6 +759,7 @@ mod tests {
                 Some(5) => "EIO".into(),
                 Some(13) => "EACCES".into(),
                 Some(18) => "EXDEV".into(),
+                Some(17) => "EEXIST".into(),
                 Some(28) => "ENOSPC".into(),
                 _ => format!("{:?}", e.kind()),
             },
