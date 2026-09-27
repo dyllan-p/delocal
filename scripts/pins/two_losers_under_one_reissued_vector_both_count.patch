@@ -4,6 +4,7 @@ across a revert with other content, only the first then counts, and the
 second's conflict copy matches no losing version (DESIGN.md §14.1 I4).
 
 test: delocal-sim regressions::two_losers_under_one_reissued_vector_both_count
+test: delocal-sim invariants::tests::two_losers_under_one_vector_are_both_losing_versions
 
 diff --git a/crates/sim/src/invariants.rs b/crates/sim/src/invariants.rs
 index 4fab526..21f57cc 100644
