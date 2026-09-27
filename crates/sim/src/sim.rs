@@ -2999,4 +2999,53 @@ mod tests {
         assert!(expected_matches(Some(&link(b"f1")), Some(&expected)));
         assert!(!expected_matches(Some(&link(b"f2")), Some(&expected)));
     }
+
+    /// A world of two nodes, for tests that need a `Node` or the `Sim`'s
+    /// bookkeeping and none of its history.
+    fn world() -> Sim {
+        Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                ..Knobs::default()
+            },
+        )
+    }
+
+    /// When sync moves content a node adopted to a conflict copy, the
+    /// adoption moves with it, dated at the move, so the user's later edit
+    /// or deletion of the copy is the user's own change and not sync's loss
+    /// (I2, 031e7aa). Here a directory is displaced with a file inside,
+    /// which is the rename `follow` is called for, file by file. Only the
+    /// adoption of the moved content at the moved path follows. The pins
+    /// `a_conflict_copy_its_user_rewrote_is_not_lost`,
+    /// `..._removed_with_its_directory_...` and `..._mass_deleted_...`
+    /// guard this only while their seeds reach it.
+    #[test]
+    fn an_adoption_follows_its_content_to_the_conflict_copy() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let moved = file(4, false);
+        let other = file(5, false).hash();
+        let (dir, at, elsewhere) = (rel("d1"), rel("d1/f2"), rel("f3"));
+        let copy = rel("d1.conflict-20231114-221320-n1");
+        let before = Timestamp::from_unix_nanos(1_700_000_000 * NANOS);
+        let now = before.plus_nanos(NANOS);
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.synced = vec![
+            (moved.hash(), at.clone(), before),
+            (other, at.clone(), before),
+            (moved.hash(), elsewhere.clone(), before),
+        ];
+        follow_moved(node, &dir, &copy, &[(at.clone(), moved.clone())], now);
+        let (synced, _) = sim.synced(id);
+        assert_eq!(
+            synced,
+            [
+                (moved.hash(), rel("d1.conflict-20231114-221320-n1/f2"), now),
+                (other, at, before),
+                (moved.hash(), elsewhere, before),
+            ]
+        );
+    }
 }
