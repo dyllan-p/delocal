@@ -9,16 +9,18 @@
 //! vanish after the daemon had already acted on them.
 //!
 //! [`Store::open`] opens the file and brings its schema up to date, and
-//! refuses one written by a newer delocal. [`Store::load`] reads back every
-//! folder's parts for `Engine::restore`; the other readers return the
-//! host's tables. Writes arrive as [`Group`]s, one per event, each holding
-//! the persistence hooks the engine returned for it and the host's writes
-//! that go with them ([`write`] maps each hook to its table), and the
-//! group-commit [`Writer`] commits them, many groups to a transaction
-//! ([`writer`]).
+//! refuses one written by a newer delocal. A commit that finds another
+//! connection holding the write lock waits up to [`BUSY_TIMEOUT`] for it.
+//! [`Store::load`] reads back every folder's parts for `Engine::restore`;
+//! the other readers return the host's tables. Writes arrive as
+//! [`Group`]s, one per event, each holding the persistence hooks the
+//! engine returned for it and the host's writes that go with them
+//! ([`write`] maps each hook to its table), and the group-commit
+//! [`Writer`] commits them, many groups to a transaction ([`writer`]).
 
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -40,6 +42,17 @@ pub use schema::SCHEMA_VERSION;
 pub use write::{Group, HostWrite};
 pub use writer::{Durable, WriteError, Writer};
 
+/// How long the store waits for another connection's write lock before
+/// the statement that needs it fails. Long enough to wait out a lock held
+/// for a moment (a `sqlite3` shell in the middle of a write, a backup);
+/// short enough that the effects waiting on a commit (§11) do not stall
+/// behind a lock that is not coming back. Past it the commit fails, and
+/// the writer takes nothing more, as after any failed commit.
+///
+/// rusqlite already sets 5 s on every connection it opens; the store sets
+/// it itself so that this does not rest on a library's default.
+pub const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The daemon's database. See the module docs.
 pub struct Store {
     conn: Connection,
@@ -52,6 +65,7 @@ impl Store {
     /// before anything is written to it.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let mut conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         schema::check_version(&conn)?;
         let mode: String =
             conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))?;
@@ -183,6 +197,7 @@ mod tests {
         assert_eq!(pragma::<String>(&store.conn, "journal_mode"), "wal");
         // 2 is FULL.
         assert_eq!(pragma::<i64>(&store.conn, "synchronous"), 2);
+        assert_eq!(pragma::<i64>(&store.conn, "busy_timeout"), 5_000);
         assert_eq!(pragma::<i64>(&store.conn, "foreign_keys"), 1);
     }
 
