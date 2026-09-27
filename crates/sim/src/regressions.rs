@@ -4295,6 +4295,8 @@ fn catch_up_never_sends_what_this_machine_has_not_announced() {
 /// e345016a's revert puts back its live d0 {2b88c6bb: 2, e345016a: 3}, which
 /// dominates 2b88c6bb's tombstone {2b88c6bb: 2, e345016a: 2}. With the fix
 /// disabled it fails I3 (no resurrection).
+/// The fix's unit test guards it whether or not a seed reaches it:
+/// `sim::tests::a_revert_sets_aside_only_the_versions_above_the_record_it_restored`.
 #[test]
 fn a_revert_discards_only_the_versions_above_the_restored_record() {
     passes(

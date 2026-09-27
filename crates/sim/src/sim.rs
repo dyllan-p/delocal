@@ -3048,4 +3048,74 @@ mod tests {
             ]
         );
     }
+
+    /// A revert discards only the versions its node wrote above the record
+    /// it puts back, which were pending; the restored record and those below
+    /// it were announced and stand (§8.3, 878e417). This is the shape the
+    /// pin `a_revert_discards_only_the_versions_above_the_restored_record`
+    /// reaches: node e's revert puts back its live `d0` {b: 2, e: 3}, which
+    /// dominates node b's tombstone {b: 2, e: 2}. Taking the restored record
+    /// for a discarded one left the tombstone looking uncontradicted, and I3
+    /// reported `d0` resurrected. Three seeds in 10,000 reached it when it
+    /// was pinned, so the pin will likely go stale again; this test guards
+    /// the checker whether or not a seed reaches it.
+    #[test]
+    fn a_revert_sets_aside_only_the_versions_above_the_record_it_restored() {
+        let mut sim = world();
+        let (b, e) = (sim.order[0], sim.order[1]);
+        let d0 = rel("d0");
+        let v = |at_b: u64, at_e: u64| Version::from_iter([(b, at_b), (e, at_e)]);
+        let dir = |by: NodeId, version: Version, deleted: bool| Entry {
+            path: d0.clone(),
+            kind: Kind::Dir,
+            size: 0,
+            mtime_ns: 0,
+            stamp: 1,
+            exec: false,
+            hash: ContentHash::EMPTY,
+            prev_hash: ContentHash::EMPTY,
+            version,
+            deleted,
+            modified_by: by,
+            author_host: HostName::empty(),
+        };
+        let below = dir(e, v(1, 1), false);
+        let tombstone = dir(b, v(2, 2), true);
+        let restored = dir(e, v(2, 3), false);
+        let pending = dir(e, v(2, 4), false);
+        // Seen at events 1 to 4, in that order; e reverts at event 10.
+        sim.seen_at.insert(
+            d0.clone(),
+            [&below, &tombstone, &restored, &pending]
+                .iter()
+                .zip(1..)
+                .map(|(entry, at)| (entry.version.clone(), at))
+                .collect(),
+        );
+        sim.reverted_at
+            .insert((e, d0.clone()), (10, Some(restored.version.clone())));
+
+        assert!(sim.discarded_by_revert(&pending));
+        assert!(!sim.discarded_by_revert(&restored));
+        assert!(!sim.discarded_by_revert(&below));
+        // Another node's record is not e's revert's to discard.
+        assert!(!sim.discarded_by_revert(&tombstone));
+        // So the tombstone is contradicted by a record that stands, which
+        // is what I3 asks.
+        assert!(restored.version.dominates(&tombstone.version));
+        // A record first seen after the revert is new, whatever it
+        // dominates.
+        let later = dir(e, v(2, 5), false);
+        sim.seen_at
+            .entry(d0.clone())
+            .or_default()
+            .push((later.version.clone(), 11));
+        assert!(!sim.discarded_by_revert(&later));
+        // A revert that removed the record, at a path peers never saw,
+        // restored nothing, and everything e wrote there before it goes.
+        sim.reverted_at.insert((e, d0), (10, None));
+        assert!(sim.discarded_by_revert(&restored));
+        assert!(sim.discarded_by_revert(&below));
+        assert!(!sim.discarded_by_revert(&later));
+    }
 }
