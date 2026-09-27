@@ -923,3 +923,51 @@ fn compare<T: PartialEq + Debug>(
     let stored = stored.unwrap_or_else(|e| panic!("reading {what}: {e}"));
     (stored != mirror).then(|| format!("{what}:\n  stored {stored:?}\n  mirror {mirror:?}"))
 }
+
+/// A stream of groups from a seed, the same in every process: the crash
+/// test's child writes it and the parent rebuilds it. Every group is
+/// bracketed by two marker rows naming its number, one written first and
+/// one last, so a store holding part of a group matches no prefix.
+pub struct Seeded {
+    runner: proptest::test_runner::TestRunner,
+    next: u64,
+}
+
+/// The machines the brackets write; the strategies never make these.
+pub const FIRST: NodeId = NodeId::from_bytes([0xaa; 16]);
+pub const LAST: NodeId = NodeId::from_bytes([0xbb; 16]);
+
+impl Seeded {
+    pub fn new(seed: u64) -> Self {
+        use proptest::test_runner::{Config, RngAlgorithm, TestRng, TestRunner};
+        let mut key = [0u8; 32];
+        key[..8].copy_from_slice(&seed.to_le_bytes());
+        let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &key);
+        Self {
+            runner: TestRunner::new_with_rng(Config::default(), rng),
+            next: 0,
+        }
+    }
+
+    /// Group number `self.next`: the setup group first, then random ones.
+    pub fn group(&mut self) -> Ops {
+        let n = self.next;
+        self.next += 1;
+        let strategy = if n == 0 { setup() } else { ops() };
+        let mut group = strategy.new_tree(&mut self.runner).unwrap().current();
+        let marker = |node| {
+            Op::Host(HostWrite::PutMachine(Machine {
+                node,
+                hostname: format!("group {n}"),
+                ts_stable_id: String::new(),
+                ts_user: String::new(),
+                trusted: false,
+                last_seen: Timestamp::from_unix_nanos(n.cast_signed()),
+                delocal_version: String::new(),
+            }))
+        };
+        group.ops.insert(0, marker(FIRST));
+        group.ops.push(marker(LAST));
+        group
+    }
+}

@@ -532,4 +532,191 @@ mod tests {
             }
         }
     }
+
+    /// The environment variable that makes [`crash_child`] the writer
+    /// process [`kill_9_leaves_a_prefix_of_whole_groups`] kills: the
+    /// database path, the stream's seed, and the WAL autocheckpoint in
+    /// pages (0 for SQLite's default), separated by `|`.
+    const CRASH_CHILD: &str = "DELOCAL_STORE_CRASH_CHILD";
+
+    /// Groups the child makes and then submits at once. Making a group takes
+    /// several times as long as committing one, so a writer fed one group
+    /// at a time would commit each alone; a burst lets transactions hold
+    /// several.
+    const BURST: usize = 8;
+
+    /// Not a test on its own: the body of the process that
+    /// `kill_9_leaves_a_prefix_of_whole_groups` starts and kills. It writes
+    /// its seed's stream through the writer in bursts of [`BURST`], and a
+    /// thread of its own prints `durable <n>` the moment the `n`th group's
+    /// `Durable` resolves, so that a report made too early is one a kill
+    /// can catch.
+    #[test]
+    #[ignore = "run by kill_9_leaves_a_prefix_of_whole_groups as its child"]
+    fn crash_child() {
+        use std::io::Write as _;
+        let Ok(spec) = std::env::var(CRASH_CHILD) else {
+            return;
+        };
+        let mut parts = spec.split('|');
+        let db = parts.next().unwrap().to_owned();
+        let seed: u64 = parts.next().unwrap().parse().unwrap();
+        let checkpoint: u32 = parts.next().unwrap().parse().unwrap();
+
+        let store = Store::open(std::path::Path::new(&db)).unwrap();
+        if checkpoint > 0 {
+            store
+                .conn
+                .pragma_update(None, "wal_autocheckpoint", checkpoint)
+                .unwrap();
+        }
+        let writer = store.writer().unwrap();
+        let mut stream = mirror::Seeded::new(seed);
+        {
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "ready").unwrap();
+            out.flush().unwrap();
+        }
+        let (durables, to_report) = mpsc::channel::<Durable>();
+        let (reported, reports) = mpsc::channel::<u64>();
+        let reporter = thread::spawn(move || {
+            let mut out = std::io::stdout().lock();
+            for (n, durable) in (1u64..).zip(to_report) {
+                durable.wait().unwrap();
+                writeln!(out, "durable {n}").unwrap();
+                out.flush().unwrap();
+                if reported.send(n).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut submitted = 0;
+        // Bounded, in case the parent never kills.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            let burst: Vec<Group> = (0..BURST).map(|_| stream.group().group()).collect();
+            for group in burst {
+                durables.send(writer.submit(group)).unwrap();
+                submitted += 1;
+            }
+            // At most one burst beyond what has been reported.
+            while reports.recv().unwrap() < submitted {}
+        }
+        drop(durables);
+        reporter.join().unwrap();
+    }
+
+    /// §11's crash safety for the writer: a writer process killed with
+    /// SIGKILL at 200 random points always reopens holding the first `k`
+    /// groups of what it submitted, whole, for some `k` at least as large as
+    /// the count it had reported durable, and never part of a group. Half
+    /// the runs checkpoint the WAL every few pages, so kills also land in a
+    /// checkpoint. (A kill leaves the page cache alone, so this checks
+    /// SQLite's atomicity and recovery, not the sync to the device.)
+    #[test]
+    fn kill_9_leaves_a_prefix_of_whole_groups() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+
+        let exe = std::env::current_exe().unwrap();
+        // How many groups each kill left committed, and how many of those
+        // had not been reported durable yet.
+        let mut committed = Vec::new();
+        let mut unreported = 0;
+        for point in 0..200u64 {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("delocal.db");
+            let checkpoint = if point % 2 == 0 { 0 } else { 4 };
+            let mut child = Command::new(&exe)
+                .args([
+                    "--exact",
+                    "store::writer::tests::crash_child",
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads",
+                    "1",
+                ])
+                .env(
+                    CRASH_CHILD,
+                    format!("{}|{point}|{checkpoint}", db.display()),
+                )
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let (lines, from_child) = mpsc::channel();
+            let stdout = child.stdout.take().unwrap();
+            let reader = thread::spawn(move || {
+                for line in std::io::BufReader::new(stdout).lines() {
+                    let Ok(line) = line else { break };
+                    if lines.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+            // libtest's "test ... " comes first, on the same line.
+            loop {
+                let line = from_child
+                    .recv_timeout(Duration::from_secs(60))
+                    .unwrap_or_else(|e| panic!("point {point}: no ready from the child: {e}"));
+                if line.ends_with("ready") {
+                    break;
+                }
+            }
+            // A spread of points from the first commit to many commits in,
+            // the same for every run of the test.
+            let delay = splitmix(point) % 40_000;
+            thread::sleep(Duration::from_micros(delay));
+            child.kill().unwrap();
+            child.wait().unwrap();
+            reader.join().unwrap();
+            let reported: u64 = from_child
+                .try_iter()
+                .filter_map(|line| line.strip_prefix("durable ")?.parse().ok())
+                .max()
+                .unwrap_or(0);
+
+            let store = Store::open(&db).unwrap();
+            let mut stream = mirror::Seeded::new(point);
+            let mut model = Mirror::default();
+            let limit = reported + BURST as u64 + 2;
+            let mut holding = None;
+            for k in 0..=limit {
+                if k > 0 {
+                    model.apply(&stream.group());
+                }
+                if k >= reported && model.difference(&store).is_none() {
+                    holding = Some(k);
+                    break;
+                }
+            }
+            let Some(k) = holding else {
+                panic!(
+                    "point {point}: after a kill with {reported} groups reported durable, the \
+                     store holds no prefix of whole groups from {reported} to {limit}"
+                );
+            };
+            committed.push(k);
+            if k > reported {
+                unreported += 1;
+            }
+        }
+        committed.sort_unstable();
+        eprintln!(
+            "kill -9 at 200 points: {} to {} groups committed (median {}), {} with nothing \
+             committed, {unreported} holding groups not yet reported durable",
+            committed[0],
+            committed[committed.len() - 1],
+            committed[committed.len() / 2],
+            committed.iter().filter(|&&k| k == 0).count(),
+        );
+    }
+
+    /// A fixed, well-spread function of `n` (SplitMix64's finaliser).
+    fn splitmix(n: u64) -> u64 {
+        let mut z = n.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
 }
