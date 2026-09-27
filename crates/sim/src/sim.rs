@@ -2950,3 +2950,35 @@ fn move_to_trash(node: &mut Node, path: &RelPath) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file the engine expects at a commit, as the scan last saw it.
+    fn file(content: u8, exec: bool) -> File {
+        File {
+            kind: Kind::File,
+            content: content_bytes(content),
+            mtime_ns: 1_700_000_000 * NANOS,
+            exec,
+        }
+    }
+
+    /// A chmod changes neither size nor mtime, so a guard on those alone
+    /// let a commit displace a file its user had just chmodded, and the
+    /// conflict copy carried the user's exec bit under the loser's name
+    /// (d12fec3). The guard is the scan fast path's predicate, which
+    /// compares the exec bit (§7.5 step 6). The pins
+    /// `a_chmod_under_a_pending_commit_is_changed_underneath` and
+    /// `..._in_a_shorter_run` guard this only while their seeds reach it.
+    #[test]
+    fn the_commit_guard_refuses_a_file_whose_exec_bit_changed() {
+        let expected = file(3, false).observed();
+        assert!(expected_matches(Some(&file(3, false)), Some(&expected)));
+        assert!(!expected_matches(Some(&file(3, true)), Some(&expected)));
+        // The other way round too: expected executable, found not.
+        let expected = file(3, true).observed();
+        assert!(!expected_matches(Some(&file(3, false)), Some(&expected)));
+    }
+}
