@@ -28,7 +28,7 @@ index e843412..79d076c 100644
 -            let occupant = match &state {
 -                ScanState::Observed(observed) => Some(observed.clone().normalised()),
 -                ScanState::Unchanged => self.index.live(&path).map(|r| r.entry.observed()),
--                ScanState::Absent => None,
+-                ScanState::Absent | ScanState::Skipped { .. } => None,
 -            };
 -            if let Some(occupant) = occupant
 -                && let Some(landed) = self.land(now, &path, &occupant)

@@ -41,8 +41,10 @@
 //!
 //! **Scan bracket.** Between `ScanStarted` and `ScanFinished` every path the
 //! host reports is marked seen; at `ScanFinished` every live record not seen
-//! becomes a tombstone dated then (§7.3). `ScanAborted` drops the bracket
-//! and announces nothing.
+//! becomes a tombstone dated then (§7.3). A path reported `Skipped` is seen
+//! and nothing more: the host could not inspect it, so its record stands
+//! and nothing is announced for it. `ScanAborted` drops the bracket and
+//! announces nothing.
 //!
 //! **Revert** (§8.3). Every pending path gets back the record peers last
 //! saw. The current file goes to trash and the restored live entry is
@@ -89,6 +91,35 @@ pub enum ScanState {
     Absent,
     Unchanged,
     Observed(Observed),
+    /// The host could not inspect the path. Inside a scan bracket the path
+    /// counts as seen and nothing else happens: its record is kept,
+    /// nothing is announced for it, and the bracket's deletion pass leaves
+    /// it alone. Outside a bracket it changes nothing (§7.3).
+    Skipped {
+        reason: SkipReason,
+    },
+}
+
+/// Why the host could not inspect a path (§7.3). The reason is for the
+/// host's own counts in `status`; the engine treats every reason alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum SkipReason {
+    /// A file that cannot be read, or a directory that can be entered but
+    /// not listed.
+    PermissionDenied,
+    /// An I/O error while reading, hashing or listing.
+    Io,
+    /// A file whose mtime has not been stable for 2 s.
+    Unstable,
+    /// A name that is not valid UTF-8, or one of two names whose index
+    /// paths coincide (§7.3, names on disk).
+    UnobservableName,
+    /// A path over 4,096 bytes.
+    PathTooLong,
+    /// A name whose NFC form is over 255 bytes.
+    NameTooLong,
+    /// A tracked path that a rule in `.delocalignore` now ignores.
+    Ignored,
 }
 
 /// The result of a host's commit attempt (§7.5 step 6).
@@ -879,17 +910,23 @@ impl FolderState {
     }
 
     /// The host reported `state` at `path` (§7.3), inside or outside a
-    /// bracket. `Absent` at a path carrying the restoring mark (§8.3) is
-    /// ignored, since absence is the trash move there; other reports for a
-    /// path in flight are ignored unless the path is marked. A change at an
-    /// observable wanted path re-classifies the want. At a marked path, an
-    /// occupant clears the mark whatever state the want is in: one that
-    /// matches the restored record leaves the index as it is and is the
-    /// landing of a refetch whose report was lost (§13); anything else is
-    /// a local change like any other.
+    /// bracket. `Skipped` only marks the path seen, and outside a bracket
+    /// does nothing at all. `Absent` at a path carrying the restoring mark
+    /// (§8.3) is ignored, since absence is the trash move there; other
+    /// reports for a path in flight are ignored unless the path is marked.
+    /// A change at an observable wanted path re-classifies the want. At a
+    /// marked path, an occupant clears the mark whatever state the want is
+    /// in: one that matches the restored record leaves the index as it is
+    /// and is the landing of a refetch whose report was lost (§13);
+    /// anything else is a local change like any other.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
         if let Some(seen) = &mut self.scan {
             seen.insert(path.clone());
+        }
+        // Not an observation: the host does not know what is at the path,
+        // so it is neither present nor absent, and no rule below applies.
+        if let ScanState::Skipped { .. } = state {
+            return Scanned::default();
         }
         let marked = self.marked(&path);
         if state == ScanState::Absent && marked {
@@ -918,7 +955,7 @@ impl FolderState {
             let occupant = match &state {
                 ScanState::Observed(observed) => Some(observed.clone().normalised()),
                 ScanState::Unchanged => self.index.live(&path).map(|r| r.entry.observed()),
-                ScanState::Absent => None,
+                ScanState::Absent | ScanState::Skipped { .. } => None,
             };
             if let Some(occupant) = occupant
                 && let Some(landed) = self.land(now, &path, &occupant)
@@ -935,7 +972,7 @@ impl FolderState {
         let change = match state {
             ScanState::Observed(observed) => self.index.observe(path.clone(), observed),
             ScanState::Absent => self.index.observe_absent(&path, now.as_unix_nanos()),
-            ScanState::Unchanged => None,
+            ScanState::Unchanged | ScanState::Skipped { .. } => None,
         };
         if change.is_some() {
             self.touched(now);
@@ -2436,6 +2473,124 @@ mod tests {
         assert_eq!(f.due(), None);
         assert_eq!(f.scan_aborted(), Err(FolderStatus::ScanNotOpen));
         assert_eq!(f.scan_finished(t(6.0)), Err(FolderStatus::ScanNotOpen));
+    }
+
+    fn skipped(reason: SkipReason) -> ScanState {
+        ScanState::Skipped { reason }
+    }
+
+    /// §7.3: a path the host could not inspect is reported `Skipped`, not
+    /// left out. Inside a bracket its record stays as it was, nothing is
+    /// announced for it, and the deletion pass does not take it for gone,
+    /// while a path the bracket did not see at all still is.
+    #[test]
+    fn a_skipped_path_keeps_its_record_and_the_deletion_pass_leaves_it_alone() {
+        let mut f = folder();
+        f.scanned(t(1.0), p("a"), file(1, 1));
+        f.scanned(t(1.0), p("b"), file(2, 1));
+        f.scanned(t(1.0), p("gone"), file(3, 1));
+        f.form_batches(t(3.0), batch_id());
+        let a = f.index().get(&p("a")).unwrap().clone();
+        f.scan_started();
+        let out = f.scanned(t(5.0), p("a"), skipped(SkipReason::PermissionDenied));
+        assert_eq!(out, Scanned::default(), "nothing to announce");
+        assert_eq!(f.index().get(&p("a")), Some(&a));
+        assert_eq!(f.window(), None, "and no window opened for it");
+        f.scanned(t(5.0), p("b"), ScanState::Unchanged);
+        let changes = f.scan_finished(t(6.0)).unwrap();
+        let gone: Vec<&RelPath> = changes.iter().map(|c| &c.record.entry.path).collect();
+        assert_eq!(gone, [&p("gone")], "only the path the bracket did not see");
+        assert_eq!(f.index().get(&p("a")), Some(&a), "the record stands");
+        let sent = f.form_batches(t(8.0), batch_id()).remove(0);
+        assert!(
+            sent.entries.iter().all(|e| e.path != p("a")),
+            "nothing announced for the skipped path"
+        );
+    }
+
+    /// §7.3: outside a bracket the host simply observes the path again once
+    /// it can, so a skip changes nothing at all: not at a tracked path, and
+    /// not at one the engine has never heard of, which `Unchanged` would
+    /// call a host bug.
+    #[test]
+    fn a_skip_outside_a_bracket_changes_nothing() {
+        let mut f = folder();
+        f.scanned(t(1.0), p("a"), file(1, 1));
+        f.form_batches(t(3.0), batch_id());
+        let before = f.clone();
+        assert_eq!(
+            f.scanned(t(5.0), p("a"), skipped(SkipReason::Io)),
+            Scanned::default()
+        );
+        assert_eq!(
+            f.scanned(t(5.0), p("new"), skipped(SkipReason::Unstable)),
+            Scanned::default()
+        );
+        assert_eq!(f, before);
+    }
+
+    /// §7.3, §8.3: a skip is not an observation of what is at the path, so
+    /// none of the rules that follow one apply. At a path carrying the
+    /// restoring mark it is neither the trash move's absence nor an
+    /// occupant: the deferred carrier keeps its mark and keeps waiting,
+    /// and a bracket that skipped the path saw it, so its end does not
+    /// want the carrier again either.
+    #[test]
+    fn a_skip_is_not_an_observation_of_the_path() {
+        let (mut b, restored) = deferred_restoring_entry();
+        let before = b.clone();
+        assert_eq!(
+            b.scanned(t(19.0), p("f00"), skipped(SkipReason::PermissionDenied)),
+            Scanned::default()
+        );
+        assert_eq!(b, before, "outside a bracket");
+        b.scan_started();
+        assert_eq!(
+            b.scanned(t(20.0), p("f00"), skipped(SkipReason::PermissionDenied)),
+            Scanned::default()
+        );
+        assert!(b.scan_finished(t(21.0)).unwrap().is_empty());
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(b.wants().is_empty(), "the carrier is not wanted again");
+        let carriers: Vec<&Deferred> = b.deferred().collect();
+        assert_eq!(carriers.len(), 1);
+        assert_eq!(carriers[0].restoring.as_ref(), Some(&restored.entry));
+    }
+
+    /// §7.3: the reason travels with the observation for the host's own
+    /// counts, and the engine treats every reason alike: a bracket that
+    /// skips a path for any of them leaves the folder in the same state.
+    #[test]
+    fn every_skip_reason_is_treated_alike() {
+        let after = |reason: SkipReason| {
+            let mut f = folder();
+            f.scanned(t(1.0), p("a"), file(1, 1));
+            f.scanned(t(1.0), p("b"), file(2, 1));
+            f.form_batches(t(3.0), batch_id());
+            f.scanned(t(4.0), p("b"), skipped(reason));
+            f.scan_started();
+            f.scanned(t(5.0), p("a"), skipped(reason));
+            f.scanned(t(5.0), p("untracked"), skipped(reason));
+            let changes = f.scan_finished(t(6.0)).unwrap();
+            (f, changes)
+        };
+        let (first, changes) = after(SkipReason::PermissionDenied);
+        let gone: Vec<&RelPath> = changes.iter().map(|c| &c.record.entry.path).collect();
+        assert_eq!(gone, [&p("b")]);
+        for reason in [
+            SkipReason::Io,
+            SkipReason::Unstable,
+            SkipReason::UnobservableName,
+            SkipReason::PathTooLong,
+            SkipReason::NameTooLong,
+            SkipReason::Ignored,
+        ] {
+            assert_eq!(
+                after(reason),
+                (first.clone(), changes.clone()),
+                "{reason:?}"
+            );
+        }
     }
 
     #[test]

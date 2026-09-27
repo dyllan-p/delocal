@@ -77,7 +77,8 @@ pub enum Event {
     },
 
     /// The scanner or watcher reports one path (§7.3). Inside a bracket it
-    /// also marks the path seen.
+    /// also marks the path seen. A path the host could not inspect is
+    /// reported `Skipped`: seen, and nothing more.
     Scanned {
         folder: FolderId,
         path: RelPath,
