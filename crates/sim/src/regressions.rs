@@ -13933,12 +13933,13 @@ fn an_exclusion_expires_for_a_file_in_a_directory() {
 /// The only source of a want served one corrupted transfer, then stayed
 /// connected and never announced the path again, and nothing changed at the
 /// path, so none of draft 31's events released it. Only the expiry does
-/// (§7.5, draft 32). Found for a symlink's conflict copy; pinned now at
-/// seed 8259 with fetch corruption on, shrunk to 299 steps, where the want
-/// is for a file's conflict copy (f0.conflict-20231114-232526-n0); with the
+/// (§7.5, draft 32). Found for a symlink's conflict copy, and pinned as
+/// `an_exclusion_expires_for_a_symlink_conflict_copy`; pinned now at seed
+/// 8259 with fetch corruption on, shrunk to 299 steps, where the want is
+/// for a file's conflict copy (f0.conflict-20231114-232526-n0); with the
 /// expiry disabled it fails I1 there.
 #[test]
-fn an_exclusion_expires_for_a_symlink_conflict_copy() {
+fn an_exclusion_expires_for_a_conflict_copy() {
     passes_with(
         8259,
         &corrupting(),
