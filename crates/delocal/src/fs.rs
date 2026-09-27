@@ -4,11 +4,37 @@
 //! wrapper is what makes disk-full, I/O-error and failing-rename tests
 //! deterministic and unprivileged.
 //!
+//! **One operation at a time** (§7.3). The daemon holds a [`Folder`] per
+//! synced folder, which is only its configured path. Each operation (a scan,
+//! a commit, a serve) calls [`Folder::open`], which opens the folder root
+//! afresh, does its work through the [`Fs`] that returns, and drops it when
+//! it ends, which closes the root:
+//!
+//! ```no_run
+//! # use delocal::fs::{Folder, RealFolder};
+//! # use std::path::Path;
+//! # fn main() -> std::io::Result<()> {
+//! let folder = RealFolder::new("/home/me/Sync");
+//! let fs = folder.open()?; // one operation
+//! let marker = fs.lstat(Path::new(".delocal/folder.json"))?;
+//! drop(fs); // the root is closed again
+//! # let _ = marker;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Nothing holds the root between operations. A root held open would stop
+//! a removable disk from unmounting, and would keep writing into a folder
+//! the user had renamed away, past a root guard that checks the marker
+//! through the old descriptor. Opened afresh, the guard checks what is at
+//! the configured path now.
+//!
 //! The operations are the ones §7.3, §7.5, §8.4 and §13 need, and nothing
 //! else:
 //!
 //! | Operation | Serves |
 //! |---|---|
+//! | [`Folder::open`] | §7.3 the folder root, opened afresh at the start of each operation |
 //! | [`read_dir`](Fs::read_dir) | §7.3 the scan walk and names on disk; §7.5 step 6 the guard's exact-name check through the parent; §7.5 removing unclaimed `tmp/` files at start; §8.4 listing and pruning the trash |
 //! | [`lstat`](Fs::lstat) | §7.3 the fast path, the stability re-stat after hashing, the root guard's marker, the shim's read-back; §7.5 step 2 a source's size and mtime check and the resume offset; §7.5 step 6 the guard; §8.4 the trash's size |
 //! | [`read_link`](Fs::read_link) | §7.3 a symlink's fast path and hash; §7.5 step 6 the guard for a symlink; §7.5 step 2 serving a symlink |
@@ -26,8 +52,8 @@
 //! | [`set_mode`](Fs::set_mode) | §7.5 step 5 the temp file's exec bit; §7.5 exec-only applies; §8.3 revert's `SetMeta` |
 //! | [`available_space`](Fs::available_space) | §7.5 local failures: `SpaceRecovered` after `DiskFull`; §13 disk full |
 //!
-//! **Paths** are relative to the folder root the `Fs` was opened on
-//! ([`RealFs::open`]): the names on disk, joined with `/`. The empty path is
+//! **Paths** are relative to the folder root the `Fs` was opened on: the
+//! names on disk, joined with `/`. The empty path is
 //! the root itself. An absolute path or a `..` would leave the folder, so it
 //! is refused with `InvalidInput`. Nothing here maps paths to index paths
 //! ([`crate::names`] does that from the names `read_dir` returns, §7.3).
@@ -63,14 +89,24 @@ pub mod faulty;
 pub mod real;
 
 #[cfg(feature = "faults")]
-pub use faulty::FaultyFs;
-pub use real::RealFs;
+pub use faulty::{FaultyFolder, FaultyFs};
+pub use real::{RealFolder, RealFs};
 
-/// Every filesystem operation on one folder, with paths relative to its root.
-/// See the module docs for which section each serves.
+/// A folder on disk, by its configured path: it holds nothing open. Each
+/// operation calls [`open`](Folder::open) and drops what it returns when it
+/// ends (see the module docs).
 ///
-/// Object-safe and `Send + Sync`, so the daemon can hold an `Arc<dyn Fs>`
-/// per folder and choose the implementation at spawn.
+/// Object-safe and `Send + Sync`, so the daemon can hold an
+/// `Arc<dyn Folder>` per folder and choose the implementation at spawn.
+pub trait Folder: Send + Sync {
+    /// Open the folder root, as it is at the configured path now, for one
+    /// operation. The root stays open until the returned `Fs` is dropped.
+    fn open(&self) -> io::Result<Box<dyn Fs>>;
+}
+
+/// Every filesystem operation on one folder during one operation, with paths
+/// relative to its root. See the module docs for which section each serves.
+/// [`Folder::open`] makes one; dropping it closes the root.
 pub trait Fs: Send + Sync {
     /// The names in `dir`, as raw bytes, without `.` and `..`, sorted by
     /// bytes. Sorting makes a scan's order the same on every run, whatever

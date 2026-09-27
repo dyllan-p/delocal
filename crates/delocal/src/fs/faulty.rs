@@ -1,17 +1,21 @@
-//! [`FaultyFs`]: the fault-injecting wrapper of the filesystem layer
-//! (DESIGN.md §14.2), built only with the `faults` feature.
+//! [`FaultyFolder`] and [`FaultyFs`]: the fault-injecting wrapper of the
+//! filesystem layer (DESIGN.md §14.2), built only with the `faults` feature.
 //!
-//! It wraps another [`Fs`] and follows a [`Spec`]: scripted rules, each an
-//! operation, a path pattern, a trigger and a fault (the [`spec`] module
-//! says exactly what each means). A call no rule fires on goes to the
-//! wrapped filesystem unchanged, so with no rules `FaultyFs` passes the same
-//! conformance checks as what it wraps.
+//! A `FaultyFolder` wraps another [`Folder`] and follows a [`Spec`]: scripted
+//! rules, each an operation, a path pattern, a trigger and a fault (the
+//! [`spec`] module says exactly what each means). Each operation's
+//! [`open`](Folder::open) gives a `FaultyFs` over what the wrapped folder
+//! opened, and every `FaultyFs` shares the folder's rules and counters, so a
+//! rule's nth call counts across operations, as a spec read once at spawn
+//! means it to. A call no rule fires on goes to the wrapped filesystem
+//! unchanged, so with no rules a `FaultyFs` passes the same conformance
+//! checks as what it wraps.
 //!
 //! **Deterministic.** Rules hold no randomness and no clock. Each call rule
 //! counts the calls that match its operation and pattern, whether or not it
 //! fires, and an offset rule looks only at the file's position. So the same
 //! spec and the same sequence of calls give the same faults on every run,
-//! and [`FaultyFs::injected`] lists them in the order they happened.
+//! and [`FaultyFolder::injected`] lists them in the order they happened.
 //!
 //! When several rules fire on one call, of either kind, the first in the
 //! spec decides the fault. A call no rule fires on but that would cross an
@@ -23,7 +27,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::{Fs, ReadFile, Stat, WriteFile};
+use super::{Folder, Fs, ReadFile, Stat, WriteFile};
 
 pub mod pattern;
 pub mod spec;
@@ -31,26 +35,35 @@ pub mod spec;
 use pattern::Pattern;
 pub use spec::{Fault, Op, Rule, Spec, SpecError, Trigger};
 
-/// One fault a [`FaultyFs`] injected.
+/// One fault a [`FaultyFolder`] injected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Injected {
     /// The rule that fired: its index in the spec, counting from 0.
     pub rule: usize,
     pub op: Op,
     /// The call's path, relative to the folder root: a rename's source, a
-    /// symlink's link, the path an open file was opened with.
+    /// symlink's link, the path an open file was opened with, the empty path
+    /// for opening the root.
     pub path: PathBuf,
     pub fault: Fault,
 }
 
-/// A filesystem that injects faults into another. See the module docs.
-pub struct FaultyFs<F> {
+/// A folder that injects faults into another's operations. See the module
+/// docs.
+pub struct FaultyFolder<F> {
     inner: F,
     rules: Arc<Rules>,
 }
 
-/// The rules and their counters, shared with every open file so that reads,
-/// writes and syncs are counted with everything else.
+/// One operation on a [`FaultyFolder`]: what the wrapped folder opened, with
+/// the folder's rules.
+pub struct FaultyFs {
+    inner: Box<dyn Fs>,
+    rules: Arc<Rules>,
+}
+
+/// The rules and their counters, shared with every operation and every open
+/// file, so that everything is counted together.
 struct Rules {
     compiled: Vec<(Rule, Pattern)>,
     state: Mutex<State>,
@@ -71,7 +84,7 @@ enum Verdict {
     AtMost(u64),
 }
 
-impl<F: Fs> FaultyFs<F> {
+impl<F: Folder> FaultyFolder<F> {
     /// Wrap `inner` with the rules of `spec`, which is validated again here
     /// in case it was built in code rather than parsed.
     pub fn new(inner: F, spec: Spec) -> Result<Self, SpecError> {
@@ -97,21 +110,48 @@ impl<F: Fs> FaultyFs<F> {
         })
     }
 
-    /// Every fault injected so far, in order.
+    /// Every fault injected so far, by every operation, in order.
+    pub fn injected(&self) -> Vec<Injected> {
+        self.rules.state().injected.clone()
+    }
+
+    /// [`Folder::open`], unboxed.
+    fn open_faulty(&self) -> io::Result<FaultyFs> {
+        self.rules.fail(Op::OpenRoot, &[Path::new("")])?;
+        Ok(FaultyFs {
+            inner: self.inner.open()?,
+            rules: Arc::clone(&self.rules),
+        })
+    }
+}
+
+impl<F: Folder> Folder for FaultyFolder<F> {
+    fn open(&self) -> io::Result<Box<dyn Fs>> {
+        Ok(Box::new(self.open_faulty()?))
+    }
+}
+
+impl FaultyFs {
+    /// Every fault injected so far, by every operation on this folder.
     pub fn injected(&self) -> Vec<Injected> {
         self.rules.state().injected.clone()
     }
 
     /// Count a call without a position, and fail it if a rule fires.
     fn check(&self, op: Op, paths: &[&Path]) -> io::Result<()> {
-        match self.rules.check(op, paths, None) {
-            Verdict::Fail(fault) => Err(fault.error()),
-            Verdict::Proceed | Verdict::AtMost(_) => Ok(()),
-        }
+        self.rules.fail(op, paths)
     }
 }
 
 impl Rules {
+    /// Count a call without a position, and fail it if a rule fires.
+    fn fail(&self, op: Op, paths: &[&Path]) -> io::Result<()> {
+        match self.check(op, paths, None) {
+            Verdict::Fail(fault) => Err(fault.error()),
+            Verdict::Proceed | Verdict::AtMost(_) => Ok(()),
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         // A panic while the lock was held (a failing test) leaves the counters
         // as they were; they are still the truth, so carry on with them.
@@ -176,7 +216,7 @@ fn at_most(len: usize, limit: u64) -> usize {
     usize::try_from(limit).map_or(len, |limit| len.min(limit))
 }
 
-impl<F: Fs> Fs for FaultyFs<F> {
+impl Fs for FaultyFs {
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<OsString>> {
         self.check(Op::ReadDir, &[dir])?;
         self.inner.read_dir(dir)
@@ -351,10 +391,10 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::fs::RealFs;
+    use crate::fs::RealFolder;
 
     crate::fs::conformance::conformance_tests!(|root: &Path| {
-        FaultyFs::new(RealFs::open(root).unwrap(), Spec::default()).unwrap()
+        FaultyFolder::new(RealFolder::new(root), Spec::default()).unwrap()
     });
 
     fn rule(op: Op, path: &str, at: Trigger, fail: Fault) -> Rule {
@@ -366,9 +406,15 @@ mod tests {
         }
     }
 
-    /// A `FaultyFs` with `rules` over the folder at `root`.
-    fn faulty(root: &Path, rules: Vec<Rule>) -> FaultyFs<RealFs> {
-        FaultyFs::new(RealFs::open(root).unwrap(), Spec { rules }).unwrap()
+    /// One operation on a `FaultyFolder` with `rules` over the folder at
+    /// `root`. The `FaultyFs` shares the folder's rules, so `injected` on it
+    /// sees every operation's faults.
+    fn faulty(root: &Path, rules: Vec<Rule>) -> FaultyFs {
+        faulty_folder(root, rules).open_faulty().unwrap()
+    }
+
+    fn faulty_folder(root: &Path, rules: Vec<Rule>) -> FaultyFolder<RealFolder> {
+        FaultyFolder::new(RealFolder::new(root), Spec { rules }).unwrap()
     }
 
     fn p(path: &str) -> &Path {
@@ -620,6 +666,36 @@ mod tests {
         file.sync().unwrap();
     }
 
+    #[test]
+    fn opening_the_root_is_an_operation_and_counts_carry_across_operations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        let folder = faulty_folder(
+            dir.path(),
+            vec![
+                rule(Op::OpenRoot, "", Trigger::Call(2), Fault::Eacces),
+                rule(Op::Lstat, "a", Trigger::Call(3), Fault::Eio),
+            ],
+        );
+        // Operation one: two lstats.
+        let fs = folder.open().unwrap();
+        fs.lstat(p("a")).unwrap();
+        fs.lstat(p("a")).unwrap();
+        drop(fs);
+        // The second open of the root fails, and opens nothing.
+        assert_eq!(errno(folder.open()), Some(13));
+        // Operation three: its first lstat is the rule's third call.
+        let fs = folder.open().unwrap();
+        assert_eq!(errno(fs.lstat(p("a"))), Some(5));
+        assert_eq!(
+            folder.injected(),
+            [
+                injected(0, Op::OpenRoot, "", Fault::Eacces),
+                injected(1, Op::Lstat, "a", Fault::Eio),
+            ]
+        );
+    }
+
     /// One step of a scripted run over a fresh directory, for the
     /// determinism tests.
     #[derive(Clone, Debug)]
@@ -640,7 +716,8 @@ mod tests {
     fn trace(spec: &Spec, steps: &[Step]) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let fs = FaultyFs::new(RealFs::open(root).unwrap(), spec.clone()).unwrap();
+        let folder = FaultyFolder::new(RealFolder::new(root), spec.clone()).unwrap();
+        let fs = folder.open().unwrap();
         let outcome = |result: io::Result<String>| match result {
             Ok(ok) => ok,
             Err(e) => match e.raw_os_error() {
@@ -700,7 +777,7 @@ mod tests {
             };
             lines.push(format!("{what}: {}", outcome(result)));
         }
-        for i in fs.injected() {
+        for i in folder.injected() {
             lines.push(format!(
                 "injected by rule {}: {:?} {} {:?}",
                 i.rule,
