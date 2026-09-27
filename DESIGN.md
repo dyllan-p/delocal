@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 39 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 38: a pin's patch names the tests written for its fix, not every test it happens to break; every fix has at least one unit test; a pin proved invalid is reported invalid even if another of its tests was not checked (§14.4).
+> Draft 40 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 39: a name whose NFC form exceeds 255 bytes is unobservable (§7.1, §7.3); `rustix` for free space (Appendix A).
+>
+> Changes from draft 38: a pin's patch names the tests written for its fix, not every test it happens to break; every fix has at least one unit test; a pin proved invalid is reported invalid even if another of its tests was not checked (§14.4).
 >
 > Changes from draft 37: a user's edit of a moved copy counts at any path along its chain (§14.1); a pin's patch names every test that guards its fix, and a check that did not finish is never reported as invalid pins (§14.4).
 >
@@ -256,7 +258,7 @@ Per folder, one record per entry the machine knows about, including deleted ones
 
 | Field | Notes |
 |---|---|
-| `path` | Relative, forward slashes, no leading `./`, at most 4,096 bytes. NFC-normalised **by the host** before it reaches the engine (§7.3 says how names on disk map to it); the engine treats paths as opaque UTF-8 |
+| `path` | Relative, forward slashes, no leading `./`, at most 4,096 bytes, each component at most 255 bytes. NFC-normalised **by the host** before it reaches the engine (§7.3 says how names on disk map to it); the engine treats paths as opaque UTF-8 |
 | `kind` | `file` / `dir` / `symlink` |
 | `size` | bytes (0 for dir; target length for symlink) |
 | `mtime_ns` | Files only, as observed or received. **0 for directories and symlinks**: a directory's mtime changes whenever a child is created or removed, so syncing it would make every file change ripple into a directory "touch" on every machine, forever; symlink timestamps are not worth the platform differences. For a tombstone, the time the deletion was observed on the machine that made it |
@@ -302,7 +304,7 @@ Wall-clock time never participates in ordering. See §7.8.
 - Always ignored: `.delocal/` at the folder root. User rules: `.delocalignore` at the folder root, gitignore syntax via the `ignore` crate. Default rules shipped for every folder: `.DS_Store`, `._*`, `*.swp`, `*~`, `.#*`, `.Trash*`.
 - Directories are tracked so that empty directories sync. Symlinks are synced as symlinks and never followed. Files that cannot be read (permissions) are skipped and counted in `status`.
 - **Names on disk.** The scan walks the tree and works from the names `readdir` returns; it never asks the filesystem for an index path by name, because a case-insensitive or normalisation-insensitive filesystem answers for a different file. A name becomes an index path by NFC normalisation, and where the two differ the host keeps the pair (`disk_names`, §11) so that commits and the guard address the file the user has. A name that is not valid UTF-8, or two names whose index paths coincide (two normalisation forms on Linux; two casings on a case-sensitive disk for a folder that also lives on macOS), are unobservable: nothing is synced for them, `status` names them, and the user renames one. Received paths are written as they are, which on Linux creates NFC names.
-- **Unobservable paths.** A path a scan bracket cannot inspect is reported as `Skipped`, with the reason, rather than left out: permission denied, an I/O error while reading or hashing, a file whose mtime has not been stable for 2 s, a name from the previous bullet, or a path over 4,096 bytes. The engine keeps whatever record it has, announces nothing for the path, and the bracket's deletion pass leaves it alone; leaving the path out instead would let that pass tombstone a live file, and every peer would then move its copy to the trash. `status` counts skipped paths by reason. Outside a bracket the host simply observes the path again once it can.
+- **Unobservable paths.** A path a scan bracket cannot inspect is reported as `Skipped`, with the reason, rather than left out: permission denied, an I/O error while reading or hashing, a file whose mtime has not been stable for 2 s, a name from the previous bullet, a path over 4,096 bytes, or a name whose NFC form is over 255 bytes. NFC can lengthen a name (a decomposed character can compose into a longer sequence, as U+0344 does), so a name that fits here can be one that no peer could create; it is unobservable rather than truncated or renamed. The engine keeps whatever record it has, announces nothing for the path, and the bracket's deletion pass leaves it alone; leaving the path out instead would let that pass tombstone a live file, and every peer would then move its copy to the trash. `status` counts skipped paths by reason. Outside a bracket the host simply observes the path again once it can.
 - **Tracked paths that become ignored** (a new rule in `.delocalignore`) are reported `Skipped` from then on: the record stays, no tombstone is announced, and the path is frozen until the rule goes, when the next bracket observes it normally. A rule that hides a file must never read as a deletion. Incoming versions at a path this machine ignores are applied as usual in v1: `.delocalignore` is synced, so the window in which one member ignores what another announces is the propagation lag of the rule itself; refusing them is a v1.1 item.
 - **Folder root guard:** each folder has a marker `.delocal/folder.json`. If the marker is missing on a scan (the drive was unmounted, the directory was deleted wholesale), the scan aborts, the folder is paused with a clear status message, and **no deletes are announced**. This is the cheapest protection against "unmounted disk → mass delete everywhere" and it is non-negotiable. The guard also covers the watcher: before the host forwards an `Absent` observation from it, the host checks that the marker is present, and if it is not the observation is dropped and the folder is treated as after an aborted scan; a removal event for the root itself is the same case. `rm -rf` of the root must not reach the engine as deletions because the watcher was faster than the hourly scan.
 
@@ -881,6 +883,7 @@ For the record, so they are not reopened by accident:
 | paths | `directories` |
 | errors & logging | `anyhow`, `thiserror`, `tracing`, `tracing-subscriber`, `tracing-appender` |
 | file metadata | `filetime`, `tempfile` |
+| free space | `rustix` (safe `statvfs`, for §7.5's recovery from `DiskFull`; already in the tree through `tempfile`) |
 | NFC normalisation of paths (binary crate only) | `unicode-normalization` |
 | ids & randomness | `rand` |
 | testing | `proptest`, `insta`, `cargo-fuzz` |
