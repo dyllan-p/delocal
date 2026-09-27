@@ -2,7 +2,7 @@
 #
 # Four checks:
 #   lint      fmt, clippy with warnings denied, and the engine boundary check
-#   test      cargo test on Linux and macOS
+#   test      cargo test on Linux and macOS, with every feature
 #   build     release binaries for the four targets; Linux ones must be static
 #   simulate  the §14.1 simulator: the pinned regression seeds and a random
 #             sweep over 1,000 seeds split across four runners, all required
@@ -51,8 +51,13 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+      # Twice: with the default features, as the binary is built, and with
+      # all of them, so the code behind `faults` (FaultyFs, DESIGN.md §14.2)
+      # is linted too.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       # DESIGN.md Appendix B: the engine does no I/O and depends on nothing
       # that does. `cargo tree -e normal` lists only normal (non-dev,
@@ -92,8 +97,11 @@ jobs:
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
+      # `--all-features` turns on `faults`, so FaultyFs's tests run here
+      # beside the filesystem layer's conformance tests (§14.2), on both
+      # Linux and macOS.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
 
   build:
     name: build (${{ matrix.target }})
