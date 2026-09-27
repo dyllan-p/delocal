@@ -2951,6 +2951,32 @@ fn move_to_trash(node: &mut Node, path: &RelPath) {
     }
 }
 
+/// For the checker's unit tests (§14.4: every fix has one, the checker's
+/// own fixes included). A test builds the history an invariant checks
+/// through the bookkeeping a run uses, instead of hoping a seed reaches it.
+#[cfg(test)]
+impl Sim {
+    /// `id`'s table write `action` becomes durable at event `event`, as at
+    /// the end of its group (§11). The node's tables then no longer match
+    /// its engine, so a test makes these writes after its node's last event.
+    pub(crate) fn durable(
+        &mut self,
+        id: NodeId,
+        action: Action,
+        event: u64,
+    ) -> Result<(), Failure> {
+        let at = self.clock;
+        self.record(
+            id,
+            Staged {
+                write: TableWrite::Hook(Box::new(action)),
+                at,
+                event,
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3117,5 +3143,67 @@ mod tests {
         assert!(sim.discarded_by_revert(&restored));
         assert!(sim.discarded_by_revert(&below));
         assert!(!sim.discarded_by_revert(&later));
+    }
+
+    /// A file record at `path` that `by` wrote, holding `file(content)`
+    /// with an mtime `secs` seconds after it.
+    fn written(path: &RelPath, by: NodeId, version: Version, content: u8, secs: i64) -> Entry {
+        let f = File {
+            mtime_ns: (1_700_000_000 + secs) * NANOS,
+            ..file(content, false)
+        };
+        Entry {
+            path: path.clone(),
+            kind: Kind::File,
+            size: f.content.len() as u64,
+            mtime_ns: f.mtime_ns,
+            stamp: f.mtime_ns,
+            exec: false,
+            hash: f.hash(),
+            prev_hash: ContentHash::EMPTY,
+            version,
+            deleted: false,
+            modified_by: by,
+            author_host: HostName::empty(),
+        }
+    }
+
+    /// The index write of `entry` under `seq`.
+    fn changed(folder: FolderId, entry: Entry, seq: u64) -> Action {
+        Action::IndexChanged {
+            folder,
+            record: IndexRecord { entry, seq },
+        }
+    }
+
+    /// I7's exemption for a vector a revert discarded (§14.1, §8.3,
+    /// 15d13ea): the discarded record was pending, so only its author ever
+    /// held it, and its vector is free to be reached again with other
+    /// content, by the author's next change or by any node's merge that
+    /// includes it. Here e writes {b: 1, e: 1} over b's file and reverts to
+    /// b's record; b's merge then reaches {b: 1, e: 1} with other content,
+    /// and takes the discarded record's place. The pin
+    /// `a_vector_a_revert_discarded_may_be_reached_again_by_a_merge` guards
+    /// this only while its seed reaches it.
+    #[test]
+    fn a_merge_may_reach_a_vector_its_authors_revert_discarded() {
+        let mut sim = world();
+        let (b, e) = (sim.order[0], sim.order[1]);
+        let folder = sim.folder;
+        let f = rel("f");
+        let base = written(&f, b, Version::from_iter([(b, 1)]), 1, 0);
+        let pending = written(&f, e, Version::from_iter([(b, 1), (e, 1)]), 2, 1);
+        let merged = written(&f, b, pending.version.clone(), 3, 2);
+        // e holds b's file, writes over it, and reverts: the record it puts
+        // back keeps its old seq.
+        sim.durable(e, changed(folder, base.clone(), 1), 1).unwrap();
+        sim.durable(e, changed(folder, pending.clone(), 2), 2)
+            .unwrap();
+        sim.durable(e, changed(folder, base.clone(), 1), 3).unwrap();
+        assert!(sim.discarded_by_revert(&pending));
+        sim.durable(b, changed(folder, merged.clone(), 1), 4)
+            .unwrap_or_else(|f| panic!("{f}"));
+        assert_eq!(sim.versions()[&f], [base, merged]);
+        assert_eq!(sim.superseded()[&f], [pending]);
     }
 }
