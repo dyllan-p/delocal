@@ -6,6 +6,7 @@ but can rank below one of them, so a node that meets the bump alone and a
 node holding the dominated version rank differently and I7 fails.
 
 test: delocal-sim regressions::a_deny_ranks_above_every_version_it_dominates
+test: delocal-engine folder::tests::a_denys_bump_ranks_above_every_version_it_dominates
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..bd3e68a 100644

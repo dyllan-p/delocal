@@ -3636,6 +3636,54 @@ mod tests {
         assert!(r.set.items.iter().all(|i| i.mode() == ApplyMode::Fetch));
     }
 
+    /// §7.6, §8.2 (1088173): a deny's bump dominates every quarantined
+    /// version at its path, so it must rank above each of them too. The
+    /// order needs every increment above everything in its causal past;
+    /// otherwise a node that meets the bump alone and a node holding a
+    /// dominated version rank the two differently, and one vector ends up
+    /// with two contents (I7). A's edits carry a much later mtime than B's
+    /// records, so their stamps are far above B's.
+    #[test]
+    fn a_denys_bump_ranks_above_every_version_it_dominates() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in 0..8 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), file(3, 1_000_000));
+        }
+        let edits = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert!(matches!(
+            b.receive(t(12.0), &edits).decision,
+            Decision::Held { .. }
+        ));
+        let held: Vec<Entry> = b
+            .quarantine()
+            .get(bid(3))
+            .unwrap()
+            .entries
+            .values()
+            .cloned()
+            .collect();
+        let local: Vec<i64> = held
+            .iter()
+            .map(|e| b.index().get(&e.path).unwrap().entry.stamp)
+            .collect();
+        let bumps = b.deny(t(13.0), bid(3)).unwrap();
+        assert_eq!(bumps.len(), held.len());
+        for ((bump, edit), local) in bumps.iter().map(|c| &c.record.entry).zip(&held).zip(local) {
+            assert_eq!(bump.path, edit.path);
+            assert!(
+                edit.stamp > local + 1,
+                "one past B's own stamp is not enough"
+            );
+            assert!(bump.version.dominates(&edit.version));
+            assert_eq!(
+                crate::conflict::winner(bump, edit).side,
+                Side::First,
+                "{}: the bump ranks above the edit it dominates",
+                bump.path
+            );
+        }
+    }
+
     #[test]
     fn revert_restores_announced_records_trashes_files_and_refetches() {
         let (_, mut b) = a_and_b(10, tight());
