@@ -6,6 +6,7 @@ reset was pending was refused, and it never hears that this machine can
 serve the file again (DESIGN.md §7.1, §8.3 step 2).
 
 test: delocal-sim regressions::a_peer_refused_during_another_reset_asks_again
+test: delocal-engine folder::tests::a_resets_landing_is_announced_under_a_new_seq
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..54e3935 100644

@@ -4202,6 +4202,33 @@ mod tests {
         assert!(landed.seq > f09.seq, "under a new seq");
     }
 
+    /// §7.1, §8.3 step 2 (0ae55b1): a reset's landing is announced, like
+    /// any commit's. While the reset was pending this machine refused the
+    /// file, since its disk did not match the record, and the announcement
+    /// is what tells a refused peer to ask again: the restored record under
+    /// a new `seq`, in the next batch.
+    #[test]
+    fn a_resets_landing_is_announced_under_a_new_seq() {
+        let (_, mut b, f09, v) = chmodded_then_reverted();
+        b.dispatch(t(13.0), &lan(&[1, 3]));
+        let written = b.applied(t(14.0), &p("f09"), &v, ApplyOutcome::Ok);
+        let landed: Vec<(&Entry, bool)> = written
+            .iter()
+            .map(|r| (&r.entry, r.seq > f09.seq))
+            .collect();
+        assert_eq!(
+            landed,
+            [(&f09.entry, true)],
+            "the restored record, re-sequenced"
+        );
+        let sent: Vec<Entry> = b
+            .form_batches(t(16.0), bid(7))
+            .into_iter()
+            .flat_map(|batch| batch.entries)
+            .collect();
+        assert_eq!(sent, [f09.entry]);
+    }
+
     /// §7.5: at most one commit is in flight per path. A version arriving
     /// while the host commits an earlier one waits for that commit's report
     /// instead of replacing the want: the report is not dropped, the landed
