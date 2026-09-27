@@ -7,6 +7,12 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# A library and a binary of the same name. The library holds the daemon's
+# machinery, so its tests sit next to it and later crates' tests can use it;
+# the binary is the CLI and the daemon's entry point.
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "delocal"
 path = "src/main.rs"
