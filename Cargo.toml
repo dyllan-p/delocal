@@ -24,6 +24,7 @@ blake3 = "1.8.7"
 filetime = "0.2.29"
 rustix = { version = "1.1.5", features = ["fs"] }
 tempfile = "3.27.0"
+unicode-normalization = "0.1.25"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

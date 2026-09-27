@@ -23,6 +23,7 @@ filetime.workspace = true
 rustix.workspace = true
 serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+unicode-normalization.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

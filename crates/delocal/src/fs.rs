@@ -27,9 +27,10 @@
 //! | [`available_space`](Fs::available_space) | §7.5 local failures: `SpaceRecovered` after `DiskFull`; §13 disk full |
 //!
 //! Paths are host paths, the folder root joined with the names on disk.
-//! Nothing here maps them to index paths (§7.3 does that from the names
-//! `read_dir` returns). Errors are the operating system's own `io::Error`s,
-//! so a caller maps a real `ENOSPC` and an injected one the same way.
+//! Nothing here maps them to index paths ([`crate::names`] does that from
+//! the names `read_dir` returns, §7.3). Errors are the operating system's
+//! own `io::Error`s, so a caller maps a real `ENOSPC` and an injected one
+//! the same way.
 //!
 //! **Symlinks.** The calls that describe or change an entry (`lstat`,
 //! `read_link`, `create_new`, `create_dir`, `symlink`, `rename`,
