@@ -436,7 +436,7 @@ mod tests {
 
     use super::*;
     use crate::knobs::Knobs;
-    use crate::sim::{File, content_bytes};
+    use crate::sim::{File, content_bytes, hash_bytes};
 
     fn loser(path: &str, kind: Kind, mtime_ns: i64, host: &str) -> Entry {
         Entry {
@@ -683,5 +683,57 @@ mod tests {
         sim.durable(e, changed(&sim, made, 1), 3).unwrap();
         assert!(sim.discarded_by_revert(&tombstone));
         i3_no_resurrection(&sim).unwrap_or_else(|f| panic!("{f}"));
+    }
+
+    /// I4 keys losing versions by vector and content (§14.1, cf000f2).
+    /// After a revert removes a record peers never saw, its author can
+    /// issue the same vector again with other content. Both versions can
+    /// lose to the same winner under the same copy name, and a copy of
+    /// either is the copy of a losing version. Here b holds the copy of e's
+    /// first version, which e's second replaced in the version table. The
+    /// pins `two_losers_under_one_reissued_vector_both_count` and
+    /// `two_symlink_losers_under_one_reissued_vector_both_count` guard this
+    /// only while their seeds reach it.
+    #[test]
+    fn two_losers_under_one_vector_are_both_losing_versions() {
+        let mut sim = world();
+        let (b, e) = (sim.node_ids()[0], sim.node_ids()[1]);
+        let f = RelPath::new("f").unwrap();
+        let entry = |by: NodeId, version: Version, content: u8, stamp: i64| {
+            let file = file_of(content);
+            Entry {
+                path: f.clone(),
+                kind: Kind::File,
+                size: file.content.len() as u64,
+                mtime_ns: file.mtime_ns,
+                stamp,
+                exec: false,
+                hash: hash_bytes(&file.content),
+                prev_hash: ContentHash::EMPTY,
+                version,
+                deleted: false,
+                modified_by: by,
+                author_host: HostName::new(if by == e { "n1" } else { "n0" }).unwrap(),
+            }
+        };
+        let reissued = Version::from_iter([(e, 1)]);
+        let first = entry(e, reissued.clone(), 1, 1);
+        let second = entry(e, reissued, 2, 1);
+        let won = entry(b, Version::from_iter([(b, 1)]), 3, 10);
+        let copy = conflict_copy_name(&first).unwrap();
+        assert_eq!(conflict_copy_name(&second), Some(copy.clone()));
+        // b made the copy of e's first version when it lost to b's.
+        sim.scanned(b, copy, file_of(1)).unwrap();
+        // e adds f, reverts before announcing it, adds f again with other
+        // content, and then takes b's version.
+        sim.durable(e, changed(&sim, first, 1), 1).unwrap();
+        let removed = Action::IndexRemoved {
+            folder: sim.folder_id(),
+            path: f.clone(),
+        };
+        sim.durable(e, removed, 2).unwrap();
+        sim.durable(e, changed(&sim, second, 2), 3).unwrap();
+        sim.durable(e, changed(&sim, won, 3), 4).unwrap();
+        i4_bounded_conflicts(&sim).unwrap_or_else(|f| panic!("{f}"));
     }
 }
