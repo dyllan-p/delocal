@@ -21,7 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use delocal_engine::batch::BatchRole;
-use delocal_engine::folder::{ApplyOutcome, Displace, FolderStatus, ScanState};
+use delocal_engine::folder::{ApplyOutcome, Displace, FolderStatus, ScanState, SkipReason};
 use delocal_engine::want::{FetchReport, Tier, Want, WantState};
 use delocal_engine::{
     Action, BatchId, ContentHash, Deferred, Engine, Entry, Event, FolderId, FolderParts,
@@ -50,6 +50,9 @@ const EVENT_BUDGET: usize = 400_000;
 const JOURNAL_STREAM: u64 = 1;
 /// The PRNG stream group commit draws its lags from (§11).
 const GROUP_STREAM: u64 = 2;
+/// The PRNG stream the skip model draws from: which paths a scan cannot
+/// inspect, why, and which tracked paths become ignored (§7.3).
+const SKIP_STREAM: u64 = 3;
 
 /// What a clean run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +93,10 @@ pub struct Stats {
     pub effects_lost: u64,
     /// Non-empty directories displaced with their children (§7.6).
     pub subtrees_displaced: u64,
+    /// Paths scans reported `Skipped`, ignored ones included (§7.3).
+    pub skipped: u64,
+    /// Tracked paths that became ignored for a while (§7.3).
+    pub ignores: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -285,6 +292,10 @@ struct Node {
     /// displacement has happened and whose rename has not. Durable, so a
     /// row a crash left open is still here at the restart.
     journal: Vec<JournalRow>,
+    /// Paths a rule in `.delocalignore` ignores, with everything beneath
+    /// them, and how many more of this node's full scans the rule lasts
+    /// (§7.3). On disk, so a restart keeps them.
+    ignored: BTreeMap<RelPath, u32>,
     // ---- invariant tracking ----
     /// Every version this node has ever sent in a batch, per path.
     sent: BTreeMap<RelPath, Vec<Version>>,
@@ -388,6 +399,28 @@ struct JournalRow {
     trash_at: usize,
 }
 
+/// What one full scan reports under the skip model (§7.3).
+#[derive(Default)]
+struct Walk {
+    /// Every path the walk found, in order, with what the scan reports for
+    /// it: `None` beneath a path it skipped, whose contents it cannot see.
+    reports: Vec<(RelPath, Option<ScanState>)>,
+    /// Paths a rule ignores that the walk did not find on disk, reported
+    /// `Skipped` after it.
+    unreached: Vec<RelPath>,
+    /// Skipped paths whose contents go unreported: the directories the
+    /// scan could not list, and every ignored path.
+    beneath: BTreeSet<RelPath>,
+}
+
+/// True if a rule on `node` ignores `path`: a rule for the path itself, or
+/// for a directory above it (§7.3).
+fn ignores(node: &Node, path: &RelPath) -> bool {
+    node.ignored
+        .keys()
+        .any(|r| r == path || r.is_ancestor_of(path))
+}
+
 /// A group of writes on its way to durability, and the effects that wait
 /// for it (§11 group commit).
 struct Group {
@@ -472,6 +505,8 @@ pub struct Sim {
     journal_rng: ChaCha8Rng,
     /// Draws for group commit's lags, on `GROUP_STREAM`.
     group_rng: ChaCha8Rng,
+    /// Draws for the skip model, on `SKIP_STREAM`.
+    skip_rng: ChaCha8Rng,
     clock: Timestamp,
     folder: FolderId,
     rules: Rules,
@@ -500,6 +535,8 @@ pub struct Sim {
     ops: Vec<Op>,
     users: Vec<UserDue>,
     corruption_on: bool,
+    /// False in the final phase, which skips nothing and ignores nothing.
+    skips_on: bool,
     steps: Vec<Step>,
     steps_applied: usize,
     stats: Stats,
@@ -554,6 +591,7 @@ impl Sim {
                 next_scan_at: clock.plus_nanos(rng.random_range(30 * NANOS..600 * NANOS)),
                 temp: BTreeMap::new(),
                 journal: Vec::new(),
+                ignored: BTreeMap::new(),
                 sent: BTreeMap::new(),
                 synced: Vec::new(),
                 local_edit_at: BTreeMap::new(),
@@ -578,12 +616,15 @@ impl Sim {
         journal_rng.set_stream(JOURNAL_STREAM);
         let mut group_rng = ChaCha8Rng::seed_from_u64(seed);
         group_rng.set_stream(GROUP_STREAM);
+        let mut skip_rng = ChaCha8Rng::seed_from_u64(seed);
+        skip_rng.set_stream(SKIP_STREAM);
         let mut sim = Self {
             seed,
             knobs,
             rng,
             journal_rng,
             group_rng,
+            skip_rng,
             clock,
             folder,
             rules,
@@ -598,6 +639,7 @@ impl Sim {
             ops: Vec::new(),
             users: Vec::new(),
             corruption_on: true,
+            skips_on: true,
             steps: Vec::new(),
             steps_applied: 0,
             stats: Stats::default(),
@@ -696,6 +738,12 @@ impl Sim {
     /// Heal everything, approve everything, scan everything, drain.
     fn final_phase(&mut self) -> Result<(), Failure> {
         self.corruption_on = false;
+        // Every ignore rule goes, and from now on every scan can look
+        // everywhere, so the final scans observe everything (§7.3).
+        self.skips_on = false;
+        for node in self.nodes.values_mut() {
+            node.ignored.clear();
+        }
         let ids = self.order.clone();
         for id in &ids {
             if self.nodes.get(id).is_some_and(|n| n.restart_at.is_some()) {
@@ -2169,6 +2217,18 @@ impl Sim {
         if self.rng.random::<f64>() < self.knobs.drop_watcher {
             return Ok(());
         }
+        // The watcher sees a path a rule ignores, and the host reports it
+        // `Skipped`, which outside a bracket changes nothing (§7.3).
+        if self.nodes.get(&id).is_some_and(|n| ignores(n, &path)) {
+            let event = Event::Scanned {
+                folder: self.folder,
+                path,
+                state: ScanState::Skipped {
+                    reason: SkipReason::Ignored,
+                },
+            };
+            return self.feed(id, event);
+        }
         let state = self
             .nodes
             .get(&id)
@@ -2185,7 +2245,7 @@ impl Sim {
     }
 
     /// A full scan (§7.3) with the fast path against the index records the
-    /// host has written.
+    /// host has written, under the skip model (see [`Sim::skip_some`]).
     fn full_scan(&mut self, id: NodeId, may_abort: bool) -> Result<(), Failure> {
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
@@ -2217,36 +2277,126 @@ impl Sim {
         } else {
             None
         };
-        self.feed(
-            id,
-            Event::ScanStarted {
-                folder: self.folder,
-            },
-        )?;
-        for (i, (path, state)) in entries.into_iter().enumerate() {
+        let walk = self.skip_some(id, entries);
+        let folder = self.folder;
+        self.feed(id, Event::ScanStarted { folder })?;
+        for (i, (path, state)) in walk.reports.into_iter().enumerate() {
             if abort_at == Some(i) {
-                return self.feed(
-                    id,
-                    Event::ScanAborted {
-                        folder: self.folder,
-                    },
-                );
+                return self.feed(id, Event::ScanAborted { folder });
             }
+            if let Some(state) = state {
+                self.feed(
+                    id,
+                    Event::Scanned {
+                        folder,
+                        path,
+                        state,
+                    },
+                )?;
+            }
+        }
+        for path in walk.unreached {
+            let state = ScanState::Skipped {
+                reason: SkipReason::Ignored,
+            };
             self.feed(
                 id,
                 Event::Scanned {
-                    folder: self.folder,
+                    folder,
                     path,
                     state,
                 },
             )?;
         }
-        self.feed(
-            id,
-            Event::ScanFinished {
-                folder: self.folder,
-            },
-        )
+        self.feed(id, Event::ScanFinished { folder })
+    }
+
+    /// The skip model (§7.3) for one full scan of `id` that walked
+    /// `entries`. Maybe a rule comes that ignores a tracked path for this
+    /// and the next zero to three of the node's scans. Then each path is
+    /// reported as the walk found it, or `Skipped`: because a rule ignores
+    /// it, or because the scan cannot inspect it, with the knob's
+    /// probability; a skipped directory's contents go unreported. Every
+    /// draw is on `SKIP_STREAM`, and none is made with the knob at 0 or in
+    /// the final phase.
+    fn skip_some(&mut self, id: NodeId, entries: Vec<(RelPath, ScanState)>) -> Walk {
+        let p = if self.skips_on { self.knobs.skip } else { 0.0 };
+        if p > 0.0 && self.skip_rng.random::<f64>() < p {
+            let tracked: Vec<RelPath> = self
+                .engine(id)
+                .and_then(|e| e.folder(self.folder))
+                .map(|f| {
+                    f.index()
+                        .live_records()
+                        .map(|r| r.entry.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !tracked.is_empty() {
+                let path = tracked[self.skip_rng.random_range(0..tracked.len())].clone();
+                let scans = self.skip_rng.random_range(1..=4);
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.ignored.insert(path, scans);
+                    self.stats.ignores += 1;
+                }
+            }
+        }
+        let Some(node) = self.nodes.get_mut(&id) else {
+            return Walk::default();
+        };
+        // This scan meets the rules as they stand; each then lasts one scan
+        // fewer.
+        let rules: BTreeSet<RelPath> = node.ignored.keys().cloned().collect();
+        node.ignored.retain(|_, left| {
+            *left -= 1;
+            *left > 0
+        });
+        // A rule covers what lies beneath its path, whatever the kind.
+        let mut walk = Walk {
+            beneath: rules.clone(),
+            ..Walk::default()
+        };
+        let mut reached = BTreeSet::new();
+        for (path, state) in entries {
+            if walk.beneath.iter().any(|d| d.is_ancestor_of(&path)) {
+                walk.reports.push((path, None));
+                continue;
+            }
+            let dir = node.fs.get(&path).is_some_and(|f| f.kind == Kind::Dir);
+            let state = if rules.contains(&path) {
+                reached.insert(path.clone());
+                ScanState::Skipped {
+                    reason: SkipReason::Ignored,
+                }
+            } else if p > 0.0 && self.skip_rng.random::<f64>() < p {
+                let reasons: &[SkipReason] = if dir {
+                    &[SkipReason::PermissionDenied, SkipReason::Io]
+                } else {
+                    &[
+                        SkipReason::PermissionDenied,
+                        SkipReason::Io,
+                        SkipReason::Unstable,
+                    ]
+                };
+                if dir {
+                    walk.beneath.insert(path.clone());
+                }
+                ScanState::Skipped {
+                    reason: reasons[self.skip_rng.random_range(0..reasons.len())],
+                }
+            } else {
+                state
+            };
+            if let ScanState::Skipped { .. } = state {
+                self.stats.skipped += 1;
+            }
+            walk.reports.push((path, Some(state)));
+        }
+        // A tracked path a rule ignores is reported `Skipped` whether or not
+        // it is on disk: while ignored its deletion must not read as one.
+        walk.unreached = rules.into_iter().filter(|r| !reached.contains(r)).collect();
+        self.stats.skipped += walk.unreached.len() as u64;
+        walk
     }
 
     // ---------------------------------------------------------------- steps
@@ -3294,5 +3444,43 @@ mod tests {
                 "{path} is served"
             );
         }
+    }
+
+    /// A directory entry, as the simulated disk holds one.
+    fn dir() -> File {
+        File {
+            kind: Kind::Dir,
+            content: Vec::new(),
+            mtime_ns: 0,
+            exec: false,
+        }
+    }
+
+    /// §7.3 through the model: a rule ignores the directory d0 and its
+    /// user deletes d0/f4 meanwhile. The scan reports d0 `Skipped` and
+    /// nothing beneath it, and the engine keeps d0/f4 live. The first scan
+    /// after the rule goes observes the deletion.
+    #[test]
+    fn an_ignored_directory_keeps_the_records_beneath_it_through_a_scan() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let (d0, f4) = (rel("d0"), rel("d0/f4"));
+        sim.scanned(id, d0.clone(), dir()).unwrap();
+        sim.scanned(id, f4.clone(), file(3, false)).unwrap();
+        let live = |sim: &Sim| {
+            sim.engine(id)
+                .and_then(|e| e.folder(sim.folder))
+                .and_then(|f| f.index().live(&f4))
+                .is_some()
+        };
+        assert!(live(&sim));
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.ignored.insert(d0.clone(), 1);
+        node.fs.remove(&f4);
+        sim.full_scan(id, false).unwrap();
+        assert!(live(&sim), "kept beneath the ignored directory");
+        assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
+        sim.full_scan(id, false).unwrap();
+        assert!(!live(&sim), "observed gone once the rule went");
     }
 }

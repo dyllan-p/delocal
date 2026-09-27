@@ -35,6 +35,14 @@ pub struct Knobs {
     /// directory's own entry moves, and a non-empty directory cannot be
     /// displaced to a conflict copy by a delete.
     pub displace_subtrees: bool,
+    /// Probability that a full scan cannot inspect a path it reaches, a
+    /// file it cannot read or a directory it cannot list, and reports it
+    /// `Skipped` (§7.3), the directory's contents unreported. With the same
+    /// probability per scan, a tracked path becomes ignored for the next
+    /// one to four of its node's scans, as if a rule had been added to
+    /// `.delocalignore` and later taken out: while it is, scans and the
+    /// watcher report it `Skipped`. The final phase's scans skip nothing.
+    pub skip: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -49,6 +57,7 @@ impl Default for Knobs {
             crash_between_renames: 0.05,
             group_commit_lag: 4,
             displace_subtrees: true,
+            skip: 0.0,
             nodes: None,
         }
     }
@@ -58,7 +67,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -66,7 +75,8 @@ impl fmt::Display for Knobs {
             self.crash_after_rename,
             self.crash_between_renames,
             self.group_commit_lag,
-            self.displace_subtrees
+            self.displace_subtrees,
+            self.skip
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;
