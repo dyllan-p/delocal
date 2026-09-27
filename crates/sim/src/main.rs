@@ -3,7 +3,7 @@
 //! ```text
 //! delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P]
 //!             [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P]
-//!             [--group-commit-lag E] [--displace-subtrees true|false] [--nodes N]
+//!             [--group-commit-lag E] [--displace-subtrees true|false] [--skip P] [--nodes N]
 //!             [--keep-going] [--jobs J] [--digests]
 //! ```
 //!
@@ -95,6 +95,7 @@ fn parse_args() -> Result<Args, String> {
                     .parse()
                     .map_err(|e| format!("--displace-subtrees: {e}"))?;
             }
+            "--skip" => args.knobs.skip = value()?.parse().map_err(|e| format!("--skip: {e}"))?,
             "--nodes" => {
                 args.knobs.nodes = Some(value()?.parse().map_err(|e| format!("--nodes: {e}"))?)
             }
@@ -112,7 +113,7 @@ fn parse_args() -> Result<Args, String> {
             "--jobs" => args.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             "--digests" => args.digests = true,
             "--help" | "-h" => {
-                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--displace-subtrees true|false] [--nodes N] [--keep-going] [--jobs J] [--digests]".to_owned());
+                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--displace-subtrees true|false] [--skip P] [--nodes N] [--keep-going] [--jobs J] [--digests]".to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -278,6 +279,8 @@ fn main() -> ExitCode {
                 totals.groups_lost += outcome.stats.groups_lost;
                 totals.effects_lost += outcome.stats.effects_lost;
                 totals.subtrees_displaced += outcome.stats.subtrees_displaced;
+                totals.skipped += outcome.stats.skipped;
+                totals.ignores += outcome.stats.ignores;
                 if args.digests {
                     println!("seed {seed} digest {}", hex(&outcome.fingerprint));
                 }
