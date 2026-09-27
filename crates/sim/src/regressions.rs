@@ -9001,6 +9001,8 @@ fn a_marked_want_whose_content_exists_nowhere_settles_unrecoverable() {
 /// follows the content to the copy (§14.1 I2). Pinned at seed 911 with the
 /// default knobs, shrunk to 73 steps; with `follow` disabled it fails I2
 /// (content ba286da6, adopted at d1/f4, in neither folder nor trash).
+/// The fix's unit test guards it whether or not a seed reaches it:
+/// `sim::tests::an_adoption_follows_its_content_to_the_conflict_copy`.
 #[test]
 fn a_conflict_copy_its_user_removed_with_its_directory_is_not_lost() {
     passes(
