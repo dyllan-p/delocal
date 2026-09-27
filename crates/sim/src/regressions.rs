@@ -4499,6 +4499,8 @@ fn a_revert_discards_only_the_versions_above_the_restored_record() {
 /// seed 117 with the default knobs, shrunk to 142 steps; with the guard's
 /// exec comparison disabled it fails I4: a conflict copy has the losing
 /// version's hash but not its exec bit.
+/// The fix's unit test guards it whether or not a seed reaches it:
+/// `sim::tests::the_commit_guard_refuses_a_file_whose_exec_bit_changed`.
 #[test]
 fn a_chmod_under_a_pending_commit_is_changed_underneath() {
     passes(
