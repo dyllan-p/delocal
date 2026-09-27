@@ -298,11 +298,12 @@ jobs:
   # Draft 36 (§14.4): a pin guards its fix only while its history still
   # reaches the bug, so every night each pin runs as it is, where it must
   # pass, and with scripts/pins/<pin>.patch applied, where it must fail
-  # (scripts/pins.sh), and so does every unit test the patch names (draft
-  # 38). It does not need the plan's seeds and runs beside the shards; the
-  # twenty-first job waits for a free runner. The script prints its table
-  # and ends with "N of M pins guard their fix"; the log ends with "pins
-  # done" only if the script got that far and ran every pin.
+  # (scripts/pins.sh), and so does each unit test of the fix that the
+  # patch names (draft 39). It does not need the plan's seeds and runs
+  # beside the shards; the twenty-first job waits for a free runner. The
+  # script prints its table and ends with "N of M pins guard their fix";
+  # the log ends with "pins done" only if the script got that far and ran
+  # every pin.
   pins:
     name: pins
     runs-on: ubuntu-24.04
@@ -348,7 +349,9 @@ jobs:
   # One issue per night on which any pin fails the check, or the check did
   # not finish, with the table of every pin if the script wrote one. A pin
   # it did not check is neither valid nor invalid (§14.4), so a check that
-  # did not finish always gets that title, whatever else its table holds.
+  # did not finish always says so in its title, and names the pins it
+  # proved invalid there too: a pin one of whose tests failed the check is
+  # invalid whatever happened to its others.
   # Kept apart from the pins job for the same reason the sweep's report is:
   # the job that builds and runs the repository's code holds no token that
   # can write.
@@ -388,6 +391,13 @@ jobs:
             title="Nightly pins: $(( total - good )) of $total pins no longer guard their fix"
           else
             title="Nightly pins: the check did not finish"
+            # "The check did not finish: U of T pins not checked, I invalid,
+            # G guard their fix." is its last line then.
+            unfinished=$({ sed -nE 's/^The check did not finish: [0-9]+ of ([0-9]+) pins not checked, ([0-9]+) invalid, [0-9]+ guard their fix\.$/\2 \1/p' pins/pins.log 2> /dev/null || true; } | tail -1)
+            if [ -n "$unfinished" ]; then
+              read -r bad total <<< "$unfinished"
+              [ "$bad" -eq 0 ] || title="$title, and $bad of $total pins no longer guard their fix"
+            fi
           fi
 
           {
@@ -399,7 +409,7 @@ jobs:
               echo
               cat pins/summary.md
             elif [ -f pins/summary.md ]; then
-              echo "The check did not run every pin: a worker died, a worktree could not be made, or a build or test run stopped without a result. A pin it did not check is neither valid nor invalid (DESIGN.md §14.4), and its rows say why; the pins-log artifact of the run has the log. Any pin in bold was checked, and is invalid."
+              echo "The check did not run every pin: a worker died, a worktree could not be made, or a build or test run stopped without a result. A pin it did not check is neither valid nor invalid (DESIGN.md §14.4), and its rows say why; the pins-log artifact of the run has the log. A pin in bold is invalid: one of its tests was checked and failed the check, whatever happened to its others."
               echo
               cat pins/summary.md
             else
