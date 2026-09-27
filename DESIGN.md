@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 43 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 42: `fchmodat` removed from §7.3's list of calls, which the text after it already rules out.
+> Draft 44 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 43: the schema sketch is replaced by the list of tables, with `schema.rs` authoritative (§11).
+>
+> Changes from draft 42: `fchmodat` removed from §7.3's list of calls, which the text after it already rules out.
 >
 > Changes from draft 41: the folder root is opened per operation, never held (§7.3); every commit rename refuses to replace (§7.5); mode changes go through a no-follow descriptor, and unreadable or unlistable paths are skipped alike on both platforms (§7.3).
 >
@@ -672,24 +674,10 @@ logs/            rotating, 7 days
 
 **SQLite schema (sketch):**
 
-```sql
-folders        (id, name, created_by, rules_json, meta_version)
-folder_state   (folder, small_rest_json)                                 -- the small rest (above)
-members        (folder, node, path, mode, joined_at)
-entries        (folder, path, kind, size, mtime_ns, exec, hash, prev_hash, stamp, version_blob, deleted,
-                modified_by, author_host, seq, PRIMARY KEY (folder, path))
-pending        (folder, path, announced_record_json, exempt)             -- §7.1, §8.1
-held_items     (folder, id, state, entries_json)                         -- state: held | denied (§8.2, §8.3)
-deferred       (folder, path, entries_json)                              -- §7.5, §8.1
-want           (folder, path, want_json)
-batches        (id, folder, source, created_at, adds, mods, dels, bytes, decision, decided_at)
-batch_entries  (batch, path, kind, hash, version_blob)
-trash          (folder, trashed_path, original_path, hash, trashed_at, size)
-mtime_shim     (folder, path, requested_ns, stored_ns)                   -- host-owned, §7.3
-disk_names     (folder, path, bytes)                                     -- host-owned, §7.3: names on disk that are not their NFC path
-commit_journal (folder, path, displaced_to, temp_file)                   -- host-owned, §7.5
-machines       (node, hostname, ts_stable_id, ts_user, trusted, last_seen, delocal_version)
-```
+The schema itself is `crates/delocal/src/store/schema.rs`, which is authoritative: every table is `STRICT`, identifiers and hashes are blobs, index paths are text and places on disk are blobs (a name on disk need not be UTF-8), nested engine values are JSON in `_json` columns, and migrations run one per transaction through `user_version`, a newer version than the binary knows being refused untouched. The tables, by owner:
+
+- engine parts: `entries` (the index), `want`, `pending`, `held_items` (keyed by batch, state and the deny's arrival number), `deferred`, and `folder_state` (the small rest);
+- host: `folders` and `members` (§9.1), `batches` and `batch_entries` (history, §8.5, keyed by the record rather than the batch id, since one id can be recorded more than once), `trash`, `mtime_shim`, `disk_names`, `commit_journal`, and `machines`.
 
 `seq` per (folder, this node) is a monotonically increasing integer, incremented on every local write to `entries`.
 
