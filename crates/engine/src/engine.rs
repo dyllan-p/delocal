@@ -93,7 +93,8 @@ pub enum Event {
     ScanFinished {
         folder: FolderId,
     },
-    /// The host stopped a scan (root guard, read error); nothing is announced.
+    /// The root guard stopped a scan (§7.3): the bracket closes without
+    /// its deletion pass, so nothing is announced for what it did not reach.
     ScanAborted {
         folder: FolderId,
     },

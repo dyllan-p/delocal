@@ -1452,9 +1452,11 @@ impl FolderState {
         Ok(changes)
     }
 
-    /// The host stopped a scan (root guard, read error): forget what it
-    /// reported and announce nothing (§7.3). Observations already applied
-    /// inside the bracket stand; only the deletion pass is skipped.
+    /// The root guard stopped a scan (§7.3): close the bracket without its
+    /// deletion pass. Observations already applied inside the bracket
+    /// stand, so nothing observed before the abort is lost, and nothing
+    /// the scan did not reach is tombstoned. A path it could not read is
+    /// not an abort; it is reported `Skipped`.
     pub fn scan_aborted(&mut self) -> Result<(), FolderStatus> {
         self.scan
             .take()
@@ -2663,6 +2665,43 @@ mod tests {
         for path in ["d", "d/x", "d/e/y", "u/z", "e"] {
             assert!(f.index().live(&p(path)).is_some(), "{path} stays live");
         }
+    }
+
+    /// §7.3: a scan the root guard stops is reported aborted, and the
+    /// engine closes the bracket without its deletion pass: what the scan
+    /// observed before the abort stands and is announced, nothing it did
+    /// not reach is tombstoned, and the next bracket owes nothing to it,
+    /// its skips included.
+    #[test]
+    fn an_aborted_scan_keeps_what_it_observed_and_tombstones_nothing() {
+        let mut f = folder();
+        for path in ["a", "b", "d/x"] {
+            f.scanned(t(1.0), p(path), file(1, 1));
+        }
+        f.form_batches(t(3.0), batch_id());
+        f.scan_started();
+        let edit = f.scanned(t(5.0), p("a"), file(2, 5)).change.unwrap();
+        f.scanned(t(5.0), p("d"), skipped(SkipReason::PermissionDenied));
+        assert_eq!(f.scan_aborted(), Ok(()));
+        assert!(!f.scan_open());
+        assert_eq!(
+            f.index().get(&p("a")),
+            Some(&edit.record),
+            "the edit stands"
+        );
+        assert!(
+            f.index().live(&p("b")).is_some(),
+            "not reached, not tombstoned"
+        );
+        let sent = f.form_batches(t(8.0), batch_id()).remove(0);
+        let paths: Vec<&RelPath> = sent.entries.iter().map(|e| &e.path).collect();
+        assert_eq!(paths, [&p("a")], "the edit is announced, and only it");
+
+        f.scan_started();
+        f.scanned(t(10.0), p("a"), ScanState::Unchanged);
+        let changes = f.scan_finished(t(11.0)).unwrap();
+        let gone: Vec<&RelPath> = changes.iter().map(|c| &c.record.entry.path).collect();
+        assert_eq!(gone, [&p("b"), &p("d/x")]);
     }
 
     #[test]
