@@ -2257,9 +2257,12 @@ impl FolderState {
     /// conflict copy, the displaced file is recorded at the conflict path
     /// as this machine's local add (§7.6). On `ChangedUnderneath` the entry
     /// is kept in the deferred set until the path is observed again. Either
-    /// way the want ends. A reset writes nothing to the index either way
-    /// (§8.3 step 2). Returns every record written, in order; empty if
-    /// nothing matched or the commit did not happen.
+    /// way the want ends. A reset (§8.3 step 2) that lands adopts the record
+    /// `revert` restored under a new `seq`, so its landing is announced
+    /// (§7.1); one whose file changed underneath writes and keeps nothing,
+    /// and the next observation of the path is a local change like any
+    /// other. Returns every record written, in order; empty if nothing
+    /// matched or the commit did not happen.
     pub fn applied(
         &mut self,
         now: Timestamp,
@@ -4561,7 +4564,8 @@ mod tests {
 
     /// §8.3 step 2: a chmod changes neither content nor mtime, so `revert`
     /// keeps the file, and a `SetMeta` guarded by the file as last observed
-    /// clears the exec bit again. The reset lands without writing the index.
+    /// clears the exec bit again. Its landing adopts the restored record
+    /// under a new `seq`, and so is announced (§7.1).
     #[test]
     fn a_chmod_only_path_is_restored_with_set_meta() {
         let (_, mut b, f09, v) = chmodded_then_reverted();
