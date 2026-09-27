@@ -2975,6 +2975,23 @@ impl Sim {
             },
         )
     }
+
+    /// `file` is at `path` on `id`'s disk, and `id`'s engine has scanned it.
+    pub(crate) fn scanned(&mut self, id: NodeId, path: RelPath, file: File) -> Result<(), Failure> {
+        let state = ScanState::Observed(file.observed());
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.fs.insert(path.clone(), file);
+        }
+        let folder = self.folder;
+        self.feed(
+            id,
+            Event::Scanned {
+                folder,
+                path,
+                state,
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3236,5 +3253,46 @@ mod tests {
             .unwrap();
         assert_eq!(sim.versions()[&f], [again]);
         assert_eq!(sim.superseded()[&f], [first]);
+    }
+
+    /// Content is requested by hash (§7.5 steps 2 and 3, 5c20f3d), so a
+    /// source serves it from its live file at the path whatever that
+    /// record's version, and failing that from any live file that holds it.
+    /// A conflict's merged version exists nowhere until someone merges, and
+    /// the winner's holders hold its content under an older version. The
+    /// pin `content_is_fetched_by_hash_from_whoever_holds_it` guards this
+    /// only while its seed reaches it.
+    #[test]
+    fn a_source_serves_the_wanted_content_under_any_version_or_path() {
+        let mut sim = world();
+        let (asker, source) = (sim.order[0], sim.order[1]);
+        let content = file(6, false);
+        sim.scanned(source, rel("w"), content.clone()).unwrap();
+        let held = sim
+            .engine(source)
+            .and_then(|e| e.folder(sim.folder))
+            .and_then(|f| f.index().live(&rel("w")))
+            .map(|r| r.entry.version.clone())
+            .unwrap();
+        let merged = held.merge(&Version::from_iter([(asker, 1)]));
+        for path in [rel("w"), rel("elsewhere")] {
+            sim.ops.push(Op::Fetch {
+                node: asker,
+                from: source,
+                path: path.clone(),
+                version: merged.clone(),
+                hash: content.hash(),
+                done_at: sim.clock,
+                next_progress: sim.clock,
+                corrupt: false,
+            });
+            let pos = sim.ops.len() - 1;
+            sim.progress_op(pos).unwrap();
+            assert_eq!(
+                sim.nodes[&asker].temp.get(&path),
+                Some(&(merged.clone(), content.content.clone())),
+                "{path} is served"
+            );
+        }
     }
 }
