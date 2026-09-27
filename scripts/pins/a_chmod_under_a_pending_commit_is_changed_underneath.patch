@@ -6,6 +6,7 @@ comparison is undone: the guard still compares a symlink's target, SetMeta
 is still guarded, and the scan fast path is unchanged.
 
 test: delocal-sim regressions::a_chmod_under_a_pending_commit_is_changed_underneath
+test: delocal-sim sim::tests::the_commit_guard_refuses_a_file_whose_exec_bit_changed
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 index 4e18586..f8da56f 100644
