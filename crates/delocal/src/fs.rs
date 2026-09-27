@@ -43,8 +43,13 @@
 //! is ever read or written. The calls that describe or change an entry
 //! never follow a symlink at the last component either, and `read_dir`,
 //! `sync_dir` and `available_space` refuse one there with `NotADirectory`.
-//! `open_read` and `open_append` still follow a symlink at the last
-//! component, as `open(2)` does.
+//!
+//! **Opening a file.** `open_read`, `open_append` and `set_mode` open the
+//! last component without following a symlink and without waiting on a
+//! FIFO, then check what the descriptor is. Anything but a file (or, for
+//! `set_mode`, a directory) is refused with [`NotAFile`], which says what
+//! was there: a file swapped for a symlink or a FIFO between a caller's
+//! `lstat` and the open is observed as what it has become.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -81,7 +86,8 @@ pub trait Fs: Send + Sync {
     fn read_link(&self, path: &Path) -> io::Result<PathBuf>;
 
     /// Open the file at `path` for reading, positioned at its start.
-    /// Follows a symlink at `path` (see the module docs).
+    /// Anything else there is refused with [`NotAFile`], neither followed nor
+    /// waited on.
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>>;
 
     /// Create a file at `path` for writing. Fails if anything is already
@@ -90,8 +96,8 @@ pub trait Fs: Send + Sync {
 
     /// Open the existing file at `path` for writing at its end. Fails if
     /// there is none: a resumed transfer whose temp file has gone starts
-    /// over, it does not create one. Follows a symlink at `path` (see the
-    /// module docs).
+    /// over, it does not create one. Anything else there is refused with
+    /// [`NotAFile`], neither followed nor waited on.
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn WriteFile>>;
 
     /// Make the entries of the directory at `path` durable: creations,
@@ -122,8 +128,8 @@ pub trait Fs: Send + Sync {
     fn set_mtime(&self, path: &Path, mtime_ns: i64) -> io::Result<()>;
 
     /// Set the permission bits of the file or directory at `path` to `mode`
-    /// (the low twelve bits are used). A symlink at `path` is refused with
-    /// `InvalidInput` rather than followed.
+    /// (the low twelve bits are used). Anything else there, a symlink
+    /// included, is refused with [`NotAFile`] rather than followed.
     fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()>;
 
     /// Bytes an unprivileged process can still write on the filesystem that
@@ -202,5 +208,44 @@ impl std::error::Error for ParentNotADirectory {}
 impl From<ParentNotADirectory> for io::Error {
     fn from(error: ParentNotADirectory) -> Self {
         io::Error::new(io::ErrorKind::NotADirectory, error)
+    }
+}
+
+/// What an open found at a path instead of a file: a symlink it did not
+/// follow, a FIFO it did not wait on, a directory, a socket or a device
+/// (§7.3). `set_mode` also accepts a directory, and refuses the rest.
+///
+/// It travels inside an `io::Error` of kind `InvalidInput`;
+/// [`NotAFile::of`] finds it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotAFile {
+    /// What was there.
+    pub kind: FileKind,
+}
+
+impl NotAFile {
+    /// The `NotAFile` inside `error`, if that is what it is.
+    pub fn of(error: &io::Error) -> Option<Self> {
+        error.get_ref()?.downcast_ref().copied()
+    }
+}
+
+impl fmt::Display for NotAFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = match self.kind {
+            FileKind::File => "a file",
+            FileKind::Dir => "a directory",
+            FileKind::Symlink => "a symlink",
+            FileKind::Other => "a FIFO, socket or device",
+        };
+        write!(f, "not a file but {what}")
+    }
+}
+
+impl std::error::Error for NotAFile {}
+
+impl From<NotAFile> for io::Error {
+    fn from(error: NotAFile) -> Self {
+        io::Error::new(io::ErrorKind::InvalidInput, error)
     }
 }

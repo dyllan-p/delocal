@@ -10,14 +10,16 @@
 //! APFS on macOS). The last checks are §7.3's reaching a path: a commit at a
 //! path longer than either platform's `PATH_MAX`, and parents that are not
 //! directories, one of them a symlink to a directory outside the folder
-//! that must come through untouched.
+//! that must come through untouched; and a file swapped for a symlink or a
+//! FIFO before it is opened, which must be seen for what it is, neither
+//! followed nor waited on.
 
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::{FileKind, Fs, ParentNotADirectory};
+use super::{FileKind, Fs, NotAFile, ParentNotADirectory};
 
 /// One `#[test]` per check. Each makes a temporary directory holding
 /// `folder`, the root it passes to `$make` (a closure from the root to an
@@ -45,6 +47,7 @@ macro_rules! conformance_tests {
             a_path_beyond_path_max_is_committed_one_component_at_a_time,
             a_parent_that_is_a_file_stops_the_operation,
             a_parent_swapped_for_a_symlink_keeps_everything_inside_the_folder,
+            a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is,
         );
     };
     ($make:expr; $($check:ident),* $(,)?) => {
@@ -76,6 +79,17 @@ fn read(fs: &dyn Fs, path: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     fs.open_read(path).unwrap().read_to_end(&mut bytes).unwrap();
     bytes
+}
+
+/// What an open that must refuse found instead of a file.
+fn not_a_file<T>(result: io::Result<T>) -> FileKind {
+    match result {
+        Ok(_) => panic!("expected NotAFile"),
+        Err(e) => {
+            assert_eq!(e.kind(), ErrorKind::InvalidInput);
+            NotAFile::of(&e).expect("a NotAFile inside").kind
+        }
+    }
 }
 
 /// The kind of the error `result` must be. Not `unwrap_err`, which needs
@@ -153,9 +167,11 @@ pub fn open_read_reads_from_the_start_and_seeks(fs: &dyn Fs, _root: &Path) {
     file.read_to_string(&mut rest).unwrap();
     assert_eq!(rest, "world");
 
-    // Opening follows a symlink, as the module docs say.
+    // A symlink is refused, not followed, and so is a directory.
     fs.symlink(Path::new("f"), p("s")).unwrap();
-    assert_eq!(read(fs, p("s")), b"hello world");
+    assert_eq!(not_a_file(fs.open_read(p("s"))), FileKind::Symlink);
+    fs.create_dir(p("d")).unwrap();
+    assert_eq!(not_a_file(fs.open_read(p("d"))), FileKind::Dir);
     assert_eq!(kind_of(fs.open_read(p("missing"))), ErrorKind::NotFound);
 }
 
@@ -186,12 +202,12 @@ pub fn open_append_writes_at_the_end_and_needs_a_file(fs: &dyn Fs, _root: &Path)
     drop(file);
     assert_eq!(read(fs, p("f")), b"abcdef");
 
-    // Opening follows a symlink, as the module docs say.
+    // A symlink is refused, not followed, and so is a directory.
     fs.symlink(Path::new("f"), p("s")).unwrap();
-    let mut file = fs.open_append(p("s")).unwrap();
-    file.write_all(b"g").unwrap();
-    drop(file);
-    assert_eq!(read(fs, p("f")), b"abcdefg");
+    assert_eq!(not_a_file(fs.open_append(p("s"))), FileKind::Symlink);
+    assert_eq!(read(fs, p("f")), b"abcdef");
+    fs.create_dir(p("d")).unwrap();
+    assert_eq!(not_a_file(fs.open_append(p("d"))), FileKind::Dir);
 
     assert_eq!(kind_of(fs.open_append(p("missing"))), ErrorKind::NotFound);
     assert_eq!(kind_of(fs.lstat(p("missing"))), ErrorKind::NotFound);
@@ -328,7 +344,7 @@ pub fn set_mode_sets_bits_and_refuses_a_symlink(fs: &dyn Fs, _root: &Path) {
     assert_eq!(fs.lstat(p("d")).unwrap().mode, 0o700);
 
     fs.symlink(Path::new("f"), p("s")).unwrap();
-    assert_eq!(kind_of(fs.set_mode(p("s"), 0o777)), ErrorKind::InvalidInput);
+    assert_eq!(not_a_file(fs.set_mode(p("s"), 0o777)), FileKind::Symlink);
     assert_eq!(fs.lstat(f).unwrap().mode, 0o600, "the target is untouched");
     assert_eq!(
         kind_of(fs.set_mode(p("missing"), 0o644)),
@@ -524,4 +540,93 @@ pub fn a_parent_swapped_for_a_symlink_keeps_everything_inside_the_folder(fs: &dy
     );
     assert_eq!(read(fs, p("x")), b"x");
     assert_eq!(read(fs, p("d.old/f")), b"inside");
+}
+
+/// Run `open`, which must not wait on the FIFO at `fifo`. If it has not
+/// returned within two seconds it is waiting, so open both ends of the FIFO
+/// (without waiting) to release it, and fail the check.
+fn without_waiting<T>(fifo: &Path, open: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let done = AtomicBool::new(false);
+    let rescued = AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !done.load(Ordering::SeqCst) {
+                if Instant::now() >= deadline {
+                    rescued.store(true, Ordering::SeqCst);
+                    let nonblocking = rustix::fs::OFlags::NONBLOCK;
+                    let mode = rustix::fs::Mode::empty();
+                    let flags = rustix::fs::OFlags::RDONLY | nonblocking;
+                    let _reader = rustix::fs::open(fifo, flags, mode);
+                    let flags = rustix::fs::OFlags::WRONLY | nonblocking;
+                    let _writer = rustix::fs::open(fifo, flags, mode);
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let result = open();
+        done.store(true, Ordering::SeqCst);
+        result
+    });
+    assert!(
+        !rescued.load(Ordering::SeqCst),
+        "the open waited on the FIFO"
+    );
+    result
+}
+
+pub fn a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is(fs: &dyn Fs, root: &Path) {
+    // Beside the folder, a file a symlink will point at.
+    let outside = root.parent().unwrap().join("target");
+    std::fs::write(&outside, "outside").unwrap();
+    let before = std::fs::symlink_metadata(&outside).unwrap();
+
+    // `f` is a file when a scan sees it, then a symlink to `target`.
+    write(fs, p("f"), b"inside");
+    assert_eq!(fs.lstat(p("f")).unwrap().kind, FileKind::File);
+    std::fs::remove_file(root.join("f")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("f")).unwrap();
+    assert_eq!(not_a_file(fs.open_read(p("f"))), FileKind::Symlink);
+    assert_eq!(not_a_file(fs.open_append(p("f"))), FileKind::Symlink);
+    assert_eq!(not_a_file(fs.set_mode(p("f"), 0o777)), FileKind::Symlink);
+    assert_eq!(fs.lstat(p("f")).unwrap().kind, FileKind::Symlink);
+    let after = std::fs::symlink_metadata(&outside).unwrap();
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+    assert_eq!(
+        (after.mode(), after.mtime(), after.mtime_nsec()),
+        (before.mode(), before.mtime(), before.mtime_nsec()),
+        "the target outside the folder is untouched"
+    );
+
+    // Then a FIFO, with nothing on its other end: an open that waited
+    // would wait forever.
+    std::fs::remove_file(root.join("f")).unwrap();
+    let fifo = root.join("f");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success(), "mkfifo");
+    assert_eq!(
+        not_a_file(without_waiting(&fifo, || fs.open_read(p("f")))),
+        FileKind::Other
+    );
+    assert_eq!(
+        not_a_file(without_waiting(&fifo, || fs.open_append(p("f")))),
+        FileKind::Other
+    );
+    assert_eq!(
+        not_a_file(without_waiting(&fifo, || fs.set_mode(p("f"), 0o600))),
+        FileKind::Other
+    );
+    assert_eq!(fs.lstat(p("f")).unwrap().kind, FileKind::Other);
+
+    // And a socket.
+    let _socket = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
+    assert_eq!(not_a_file(fs.open_read(p("sock"))), FileKind::Other);
+    assert_eq!(not_a_file(fs.open_append(p("sock"))), FileKind::Other);
 }

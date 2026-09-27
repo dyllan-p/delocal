@@ -5,11 +5,21 @@
 //! component at a time from there, opening each parent with `O_DIRECTORY |
 //! O_NOFOLLOW`, and then acts on the last component with a
 //! directory-relative call (`openat`, `fstatat`, `renameat`, `unlinkat`,
-//! `mkdirat`, `symlinkat`, `readlinkat`, `utimensat`, `fchmodat`). The kernel
+//! `mkdirat`, `symlinkat`, `readlinkat`, `utimensat`). The kernel
 //! never sees a whole path, so `PATH_MAX` (4,096 bytes on Linux, 1,024 on
 //! macOS) never applies, and a parent that is not a directory stops the walk
 //! with [`ParentNotADirectory`] before anything outside the folder is read
 //! or written.
+//!
+//! Files are opened with `O_NOFOLLOW | O_NONBLOCK` and checked with `fstat`
+//! on the descriptor, so a symlink is never followed, a FIFO never waited
+//! on, and either is refused with [`NotAFile`]. `set_mode` opens the same
+//! way and uses `fchmod` on the descriptor. §7.3 names `fchmodat`, but Linux
+//! cannot tell `fchmodat` not to follow a symlink (rustix answers
+//! `EOPNOTSUPP` for `AT_SYMLINK_NOFOLLOW` there), so a check before it would
+//! leave a window in which a swapped-in symlink is followed. Until DESIGN.md
+//! settles which gives way, this keeps §7.3's rule that nothing is followed
+//! over the name of the call, at the cost of needing read permission.
 //!
 //! The system calls come from `rustix` (Appendix A), which wraps them
 //! safely; `std` has no directory-relative calls at all. A walk costs one
@@ -25,7 +35,7 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, Timespec, Timestamps};
 use rustix::io::Errno;
 
-use super::{FileKind, Fs, ParentNotADirectory, ReadFile, Stat, WriteFile};
+use super::{FileKind, Fs, NotAFile, ParentNotADirectory, ReadFile, Stat, WriteFile};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -99,6 +109,46 @@ impl RealFs {
         dir.as_ref().map_or(self.root.as_fd(), AsFd::as_fd)
     }
 
+    /// Open the last component of `path` with `flags`, never following a
+    /// symlink or waiting on a FIFO, and return the descriptor with what it
+    /// is. What the open refuses outright is [`NotAFile`] when it is not a
+    /// file.
+    fn open_entry(&self, path: &Path, flags: OFlags) -> io::Result<(OwnedFd, FileKind)> {
+        let (dir, name) = self.entry(path)?;
+        let at = self.at(&dir);
+        let flags = flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        match rustix::fs::openat(at, name, flags, Mode::empty()) {
+            Ok(fd) => {
+                let kind = kind(&rustix::fs::fstat(&fd)?);
+                Ok((fd, kind))
+            }
+            // Refused without following or waiting: a symlink (ELOOP under
+            // O_NOFOLLOW), a directory opened for writing (EISDIR), a FIFO
+            // opened for writing with no reader, or a socket (ENXIO, or
+            // EOPNOTSUPP for a socket on macOS). Say what is there instead.
+            Err(e @ (Errno::LOOP | Errno::ISDIR | Errno::NXIO | Errno::OPNOTSUPP)) => {
+                match kind(&rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?) {
+                    FileKind::File => Err(e.into()),
+                    kind => Err(NotAFile { kind }.into()),
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Open the file at `path` with `flags`: anything else is [`NotAFile`].
+    /// The descriptor keeps `O_NONBLOCK`, which changes nothing about reading
+    /// or writing a file. At the open it does one thing more on Linux: a file
+    /// under a conflicting lease (a Samba or NFS server's) fails with
+    /// `EWOULDBLOCK` instead of waiting for the lease to break, an I/O error
+    /// the caller retries.
+    fn open_file(&self, path: &Path, flags: OFlags) -> io::Result<File> {
+        match self.open_entry(path, flags)? {
+            (fd, FileKind::File) => Ok(File::from(fd)),
+            (_, kind) => Err(NotAFile { kind }.into()),
+        }
+    }
+
     /// Open the directory at `path` without following a symlink there:
     /// anything but a directory is `NotADirectory`.
     fn open_dir(&self, path: &Path) -> io::Result<OwnedFd> {
@@ -169,10 +219,7 @@ impl Fs for RealFs {
     }
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadFile>> {
-        let (dir, name) = self.entry(path)?;
-        let flags = OFlags::RDONLY | OFlags::CLOEXEC;
-        let fd = rustix::fs::openat(self.at(&dir), name, flags, Mode::empty())?;
-        Ok(Box::new(File::from(fd)))
+        Ok(Box::new(self.open_file(path, OFlags::RDONLY)?))
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn WriteFile>> {
@@ -185,10 +232,9 @@ impl Fs for RealFs {
     }
 
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn WriteFile>> {
-        let (dir, name) = self.entry(path)?;
-        let flags = OFlags::WRONLY | OFlags::APPEND | OFlags::CLOEXEC;
-        let fd = rustix::fs::openat(self.at(&dir), name, flags, Mode::empty())?;
-        Ok(Box::new(File::from(fd)))
+        Ok(Box::new(
+            self.open_file(path, OFlags::WRONLY | OFlags::APPEND)?,
+        ))
     }
 
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
@@ -252,25 +298,15 @@ impl Fs for RealFs {
 
     fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()> {
         let mode = Mode::from_raw_mode(narrow(mode & 0o7777));
-        let (dir, name) = match self.walk(path)? {
-            (dir, Some(name)) => (dir, name),
-            (_, None) => return Ok(rustix::fs::fchmod(&self.root, mode)?),
-        };
-        // fchmodat follows a symlink and Linux cannot be told not to, so
-        // refuse one here. A symlink swapped in between is followed.
-        let st = rustix::fs::statat(self.at(&dir), name, AtFlags::SYMLINK_NOFOLLOW)?;
-        if kind(&st) == FileKind::Symlink {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "set_mode on a symlink",
-            ));
+        if components(path)?.is_empty() {
+            return Ok(rustix::fs::fchmod(&self.root, mode)?);
         }
-        Ok(rustix::fs::chmodat(
-            self.at(&dir),
-            name,
-            mode,
-            AtFlags::empty(),
-        )?)
+        // On the descriptor, not by name (see the module docs). Opening for
+        // reading needs read permission, which chmod by name would not.
+        match self.open_entry(path, OFlags::RDONLY)? {
+            (fd, FileKind::File | FileKind::Dir) => Ok(rustix::fs::fchmod(&fd, mode)?),
+            (_, kind) => Err(NotAFile { kind }.into()),
+        }
     }
 
     fn available_space(&self, path: &Path) -> io::Result<u64> {
