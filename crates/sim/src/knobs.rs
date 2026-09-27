@@ -57,7 +57,7 @@ impl Default for Knobs {
             crash_between_renames: 0.05,
             group_commit_lag: 4,
             displace_subtrees: true,
-            skip: 0.0,
+            skip: 0.002,
             nodes: None,
         }
     }
