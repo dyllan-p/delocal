@@ -15,7 +15,7 @@ diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..e310710 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -1331,20 +1331,6 @@ impl FolderState {
+@@ -1331,18 +1331,6 @@ impl FolderState {
              // caught here: later scans never report a tombstoned path.
              self.reconsider(now, path, DeferredReason::ChangedUnderneath);
          }
@@ -25,9 +25,7 @@ index e843412..e310710 100644
 -        let unseen: Vec<RelPath> = self
 -            .deferred
 -            .paths()
--            .filter(|p| {
--                !seen.contains(*p) && self.index.live(p).is_none() && !self.wants.in_flight(p)
--            })
+-            .filter(|p| !bracket.saw(p) && self.index.live(p).is_none() && !self.wants.in_flight(p))
 -            .cloned()
 -            .collect();
 -        for path in &unseen {

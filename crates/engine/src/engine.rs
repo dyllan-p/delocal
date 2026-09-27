@@ -88,7 +88,8 @@ pub enum Event {
     ScanStarted {
         folder: FolderId,
     },
-    /// A full scan ended; live records it did not report are deleted.
+    /// A full scan ended; live records it did not report, and no skip it
+    /// reported covers, are deleted.
     ScanFinished {
         folder: FolderId,
     },
