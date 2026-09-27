@@ -408,9 +408,49 @@ struct Walk {
     /// Paths a rule ignores that the walk did not find on disk, reported
     /// `Skipped` after it.
     unreached: Vec<RelPath>,
-    /// Skipped paths whose contents go unreported: the directories the
-    /// scan could not list, and every ignored path.
+    /// Skipped paths whose skip covers what lies beneath them: the
+    /// directories the scan could not list, and every ignored path.
     beneath: BTreeSet<RelPath>,
+}
+
+/// What the skip checker holds one node's index writes against (§7.3).
+struct SkipCheck {
+    node: NodeId,
+    /// The paths reported `Skipped` so far in the bracket, or the one path
+    /// the watcher reported.
+    skipped: BTreeSet<RelPath>,
+    /// Those whose skip covers what lies beneath them (see [`Walk`]).
+    beneath: BTreeSet<RelPath>,
+    /// As the watched event began: the paths with a live record, and the
+    /// index's `seq`, so a tombstone written above it is one the event
+    /// wrote.
+    live: BTreeSet<RelPath>,
+    seq: u64,
+}
+
+impl SkipCheck {
+    fn new(node: NodeId) -> Self {
+        Self {
+            node,
+            skipped: BTreeSet::new(),
+            beneath: BTreeSet::new(),
+            live: BTreeSet::new(),
+            seq: 0,
+        }
+    }
+
+    /// True if a skip covers `path`: it was reported `Skipped`, or lies
+    /// beneath a skip that covers what is beneath it.
+    fn covers(&self, path: &RelPath) -> bool {
+        self.skipped.contains(path) || self.skipped_above(path).is_some()
+    }
+
+    /// The skipped path above `path` that covers it, if any.
+    fn skipped_above(&self, path: &RelPath) -> Option<&RelPath> {
+        self.beneath
+            .iter()
+            .find(|d| self.skipped.contains(*d) && d.is_ancestor_of(path))
+    }
 }
 
 /// True if a rule on `node` ignores `path`: a rule for the path itself, or
@@ -507,6 +547,9 @@ pub struct Sim {
     group_rng: ChaCha8Rng,
     /// Draws for the skip model, on `SKIP_STREAM`.
     skip_rng: ChaCha8Rng,
+    /// While a node is fed a `Skipped` report or the end of a bracket that
+    /// had one, what the skip checker holds its index writes against.
+    checking: Option<SkipCheck>,
     clock: Timestamp,
     folder: FolderId,
     rules: Rules,
@@ -625,6 +668,7 @@ impl Sim {
             journal_rng,
             group_rng,
             skip_rng,
+            checking: None,
             clock,
             folder,
             rules,
@@ -1142,7 +1186,41 @@ impl Sim {
             .map(|_| path.clone())
     }
 
+    /// §7.3: the engine keeps the record of a path a bracket reports
+    /// `Skipped` and of every tracked path beneath a directory it skipped,
+    /// and a skip outside a bracket changes nothing. So while the checker
+    /// watches, no index write may be a tombstone of this node's own, under
+    /// a new `seq`, over a record that was live at a path a skip covers.
+    fn tombstones_a_skip(&self, id: NodeId, action: &Action) -> Option<String> {
+        let check = self.checking.as_ref().filter(|c| c.node == id)?;
+        let Action::IndexChanged { record, .. } = action else {
+            return None;
+        };
+        let path = &record.entry.path;
+        if !record.entry.deleted
+            || record.entry.modified_by != id
+            || record.seq <= check.seq
+            || !check.live.contains(path)
+            || !check.covers(path)
+        {
+            return None;
+        }
+        Some(match check.skipped_above(path) {
+            Some(dir) => format!(
+                "{} tombstoned {path}, beneath {dir}, which its scan reported Skipped",
+                Self::short(id)
+            ),
+            None => format!(
+                "{} tombstoned {path}, which was reported Skipped",
+                Self::short(id)
+            ),
+        })
+    }
+
     fn act(&mut self, id: NodeId, action: Action) -> Result<(), Failure> {
+        if let Some(detail) = self.tombstones_a_skip(id, &action) {
+            return Err(self.fail("Skipped", detail));
+        }
         if let Some(path) = self.commits_held_item(id, &action) {
             return Err(self.fail(
                 "I5 brake",
@@ -2220,6 +2298,8 @@ impl Sim {
         // The watcher sees a path a rule ignores, and the host reports it
         // `Skipped`, which outside a bracket changes nothing (§7.3).
         if self.nodes.get(&id).is_some_and(|n| ignores(n, &path)) {
+            let mut check = SkipCheck::new(id);
+            check.skipped.insert(path.clone());
             let event = Event::Scanned {
                 folder: self.folder,
                 path,
@@ -2227,7 +2307,7 @@ impl Sim {
                     reason: SkipReason::Ignored,
                 },
             };
-            return self.feed(id, event);
+            return self.checked(id, event, &mut check);
         }
         let state = self
             .nodes
@@ -2245,7 +2325,9 @@ impl Sim {
     }
 
     /// A full scan (§7.3) with the fast path against the index records the
-    /// host has written, under the skip model (see [`Sim::skip_some`]).
+    /// host has written, under the skip model (see [`Sim::skip_some`]). The
+    /// skip checker watches every report of `Skipped` and, if there was
+    /// one, the end of the bracket.
     fn full_scan(&mut self, id: NodeId, may_abort: bool) -> Result<(), Failure> {
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
@@ -2278,37 +2360,51 @@ impl Sim {
             None
         };
         let walk = self.skip_some(id, entries);
+        let mut check = SkipCheck::new(id);
+        check.beneath = walk.beneath;
         let folder = self.folder;
         self.feed(id, Event::ScanStarted { folder })?;
         for (i, (path, state)) in walk.reports.into_iter().enumerate() {
             if abort_at == Some(i) {
-                return self.feed(id, Event::ScanAborted { folder });
+                return self.bracket_end(id, Event::ScanAborted { folder }, &mut check);
             }
             if let Some(state) = state {
-                self.feed(
-                    id,
-                    Event::Scanned {
-                        folder,
-                        path,
-                        state,
-                    },
-                )?;
+                self.report(id, path, state, &mut check)?;
             }
         }
         for path in walk.unreached {
             let state = ScanState::Skipped {
                 reason: SkipReason::Ignored,
             };
-            self.feed(
-                id,
-                Event::Scanned {
-                    folder,
-                    path,
-                    state,
-                },
-            )?;
+            self.report(id, path, state, &mut check)?;
         }
-        self.feed(id, Event::ScanFinished { folder })
+        self.bracket_end(id, Event::ScanFinished { folder }, &mut check)
+    }
+
+    /// One report of a full scan. A `Skipped` one joins the bracket's skips
+    /// and is fed with the skip checker watching.
+    fn report(
+        &mut self,
+        id: NodeId,
+        path: RelPath,
+        state: ScanState,
+        check: &mut SkipCheck,
+    ) -> Result<(), Failure> {
+        let skipped = matches!(state, ScanState::Skipped { .. });
+        if skipped {
+            check.skipped.insert(path.clone());
+        }
+        let folder = self.folder;
+        let event = Event::Scanned {
+            folder,
+            path,
+            state,
+        };
+        if skipped {
+            self.checked(id, event, check)
+        } else {
+            self.feed(id, event)
+        }
     }
 
     /// The skip model (§7.3) for one full scan of `id` that walked
@@ -2397,6 +2493,40 @@ impl Sim {
         walk.unreached = rules.into_iter().filter(|r| !reached.contains(r)).collect();
         self.stats.skipped += walk.unreached.len() as u64;
         walk
+    }
+
+    /// Feed `event` to `id` with the skip checker watching the index writes
+    /// it causes, against the index as the event begins.
+    fn checked(&mut self, id: NodeId, event: Event, check: &mut SkipCheck) -> Result<(), Failure> {
+        if let Some(f) = self.engine(id).and_then(|e| e.folder(self.folder)) {
+            check.seq = f.index().seq();
+            check.live = f
+                .index()
+                .live_records()
+                .map(|r| r.entry.path.clone())
+                .collect();
+        }
+        self.checking = Some(std::mem::replace(check, SkipCheck::new(id)));
+        let fed = self.feed(id, event);
+        if let Some(back) = self.checking.take() {
+            *check = back;
+        }
+        fed
+    }
+
+    /// The end of a bracket, finished or aborted: watched by the skip
+    /// checker if the bracket skipped anything.
+    fn bracket_end(
+        &mut self,
+        id: NodeId,
+        event: Event,
+        check: &mut SkipCheck,
+    ) -> Result<(), Failure> {
+        if check.skipped.is_empty() {
+            self.feed(id, event)
+        } else {
+            self.checked(id, event, check)
+        }
     }
 
     // ---------------------------------------------------------------- steps
@@ -3456,10 +3586,75 @@ mod tests {
         }
     }
 
+    /// The skip checker (§7.3). While it watches a node, a tombstone of
+    /// that node's own under a new `seq`, over a record that was live at a
+    /// path reported `Skipped` or beneath a skipped directory, is a failure.
+    /// Nothing else is: a path no skip covers, a record put back by a
+    /// revert under its old `seq`, a peer's tombstone, a live record, or
+    /// another node's write.
+    #[test]
+    fn the_skip_checker_flags_a_tombstone_a_skip_covers() {
+        let mut sim = world();
+        let (id, other) = (sim.order[0], sim.order[1]);
+        let mut check = SkipCheck::new(id);
+        check.skipped = [rel("d0"), rel("f1"), rel("d1")].into();
+        check.beneath = [rel("d0"), rel("d2")].into();
+        check.live = [rel("d0/f4"), rel("f1"), rel("d1/f5"), rel("f2")].into();
+        check.seq = 10;
+        sim.checking = Some(check);
+        let folder = sim.folder;
+        let record = |path: &str, seq: u64, by: NodeId, deleted: bool| Action::IndexChanged {
+            folder,
+            record: IndexRecord {
+                entry: Entry {
+                    path: rel(path),
+                    kind: Kind::File,
+                    size: 0,
+                    mtime_ns: 0,
+                    stamp: 1,
+                    exec: false,
+                    hash: ContentHash::EMPTY,
+                    prev_hash: ContentHash::EMPTY,
+                    version: Version::from_iter([(by, 1)]),
+                    deleted,
+                    modified_by: by,
+                    author_host: HostName::empty(),
+                },
+                seq,
+            },
+        };
+        let flagged = |sim: &Sim, action: Action| sim.tombstones_a_skip(id, &action);
+        assert!(
+            flagged(&sim, record("f1", 11, id, true)).is_some(),
+            "skipped"
+        );
+        let beneath = flagged(&sim, record("d0/f4", 11, id, true)).unwrap();
+        assert!(beneath.contains("beneath d0"), "{beneath}");
+        for (action, why) in [
+            (record("d1/f5", 11, id, true), "d1 skipped as a file"),
+            (record("f2", 11, id, true), "no skip covers f2"),
+            (record("d0/f6", 11, id, true), "d0/f6 was not live"),
+            (record("f1", 10, id, true), "a revert's old seq"),
+            (record("f1", 11, other, true), "a peer's tombstone"),
+            (record("f1", 11, id, false), "a live record"),
+        ] {
+            assert_eq!(flagged(&sim, action), None, "{why}");
+        }
+        let seen_by_other = record("f1", 11, id, true);
+        assert_eq!(sim.tombstones_a_skip(other, &seen_by_other), None);
+        sim.checking = None;
+        assert_eq!(
+            flagged(&sim, record("f1", 11, id, true)),
+            None,
+            "not watching"
+        );
+    }
+
     /// §7.3 through the model: a rule ignores the directory d0 and its
     /// user deletes d0/f4 meanwhile. The scan reports d0 `Skipped` and
-    /// nothing beneath it, and the engine keeps d0/f4 live. The first scan
-    /// after the rule goes observes the deletion.
+    /// nothing beneath it, the engine keeps d0/f4 live, and the checker,
+    /// which watches that bracket, is satisfied. The first scan after the
+    /// rule goes observes the deletion.
     #[test]
     fn an_ignored_directory_keeps_the_records_beneath_it_through_a_scan() {
         let mut sim = world();
