@@ -2981,4 +2981,22 @@ mod tests {
         let expected = file(3, true).observed();
         assert!(!expected_matches(Some(&file(3, false)), Some(&expected)));
     }
+
+    /// The same for a retarget, which changes nothing about a symlink but
+    /// its target (d12fec3, §7.5 step 6). The targets have the same length,
+    /// so only the target itself tells them apart. The pins
+    /// `a_retarget_under_a_pending_commit_is_changed_underneath` and
+    /// `..._in_another_run` guard this only while their seeds reach it.
+    #[test]
+    fn the_commit_guard_refuses_a_symlink_whose_target_changed() {
+        let link = |target: &[u8]| File {
+            kind: Kind::Symlink,
+            content: target.to_vec(),
+            mtime_ns: 0,
+            exec: false,
+        };
+        let expected = link(b"f1").observed();
+        assert!(expected_matches(Some(&link(b"f1")), Some(&expected)));
+        assert!(!expected_matches(Some(&link(b"f2")), Some(&expected)));
+    }
 }
