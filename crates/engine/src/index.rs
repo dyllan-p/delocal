@@ -1084,6 +1084,10 @@ mod tests {
         idx.adopt(newer);
     }
 
+    // The panic is `adopt`'s debug assertion, which a release build leaves
+    // out (there the adopt is refused instead), so the test exists only in
+    // debug builds and `cargo test --release` still passes.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "does not dominate")]
     fn adopt_of_a_concurrent_version_is_a_bug() {
