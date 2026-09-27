@@ -62,13 +62,16 @@ jobs:
       # DESIGN.md Appendix B: the engine does no I/O and depends on nothing
       # that does. `cargo tree -e normal` lists only normal (non-dev,
       # non-build) dependencies, which is what ships in the binary. If any
-      # of these crates appear, the boundary is in the wrong place.
+      # of these crates appear, the boundary is in the wrong place. Each
+      # I/O crate joins the list in the PR that brings it into the
+      # workspace: filetime, rustix and tempfile touch the filesystem, and
+      # Appendix A gives unicode-normalization to the binary crate only.
       - name: Engine boundary (dependencies)
         run: |
           set -euo pipefail
           tree="$(cargo tree -p delocal-engine -e normal --locked)"
           echo "$tree"
-          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio|rand'; then
+          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio|rand|filetime|rustix|tempfile|unicode-normalization'; then
             echo "::error::delocal-engine depends on an I/O or randomness crate (see CLAUDE.md, crate boundary)"
             exit 1
           fi
