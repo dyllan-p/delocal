@@ -300,7 +300,8 @@ jobs:
   # (scripts/pins.sh). It does not need the plan's seeds and runs beside
   # the shards; the twenty-first job waits for a free runner. The script
   # prints its table and ends with "N of M pins guard their fix"; the log
-  # ends with "pins done" only if the script got that far.
+  # ends with "pins done" only if the script got that far and ran every
+  # pin.
   pins:
     name: pins
     runs-on: ubuntu-24.04
@@ -325,7 +326,9 @@ jobs:
           status=${PIPESTATUS[0]}
           cp "$RUNNER_TEMP/pins/summary.md" . 2> /dev/null || true
           # 0: every pin is valid; 1: some are not. Either way the check ran
-          # to the end. Anything else is a setup error or a signal.
+          # to the end. 3: it wrote its table, but some pins were not checked
+          # (a worker died, a worktree could not be made), so it did not
+          # finish. Anything else is a setup error or a signal.
           if [ "$status" -le 1 ]; then
             echo "pins done" >> pins.log
           fi
@@ -342,9 +345,12 @@ jobs:
           if-no-files-found: warn
 
   # One issue per night on which any pin fails the check, or the check did
-  # not finish, with the table of every pin. Kept apart from the pins job
-  # for the same reason the sweep's report is: the job that builds and runs
-  # the repository's code holds no token that can write.
+  # not finish, with the table of every pin if the script wrote one. A pin
+  # it did not check is neither valid nor invalid (§14.4), so a check that
+  # did not finish always gets that title, whatever else its table holds.
+  # Kept apart from the pins job for the same reason the sweep's report is:
+  # the job that builds and runs the repository's code holds no token that
+  # can write.
   pins-report:
     name: pins report
     needs: pins
@@ -389,6 +395,10 @@ jobs:
             echo
             if [ "$finished" = yes ]; then
               echo "A pin is valid only if its test passes as it is and fails with its patch, scripts/pins/<pin>.patch, applied (DESIGN.md §14.4). The invalid ones are in bold. A pin that passes with its patch no longer reaches the bug its fix is for: replace it with a new seed that fails with the patch, or with a unit test next to the fix."
+              echo
+              cat pins/summary.md
+            elif [ -f pins/summary.md ]; then
+              echo "The check did not run every pin: a worker died, a worktree could not be made, or a build or test run stopped without a result. A pin it did not check is neither valid nor invalid (DESIGN.md §14.4), and its rows say why; the pins-log artifact of the run has the log. Any pin in bold was checked, and is invalid."
               echo
               cat pins/summary.md
             else

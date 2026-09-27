@@ -26,10 +26,17 @@
 # its patches touch. Tests run in release, as CI's pinned job runs them,
 # and a test that runs for more than ten minutes counts as not failing.
 #
+# A pin the script could not run is not checked, which makes it neither
+# valid nor invalid: its worker died, its worktree could not be made, or a
+# build or test run of it stopped before the end without a compile error
+# or a result. If any pin is not checked, the check did not finish.
+#
 # With NAMEs only those pins are checked, and the coverage check is
 # skipped. The logs of pin NAME go to DIR/NAME, by default
 # target/pins/NAME, and DIR/summary.md holds the table the nightly puts in
-# an issue. Exit status 0 means every pin checked is valid.
+# an issue. Exit status: 0, every pin is valid; 1, the check finished and
+# some pin is not valid; 3, the check did not finish; 2, the arguments or a
+# patch's header are wrong, and nothing ran.
 
 set -euo pipefail
 
@@ -69,6 +76,9 @@ out=${out:-$repo/target/pins}
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 pins=$repo/scripts/pins
+# The logs are read by grep below, and by people in the nightly's
+# artifact; colour codes would get in the way of both.
+export CARGO_TERM_COLOR=never
 
 # Every test in regressions.rs, read from REV: a `#[test]` line, perhaps
 # an `#[ignore]`, then its `fn`.
@@ -79,6 +89,8 @@ pinned=$(git -C "$repo" show "$commit:crates/sim/src/regressions.rs" |
 names=() packages=() tests=()
 add() {
   local name=$1 patch=$pins/$1.patch line
+  # The name becomes a directory under DIR, removed at the start of a run.
+  [[ $name =~ ^[a-z0-9_]+$ ]] || { echo "pin names are lower-case letters, digits and '_': $name" >&2; exit 2; }
   [ -f "$patch" ] || { echo "no patch $patch" >&2; exit 2; }
   line=$(grep -E '^test: ' "$patch" || true)
   [ "$(echo "$line" | grep -c .)" -eq 1 ] || { echo "$patch needs exactly one 'test: PACKAGE TEST' line" >&2; exit 2; }
@@ -146,21 +158,42 @@ trap remove_trees EXIT
 trap stop INT TERM
 remove_trees
 
+# Nothing from an earlier run may stand in for a result of this one.
+rm -f "$out/summary.md" "$out"/base/*.log
+for name in "${names[@]}"; do
+  rm -rf "${out:?}/$name"
+  mkdir -p "$out/$name"
+done
+
+# result_in LOG TEST: "passes" or "fails" if libtest's log LOG has TEST's
+# line ("test NAME ... ok" or "... FAILED"), "missing" if it has none but
+# the run got to its "test result:" line, and nothing if the run did not
+# get that far, which says nothing about TEST.
+result_in() {
+  [ -f "$1" ] || return 0
+  if grep -qxF "test $2 ... ok" "$1"; then
+    echo passes
+  elif grep -qxF "test $2 ... FAILED" "$1"; then
+    echo fails
+  elif grep -q '^test result: ' "$1"; then
+    echo missing
+  fi
+}
+
 # run_one TREE PACKAGE TEST LOG: run one test at TREE in release, and
-# print "passes", "fails", "hangs" or "missing" (the test does not exist).
-# libtest prints "test NAME ... ok" or "... FAILED" for every test it runs.
+# print "passes", "fails", "hangs", "missing" (the test does not exist),
+# or "not checked" with why.
 run_one() {
-  local tree=$1 package=$2 test=$3 log=$4 status=0
+  local tree=$1 package=$2 test=$3 log=$4 status=0 result
   (cd "$tree" && timeout 600 cargo test --release --locked -j "$threads" -p "$package" --lib -- "$test" --exact) \
     > "$log" 2>&1 || status=$?
+  result=$(result_in "$log" "$test")
   if [ "$status" -eq 124 ]; then
     echo hangs
-  elif grep -qxF "test $test ... ok" "$log"; then
-    echo passes
-  elif grep -qxF "test $test ... FAILED" "$log"; then
-    echo fails
+  elif [ -n "$result" ]; then
+    echo "$result"
   else
-    echo missing
+    echo "not checked: its test run stopped (status $status)"
   fi
 }
 
@@ -174,95 +207,138 @@ echo "pins: ${#names[@]} of $(git -C "$repo" rev-parse --short "$commit"), $jobs
 
 # Every worktree is made before anything runs, one at a time: two `git
 # worktree add` at once can read the other's half-made entry under
-# .git/worktrees and fail ("failed to read .../commondir").
+# .git/worktrees and fail ("failed to read .../commondir"). A worktree
+# that cannot be made leaves its pins not checked.
 base=$out/base
 mkdir -p "$base"
-git -C "$repo" worktree add --quiet --detach "$base/tree" "$commit"
+base_tree=yes
+git -C "$repo" worktree add --quiet --detach "$base/tree" "$commit" 2> "$base/worktree.log" || base_tree=no
+trees=()
 for (( w = 0; w < jobs; w++ )); do
   mkdir -p "$out/worker-$w"
-  git -C "$repo" worktree add --quiet --detach "$out/worker-$w/tree" "$commit"
+  trees[w]=yes
+  git -C "$repo" worktree add --quiet --detach "$out/worker-$w/tree" "$commit" 2> "$out/worker-$w/worktree.log" ||
+    trees[w]=no
 done
 
 # The unpatched half: one build of REV, every named test in it. Each pin
 # must pass here.
 export CARGO_TARGET_DIR=$base/target
-for package in $(printf '%s\n' "${packages[@]}" | sort -u); do
-  filters=()
-  for i in "${!names[@]}"; do
-    [ "${packages[$i]}" = "$package" ] && filters+=("${tests[$i]}")
+if [ "$base_tree" = yes ]; then
+  for package in $(printf '%s\n' "${packages[@]}" | sort -u); do
+    filters=()
+    for i in "${!names[@]}"; do
+      [ "${packages[$i]}" = "$package" ] && filters+=("${tests[$i]}")
+    done
+    (cd "$base/tree" && cargo test --release --locked -p "$package" --lib -- --exact "${filters[@]}") \
+      > "$base/$package.log" 2>&1 || true
   done
-  (cd "$base/tree" && cargo test --release --locked -p "$package" --lib -- --exact "${filters[@]}") \
-    > "$base/$package.log" 2>&1 || true
-done
+fi
 for i in "${!names[@]}"; do
-  mkdir -p "$out/${names[$i]}"
-  log=$base/${packages[$i]}.log
-  if grep -qxF "test ${tests[$i]} ... ok" "$log"; then
-    echo passes
-  elif grep -qxF "test ${tests[$i]} ... FAILED" "$log"; then
-    echo fails
+  if [ "$base_tree" = no ]; then
+    echo "not checked: the unpatched worktree could not be made"
   else
-    echo missing
+    result=$(result_in "$base/${packages[$i]}.log" "${tests[$i]}")
+    echo "${result:-not checked: the unpatched run stopped}"
   fi > "$out/${names[$i]}/unpatched"
 done
 
-# The patched half. Worker W takes pins W, W + J, W + 2J, ...
+# The patched half. Worker W takes pins W, W + J, W + 2J, ... A pin's
+# result reaches DIR/NAME/patched only once its test has run, so a pin
+# whose worker died midway has none.
 work() {
-  local w=$1 dir=$out/worker-$1 i name patch result
-  local tree=$dir/tree
-  export CARGO_TARGET_DIR=$dir/target
+  local w=$1 tree=$out/worker-$1/tree i name dir result
+  export CARGO_TARGET_DIR=$out/worker-$1/target
   for (( i = w; i < ${#names[@]}; i += jobs )); do
-    name=${names[$i]} patch=$pins/${names[$i]}.patch
-    rm -f "$out/$name/patched" "$out/$name"/*.log
+    name=${names[$i]} dir=$out/${names[$i]}
     git -C "$tree" checkout --quiet --force --detach "$commit"
     git -C "$tree" clean --quiet -fdx
-    if ! git -C "$tree" apply "$patch" 2> "$out/$name/apply.log"; then
-      echo does-not-apply > "$out/$name/patched"
-      continue
+    if ! git -C "$tree" apply "$pins/$name.patch" 2> "$dir/apply.log"; then
+      result=does-not-apply
+    elif ! (cd "$tree" && cargo test --release --locked -j "$threads" -p "${packages[$i]}" --lib --no-run) \
+      > "$dir/build.log" 2>&1; then
+      # A compile error is the patch's; a build that stopped without one
+      # (a killed compiler, a full disk) says nothing about the pin.
+      if grep -q '^error: could not compile .* due to .*previous error' "$dir/build.log"; then
+        result=does-not-build
+      else
+        result="not checked: its build stopped"
+      fi
+    else
+      result=$(run_one "$tree" "${packages[$i]}" "${tests[$i]}" "$dir/test.log")
     fi
-    if ! (cd "$tree" && cargo test --release --locked -j "$threads" -p "${packages[$i]}" --lib --no-run) \
-      > "$out/$name/build.log" 2>&1; then
-      echo does-not-build > "$out/$name/patched"
-      continue
-    fi
-    result=$(run_one "$tree" "${packages[$i]}" "${tests[$i]}" "$out/$name/test.log")
-    echo "$result" > "$out/$name/patched"
+    echo "$result" > "$dir/patched.part"
+    mv "$dir/patched.part" "$dir/patched"
     echo "  $name: $result with its patch"
   done
 }
 for (( w = 0; w < jobs; w++ )); do
+  [ "${trees[w]}" = yes ] || continue
   work "$w" &
-  pids+=($!)
+  pids[w]=$!
 done
-wait
+# A worker's status says whether it got to the end of its pins.
+ended=()
+for w in "${!pids[@]}"; do
+  ended[w]=0
+  wait "${pids[w]}" || ended[w]=$?
+done
 
-# One row per pin. A pin is valid if it passes unpatched and fails
-# patched; the failure's first line says how.
-status=0 invalid=0
+# Why pin I has no patched results: its worker never started or died.
+unrun() {
+  local w=$(( $1 % jobs ))
+  if [ "${trees[w]}" = no ]; then
+    echo "not checked: worker $w's worktree could not be made"
+  elif [ "${ended[w]}" -ne 0 ]; then
+    echo "not checked: worker $w died (status ${ended[w]})"
+  else
+    echo "not checked: worker $w left no result"
+  fi
+}
+
+# One row per pin. A pin is not checked if either half did not run it;
+# otherwise it is valid if it passes unpatched and fails patched, and the
+# failure's first line says how.
+invalid=0 unchecked=0
+rows=()
+for i in "${!names[@]}"; do
+  name=${names[$i]} dir=$out/${names[$i]}
+  [ -f "$dir/patched" ] || unrun "$i" > "$dir/patched"
+  unpatched=$(cat "$dir/unpatched")
+  patched=$(cat "$dir/patched")
+  shown=$patched
+  [ "$patched" != fails ] || shown="fails: $(why "$dir/test.log")"
+  case "$unpatched $patched" in
+    *"not checked"*) name="*$name* (not checked)"; unchecked=$(( unchecked + 1 )) ;;
+    "passes fails") ;;
+    *) name="**$name** (invalid)"; invalid=$(( invalid + 1 )) ;;
+  esac
+  rows+=("| $name | \`${packages[$i]} ${tests[$i]}\` | $unpatched | ${shown//|/\\|} |")
+done
+for name in "${unguarded[@]}"; do
+  rows+=("| **$name** (invalid) | \`delocal-sim regressions::$name\` | - | no patch in scripts/pins |")
+  invalid=$(( invalid + 1 ))
+done
+
+total=$(( ${#names[@]} + ${#unguarded[@]} ))
 {
+  if [ "$unchecked" -gt 0 ]; then
+    echo "**The check did not finish:** $unchecked of $total pins were not checked, so they are neither valid nor invalid. Each of their rows says why."
+    echo
+  fi
   echo '| Pin | Test | Unpatched | With its patch |'
   echo '|---|---|---|---|'
-  for i in "${!names[@]}"; do
-    name=${names[$i]} dir=$out/${names[$i]}
-    unpatched=$(cat "$dir/unpatched" 2> /dev/null || echo error)
-    patched=$(cat "$dir/patched" 2> /dev/null || echo error)
-    shown=$patched
-    [ "$patched" != fails ] || shown="fails: $(why "$dir/test.log")"
-    if [ "$unpatched" != passes ] || [ "$patched" != fails ]; then
-      name="**$name** (invalid)"
-      invalid=$(( invalid + 1 ))
-    fi
-    echo "| $name | \`${packages[$i]} ${tests[$i]}\` | $unpatched | ${shown//|/\\|} |"
-  done
-  for name in "${unguarded[@]}"; do
-    echo "| **$name** (invalid) | \`delocal-sim regressions::$name\` | - | no patch in scripts/pins |"
-    invalid=$(( invalid + 1 ))
-  done
+  printf '%s\n' "${rows[@]}"
+  echo
+  if [ "$unchecked" -gt 0 ]; then
+    echo "The check did not finish: $unchecked of $total pins not checked, $invalid invalid, $(( total - unchecked - invalid )) guard their fix."
+  else
+    echo "$(( total - invalid )) of $total pins guard their fix."
+  fi
 } > "$out/summary.md"
-[ "$invalid" -eq 0 ] || status=1
 echo
 cat "$out/summary.md"
-echo
-total=$(( ${#names[@]} + ${#unguarded[@]} ))
-echo "$(( total - invalid )) of $total pins guard their fix."
-exit "$status"
+if [ "$unchecked" -gt 0 ]; then
+  exit 3
+fi
+[ "$invalid" -eq 0 ] || exit 1
