@@ -7,6 +7,7 @@ record (DESIGN.md §14.1 I7, §8.3). The replacement of the discarded record
 (8d4620d) is left alone.
 
 test: delocal-sim regressions::a_vector_a_revert_discarded_may_be_reached_again_by_a_merge
+test: delocal-sim sim::tests::a_merge_may_reach_a_vector_its_authors_revert_discarded
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 index 4e18586..55465ab 100644
