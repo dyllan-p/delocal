@@ -28,11 +28,13 @@
 #
 # A test the script could not run is not checked: its worker died, its
 # worktree could not be made, or a build or test run of it stopped before
-# the end without a compile error or a result. A pin one of whose tests
-# was checked and failed the check is invalid, whatever happened to its
-# other tests. A pin with a test not checked and none that failed is not
-# checked, which makes it neither valid nor invalid. If any pin is not
-# checked, the check did not finish.
+# the end without a compile error or a result. A test whose own process
+# died before it reported, by an abort, a stack overflow or a call to
+# exit, did run, and failed. A pin one of whose tests was checked and
+# failed the check is invalid, whatever happened to its other tests. A pin
+# with a test not checked and none that failed is not checked, which makes
+# it neither valid nor invalid. If any pin is not checked, the check did
+# not finish.
 #
 # With NAMEs only those pins are checked, and the coverage check is
 # skipped. The logs of pin NAME go to DIR/NAME, by default
@@ -195,9 +197,36 @@ result_in() {
   fi
 }
 
+# ended_by LOG: how the test process of LOG ended, if it started (libtest's
+# "running N tests") and did not exit successfully: "signal: 6, SIGABRT:
+# process abort signal", say, or "exit status: 101", as cargo's "process
+# didn't exit successfully" line gives it. Nothing if it never started.
+ended_by() {
+  [ -f "$1" ] && grep -qE '^running [0-9]+ tests?$' "$1" || return 0
+  sed -nE "s/^ *process didn't exit successfully: .* \\((signal: [0-9]+[^)]*|exit status: [0-9]+)\\)\$/\\1/p" "$1" | tail -1
+}
+
+# died_of LOG: how the test process of LOG died, if it died of its own
+# accord before it reported every test: "signal: 6, SIGABRT: process abort
+# signal" for an abort or a stack overflow, or "exit status: 3" for a call
+# to exit. Nothing if the process never started, which is the harness
+# failing, or if the signal came from outside (SIGHUP, SIGINT, SIGKILL,
+# SIGTERM: a user, the OOM killer, a runner shutting down), which says
+# nothing about the test.
+died_of() {
+  local how
+  how=$(ended_by "$1")
+  case $how in
+    "signal: 1,"* | "signal: 2,"* | "signal: 9,"* | "signal: 15,"*) ;;
+    *) echo "$how" ;;
+  esac
+}
+
 # run_one TREE PACKAGE TEST LOG: run one test at TREE in release, and
 # print "passes", "fails", "hangs", "missing" (the test does not exist),
-# or "not checked" with why.
+# or "not checked" with why. A test whose process died of its own accord
+# before it reported fails: with one test to the process, the test is what
+# died.
 run_one() {
   local tree=$1 package=$2 test=$3 log=$4 status=0 result
   (cd "$tree" && timeout 600 cargo test --release --locked -j "$threads" -p "$package" --lib -- "$test" --exact) \
@@ -207,15 +236,25 @@ run_one() {
     echo hangs
   elif [ -n "$result" ]; then
     echo "$result"
+  elif [ -n "$(died_of "$log")" ]; then
+    echo fails
+  elif [ -n "$(ended_by "$log")" ]; then
+    echo "not checked: its test process was stopped from outside ($(ended_by "$log"))"
   else
     echo "not checked: its test run stopped (status $status)"
   fi
 }
 
 # why LOG: the first line of the failure, which for a pinned seed is
-# "FAILED <invariant>: ...", and for a unit test the panic message.
+# "FAILED <invariant>: ...", and for a unit test the panic message. For a
+# test whose process died, how, and the runtime's last word if it left one
+# (a stack overflow does).
 why() {
-  awk '/^FAILED / { print; exit } /panicked at/ { getline; print; exit }' "$1" | cut -c1-200
+  local first how=
+  first=$(awk '/^FAILED / { print; exit } /panicked at/ { getline; print; exit } /^fatal runtime error: / { print; exit }' "$1")
+  grep -qE '^test .* \.\.\. FAILED$' "$1" || how=$(died_of "$1")
+  [ -z "$how" ] || first="the test process died ($how)${first:+: $first}"
+  printf '%s\n' "$first" | cut -c1-200
 }
 
 echo "pins: ${#names[@]} of $(git -C "$repo" rev-parse --short "$commit"), $jobs workers of $threads threads, in $out"
@@ -253,10 +292,17 @@ for i in "${!names[@]}"; do
   for (( j = first[i]; j < first[i] + count[i]; j++ )); do
     if [ "$base_tree" = no ]; then
       echo "not checked: the unpatched worktree could not be made"
-    else
-      result=$(result_in "$base/${packages[$j]}.log" "${tests[$j]}")
-      echo "${result:-not checked: the unpatched run stopped}"
+      continue
     fi
+    log=$base/${packages[$j]}.log
+    result=$(result_in "$log" "${tests[$j]}")
+    # A process that died partway reported none of the tests it had not
+    # finished. Each of those runs again on its own, which says whether it
+    # was the one that died.
+    if [ -z "$result" ] && [ -n "$(died_of "$log")" ]; then
+      result=$(run_one "$base/tree" "${packages[$j]}" "${tests[$j]}" "$base/test-$j.log")
+    fi
+    echo "${result:-not checked: the unpatched run stopped}"
   done > "$out/${names[$i]}/unpatched"
 done
 
@@ -295,7 +341,8 @@ work() {
       fi
     done > "$dir/patched.part"
     mv "$dir/patched.part" "$dir/patched"
-    echo "  $name: $(paste -sd, "$dir/patched" | sed 's/,/, /g') with its patch"
+    # Joined with ", ", which a result's own text may also hold.
+    echo "  $name: $(awk 'NR > 1 { printf ", " } { printf "%s", $0 }' "$dir/patched") with its patch"
   done
 }
 for (( w = 0; w < jobs; w++ )); do
