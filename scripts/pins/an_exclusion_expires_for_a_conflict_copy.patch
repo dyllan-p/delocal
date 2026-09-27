@@ -7,7 +7,7 @@ announcing the wanted content at the path, or the index at the path
 changing), and a want whose only source stays connected and silent waits
 for it to the end of the run.
 
-test: delocal-sim regressions::an_exclusion_expires_for_a_symlink_conflict_copy
+test: delocal-sim regressions::an_exclusion_expires_for_a_conflict_copy
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
 index a48d211..497a28d 100644
