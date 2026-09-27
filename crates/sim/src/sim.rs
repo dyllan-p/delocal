@@ -3206,4 +3206,35 @@ mod tests {
         assert_eq!(sim.versions()[&f], [base, merged]);
         assert_eq!(sim.superseded()[&f], [pending]);
     }
+
+    /// A vector a revert discarded and its author reached again replaces
+    /// the discarded record in the version table even when the content is
+    /// the same (§8.3, 8d4620d): the new record has its own mtime, and I4
+    /// checks conflict-copy names, which carry the loser's mtime, against
+    /// the records that exist. The pin
+    /// `a_reissued_vector_replaces_the_discarded_record_whatever_its_content`
+    /// guards this only while its seed reaches it.
+    #[test]
+    fn a_reissued_vector_replaces_the_discarded_record_with_the_same_content() {
+        let mut sim = world();
+        let e = sim.order[1];
+        let folder = sim.folder;
+        let f = rel("f");
+        let v = Version::from_iter([(e, 1)]);
+        let first = written(&f, e, v.clone(), 1, 0);
+        let again = written(&f, e, v, 1, 5);
+        assert!(first.same_content(&again));
+        // e adds f, reverts before announcing it, and adds it again.
+        sim.durable(e, changed(folder, first.clone(), 1), 1)
+            .unwrap();
+        let removed = Action::IndexRemoved {
+            folder,
+            path: f.clone(),
+        };
+        sim.durable(e, removed, 2).unwrap();
+        sim.durable(e, changed(folder, again.clone(), 2), 3)
+            .unwrap();
+        assert_eq!(sim.versions()[&f], [again]);
+        assert_eq!(sim.superseded()[&f], [first]);
+    }
 }

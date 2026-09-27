@@ -6,6 +6,7 @@ names against an mtime nobody holds any more (DESIGN.md §14.1 I4 and I7,
 §8.3).
 
 test: delocal-sim regressions::a_reissued_vector_replaces_the_discarded_record_whatever_its_content
+test: delocal-sim sim::tests::a_reissued_vector_replaces_the_discarded_record_with_the_same_content
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 index 4e18586..359792b 100644
