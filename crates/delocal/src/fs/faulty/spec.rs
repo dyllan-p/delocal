@@ -6,15 +6,16 @@
 //!
 //! ```json
 //! { "rules": [
-//!     { "op": "write",  "path": "**/.delocal/tmp/*", "at": { "offset": 1048576 }, "fail": "ENOSPC" },
-//!     { "op": "rename", "path": "**/.delocal/trash/**", "at": { "call": 2 },    "fail": "EXDEV" },
-//!     { "op": "lstat",  "path": "**/private/*",       "at": { "from_call": 1 }, "fail": "EACCES" }
+//!     { "op": "write",  "path": ".delocal/tmp/*",    "at": { "offset": 1048576 }, "fail": "ENOSPC" },
+//!     { "op": "rename", "path": ".delocal/trash/**", "at": { "call": 2 },         "fail": "EXDEV" },
+//!     { "op": "lstat",  "path": "**/private/*",      "at": { "from_call": 1 },    "fail": "EACCES" }
 //! ] }
 //! ```
 //!
 //! - `op` is one [`Op`]: an [`Fs`](crate::fs::Fs) method, or `read`,
 //!   `write` or `sync` on an open file.
-//! - `path` is a [`Pattern`](super::pattern::Pattern) over the host path. A
+//! - `path` is a [`Pattern`](super::pattern::Pattern) over the path,
+//!   relative to the folder root as the [`Fs`](crate::fs::Fs) takes it. A
 //!   rename matches if either of its paths does; a symlink matches on the
 //!   link, not the target; a read, write or sync on the path the file was
 //!   opened with.
@@ -208,8 +209,8 @@ mod tests {
     fn the_module_example_parses() {
         let spec = Spec::parse(
             r#"{ "rules": [
-                { "op": "write",  "path": "**/.delocal/tmp/*", "at": { "offset": 1048576 }, "fail": "ENOSPC" },
-                { "op": "rename", "path": "**/.delocal/trash/**", "at": { "call": 2 },    "fail": "EXDEV" },
+                { "op": "write",  "path": ".delocal/tmp/*",   "at": { "offset": 1048576 }, "fail": "ENOSPC" },
+                { "op": "rename", "path": ".delocal/trash/**", "at": { "call": 2 },    "fail": "EXDEV" },
                 { "op": "lstat",  "path": "**/private/*",       "at": { "from_call": 1 }, "fail": "EACCES" }
             ] }"#,
         )
@@ -219,13 +220,13 @@ mod tests {
             [
                 Rule {
                     op: Op::Write,
-                    path: "**/.delocal/tmp/*".into(),
+                    path: ".delocal/tmp/*".into(),
                     at: Trigger::Offset(1_048_576),
                     fail: Fault::Enospc,
                 },
                 Rule {
                     op: Op::Rename,
-                    path: "**/.delocal/trash/**".into(),
+                    path: ".delocal/trash/**".into(),
                     at: Trigger::Call(2),
                     fail: Fault::Exdev,
                 },

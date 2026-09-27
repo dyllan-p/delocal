@@ -1,13 +1,15 @@
 //! Path patterns for fault rules (DESIGN.md §14.2): which paths a rule
 //! applies to.
 //!
-//! A pattern matches a whole host path, byte by byte, so it works on names
-//! that are not UTF-8. `*` matches any run of bytes without a `/`; `**/`
+//! A pattern matches a whole path, relative to the folder root as the
+//! [`Fs`](crate::fs::Fs) takes it, byte by byte, so it works on names that
+//! are not UTF-8. `*` matches any run of bytes without a `/`; `**/`
 //! matches zero or more whole directories, so `/r/**/x` matches `/r/x` and
 //! `/r/a/b/x`; `**` anywhere else matches any run of bytes, `/` included;
 //! and `?` matches one byte that is not `/`. Every other byte matches
-//! itself. There are no escapes and no classes. So `**/.delocal/tmp/*`
-//! matches every temp file of every folder, and `**` matches everything.
+//! itself. There are no escapes and no classes. So `.delocal/tmp/*` matches
+//! every temp file, `**/report.txt` a `report.txt` at any depth, the root
+//! included, and `**` everything.
 //!
 //! Hand-rolled rather than taken from a crate: the matcher is one short
 //! function, and the gitignore matcher in `ignore` (Appendix A) has
