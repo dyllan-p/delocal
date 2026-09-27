@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 38 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 37: a user's edit of a moved copy counts at any path along its chain (§14.1); a pin's patch names every test that guards its fix, and a check that did not finish is never reported as invalid pins (§14.4).
+> Draft 39 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 38: a pin's patch names the tests written for its fix, not every test it happens to break; every fix has at least one unit test; a pin proved invalid is reported invalid even if another of its tests was not checked (§14.4).
+>
+> Changes from draft 37: a user's edit of a moved copy counts at any path along its chain (§14.1); a pin's patch names every test that guards its fix, and a check that did not finish is never reported as invalid pins (§14.4).
 >
 > Changes from draft 36: I4 accepts a moved copy at any point along its chain of displacements (§14.1); pins and their patches in the repository layout (Appendix B).
 >
@@ -778,7 +780,7 @@ Three real machines (Linux ×2, macOS ×1) on a tailnet, with a chaos script tha
 
 Fuzz the frame decoder and `postcard` message parsing. Snapshot-test CLI output with `insta`. Every bug found in the field gets a simulator step that reproduces it before it is fixed.
 
-A pinned seed guards its fix only while its history still reaches the bug, and changes to the simulator's draws or defaults quietly move histories elsewhere. So every pin is stored with a patch that disables its fix and names every test that guards that fix, the pinned seed and any unit tests; a pin is valid only if each of those tests fails with the patch applied and passes without it. The nightly checks every pin both ways; a pin that stops failing with its fix disabled is replaced by a new seed that does, and the fix's per-rule unit test remains the durable guard. A check that could not run a pin (a worker died, a worktree failed) reports that pin as not checked, and the report says the check did not finish; it never counts a pin it did not run as invalid, or as valid.
+A pinned seed guards its fix only while its history still reaches the bug, and changes to the simulator's draws or defaults quietly move histories elsewhere. So every pin is stored with a patch that disables its fix and names the tests written to guard that fix: the pinned seed and the fix's own unit tests, at least one of which every fix has. Other tests the patch happens to break are not named; they guard other rules and may stop breaking for good reasons. A pin is valid only if each named test fails with the patch applied and passes without it. The nightly checks every pin both ways; a pin that stops failing with its fix disabled is replaced by a new seed that does, and the fix's per-rule unit test remains the durable guard. A check that could not run a pin (a worker died, a worktree failed) reports that pin as not checked, and the report says the check did not finish; it never counts a pin it did not run as invalid, or as valid. A pin one of whose tests was checked and failed the check is invalid, whatever happened to its other tests.
 
 ---
 
