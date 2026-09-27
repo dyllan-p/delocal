@@ -26,24 +26,28 @@
 //! | [`set_mode`](Fs::set_mode) | §7.5 step 5 the temp file's exec bit; §7.5 exec-only applies; §8.3 revert's `SetMeta` |
 //! | [`available_space`](Fs::available_space) | §7.5 local failures: `SpaceRecovered` after `DiskFull`; §13 disk full |
 //!
-//! Paths are host paths, the folder root joined with the names on disk.
-//! Nothing here maps them to index paths ([`crate::names`] does that from
-//! the names `read_dir` returns, §7.3). Errors are the operating system's
-//! own `io::Error`s, so a caller maps a real `ENOSPC` and an injected one
-//! the same way.
+//! **Paths** are relative to the folder root the `Fs` was opened on
+//! ([`RealFs::open`]): the names on disk, joined with `/`. The empty path is
+//! the root itself. An absolute path or a `..` would leave the folder, so it
+//! is refused with `InvalidInput`. Nothing here maps paths to index paths
+//! ([`crate::names`] does that from the names `read_dir` returns, §7.3).
+//! Errors are the operating system's own `io::Error`s, so a caller maps a
+//! real `ENOSPC` and an injected one the same way.
 //!
-//! **Symlinks.** The calls that describe or change an entry (`lstat`,
-//! `read_link`, `create_new`, `create_dir`, `symlink`, `rename`,
-//! `remove_file`, `remove_dir`, `set_mtime`, `set_mode`) never follow a
-//! symlink at the end of a path, since §7.3 syncs symlinks as symlinks. The
-//! calls that open something (`read_dir`, `open_read`, `open_append`,
-//! `sync_dir`) and `available_space` do follow one, as their system calls
-//! do: `std` has no way to open without following. A caller opens what it
-//! has just seen with `lstat`, so only a path swapped in between is at
-//! risk, and §7.3's re-stat after hashing catches a swapped file; a FIFO
-//! swapped in there would block the open until something writes to it.
+//! **Reaching a path** (§7.3). A path is reached one component at a time
+//! from the open root, never handed to the kernel whole, so `PATH_MAX`
+//! never applies: every index path within §7.1's limits works on every
+//! platform. Each parent is opened as a directory without following a
+//! symlink, and a parent that is a symlink, a file or anything else stops
+//! the operation with [`ParentNotADirectory`], so nothing outside the folder
+//! is ever read or written. The calls that describe or change an entry
+//! never follow a symlink at the last component either, and `read_dir`,
+//! `sync_dir` and `available_space` refuse one there with `NotADirectory`.
+//! `open_read` and `open_append` still follow a symlink at the last
+//! component, as `open(2)` does.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
@@ -57,17 +61,17 @@ pub mod real;
 pub use faulty::FaultyFs;
 pub use real::RealFs;
 
-/// Every filesystem operation on a folder. See the module docs for which
-/// section each serves.
+/// Every filesystem operation on one folder, with paths relative to its root.
+/// See the module docs for which section each serves.
 ///
 /// Object-safe and `Send + Sync`, so the daemon can hold an `Arc<dyn Fs>`
-/// and choose the implementation at spawn.
+/// per folder and choose the implementation at spawn.
 pub trait Fs: Send + Sync {
     /// The names in `dir`, as raw bytes, without `.` and `..`, sorted by
     /// bytes. Sorting makes a scan's order the same on every run, whatever
     /// order the filesystem keeps; the names themselves are exactly what
-    /// `readdir` returned, never normalised (§7.3). Follows a symlink at
-    /// `dir` (see the module docs).
+    /// `readdir` returned, never normalised (§7.3). A symlink at `dir` is
+    /// not followed: it is `NotADirectory`.
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<OsString>>;
 
     /// What is at `path`, without following a symlink there.
@@ -91,7 +95,8 @@ pub trait Fs: Send + Sync {
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn WriteFile>>;
 
     /// Make the entries of the directory at `path` durable: creations,
-    /// removals and renames in it survive a power loss once this returns.
+    /// removals and renames in it survive a power loss once this returns. A
+    /// symlink at `path` is not followed: it is `NotADirectory`.
     fn sync_dir(&self, path: &Path) -> io::Result<()>;
 
     /// Rename `from` to `to` atomically, replacing a file at `to`. Both must
@@ -122,7 +127,7 @@ pub trait Fs: Send + Sync {
     fn set_mode(&self, path: &Path, mode: u32) -> io::Result<()>;
 
     /// Bytes an unprivileged process can still write on the filesystem that
-    /// holds `path`.
+    /// holds the directory at `path`.
     fn available_space(&self, path: &Path) -> io::Result<u64>;
 }
 
@@ -165,4 +170,37 @@ pub enum FileKind {
     Dir,
     Symlink,
     Other,
+}
+
+/// A parent on the way to a path is not a directory: a symlink, a file or
+/// anything else. The operation stopped there and followed nothing (§7.3); a
+/// commit reports `ChangedUnderneath` for it (§7.5 step 6).
+///
+/// It travels inside an `io::Error` of kind `NotADirectory`;
+/// [`ParentNotADirectory::of`] finds it there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParentNotADirectory {
+    /// The parent that is not a directory, relative to the folder root.
+    pub parent: PathBuf,
+}
+
+impl ParentNotADirectory {
+    /// The `ParentNotADirectory` inside `error`, if that is what it is.
+    pub fn of(error: &io::Error) -> Option<&Self> {
+        error.get_ref()?.downcast_ref()
+    }
+}
+
+impl fmt::Display for ParentNotADirectory {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} is not a directory", self.parent.display())
+    }
+}
+
+impl std::error::Error for ParentNotADirectory {}
+
+impl From<ParentNotADirectory> for io::Error {
+    fn from(error: ParentNotADirectory) -> Self {
+        io::Error::new(io::ErrorKind::NotADirectory, error)
+    }
 }

@@ -37,8 +37,8 @@ pub struct Injected {
     /// The rule that fired: its index in the spec, counting from 0.
     pub rule: usize,
     pub op: Op,
-    /// The call's path: a rename's source, a symlink's link, the path an
-    /// open file was opened with.
+    /// The call's path, relative to the folder root: a rename's source, a
+    /// symlink's link, the path an open file was opened with.
     pub path: PathBuf,
     pub fault: Fault,
 }
@@ -353,7 +353,9 @@ mod tests {
     use super::*;
     use crate::fs::RealFs;
 
-    crate::fs::conformance::conformance_tests!(FaultyFs::new(RealFs, Spec::default()).unwrap());
+    crate::fs::conformance::conformance_tests!(|root: &Path| {
+        FaultyFs::new(RealFs::open(root).unwrap(), Spec::default()).unwrap()
+    });
 
     fn rule(op: Op, path: &str, at: Trigger, fail: Fault) -> Rule {
         Rule {
@@ -364,8 +366,13 @@ mod tests {
         }
     }
 
-    fn faulty(rules: Vec<Rule>) -> FaultyFs<RealFs> {
-        FaultyFs::new(RealFs, Spec { rules }).unwrap()
+    /// A `FaultyFs` with `rules` over the folder at `root`.
+    fn faulty(root: &Path, rules: Vec<Rule>) -> FaultyFs<RealFs> {
+        FaultyFs::new(RealFs::open(root).unwrap(), Spec { rules }).unwrap()
+    }
+
+    fn p(path: &str) -> &Path {
+        Path::new(path)
     }
 
     fn errno<T>(result: io::Result<T>) -> Option<i32> {
@@ -375,11 +382,11 @@ mod tests {
         }
     }
 
-    fn injected(rule: usize, op: Op, path: &Path, fault: Fault) -> Injected {
+    fn injected(rule: usize, op: Op, path: &str, fault: Fault) -> Injected {
         Injected {
             rule,
             op,
-            path: path.to_path_buf(),
+            path: path.into(),
             fault,
         }
     }
@@ -387,34 +394,39 @@ mod tests {
     #[test]
     fn call_fails_only_the_nth_matching_call() {
         let dir = tempfile::tempdir().unwrap();
-        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-        std::fs::write(&a, "x").unwrap();
-        std::fs::write(&b, "x").unwrap();
-        let fs = faulty(vec![rule(Op::Lstat, "**/a", Trigger::Call(2), Fault::Eio)]);
-        fs.lstat(&a).unwrap();
-        fs.lstat(&b).unwrap(); // does not match, so not counted
-        assert_eq!(errno(fs.lstat(&a)), Some(5));
-        fs.lstat(&a).unwrap();
-        fs.read_dir(dir.path()).unwrap(); // another op, not counted
-        assert_eq!(fs.injected(), [injected(0, Op::Lstat, &a, Fault::Eio)]);
+        let root = dir.path();
+        std::fs::write(root.join("a"), "x").unwrap();
+        std::fs::write(root.join("b"), "x").unwrap();
+        let fs = faulty(
+            root,
+            vec![rule(Op::Lstat, "**/a", Trigger::Call(2), Fault::Eio)],
+        );
+        fs.lstat(p("a")).unwrap();
+        fs.lstat(p("b")).unwrap(); // does not match, so not counted
+        assert_eq!(errno(fs.lstat(p("a"))), Some(5));
+        fs.lstat(p("a")).unwrap();
+        fs.read_dir(p("")).unwrap(); // another op, not counted
+        assert_eq!(fs.injected(), [injected(0, Op::Lstat, "a", Fault::Eio)]);
     }
 
     #[test]
     fn from_call_fails_every_call_from_the_nth_and_does_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        let fs = faulty(vec![rule(
-            Op::CreateDir,
-            "**",
-            Trigger::FromCall(2),
-            Fault::Eacces,
-        )]);
-        fs.create_dir(&root.join("d1")).unwrap();
+        let fs = faulty(
+            dir.path(),
+            vec![rule(
+                Op::CreateDir,
+                "**",
+                Trigger::FromCall(2),
+                Fault::Eacces,
+            )],
+        );
+        fs.create_dir(p("d1")).unwrap();
         for name in ["d2", "d3", "d4"] {
-            assert_eq!(errno(fs.create_dir(&root.join(name))), Some(13));
+            assert_eq!(errno(fs.create_dir(p(name))), Some(13));
         }
         assert_eq!(
-            fs.read_dir(root).unwrap(),
+            fs.read_dir(p("")).unwrap(),
             ["d1"],
             "a failed call does nothing"
         );
@@ -426,33 +438,35 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir(root.join("tmp")).unwrap();
-        let (temp, other) = (root.join("tmp/t"), root.join("other"));
-        let fs = faulty(vec![rule(
-            Op::Write,
-            "**/tmp/*",
-            Trigger::Offset(5),
-            Fault::Enospc,
-        )]);
+        let fs = faulty(
+            root,
+            vec![rule(
+                Op::Write,
+                "**/tmp/*",
+                Trigger::Offset(5),
+                Fault::Enospc,
+            )],
+        );
 
-        let mut file = fs.create_new(&temp).unwrap();
+        let mut file = fs.create_new(p("tmp/t")).unwrap();
         let err = file.write_all(b"0123456789").unwrap_err();
         assert_eq!(err.kind(), ErrorKind::StorageFull);
         drop(file);
-        assert_eq!(std::fs::read(&temp).unwrap(), b"01234");
+        assert_eq!(std::fs::read(root.join("tmp/t")).unwrap(), b"01234");
 
         // Resuming at the end of the file is already past the offset.
-        let mut file = fs.open_append(&temp).unwrap();
+        let mut file = fs.open_append(p("tmp/t")).unwrap();
         assert_eq!(errno(file.write(b"x")), Some(28));
-        assert_eq!(std::fs::read(&temp).unwrap(), b"01234");
+        assert_eq!(std::fs::read(root.join("tmp/t")).unwrap(), b"01234");
 
-        let mut file = fs.create_new(&other).unwrap();
+        let mut file = fs.create_new(p("other")).unwrap();
         file.write_all(b"0123456789").unwrap();
-        assert_eq!(std::fs::read(&other).unwrap(), b"0123456789");
+        assert_eq!(std::fs::read(root.join("other")).unwrap(), b"0123456789");
         assert_eq!(
             fs.injected(),
             [
-                injected(0, Op::Write, &temp, Fault::Enospc),
-                injected(0, Op::Write, &temp, Fault::Enospc),
+                injected(0, Op::Write, "tmp/t", Fault::Enospc),
+                injected(0, Op::Write, "tmp/t", Fault::Enospc),
             ]
         );
     }
@@ -460,10 +474,12 @@ mod tests {
     #[test]
     fn offset_cuts_a_read_short_then_fails_it() {
         let dir = tempfile::tempdir().unwrap();
-        let f = dir.path().join("f");
-        std::fs::write(&f, "hello world").unwrap();
-        let fs = faulty(vec![rule(Op::Read, "**/f", Trigger::Offset(5), Fault::Eio)]);
-        let mut file = fs.open_read(&f).unwrap();
+        std::fs::write(dir.path().join("f"), "hello world").unwrap();
+        let fs = faulty(
+            dir.path(),
+            vec![rule(Op::Read, "**/f", Trigger::Offset(5), Fault::Eio)],
+        );
+        let mut file = fs.open_read(p("f")).unwrap();
         let mut bytes = Vec::new();
         assert_eq!(errno(file.read_to_end(&mut bytes)), Some(5));
         assert_eq!(bytes, b"hello", "the bytes before the offset arrive");
@@ -484,46 +500,46 @@ mod tests {
         std::fs::create_dir(root.join("trash")).unwrap();
         std::fs::write(root.join("a"), "a").unwrap();
         std::fs::write(root.join("trash/b"), "b").unwrap();
-        let fs = faulty(vec![rule(
-            Op::Rename,
-            "**/trash/*",
-            Trigger::FromCall(1),
-            Fault::Exdev,
-        )]);
-        let err = fs
-            .rename(&root.join("a"), &root.join("trash/a"))
-            .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::CrossesDevices);
-        assert_eq!(
-            errno(fs.rename(&root.join("trash/b"), &root.join("b"))),
-            Some(18)
+        let fs = faulty(
+            root,
+            vec![rule(
+                Op::Rename,
+                "**/trash/*",
+                Trigger::FromCall(1),
+                Fault::Exdev,
+            )],
         );
-        assert_eq!(fs.read_dir(root).unwrap(), ["a", "trash"], "nothing moved");
-        assert_eq!(fs.read_dir(&root.join("trash")).unwrap(), ["b"]);
-        fs.rename(&root.join("a"), &root.join("c")).unwrap();
+        let err = fs.rename(p("a"), p("trash/a")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::CrossesDevices);
+        assert_eq!(errno(fs.rename(p("trash/b"), p("b"))), Some(18));
+        assert_eq!(fs.read_dir(p("")).unwrap(), ["a", "trash"], "nothing moved");
+        assert_eq!(fs.read_dir(p("trash")).unwrap(), ["b"]);
+        fs.rename(p("a"), p("c")).unwrap();
     }
 
     #[test]
     fn every_matching_rule_counts_and_the_first_to_fire_wins() {
         let dir = tempfile::tempdir().unwrap();
-        let a = dir.path().join("a");
-        std::fs::write(&a, "x").unwrap();
-        let fs = faulty(vec![
-            rule(Op::Lstat, "**", Trigger::Call(2), Fault::Eio),
-            rule(Op::Lstat, "**/a", Trigger::Call(2), Fault::Eacces),
-            rule(Op::Lstat, "**/a", Trigger::Call(3), Fault::Enospc),
-        ]);
-        fs.lstat(&a).unwrap();
+        std::fs::write(dir.path().join("a"), "x").unwrap();
+        let fs = faulty(
+            dir.path(),
+            vec![
+                rule(Op::Lstat, "**", Trigger::Call(2), Fault::Eio),
+                rule(Op::Lstat, "**/a", Trigger::Call(2), Fault::Eacces),
+                rule(Op::Lstat, "**/a", Trigger::Call(3), Fault::Enospc),
+            ],
+        );
+        fs.lstat(p("a")).unwrap();
         // Rules 0 and 1 both fire on the second call; rule 0 is first.
-        assert_eq!(errno(fs.lstat(&a)), Some(5));
+        assert_eq!(errno(fs.lstat(p("a"))), Some(5));
         // Rule 1 counted that call, so it does not fire on the third.
-        assert_eq!(errno(fs.lstat(&a)), Some(28));
-        fs.lstat(&a).unwrap();
+        assert_eq!(errno(fs.lstat(p("a"))), Some(28));
+        fs.lstat(p("a")).unwrap();
         assert_eq!(
             fs.injected(),
             [
-                injected(0, Op::Lstat, &a, Fault::Eio),
-                injected(2, Op::Lstat, &a, Fault::Enospc),
+                injected(0, Op::Lstat, "a", Fault::Eio),
+                injected(2, Op::Lstat, "a", Fault::Enospc),
             ]
         );
     }
@@ -531,26 +547,31 @@ mod tests {
     #[test]
     fn the_first_rule_to_fire_wins_whatever_its_trigger() {
         let dir = tempfile::tempdir().unwrap();
-        let (t, u) = (dir.path().join("t"), dir.path().join("u"));
         // An offset rule listed first beats a call rule firing on the same
         // write.
-        let fs = faulty(vec![
-            rule(Op::Write, "**", Trigger::Offset(0), Fault::Eio),
-            rule(Op::Write, "**", Trigger::Call(1), Fault::Enospc),
-        ]);
-        assert_eq!(errno(fs.create_new(&t).unwrap().write(b"x")), Some(5));
+        let fs = faulty(
+            dir.path(),
+            vec![
+                rule(Op::Write, "**", Trigger::Offset(0), Fault::Eio),
+                rule(Op::Write, "**", Trigger::Call(1), Fault::Enospc),
+            ],
+        );
+        assert_eq!(errno(fs.create_new(p("t")).unwrap().write(b"x")), Some(5));
 
         // Past two offsets, the first rule wins, not the smaller offset.
-        std::fs::write(&u, [0; 12]).unwrap();
-        let fs = faulty(vec![
-            rule(Op::Write, "**", Trigger::Offset(10), Fault::Eio),
-            rule(Op::Write, "**", Trigger::Offset(5), Fault::Enospc),
-        ]);
-        assert_eq!(errno(fs.open_append(&u).unwrap().write(b"x")), Some(5));
+        std::fs::write(dir.path().join("u"), [0; 12]).unwrap();
+        let fs = faulty(
+            dir.path(),
+            vec![
+                rule(Op::Write, "**", Trigger::Offset(10), Fault::Eio),
+                rule(Op::Write, "**", Trigger::Offset(5), Fault::Enospc),
+            ],
+        );
+        assert_eq!(errno(fs.open_append(p("u")).unwrap().write(b"x")), Some(5));
 
         // Before both, a write stops short of the nearer one, whichever is
         // listed first, and the next write fails there.
-        let mut file = fs.create_new(&t.with_extension("new")).unwrap();
+        let mut file = fs.create_new(p("t.new")).unwrap();
         assert_eq!(file.write(b"0123456789abcdef").unwrap(), 5);
         assert_eq!(errno(file.write(b"5")), Some(28));
         assert_eq!(
@@ -562,30 +583,38 @@ mod tests {
     #[test]
     fn enospc_on_available_space_reports_nothing_free() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = faulty(vec![
-            rule(Op::AvailableSpace, "**", Trigger::Call(1), Fault::Enospc),
-            rule(Op::AvailableSpace, "**", Trigger::Call(2), Fault::Eio),
-        ]);
-        assert_eq!(fs.available_space(dir.path()).unwrap(), 0);
-        assert_eq!(errno(fs.available_space(dir.path())), Some(5));
-        assert!(fs.available_space(dir.path()).unwrap() > 0);
+        let fs = faulty(
+            dir.path(),
+            vec![
+                rule(Op::AvailableSpace, "**", Trigger::Call(1), Fault::Enospc),
+                rule(Op::AvailableSpace, "**", Trigger::Call(2), Fault::Eio),
+            ],
+        );
+        assert_eq!(fs.available_space(p("")).unwrap(), 0);
+        assert_eq!(errno(fs.available_space(p(""))), Some(5));
+        assert!(fs.available_space(p("")).unwrap() > 0);
     }
 
     #[test]
     fn opening_and_using_a_file_are_separate_ops() {
         let dir = tempfile::tempdir().unwrap();
-        let (f, t) = (dir.path().join("f"), dir.path().join("t"));
-        std::fs::write(&f, "x").unwrap();
-        let fs = faulty(vec![
-            rule(Op::OpenRead, "**/f", Trigger::Call(1), Fault::Eacces),
-            rule(Op::CreateNew, "**/t", Trigger::Call(1), Fault::Enospc),
-            rule(Op::Sync, "**/t", Trigger::Call(1), Fault::Eio),
-        ]);
-        assert_eq!(errno(fs.open_read(&f)), Some(13));
-        fs.open_read(&f).unwrap();
-        assert_eq!(errno(fs.create_new(&t)), Some(28));
-        assert!(!t.exists(), "a failed create creates nothing");
-        let mut file = fs.create_new(&t).unwrap();
+        std::fs::write(dir.path().join("f"), "x").unwrap();
+        let fs = faulty(
+            dir.path(),
+            vec![
+                rule(Op::OpenRead, "**/f", Trigger::Call(1), Fault::Eacces),
+                rule(Op::CreateNew, "**/t", Trigger::Call(1), Fault::Enospc),
+                rule(Op::Sync, "**/t", Trigger::Call(1), Fault::Eio),
+            ],
+        );
+        assert_eq!(errno(fs.open_read(p("f"))), Some(13));
+        fs.open_read(p("f")).unwrap();
+        assert_eq!(errno(fs.create_new(p("t"))), Some(28));
+        assert!(
+            !dir.path().join("t").exists(),
+            "a failed create creates nothing"
+        );
+        let mut file = fs.create_new(p("t")).unwrap();
         file.write_all(b"data").unwrap();
         assert_eq!(errno(file.sync()), Some(5));
         file.sync().unwrap();
@@ -606,12 +635,12 @@ mod tests {
     }
 
     /// Run `steps` through a `FaultyFs` over a fresh temporary directory and
-    /// describe everything that happened, with paths relative to it: each
-    /// step's result, then the injected faults.
+    /// describe everything that happened: each step's result, then the
+    /// injected faults.
     fn trace(spec: &Spec, steps: &[Step]) -> Vec<String> {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let fs = FaultyFs::new(RealFs, spec.clone()).unwrap();
+        let fs = FaultyFs::new(RealFs::open(root).unwrap(), spec.clone()).unwrap();
         let outcome = |result: io::Result<String>| match result {
             Ok(ok) => ok,
             Err(e) => match e.raw_os_error() {
@@ -625,31 +654,30 @@ mod tests {
         let mut lines = Vec::new();
         for step in steps {
             let (what, result) = match *step {
-                Step::Lstat(p) => (
-                    format!("lstat {p}"),
-                    fs.lstat(&root.join(p))
+                Step::Lstat(path) => (
+                    format!("lstat {path}"),
+                    fs.lstat(p(path))
                         .map(|s| format!("{:?} {}", s.kind, s.size)),
                 ),
-                Step::Mkdir(p) => (
-                    format!("mkdir {p}"),
-                    fs.create_dir(&root.join(p)).map(|()| "ok".into()),
+                Step::Mkdir(path) => (
+                    format!("mkdir {path}"),
+                    fs.create_dir(p(path)).map(|()| "ok".into()),
                 ),
-                Step::Write(p, len) => {
-                    let path = root.join(p);
-                    let result = fs.create_new(&path).and_then(|mut file| {
+                Step::Write(path, len) => {
+                    let result = fs.create_new(p(path)).and_then(|mut file| {
                         file.write_all(&vec![b'x'; len])?;
                         file.sync()
                     });
-                    let on_disk = std::fs::metadata(&path).map_or(0, |m| m.len());
+                    let on_disk = std::fs::metadata(root.join(path)).map_or(0, |m| m.len());
                     let result = match result {
                         Ok(()) => Ok("ok".into()),
                         Err(e) => Ok(format!("{}, {on_disk} bytes on disk", outcome(Err(e)))),
                     };
-                    (format!("write {p} {len}"), result)
+                    (format!("write {path} {len}"), result)
                 }
-                Step::Read(p) => (
-                    format!("read {p}"),
-                    fs.open_read(&root.join(p)).map(|mut file| {
+                Step::Read(path) => (
+                    format!("read {path}"),
+                    fs.open_read(p(path)).map(|mut file| {
                         let mut bytes = Vec::new();
                         match file.read_to_end(&mut bytes) {
                             Ok(n) => format!("{n} bytes"),
@@ -659,25 +687,26 @@ mod tests {
                 ),
                 Step::Rename(from, to) => (
                     format!("rename {from} {to}"),
-                    fs.rename(&root.join(from), &root.join(to))
-                        .map(|()| "ok".into()),
+                    fs.rename(p(from), p(to)).map(|()| "ok".into()),
                 ),
-                Step::Remove(p) => (
-                    format!("remove {p}"),
-                    fs.remove_file(&root.join(p)).map(|()| "ok".into()),
+                Step::Remove(path) => (
+                    format!("remove {path}"),
+                    fs.remove_file(p(path)).map(|()| "ok".into()),
                 ),
-                Step::List(p) => (
-                    format!("list {p}"),
-                    fs.read_dir(&root.join(p)).map(|names| format!("{names:?}")),
+                Step::List(path) => (
+                    format!("list {path}"),
+                    fs.read_dir(p(path)).map(|names| format!("{names:?}")),
                 ),
             };
             lines.push(format!("{what}: {}", outcome(result)));
         }
         for i in fs.injected() {
-            let path = i.path.strip_prefix(root).unwrap().display().to_string();
             lines.push(format!(
-                "injected by rule {}: {:?} {path} {:?}",
-                i.rule, i.op, i.fault
+                "injected by rule {}: {:?} {} {:?}",
+                i.rule,
+                i.op,
+                i.path.display(),
+                i.fault
             ));
         }
         lines

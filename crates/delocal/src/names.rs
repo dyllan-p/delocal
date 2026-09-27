@@ -339,15 +339,14 @@ mod tests {
         use crate::fs::{Fs, RealFs};
 
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-        let fs = RealFs;
-        let create = |name: &[u8]| fs.create_new(&root.join(OsStr::from_bytes(name)));
+        let fs = RealFs::open(tmp.path()).unwrap();
+        let create = |name: &[u8]| fs.create_new(std::path::Path::new(OsStr::from_bytes(name)));
         create(b"plain").unwrap();
         create("café".as_bytes()).unwrap();
         let nfd = create("cafe\u{301}".as_bytes());
         let latin1 = create(b"caf\xe9");
 
-        let listed = fs.read_dir(root).unwrap();
+        let listed = fs.read_dir(std::path::Path::new("")).unwrap();
         let mapped: Vec<Name> = dir(None, &listed).into_iter().map(|(_, n)| n).collect();
         if cfg!(target_os = "macos") {
             assert_eq!(

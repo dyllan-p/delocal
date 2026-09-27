@@ -63,9 +63,10 @@ jobs:
       # that does. `cargo tree -e normal` lists only normal (non-dev,
       # non-build) dependencies, which is what ships in the binary. If any
       # of these crates appear, the boundary is in the wrong place. Each
-      # I/O crate joins the list in the PR that brings it into the
-      # workspace: filetime, rustix and tempfile touch the filesystem, and
-      # Appendix A gives unicode-normalization to the binary crate only.
+      # I/O crate of Appendix A joins the list no later than the PR that
+      # brings it into the workspace: filetime, rustix and tempfile touch
+      # the filesystem, and Appendix A gives unicode-normalization to the
+      # binary crate only.
       - name: Engine boundary (dependencies)
         run: |
           set -euo pipefail
