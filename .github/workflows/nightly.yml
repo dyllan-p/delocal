@@ -14,8 +14,9 @@
 # GitHub Free runs at once, so no shard waits for another.
 #
 # Beside the sweep, the pins job checks every pinned seed both ways
-# (§14.4): it passes as it is and fails with its fix disabled. A pin that
-# stops failing no longer guards anything, and its own issue says which.
+# (§14.4): it passes as it is and fails with its fix disabled, and so does
+# each unit test its patch names. A pin that stops failing no longer
+# guards anything, and its own issue says which.
 
 name: Nightly simulation
 
@@ -297,11 +298,11 @@ jobs:
   # Draft 36 (§14.4): a pin guards its fix only while its history still
   # reaches the bug, so every night each pin runs as it is, where it must
   # pass, and with scripts/pins/<pin>.patch applied, where it must fail
-  # (scripts/pins.sh). It does not need the plan's seeds and runs beside
-  # the shards; the twenty-first job waits for a free runner. The script
-  # prints its table and ends with "N of M pins guard their fix"; the log
-  # ends with "pins done" only if the script got that far and ran every
-  # pin.
+  # (scripts/pins.sh), and so does every unit test the patch names (draft
+  # 38). It does not need the plan's seeds and runs beside the shards; the
+  # twenty-first job waits for a free runner. The script prints its table
+  # and ends with "N of M pins guard their fix"; the log ends with "pins
+  # done" only if the script got that far and ran every pin.
   pins:
     name: pins
     runs-on: ubuntu-24.04
@@ -394,7 +395,7 @@ jobs:
             echo "Commit: $GITHUB_SHA"
             echo
             if [ "$finished" = yes ]; then
-              echo "A pin is valid only if its test passes as it is and fails with its patch, scripts/pins/<pin>.patch, applied (DESIGN.md §14.4). The invalid ones are in bold. A pin that passes with its patch no longer reaches the bug its fix is for: replace it with a new seed that fails with the patch, or with a unit test next to the fix."
+              echo "A pin is valid only if each test its patch, scripts/pins/<pin>.patch, names passes as it is and fails with the patch applied (DESIGN.md §14.4). The invalid ones are in bold. A pin whose seed passes with its patch no longer reaches the bug its fix is for: replace it with a new seed that fails with the patch, or with a unit test next to the fix. A unit test that passes with it no longer tests the fix."
               echo
               cat pins/summary.md
             elif [ -f pins/summary.md ]; then

@@ -6,21 +6,21 @@
 # A pinned seed guards its fix only while its history still reaches the
 # bug, so every pin NAME is stored with scripts/pins/NAME.patch, a patch
 # that disables the fix it guards. The patch starts with a paragraph that
-# says what it disables and one line naming the test it must break:
+# says what it disables and one line for each test that guards that fix:
 #
 #   test: PACKAGE TEST
 #
-# For a pinned seed that is `delocal-sim regressions::NAME`. A pin whose
-# fix no seed reaches is replaced by a unit test next to the fix, and its
-# patch names that test instead. `git apply` skips the text before the
-# first `diff`.
+# For a pinned seed the first is `delocal-sim regressions::NAME`, and any
+# unit tests of the same fix follow. A pin whose fix no seed reaches is
+# replaced by a unit test next to the fix, and its patch names only unit
+# tests. `git apply` skips the text before the first `diff`.
 #
-# A pin is valid only if its test passes at REV (default HEAD) and fails
-# with its patch applied. The script first checks that every test in
-# crates/sim/src/regressions.rs has a patch, then makes all its worktrees,
-# one at a time, then builds REV once and runs every named test there,
-# then applies each patch to a clean checkout of REV and runs its test
-# alone. J workers (default: one per four cores) each keep a worktree and
+# A pin is valid only if each test it names passes at REV (default HEAD)
+# and fails with its patch applied. The script first checks that every
+# test in crates/sim/src/regressions.rs has a patch, then makes all its
+# worktrees, one at a time, then builds REV once and runs every named test
+# there, then applies each patch to a clean checkout of REV and runs its
+# tests. J workers (default: one per four cores) each keep a worktree and
 # a target directory and take the patches in turn, resetting the worktree
 # to REV before each one, so a worker's second build recompiles only what
 # its patches touch. Tests run in release, as CI's pinned job runs them,
@@ -85,23 +85,35 @@ export CARGO_TERM_COLOR=never
 pinned=$(git -C "$repo" show "$commit:crates/sim/src/regressions.rs" |
   awk '/^#\[test\]/ { t = 1; next } t && /^fn / { sub(/^fn /, ""); sub(/\(.*/, ""); print; t = 0; next } !/^#\[/ { t = 0 }')
 
-# The pins to check, and the test each one names.
-names=() packages=() tests=()
+# The pins to check and the tests each one names, in one list of tests:
+# pin I names tests first[I] to first[I] + count[I] - 1.
+names=() first=() count=() packages=() tests=()
 add() {
-  local name=$1 patch=$pins/$1.patch line
+  local name=$1 patch=$pins/$1.patch line package test extra seen=/ seeded=no start=${#tests[@]}
   # The name becomes a directory under DIR, removed at the start of a run.
   [[ $name =~ ^[a-z0-9_]+$ ]] || { echo "pin names are lower-case letters, digits and '_': $name" >&2; exit 2; }
   [ -f "$patch" ] || { echo "no patch $patch" >&2; exit 2; }
-  line=$(grep -E '^test: ' "$patch" || true)
-  [ "$(echo "$line" | grep -c .)" -eq 1 ] || { echo "$patch needs exactly one 'test: PACKAGE TEST' line" >&2; exit 2; }
-  read -r _ package test extra <<< "$line"
-  [ -n "$test" ] && [ -z "${extra:-}" ] || { echo "$patch: '$line' is not 'test: PACKAGE TEST'" >&2; exit 2; }
-  # A pinned seed's patch is named after its test, so a pin can be found
-  # from either side.
-  case $test in
-    regressions::*) [ "$test" = "regressions::$name" ] || { echo "$patch names $test, not regressions::$name" >&2; exit 2; } ;;
-  esac
-  names+=("$name") packages+=("$package") tests+=("$test")
+  # Only the header's `test:` lines count; it ends at the first `diff`.
+  while IFS= read -r line; do
+    read -r _ package test extra <<< "$line"
+    [ -n "$test" ] && [ -z "${extra:-}" ] || { echo "$patch: '$line' is not 'test: PACKAGE TEST'" >&2; exit 2; }
+    case $seen in *"/$package $test/"*) echo "$patch names $package $test twice" >&2; exit 2 ;; esac
+    seen="$seen$package $test/"
+    # A pinned seed's patch is named after its test, so a pin can be found
+    # from either side, and no patch names another pin's seed.
+    case $test in
+      regressions::*) [ "$test" = "regressions::$name" ] || { echo "$patch names $test, not regressions::$name" >&2; exit 2; } ;;
+    esac
+    [ "$package $test" != "delocal-sim regressions::$name" ] || seeded=yes
+    packages+=("$package") tests+=("$test")
+  done < <(sed -n -e '/^diff /q' -e '/^test: /p' "$patch")
+  [ "${#tests[@]}" -gt "$start" ] || { echo "$patch needs a 'test: PACKAGE TEST' line" >&2; exit 2; }
+  # A pin that is still a seed at REV must be checked as one.
+  if [ "$seeded" = no ] && grep -qxF "$name" <<< "$pinned"; then
+    echo "$patch does not name its pinned seed, delocal-sim regressions::$name" >&2
+    exit 2
+  fi
+  names+=("$name") first+=("$start") count+=("$(( ${#tests[@]} - start ))")
 }
 # Pinned seeds with no patch, which the summary lists as invalid.
 unguarded=()
@@ -221,41 +233,47 @@ for (( w = 0; w < jobs; w++ )); do
     trees[w]=no
 done
 
-# The unpatched half: one build of REV, every named test in it. Each pin
+# The unpatched half: one build of REV, every named test in it. Each test
 # must pass here.
 export CARGO_TARGET_DIR=$base/target
 if [ "$base_tree" = yes ]; then
   for package in $(printf '%s\n' "${packages[@]}" | sort -u); do
     filters=()
-    for i in "${!names[@]}"; do
-      [ "${packages[$i]}" = "$package" ] && filters+=("${tests[$i]}")
+    for j in "${!tests[@]}"; do
+      [ "${packages[$j]}" = "$package" ] && filters+=("${tests[$j]}")
     done
     (cd "$base/tree" && cargo test --release --locked -p "$package" --lib -- --exact "${filters[@]}") \
       > "$base/$package.log" 2>&1 || true
   done
 fi
 for i in "${!names[@]}"; do
-  if [ "$base_tree" = no ]; then
-    echo "not checked: the unpatched worktree could not be made"
-  else
-    result=$(result_in "$base/${packages[$i]}.log" "${tests[$i]}")
-    echo "${result:-not checked: the unpatched run stopped}"
-  fi > "$out/${names[$i]}/unpatched"
+  for (( j = first[i]; j < first[i] + count[i]; j++ )); do
+    if [ "$base_tree" = no ]; then
+      echo "not checked: the unpatched worktree could not be made"
+    else
+      result=$(result_in "$base/${packages[$j]}.log" "${tests[$j]}")
+      echo "${result:-not checked: the unpatched run stopped}"
+    fi
+  done > "$out/${names[$i]}/unpatched"
 done
 
 # The patched half. Worker W takes pins W, W + J, W + 2J, ... A pin's
-# result reaches DIR/NAME/patched only once its test has run, so a pin
-# whose worker died midway has none.
+# results reach DIR/NAME/patched only once all its tests have run, so a
+# pin whose worker died midway has none.
 work() {
-  local w=$1 tree=$out/worker-$1/tree i name dir result
+  local w=$1 tree=$out/worker-$1/tree i j k name dir result package build
   export CARGO_TARGET_DIR=$out/worker-$1/target
   for (( i = w; i < ${#names[@]}; i += jobs )); do
-    name=${names[$i]} dir=$out/${names[$i]}
+    name=${names[$i]} dir=$out/${names[$i]} result=
     git -C "$tree" checkout --quiet --force --detach "$commit"
     git -C "$tree" clean --quiet -fdx
+    build=()
+    for package in $(printf '%s\n' "${packages[@]:${first[$i]}:${count[$i]}}" | sort -u); do
+      build+=(-p "$package")
+    done
     if ! git -C "$tree" apply "$pins/$name.patch" 2> "$dir/apply.log"; then
       result=does-not-apply
-    elif ! (cd "$tree" && cargo test --release --locked -j "$threads" -p "${packages[$i]}" --lib --no-run) \
+    elif ! (cd "$tree" && cargo test --release --locked -j "$threads" "${build[@]}" --lib --no-run) \
       > "$dir/build.log" 2>&1; then
       # A compile error is the patch's; a build that stopped without one
       # (a killed compiler, a full disk) says nothing about the pin.
@@ -264,12 +282,17 @@ work() {
       else
         result="not checked: its build stopped"
       fi
-    else
-      result=$(run_one "$tree" "${packages[$i]}" "${tests[$i]}" "$dir/test.log")
     fi
-    echo "$result" > "$dir/patched.part"
+    for (( k = 0; k < count[i]; k++ )); do
+      j=$(( first[i] + k ))
+      if [ -n "$result" ]; then
+        echo "$result"
+      else
+        run_one "$tree" "${packages[$j]}" "${tests[$j]}" "$dir/test-$k.log"
+      fi
+    done > "$dir/patched.part"
     mv "$dir/patched.part" "$dir/patched"
-    echo "  $name: $result with its patch"
+    echo "  $name: $(paste -sd, "$dir/patched" | sed 's/,/, /g') with its patch"
   done
 }
 for (( w = 0; w < jobs; w++ )); do
@@ -296,24 +319,36 @@ unrun() {
   fi
 }
 
-# One row per pin. A pin is not checked if either half did not run it;
-# otherwise it is valid if it passes unpatched and fails patched, and the
-# failure's first line says how.
-invalid=0 unchecked=0
+# One row per test, the pin's name on its first. A pin is not checked if
+# any of its tests was not run both ways; otherwise it is valid if each of
+# its tests passes unpatched and fails patched, and the failure's first
+# line says how.
+invalid=0 unchecked=0 checked=0
 rows=()
 for i in "${!names[@]}"; do
   name=${names[$i]} dir=$out/${names[$i]}
-  [ -f "$dir/patched" ] || unrun "$i" > "$dir/patched"
-  unpatched=$(cat "$dir/unpatched")
-  patched=$(cat "$dir/patched")
-  shown=$patched
-  [ "$patched" != fails ] || shown="fails: $(why "$dir/test.log")"
-  case "$unpatched $patched" in
-    *"not checked"*) name="*$name* (not checked)"; unchecked=$(( unchecked + 1 )) ;;
-    "passes fails") ;;
-    *) name="**$name** (invalid)"; invalid=$(( invalid + 1 )) ;;
+  [ -f "$dir/patched" ] || for (( k = 0; k < count[i]; k++ )); do unrun "$i"; done > "$dir/patched"
+  state=valid
+  for (( k = 0; k < count[i]; k++ )); do
+    case "$(sed -n "$(( k + 1 ))p" "$dir/unpatched") $(sed -n "$(( k + 1 ))p" "$dir/patched")" in
+      *"not checked"*) state=unchecked ;;
+      "passes fails") checked=$(( checked + 1 )) ;;
+      *) checked=$(( checked + 1 )); [ "$state" = unchecked ] || state=invalid ;;
+    esac
+  done
+  case $state in
+    invalid) cell="**$name** (invalid)"; invalid=$(( invalid + 1 )) ;;
+    unchecked) cell="*$name* (not checked)"; unchecked=$(( unchecked + 1 )) ;;
+    *) cell=$name ;;
   esac
-  rows+=("| $name | \`${packages[$i]} ${tests[$i]}\` | $unpatched | ${shown//|/\\|} |")
+  for (( k = 0; k < count[i]; k++ )); do
+    j=$(( first[i] + k ))
+    unpatched=$(sed -n "$(( k + 1 ))p" "$dir/unpatched")
+    shown=$(sed -n "$(( k + 1 ))p" "$dir/patched")
+    [ "$shown" != fails ] || shown="fails: $(why "$dir/test-$k.log")"
+    rows+=("| $cell | \`${packages[$j]} ${tests[$j]}\` | $unpatched | ${shown//|/\\|} |")
+    cell=
+  done
 done
 for name in "${unguarded[@]}"; do
   rows+=("| **$name** (invalid) | \`delocal-sim regressions::$name\` | - | no patch in scripts/pins |")
@@ -330,6 +365,7 @@ total=$(( ${#names[@]} + ${#unguarded[@]} ))
   echo '|---|---|---|---|'
   printf '%s\n' "${rows[@]}"
   echo
+  echo "$checked of ${#tests[@]} named tests checked both ways."
   if [ "$unchecked" -gt 0 ]; then
     echo "The check did not finish: $unchecked of $total pins not checked, $invalid invalid, $(( total - unchecked - invalid )) guard their fix."
   else
