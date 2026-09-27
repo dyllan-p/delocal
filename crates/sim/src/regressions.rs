@@ -5299,6 +5299,8 @@ fn a_chmod_under_a_pending_commit_is_changed_underneath_in_a_shorter_run() {
 /// shrunk to 113 steps; with the guard's target comparison disabled it
 /// fails I4: a symlink's conflict copy has the user's later target, not
 /// the losing version's.
+/// The fix's unit test guards it whether or not a seed reaches it:
+/// `sim::tests::the_commit_guard_refuses_a_symlink_whose_target_changed`.
 #[test]
 fn a_retarget_under_a_pending_commit_is_changed_underneath() {
     passes(
