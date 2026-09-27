@@ -19,6 +19,11 @@ path = "src/main.rs"
 
 [dependencies]
 delocal-engine.workspace = true
+filetime.workspace = true
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
