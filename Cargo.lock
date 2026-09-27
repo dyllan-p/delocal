@@ -115,7 +115,10 @@ version = "0.1.0"
 dependencies = [
  "delocal-engine",
  "filetime",
+ "proptest",
  "rustix",
+ "serde",
+ "serde_json",
  "tempfile",
 ]
 
