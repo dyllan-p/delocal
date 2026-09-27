@@ -5,6 +5,7 @@ the mesh agreed on. The fix leaves such records out because nobody else ever
 held them (DESIGN.md §14.1 I3, §8.3).
 
 test: delocal-sim regressions::a_tombstone_a_revert_discarded_is_not_a_deletion
+test: delocal-sim invariants::tests::a_tombstone_its_authors_revert_discarded_deleted_nothing
 
 diff --git a/crates/sim/src/invariants.rs b/crates/sim/src/invariants.rs
 index 4fab526..b04a5ab 100644
