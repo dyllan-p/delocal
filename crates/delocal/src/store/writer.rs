@@ -277,9 +277,9 @@ mod tests {
     use proptest::prelude::*;
     use rusqlite::Connection;
 
-    use super::super::HostWrite;
     use super::super::mirror::{self, Mirror};
     use super::super::sample::*;
+    use super::super::{BUSY_TIMEOUT, HostWrite};
     use super::*;
 
     fn open(dir: &tempfile::TempDir) -> Store {
@@ -345,17 +345,10 @@ mod tests {
         }
     }
 
-    /// A store whose writer waits for a lock instead of failing on it.
-    fn patient(dir: &tempfile::TempDir) -> Store {
-        let store = open(dir);
-        store.conn.busy_timeout(Duration::from_secs(30)).unwrap();
-        store
-    }
-
     #[test]
     fn nothing_is_reported_durable_until_the_commit_returns() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = patient(&dir).writer().unwrap();
+        let writer = open(&dir).writer().unwrap();
         writer.submit(joined()).wait().unwrap();
 
         let lock = Lock::take(&dir);
@@ -374,6 +367,76 @@ mod tests {
         empty.wait().unwrap();
         drop(writer.close().unwrap());
         assert_eq!(seqs(&open(&dir)), [1]);
+    }
+
+    /// Submit a group while another connection holds the write lock for
+    /// `hold`: the group's outcome, and how long it took to arrive. The
+    /// writer must have recorded folder 1 already. The lock is released,
+    /// and its thread joined, before this returns.
+    fn behind_a_lock(
+        dir: &tempfile::TempDir,
+        writer: &Writer,
+        hold: Duration,
+    ) -> (Result<(), WriteError>, Duration) {
+        let lock = Lock::take(dir);
+        let started = std::time::Instant::now();
+        let durable = writer.submit(record_group(1));
+        let release = thread::spawn(move || {
+            thread::sleep(hold);
+            lock.release();
+        });
+        let outcome = durable.wait();
+        let waited = started.elapsed();
+        release.join().unwrap();
+        (outcome, waited)
+    }
+
+    #[test]
+    fn a_write_lock_held_for_a_second_is_waited_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = open(&dir).writer().unwrap();
+        writer.submit(joined()).wait().unwrap();
+        let (outcome, waited) = behind_a_lock(&dir, &writer, Duration::from_secs(1));
+        outcome.unwrap();
+        assert!(
+            waited >= Duration::from_secs(1),
+            "committed under the lock after {waited:?}"
+        );
+        // The writer carries on.
+        writer.submit(record_group(2)).wait().unwrap();
+        drop(writer.close().unwrap());
+        assert_eq!(seqs(&open(&dir)), [1, 2]);
+    }
+
+    #[test]
+    fn a_write_lock_held_past_the_busy_timeout_fails_the_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = open(&dir).writer().unwrap();
+        writer.submit(joined()).wait().unwrap();
+        let (outcome, waited) = behind_a_lock(&dir, &writer, Duration::from_secs(10));
+        match outcome {
+            Err(WriteError::Failed(error)) => assert!(
+                matches!(
+                    &*error,
+                    StoreError::Sqlite(rusqlite::Error::SqliteFailure(e, _))
+                        if e.code == rusqlite::ErrorCode::DatabaseBusy
+                ),
+                "{error}"
+            ),
+            other => panic!("expected the commit to fail on the lock, got {other:?}"),
+        }
+        // It gave up at the timeout, not when the lock went.
+        assert!(
+            waited >= BUSY_TIMEOUT - Duration::from_millis(500) && waited < Duration::from_secs(10),
+            "gave up after {waited:?}"
+        );
+        // As after any failed commit, the writer takes nothing more.
+        assert!(matches!(
+            writer.submit(record_group(2)).wait(),
+            Err(WriteError::Poisoned(_))
+        ));
+        drop(writer.close().unwrap());
+        assert!(seqs(&open(&dir)).is_empty());
     }
 
     #[test]
@@ -465,7 +528,7 @@ mod tests {
     #[test]
     fn durable_can_be_awaited() {
         let dir = tempfile::tempdir().unwrap();
-        let writer = patient(&dir).writer().unwrap();
+        let writer = open(&dir).writer().unwrap();
         block_on(writer.submit(joined())).unwrap();
         let lock = Lock::take(&dir);
         let durable = writer.submit(record_group(7));
