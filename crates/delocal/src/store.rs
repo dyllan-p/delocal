@@ -26,6 +26,8 @@ mod codec;
 pub mod host;
 mod load;
 #[cfg(test)]
+mod mirror;
+#[cfg(test)]
 mod sample;
 pub mod schema;
 pub mod write;
