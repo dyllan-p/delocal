@@ -10,6 +10,7 @@ smallest place to turn it off; the engine half of 5c20f3d, which keys a
 want's sources by content, is left as it is.
 
 test: delocal-sim regressions::content_is_fetched_by_hash_from_whoever_holds_it
+test: delocal-sim sim::tests::a_source_serves_the_wanted_content_under_any_version_or_path
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 index 4e18586..05a0c7d 100644
