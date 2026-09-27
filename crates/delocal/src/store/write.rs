@@ -1089,4 +1089,306 @@ mod tests {
         // The machine in the first group went too: a transaction is whole.
         assert!(store.machines().unwrap().is_empty());
     }
+
+    /// Two engines, `a` and `b`; `b`'s hook actions go through groups into
+    /// the store, and after every event `b` handles, the parts reloaded
+    /// from the store must be `b`'s own.
+    struct Pair {
+        a: delocal_engine::Engine,
+        b: delocal_engine::Engine,
+        store: Store,
+        folder: FolderId,
+        seconds: i64,
+        fresh: u8,
+        /// The writing actions `b` has returned, by name.
+        seen: std::collections::BTreeSet<&'static str>,
+    }
+
+    /// The name of an action that writes, or `None` for an effect.
+    fn writes(action: &Action) -> Option<&'static str> {
+        Some(match action {
+            Action::IndexChanged { .. } => "IndexChanged",
+            Action::IndexRemoved { .. } => "IndexRemoved",
+            Action::WantChanged { .. } => "WantChanged",
+            Action::PendingChanged { .. } => "PendingChanged",
+            Action::HeldChanged { .. } => "HeldChanged",
+            Action::DeferredChanged { .. } => "DeferredChanged",
+            Action::RestChanged { .. } => "RestChanged",
+            Action::RecordBatch { .. } => "RecordBatch",
+            _ => return None,
+        })
+    }
+
+    impl Pair {
+        fn now(&self) -> Timestamp {
+            at(self.seconds * 1_000_000_000)
+        }
+
+        fn fresh(&mut self) -> BatchId {
+            self.fresh += 1;
+            BatchId::from_bytes([self.fresh; 16])
+        }
+
+        fn a(&mut self, event: delocal_engine::Event) -> Vec<Action> {
+            let now = self.now();
+            self.a.handle(now, event)
+        }
+
+        /// `b` handles `event` with `host` written beside its hooks; the
+        /// effects come back.
+        fn b_with(&mut self, host: Vec<HostWrite>, event: delocal_engine::Event) -> Vec<Action> {
+            let now = self.now();
+            let mut group = Group::new(now);
+            for write in host {
+                group.host(write);
+            }
+            let effects: Vec<Action> = self
+                .b
+                .handle(now, event)
+                .into_iter()
+                .inspect(|action| self.seen.extend(writes(action)))
+                .filter_map(|action| group.push(action))
+                .collect();
+            self.store.commit(&[group]).unwrap();
+            let parts = self
+                .b
+                .folder(self.folder)
+                .map(delocal_engine::FolderState::parts);
+            assert_eq!(self.store.parts(self.folder).unwrap(), parts);
+            effects
+        }
+
+        fn b(&mut self, event: delocal_engine::Event) -> Vec<Action> {
+            self.b_with(Vec::new(), event)
+        }
+
+        /// Hand every batch `a` sent to `b`.
+        fn deliver(&mut self, from_a: Vec<Action>) -> Vec<Action> {
+            let mut effects = Vec::new();
+            for action in from_a {
+                if let Action::Send {
+                    payload: Outbound::Batch(batch),
+                    ..
+                } = action
+                {
+                    effects.extend(self.b(delocal_engine::Event::BatchReceived {
+                        from: node(1),
+                        batch,
+                    }));
+                }
+            }
+            effects
+        }
+
+        /// A tick on `a` after the batch window, with a fresh batch id.
+        fn tick_a(&mut self) -> Vec<Action> {
+            self.seconds += 11;
+            let fresh_batch_id = self.fresh();
+            self.a(delocal_engine::Event::Tick { fresh_batch_id })
+        }
+
+        fn tick_b(&mut self) -> Vec<Action> {
+            self.seconds += 11;
+            let fresh_batch_id = self.fresh();
+            self.b(delocal_engine::Event::Tick { fresh_batch_id })
+        }
+    }
+
+    fn file(n: u8) -> Observed {
+        Observed {
+            kind: Kind::File,
+            size: u64::from(n),
+            mtime_ns: 1_000 + i64::from(n),
+            exec: false,
+            hash: hash(n),
+        }
+    }
+
+    #[test]
+    fn a_real_engines_hooks_reload_as_its_parts() {
+        use delocal_engine::{
+            ApplyOutcome, Engine, Event, FetchReport, HostName, NodeConfig, ScanState, Tier,
+        };
+        let (_dir, store) = open();
+        let f = folder(1);
+        let rules = Rules {
+            hold_count: 2,
+            ..Rules::default()
+        };
+        let config = |n: u8, host: &str| NodeConfig {
+            node_id: node(n),
+            author_host: HostName::new(host).unwrap(),
+        };
+        let mut pair = Pair {
+            a: Engine::new(config(1, "one")),
+            b: Engine::new(config(2, "two")),
+            store,
+            folder: f,
+            seconds: 1,
+            fresh: 0,
+            seen: std::collections::BTreeSet::new(),
+        };
+        let joined = || Event::FolderJoined {
+            folder: f,
+            rules: rules.clone(),
+            members: vec![node(1), node(2)],
+        };
+        let mut row = folder_row(f);
+        row.rules = rules.clone();
+        let host = vec![
+            HostWrite::PutFolder(row),
+            HostWrite::PutMember {
+                folder: f,
+                member: member(1),
+            },
+            HostWrite::PutMember {
+                folder: f,
+                member: member(2),
+            },
+        ];
+        pair.a(joined());
+        pair.b_with(host, joined());
+        pair.a(Event::PeerConnected {
+            peer: node(2),
+            tier: Tier::Lan,
+        });
+        pair.b(Event::PeerConnected {
+            peer: node(1),
+            tier: Tier::Lan,
+        });
+
+        // `a` announces twelve files; `b` wants them and lands two.
+        for n in 1..=12 {
+            pair.a(Event::Scanned {
+                folder: f,
+                path: path(&format!("f{n:02}")),
+                state: ScanState::Observed(file(n)),
+            });
+        }
+        let sent = pair.tick_a();
+        let effects = pair.deliver(sent);
+        let fetches: Vec<(RelPath, delocal_engine::ContentHash, Version)> = effects
+            .into_iter()
+            .filter_map(|action| match action {
+                Action::Fetch {
+                    path,
+                    hash,
+                    version,
+                    ..
+                } => Some((path, hash, version)),
+                _ => None,
+            })
+            .collect();
+        // At most four at once from one peer (§7.5).
+        assert_eq!(fetches.len(), 4);
+        let landed: Vec<RelPath> = fetches.iter().take(2).map(|(p, ..)| p.clone()).collect();
+        // The third finds its path changed underneath and is deferred.
+        let outcomes = [
+            ApplyOutcome::Ok,
+            ApplyOutcome::Ok,
+            ApplyOutcome::ChangedUnderneath,
+        ];
+        for ((path, hash, version), outcome) in fetches.into_iter().zip(outcomes) {
+            pair.b(Event::Fetched {
+                folder: f,
+                path: path.clone(),
+                hash,
+                version: version.clone(),
+                outcome: FetchReport::Ok,
+            });
+            pair.b(Event::Applied {
+                folder: f,
+                path,
+                version,
+                outcome,
+            });
+        }
+        assert!(!pair.store.parts(f).unwrap().unwrap().deferred.is_empty());
+
+        // A local change of `b`'s own, pending until its window closes.
+        pair.b(Event::Scanned {
+            folder: f,
+            path: path("mine"),
+            state: ScanState::Observed(file(9)),
+        });
+        pair.tick_b();
+
+        // `a` deletes the two `b` has: 2 of 12 passes `a`'s own brake, but
+        // 2 of `b`'s 3 does not, so `b` holds the batch, then denies it.
+        for path in landed {
+            pair.a(Event::Scanned {
+                folder: f,
+                path,
+                state: ScanState::Absent,
+            });
+        }
+        let sent = pair.tick_a();
+        pair.deliver(sent);
+        let parts = pair.store.parts(f).unwrap().unwrap();
+        let held = parts
+            .held
+            .keys()
+            .find(|(_, state)| *state == HeldState::Held)
+            .map(|(batch, _)| *batch)
+            .expect("b held the deletes");
+        pair.b(Event::Deny {
+            folder: f,
+            batch: held,
+        });
+        let parts = pair.store.parts(f).unwrap().unwrap();
+        assert!(
+            parts
+                .held
+                .keys()
+                .any(|(_, state)| matches!(state, HeldState::Denied { .. })),
+            "the deny's row is kept until its bumps are announced"
+        );
+        assert!(!parts.pending.is_empty(), "the deny's bumps are pending");
+        pair.tick_b();
+
+        // `b` deletes its own file and one it landed, and adds another: its
+        // own brake pauses the folder, and `revert` removes the add peers
+        // never saw.
+        for path in [path("mine"), path("f01")] {
+            pair.b(Event::Scanned {
+                folder: f,
+                path,
+                state: ScanState::Absent,
+            });
+        }
+        pair.b(Event::Scanned {
+            folder: f,
+            path: path("new"),
+            state: ScanState::Observed(file(10)),
+        });
+        pair.tick_b();
+        assert!(pair.store.parts(f).unwrap().unwrap().rest.paused.is_some());
+        pair.b(Event::Revert { folder: f });
+        let parts = pair.store.parts(f).unwrap().unwrap();
+        assert!(!parts.records.contains_key(&path("new")));
+
+        // What a restart hands the engine is what the engine had.
+        let loaded = pair.store.load().unwrap();
+        let own = vec![pair.b.folder(f).unwrap().parts()];
+        let now = pair.now();
+        assert_eq!(
+            Engine::restore(config(2, "two"), loaded, now),
+            Engine::restore(config(2, "two"), own, now)
+        );
+        assert!(!pair.store.history(f).unwrap().is_empty());
+        // The scenario reaches every action that writes.
+        assert_eq!(
+            pair.seen.into_iter().collect::<Vec<_>>(),
+            [
+                "DeferredChanged",
+                "HeldChanged",
+                "IndexChanged",
+                "IndexRemoved",
+                "PendingChanged",
+                "RecordBatch",
+                "RestChanged",
+                "WantChanged",
+            ]
+        );
+    }
 }
