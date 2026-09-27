@@ -26,10 +26,13 @@
 # its patches touch. Tests run in release, as CI's pinned job runs them,
 # and a test that runs for more than ten minutes counts as not failing.
 #
-# A pin the script could not run is not checked, which makes it neither
-# valid nor invalid: its worker died, its worktree could not be made, or a
-# build or test run of it stopped before the end without a compile error
-# or a result. If any pin is not checked, the check did not finish.
+# A test the script could not run is not checked: its worker died, its
+# worktree could not be made, or a build or test run of it stopped before
+# the end without a compile error or a result. A pin one of whose tests
+# was checked and failed the check is invalid, whatever happened to its
+# other tests. A pin with a test not checked and none that failed is not
+# checked, which makes it neither valid nor invalid. If any pin is not
+# checked, the check did not finish.
 #
 # With NAMEs only those pins are checked, and the coverage check is
 # skipped. The logs of pin NAME go to DIR/NAME, by default
@@ -319,10 +322,13 @@ unrun() {
   fi
 }
 
-# One row per test, the pin's name on its first. A pin is not checked if
-# any of its tests was not run both ways; otherwise it is valid if each of
-# its tests passes unpatched and fails patched, and the failure's first
-# line says how.
+# One row per test, the pin's name on its first, and the failure's first
+# line says how a test failed with the patch. A test fails the check as
+# soon as either half has a result that is wrong: it does not pass as it
+# is, or it does not fail with the patch. That makes its pin invalid,
+# whatever happened to its other tests, since nothing they could show would
+# make it valid. A pin none of whose tests failed the check is not checked
+# if one of them was not run both ways, and valid otherwise.
 invalid=0 unchecked=0 checked=0
 rows=()
 for i in "${!names[@]}"; do
@@ -330,10 +336,13 @@ for i in "${!names[@]}"; do
   [ -f "$dir/patched" ] || for (( k = 0; k < count[i]; k++ )); do unrun "$i"; done > "$dir/patched"
   state=valid
   for (( k = 0; k < count[i]; k++ )); do
-    case "$(sed -n "$(( k + 1 ))p" "$dir/unpatched") $(sed -n "$(( k + 1 ))p" "$dir/patched")" in
-      *"not checked"*) state=unchecked ;;
-      "passes fails") checked=$(( checked + 1 )) ;;
-      *) checked=$(( checked + 1 )); [ "$state" = unchecked ] || state=invalid ;;
+    unpatched=$(sed -n "$(( k + 1 ))p" "$dir/unpatched")
+    shown=$(sed -n "$(( k + 1 ))p" "$dir/patched")
+    case $unpatched in "not checked"*) ;; passes) ;; *) state=invalid ;; esac
+    case $shown in "not checked"*) ;; fails) ;; *) state=invalid ;; esac
+    case "$unpatched $shown" in
+      *"not checked"*) [ "$state" = invalid ] || state=unchecked ;;
+      *) checked=$(( checked + 1 )) ;;
     esac
   done
   case $state in
@@ -358,7 +367,7 @@ done
 total=$(( ${#names[@]} + ${#unguarded[@]} ))
 {
   if [ "$unchecked" -gt 0 ]; then
-    echo "**The check did not finish:** $unchecked of $total pins were not checked, so they are neither valid nor invalid. Each of their rows says why."
+    echo "**The check did not finish:** $unchecked of $total pins were not checked, so they are neither valid nor invalid. Each of their rows says why. A pin in bold is invalid: one of its tests was checked and failed the check, whatever happened to its others."
     echo
   fi
   echo '| Pin | Test | Unpatched | With its patch |'
