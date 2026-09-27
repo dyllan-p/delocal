@@ -13,8 +13,9 @@
 //! folder's parts for `Engine::restore`; the other readers return the
 //! host's tables. Writes arrive as [`Group`]s, one per event, each holding
 //! the persistence hooks the engine returned for it and the host's writes
-//! that go with them ([`write`] maps each hook to its table), and
-//! [`Store::commit`] commits them.
+//! that go with them ([`write`] maps each hook to its table), and the
+//! group-commit [`Writer`] commits them, many groups to a transaction
+//! ([`writer`]).
 
 use std::fmt;
 use std::path::Path;
@@ -28,12 +29,14 @@ mod load;
 mod sample;
 pub mod schema;
 pub mod write;
+pub mod writer;
 
 pub use host::{
     DiskName, FolderRow, HistoryRow, JournalRow, Machine, Member, Mode, Shim, TrashRow,
 };
 pub use schema::SCHEMA_VERSION;
 pub use write::{Group, HostWrite};
+pub use writer::{Durable, WriteError, Writer};
 
 /// The daemon's database. See the module docs.
 pub struct Store {
@@ -82,6 +85,8 @@ pub enum StoreError {
     Corrupt { table: &'static str, detail: String },
     /// A value for `table` could not be encoded as JSON.
     Encode { table: &'static str, detail: String },
+    /// The writer thread could not be started.
+    Spawn(std::io::Error),
 }
 
 impl fmt::Display for StoreError {
@@ -101,6 +106,7 @@ impl fmt::Display for StoreError {
             Self::Encode { table, detail } => {
                 write!(f, "a value for {table} could not be encoded: {detail}")
             }
+            Self::Spawn(e) => write!(f, "the store's writer could not start: {e}"),
         }
     }
 }
@@ -109,6 +115,7 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(e) => Some(e),
+            Self::Spawn(e) => Some(e),
             Self::UnknownSchema { .. }
             | Self::NotWal { .. }
             | Self::Corrupt { .. }
