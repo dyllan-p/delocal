@@ -17,14 +17,14 @@
 #
 # A pin is valid only if its test passes at REV (default HEAD) and fails
 # with its patch applied. The script first checks that every test in
-# crates/sim/src/regressions.rs has a patch, then builds REV once and runs
-# every named test there, then applies each patch to a clean checkout of
-# REV and runs its test alone. J workers (default: one per four cores)
-# each keep a worktree and a target directory and take the patches in
-# turn, resetting the worktree to REV before each one, so a worker's
-# second build recompiles only what its patches touch. Tests run in
-# release, as CI's pinned job runs them, and a test that runs for more
-# than ten minutes counts as not failing.
+# crates/sim/src/regressions.rs has a patch, then makes all its worktrees,
+# one at a time, then builds REV once and runs every named test there,
+# then applies each patch to a clean checkout of REV and runs its test
+# alone. J workers (default: one per four cores) each keep a worktree and
+# a target directory and take the patches in turn, resetting the worktree
+# to REV before each one, so a worker's second build recompiles only what
+# its patches touch. Tests run in release, as CI's pinned job runs them,
+# and a test that runs for more than ten minutes counts as not failing.
 #
 # With NAMEs only those pins are checked, and the coverage check is
 # skipped. The logs of pin NAME go to DIR/NAME, by default
@@ -172,11 +172,19 @@ why() {
 
 echo "pins: ${#names[@]} of $(git -C "$repo" rev-parse --short "$commit"), $jobs workers of $threads threads, in $out"
 
-# The unpatched half: one build of REV, every named test in it. Each pin
-# must pass here.
+# Every worktree is made before anything runs, one at a time: two `git
+# worktree add` at once can read the other's half-made entry under
+# .git/worktrees and fail ("failed to read .../commondir").
 base=$out/base
 mkdir -p "$base"
 git -C "$repo" worktree add --quiet --detach "$base/tree" "$commit"
+for (( w = 0; w < jobs; w++ )); do
+  mkdir -p "$out/worker-$w"
+  git -C "$repo" worktree add --quiet --detach "$out/worker-$w/tree" "$commit"
+done
+
+# The unpatched half: one build of REV, every named test in it. Each pin
+# must pass here.
 export CARGO_TARGET_DIR=$base/target
 for package in $(printf '%s\n' "${packages[@]}" | sort -u); do
   filters=()
@@ -202,8 +210,6 @@ done
 work() {
   local w=$1 dir=$out/worker-$1 i name patch result
   local tree=$dir/tree
-  mkdir -p "$dir"
-  git -C "$repo" worktree add --quiet --detach "$tree" "$commit"
   export CARGO_TARGET_DIR=$dir/target
   for (( i = w; i < ${#names[@]}; i += jobs )); do
     name=${names[$i]} patch=$pins/${names[$i]}.patch
