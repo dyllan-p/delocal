@@ -23,7 +23,7 @@ index e843412..36cd6af 100644
 -            .deferred
 -            .iter()
 -            .filter(|(p, list)| {
--                !seen.contains(*p)
+-                !bracket.saw(p)
 -                    && !self.wants.in_flight(p)
 -                    && list.iter().any(|d| d.restoring.is_some())
 -            })

@@ -43,8 +43,9 @@
 //! host reports is marked seen; at `ScanFinished` every live record not seen
 //! becomes a tombstone dated then (§7.3). A path reported `Skipped` is seen
 //! and nothing more: the host could not inspect it, so its record stands
-//! and nothing is announced for it. `ScanAborted` drops the bracket and
-//! announces nothing.
+//! and nothing is announced for it. A skip also covers every tracked path
+//! beneath it, which is how a directory that cannot be listed keeps its
+//! children. `ScanAborted` drops the bracket and announces nothing.
 //!
 //! **Revert** (§8.3). Every pending path gets back the record peers last
 //! saw. The current file goes to trash and the restored live entry is
@@ -94,7 +95,8 @@ pub enum ScanState {
     /// The host could not inspect the path. Inside a scan bracket the path
     /// counts as seen and nothing else happens: its record is kept,
     /// nothing is announced for it, and the bracket's deletion pass leaves
-    /// it alone. Outside a bracket it changes nothing (§7.3).
+    /// it alone, and every tracked path beneath it too. Outside a bracket
+    /// it changes nothing (§7.3).
     Skipped {
         reason: SkipReason,
     },
@@ -450,6 +452,49 @@ pub struct Scanned {
     pub landed: Option<IndexRecord>,
 }
 
+/// An open scan bracket (§7.3): every path the host has reported since
+/// `ScanStarted`, and which of them it reported `Skipped`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Bracket {
+    seen: BTreeSet<RelPath>,
+    skipped: BTreeSet<RelPath>,
+}
+
+impl Bracket {
+    /// The host reported `path` as `state`.
+    fn report(&mut self, path: &RelPath, state: &ScanState) {
+        self.seen.insert(path.clone());
+        if let ScanState::Skipped { .. } = state {
+            self.skipped.insert(path.clone());
+        }
+    }
+
+    /// True if the bracket's end may not take `path` for absent: the host
+    /// reported it, or reported a path above it `Skipped`. A directory
+    /// that cannot be listed is reported once and covers every tracked
+    /// path beneath it, since the host cannot see the children to report
+    /// them one by one (§7.3). The engine does not know what the host found
+    /// at a skipped path, so any skip covers what lies beneath it; beneath
+    /// a file there is nothing on disk to cover.
+    fn saw(&self, path: &RelPath) -> bool {
+        if self.seen.contains(path) {
+            return true;
+        }
+        // Most brackets skip nothing, and then there is no need to walk up.
+        if self.skipped.is_empty() {
+            return false;
+        }
+        let mut above = path.parent();
+        while let Some(dir) = above {
+            if self.skipped.contains(&dir) {
+                return true;
+            }
+            above = dir.parent();
+        }
+        false
+    }
+}
+
 /// What a due tick did (§7.4, §8.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ticked {
@@ -572,8 +617,8 @@ pub struct FolderState {
     members: BTreeSet<NodeId>,
     index: Index,
     window: Option<Window>,
-    /// Paths reported since `ScanStarted`, while a bracket is open.
-    scan: Option<BTreeSet<RelPath>>,
+    /// The open scan bracket, if any.
+    scan: Option<Bracket>,
     wants: WantList,
     /// This machine's `seq` as acknowledged by each peer's decisions or its
     /// `have_up_to` (§7.4).
@@ -920,8 +965,8 @@ impl FolderState {
     /// and is the landing of a refetch whose report was lost (§13);
     /// anything else is a local change like any other.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
-        if let Some(seen) = &mut self.scan {
-            seen.insert(path.clone());
+        if let Some(bracket) = &mut self.scan {
+            bracket.report(&path, &state);
         }
         // Not an observation: the host does not know what is at the path,
         // so it is neither present nor absent, and no rule below applies.
@@ -1342,21 +1387,25 @@ impl FolderState {
 
     /// A full scan begins: start collecting the paths it reports.
     pub fn scan_started(&mut self) {
-        self.scan = Some(BTreeSet::new());
+        self.scan = Some(Bracket::default());
     }
 
     /// A full scan ended: every live record it did not report is gone
-    /// (§7.3), except paths in flight and paths carrying the restoring
-    /// mark, whatever state the want that carries it is in, or whether a
-    /// deferred entry carries it instead (§8.3). Returns the tombstones,
-    /// or `Err` if no bracket was open.
+    /// (§7.3), except records beneath a path it reported `Skipped`, paths
+    /// in flight and paths carrying the restoring mark, whatever state the
+    /// want that carries it is in, or whether a deferred entry carries it
+    /// instead (§8.3). Returns the tombstones, or `Err` if no bracket was
+    /// open.
     pub fn scan_finished(&mut self, now: Timestamp) -> Result<Vec<LocalChange>, FolderStatus> {
-        let seen = self.scan.take().ok_or(FolderStatus::ScanNotOpen)?;
+        // Beneath a skipped path the bracket observed nothing, neither
+        // presence nor absence, so all three passes below treat those
+        // paths as they treat the skipped path itself: as seen (§7.3).
+        let bracket = self.scan.take().ok_or(FolderStatus::ScanNotOpen)?;
         let gone: Vec<RelPath> = self
             .index
             .live_records()
             .map(|r| r.entry.path.clone())
-            .filter(|p| !seen.contains(p) && !self.wants.in_flight(p) && !self.marked(p))
+            .filter(|p| !bracket.saw(p) && !self.wants.in_flight(p) && !self.marked(p))
             .collect();
         let mut changes = Vec::new();
         for path in &gone {
@@ -1374,9 +1423,7 @@ impl FolderState {
         let unseen: Vec<RelPath> = self
             .deferred
             .paths()
-            .filter(|p| {
-                !seen.contains(*p) && self.index.live(p).is_none() && !self.wants.in_flight(p)
-            })
+            .filter(|p| !bracket.saw(p) && self.index.live(p).is_none() && !self.wants.in_flight(p))
             .cloned()
             .collect();
         for path in &unseen {
@@ -1389,7 +1436,7 @@ impl FolderState {
             .deferred
             .iter()
             .filter(|(p, list)| {
-                !seen.contains(*p)
+                !bracket.saw(p)
                     && !self.wants.in_flight(p)
                     && list.iter().any(|d| d.restoring.is_some())
             })
@@ -2593,6 +2640,31 @@ mod tests {
         }
     }
 
+    /// §7.3: a directory that cannot be listed is reported `Skipped` once,
+    /// and the skip covers every tracked path beneath it, however deep and
+    /// whether or not the directory has a record itself; leaving the
+    /// children out would tombstone them all. A sibling whose name merely
+    /// starts the same is not beneath it.
+    #[test]
+    fn a_skipped_directory_covers_every_tracked_path_beneath_it() {
+        let mut f = folder();
+        f.scanned(t(1.0), p("d"), observed(Kind::Dir, 0, 0, false));
+        for path in ["d/x", "d/e/y", "dx", "u/z", "e"] {
+            f.scanned(t(1.0), p(path), file(1, 1));
+        }
+        f.form_batches(t(3.0), batch_id());
+        f.scan_started();
+        f.scanned(t(5.0), p("d"), skipped(SkipReason::PermissionDenied));
+        f.scanned(t(5.0), p("u"), skipped(SkipReason::Io));
+        f.scanned(t(5.0), p("e"), ScanState::Unchanged);
+        let changes = f.scan_finished(t(6.0)).unwrap();
+        let gone: Vec<&RelPath> = changes.iter().map(|c| &c.record.entry.path).collect();
+        assert_eq!(gone, [&p("dx")]);
+        for path in ["d", "d/x", "d/e/y", "u/z", "e"] {
+            assert!(f.index().live(&p(path)).is_some(), "{path} stays live");
+        }
+    }
+
     #[test]
     fn watcher_absent_outside_a_bracket_deletes_directly() {
         let mut f = folder();
@@ -3153,9 +3225,16 @@ mod tests {
     /// A (node 1) with `n` announced files, and B (node 2, `rules`) holding
     /// the same files after committing A's batch.
     fn a_and_b(n: usize, rules: Rules) -> (FolderState, FolderState) {
+        let paths: Vec<RelPath> = (0..n).map(|i| p(&format!("f{i:02}"))).collect();
+        a_and_b_at(&paths, rules)
+    }
+
+    /// As [`a_and_b`], with A's files at `paths`.
+    fn a_and_b_at(paths: &[RelPath], rules: Rules) -> (FolderState, FolderState) {
+        let n = paths.len();
         let mut a = folder_with(Rules::default(), 1, "alpha");
-        for i in 0..n {
-            a.scanned(t(1.0), p(&format!("f{i:02}")), file(1, 1));
+        for path in paths {
+            a.scanned(t(1.0), path.clone(), file(1, 1));
         }
         let batch = a.form_batches(t(3.0), bid(1)).remove(0);
         // The base is built under the defaults so a tight H2 in `rules`
@@ -3665,6 +3744,46 @@ mod tests {
         let want = b.wants().get(&p("z")).unwrap();
         assert_eq!(want.version(), &v, "wanted again");
         assert!(!want.fetched, "a fresh want fetches again");
+    }
+
+    /// §7.3: beneath a skipped directory the bracket observed nothing, so a
+    /// deferred entry at a path there with no record is not taken for
+    /// absent (as above) either. It keeps waiting, and the first bracket
+    /// that can look and does not find it reconsiders it.
+    #[test]
+    fn a_skipped_directory_leaves_a_deferred_entry_beneath_it_waiting() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("d/z"), file(3, 30));
+        let batch = a.form_batches(t(12.0), bid(6)).remove(0);
+        assert_eq!(b.receive(t(12.0), &batch).decision, Decision::Accepted);
+        let v = b.wants().get(&p("d/z")).unwrap().version().clone();
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Fetch { .. }));
+        b.fetched(t(13.5), &p("d/z"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { .. }));
+        assert!(
+            b.applied(t(15.0), &p("d/z"), &v, ApplyOutcome::ChangedUnderneath)
+                .is_empty()
+        );
+        assert_eq!(b.deferred().count(), 1);
+
+        b.scan_started();
+        b.scanned(t(16.0), p("d"), skipped(SkipReason::PermissionDenied));
+        for i in 0..10 {
+            b.scanned(t(16.0), p(&format!("f{i:02}")), ScanState::Unchanged);
+        }
+        assert!(b.scan_finished(t(17.0)).unwrap().is_empty());
+        assert_eq!(b.deferred().count(), 1, "still waiting");
+        assert!(b.wants().is_empty());
+
+        b.scan_started();
+        for i in 0..10 {
+            b.scanned(t(18.0), p(&format!("f{i:02}")), ScanState::Unchanged);
+        }
+        assert!(b.scan_finished(t(19.0)).unwrap().is_empty());
+        assert!(b.deferred().next().is_none(), "reconsidered");
+        assert_eq!(b.wants().get(&p("d/z")).unwrap().version(), &v);
     }
 
     #[test]
@@ -5026,25 +5145,30 @@ mod tests {
     /// restoring want is deferred and its entry carries the mark. The
     /// write went to the trash-restored record at `f00`.
     fn deferred_restoring_entry() -> (FolderState, IndexRecord) {
-        let (_, mut b) = a_and_b(
-            1,
+        deferred_restoring_entry_at(p("f00"))
+    }
+
+    /// As [`deferred_restoring_entry`], at `path`.
+    fn deferred_restoring_entry_at(path: RelPath) -> (FolderState, IndexRecord) {
+        let (_, mut b) = a_and_b_at(
+            std::slice::from_ref(&path),
             Rules {
                 hold_count: 1,
                 hold_pct: 0,
                 ..Rules::default()
             },
         );
-        b.scanned(t(10.0), p("f00"), file(5, 5));
+        b.scanned(t(10.0), path.clone(), file(5, 5));
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
         b.revert(t(13.0)).unwrap();
-        let restored = b.index().get(&p("f00")).unwrap().clone();
+        let restored = b.index().get(&path).unwrap().clone();
         let v = restored.entry.version.clone();
         b.dispatch(t(13.0), &lan(&[1]));
-        b.fetched(t(14.0), &p("f00"), &v, FetchReport::Ok);
+        b.fetched(t(14.0), &path, &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
         assert!(
-            b.applied(t(15.0), &p("f00"), &v, ApplyOutcome::ChangedUnderneath)
+            b.applied(t(15.0), &path, &v, ApplyOutcome::ChangedUnderneath)
                 .is_empty()
         );
         assert!(b.wants().is_empty());
@@ -5203,6 +5327,27 @@ mod tests {
         assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
         let written = b.applied(t(23.0), &p("f00"), &v, ApplyOutcome::Ok);
         assert!(written[0].seq > restored.seq, "the landing is announced");
+    }
+
+    /// §7.3, §8.3: a bracket end that does not see a marked path wants its
+    /// deferred carrier again, since absence is the normal state there (as
+    /// above). Beneath a skipped directory the bracket did not look, so the
+    /// carrier keeps waiting, and the first bracket that can look wants it.
+    #[test]
+    fn a_skipped_directory_leaves_a_deferred_carrier_beneath_it_waiting() {
+        let (mut b, restored) = deferred_restoring_entry_at(p("d/f00"));
+        b.scan_started();
+        b.scanned(t(20.0), p("d"), skipped(SkipReason::PermissionDenied));
+        assert!(b.scan_finished(t(20.0)).unwrap().is_empty());
+        assert!(b.wants().is_empty(), "not wanted again");
+        assert_eq!(b.deferred().count(), 1);
+
+        b.scan_started();
+        assert!(b.scan_finished(t(21.0)).unwrap().is_empty());
+        assert_eq!(b.deferred().count(), 0);
+        let want = b.wants().get(&p("d/f00")).unwrap();
+        assert_eq!(want.entry, restored.entry);
+        assert!(want.restoring);
     }
 
     /// §8.3, fix 4: a later version replaced the restoring want, inherited
