@@ -6,6 +6,7 @@ absent and fails, the refetch is deferred as changed underneath, and the
 next bracket end tombstones the path (DESIGN.md §8.3 step 2, §7.5 step 6).
 
 test: delocal-sim regressions::a_reverts_refetch_expects_the_path_it_trashed_to_be_absent
+test: delocal-engine folder::tests::a_restoring_wants_commit_expects_the_path_to_be_absent
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
 index e843412..721eea7 100644
