@@ -6,8 +6,9 @@
 //! `RealFs`, which holds the root until it is dropped. Every call on it walks
 //! its path one component at a time from there, opening each parent with
 //! `O_DIRECTORY | O_NOFOLLOW`, and then acts on the last component with a
-//! directory-relative call (`openat`, `fstatat`, `renameat`, `unlinkat`,
-//! `mkdirat`, `symlinkat`, `readlinkat`, `utimensat`). The kernel
+//! directory-relative call (`openat`, `fstatat`, `renameat`, `renameat2` or
+//! `renameatx_np`, `unlinkat`, `mkdirat`, `symlinkat`, `readlinkat`,
+//! `utimensat`). The kernel
 //! never sees a whole path, so `PATH_MAX` (4,096 bytes on Linux, 1,024 on
 //! macOS) never applies, and a parent that is not a directory stops the walk
 //! with [`ParentNotADirectory`] before anything outside the folder is read
@@ -34,7 +35,10 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, Timespec, Timestamps};
 use rustix::io::Errno;
 
-use super::{FileKind, Folder, Fs, NotAFile, ParentNotADirectory, ReadFile, Stat, WriteFile};
+use super::{
+    FileKind, Folder, Fs, NoReplaceUnsupported, NotAFile, ParentNotADirectory, ReadFile, Stat,
+    WriteFile,
+};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -205,6 +209,13 @@ fn components(path: &Path) -> io::Result<Vec<&OsStr>> {
         .collect()
 }
 
+/// Whether `inner` is strictly inside `outer`: moving `outer` there would
+/// move a directory into itself.
+fn is_inside(inner: &Path, outer: &Path) -> io::Result<bool> {
+    let (inner, outer) = (components(inner)?, components(outer)?);
+    Ok(inner.len() > outer.len() && inner.starts_with(&outer))
+}
+
 impl ReadFile for File {}
 
 impl WriteFile for File {
@@ -273,6 +284,27 @@ impl Fs for RealFs {
         let (to_dir, to_name) = self.entry(to)?;
         let (from_at, to_at) = (self.at(&from_dir), self.at(&to_dir));
         Ok(rustix::fs::renameat(from_at, from_name, to_at, to_name)?)
+    }
+
+    fn rename_noreplace(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let (from_dir, from_name) = self.entry(from)?;
+        let (to_dir, to_name) = self.entry(to)?;
+        let (from_at, to_at) = (self.at(&from_dir), self.at(&to_dir));
+        let flags = rustix::fs::RenameFlags::NOREPLACE;
+        match rustix::fs::renameat_with(from_at, from_name, to_at, to_name, flags) {
+            Ok(()) => Ok(()),
+            // No such system call (Linux before 3.15, macOS before 10.12),
+            // or a filesystem that does not take the flag: ENOTSUP on macOS,
+            // EOPNOTSUPP or EINVAL on Linux. Written as a guard, since some of
+            // these are the same number on one platform and not the other.
+            Err(e) if e == Errno::NOSYS || e == Errno::NOTSUP || e == Errno::OPNOTSUPP => {
+                Err(NoReplaceUnsupported.into())
+            }
+            // EINVAL also means moving a directory into itself, the one case
+            // where it is about the paths rather than the flag.
+            Err(Errno::INVAL) if !is_inside(to, from)? => Err(NoReplaceUnsupported.into()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn remove_file(&self, path: &Path) -> io::Result<()> {

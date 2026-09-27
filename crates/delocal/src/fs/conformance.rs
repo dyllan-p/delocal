@@ -14,16 +14,16 @@
 //! directories, one of them a symlink to a directory outside the folder
 //! that must come through untouched; and a file swapped for a symlink or a
 //! FIFO before it is opened, which must be seen for what it is, neither
-//! followed nor waited on. Then the root opened afresh for every operation,
-//! so a folder renamed away between two operations is left alone by the
-//! second.
+//! followed nor waited on. Then §7.5's rename that never replaces, and the
+//! root opened afresh for every operation, so a folder renamed away between
+//! two operations is left alone by the second.
 
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::{FileKind, Folder, Fs, NotAFile, ParentNotADirectory};
+use super::{FileKind, Folder, Fs, NoReplaceUnsupported, NotAFile, ParentNotADirectory};
 
 /// One `#[test]` per check. Each makes a temporary directory holding
 /// `folder`, the root it passes to `$make` (a closure from the root to a
@@ -53,6 +53,7 @@ macro_rules! conformance_tests {
             a_parent_that_is_a_file_stops_the_operation,
             a_parent_swapped_for_a_symlink_keeps_everything_inside_the_folder,
             a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is,
+            rename_noreplace_refuses_to_replace,
         );
         $crate::fs::conformance::conformance_tests!(
             @folder $make;
@@ -543,6 +544,8 @@ pub fn a_parent_swapped_for_a_symlink_keeps_everything_inside_the_folder(fs: &dy
     assert_stopped_at(fs.available_space(p("d/sub")), "d");
     assert_stopped_at(fs.rename(p("x"), p("d/x")), "d");
     assert_stopped_at(fs.rename(p("d/f"), p("y")), "d");
+    assert_stopped_at(fs.rename_noreplace(p("x"), p("d/x")), "d");
+    assert_stopped_at(fs.rename_noreplace(p("d/f"), p("y")), "d");
     assert_stopped_at(fs.remove_file(p("d/f")), "d");
     assert_stopped_at(fs.remove_dir(p("d/sub")), "d");
     assert_stopped_at(fs.create_dir(p("d/new")), "d");
@@ -651,6 +654,57 @@ pub fn a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is(fs: &dyn Fs, 
     let _socket = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
     assert_eq!(not_a_file(fs.open_read(p("sock"))), FileKind::Other);
     assert_eq!(not_a_file(fs.open_append(p("sock"))), FileKind::Other);
+}
+
+pub fn rename_noreplace_refuses_to_replace(fs: &dyn Fs, root: &Path) {
+    // Into an empty path it is a rename.
+    write(fs, p("a"), b"A");
+    fs.rename_noreplace(p("a"), p("b")).unwrap();
+    assert_eq!(fs.read_dir(p("")).unwrap(), ["b"]);
+
+    // The commit path has just found the target empty, and then the user
+    // creates a file there: it survives, and the rename fails with EEXIST.
+    write(fs, p("temp"), b"received");
+    assert_eq!(kind_of(fs.lstat(p("target"))), ErrorKind::NotFound);
+    std::fs::write(root.join("target"), "the user's").unwrap();
+    let err = fs.rename_noreplace(p("temp"), p("target")).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+    assert_eq!(
+        err.raw_os_error(),
+        Some(rustix::io::Errno::EXIST.raw_os_error())
+    );
+    assert_eq!(read(fs, p("target")), b"the user's");
+    assert_eq!(read(fs, p("temp")), b"received", "nothing moved");
+
+    // A directory, an empty one included, is something too, and so is a
+    // symlink, which is not followed.
+    fs.create_dir(p("d")).unwrap();
+    assert_eq!(
+        kind_of(fs.rename_noreplace(p("temp"), p("d"))),
+        ErrorKind::AlreadyExists
+    );
+    fs.symlink(p("nowhere"), p("s")).unwrap();
+    assert_eq!(
+        kind_of(fs.rename_noreplace(p("temp"), p("s"))),
+        ErrorKind::AlreadyExists
+    );
+    assert_eq!(kind_of(fs.lstat(p("nowhere"))), ErrorKind::NotFound);
+
+    // A directory moves whole, as §7.6's displacement expects.
+    write(fs, p("d/child"), b"x");
+    fs.rename_noreplace(p("d"), p("e")).unwrap();
+    assert_eq!(read(fs, p("e/child")), b"x");
+
+    // Moving a directory into itself is refused for what it is, not taken
+    // for a filesystem without the flag.
+    let into_itself = fs.rename_noreplace(p("e"), p("e/inner")).unwrap_err();
+    assert_eq!(into_itself.kind(), ErrorKind::InvalidInput);
+    assert!(!NoReplaceUnsupported::of(&into_itself));
+
+    assert_eq!(
+        kind_of(fs.rename_noreplace(p("missing"), p("x"))),
+        ErrorKind::NotFound
+    );
 }
 
 pub fn the_root_is_opened_afresh_for_each_operation(folder: &dyn Folder, root: &Path) {
