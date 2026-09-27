@@ -252,7 +252,9 @@ impl EngineWrite {
 impl Store {
     /// Apply every write of `groups`, in order, in one transaction, and
     /// commit it: when this returns `Ok` they are all durable (§11), and
-    /// when it returns `Err` none of them is.
+    /// when it returns `Err` none of them is. The group-commit writer calls
+    /// this for each transaction; before it starts, the daemon may call it
+    /// directly.
     pub fn commit(&mut self, groups: &[Group]) -> Result<(), StoreError> {
         let tx = self
             .conn
