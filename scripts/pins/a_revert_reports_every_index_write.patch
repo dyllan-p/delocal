@@ -6,6 +6,7 @@ acts on it, and without the reports the persisted index keeps the pending
 records the revert (§8.3) discarded.
 
 test: delocal-sim regressions::a_revert_reports_every_index_write
+test: delocal-engine engine::tests::a_revert_reports_every_index_write_it_makes
 
 diff --git a/crates/engine/src/engine.rs b/crates/engine/src/engine.rs
 index 01954b3..2427b82 100644
