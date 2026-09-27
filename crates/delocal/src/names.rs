@@ -336,10 +336,10 @@ mod tests {
     /// that is not UTF-8.
     #[test]
     fn names_as_the_real_filesystem_lists_them() {
-        use crate::fs::{Fs, RealFs};
+        use crate::fs::{Folder, RealFolder};
 
         let tmp = tempfile::tempdir().unwrap();
-        let fs = RealFs::open(tmp.path()).unwrap();
+        let fs = RealFolder::new(tmp.path()).open().unwrap();
         let create = |name: &[u8]| fs.create_new(std::path::Path::new(OsStr::from_bytes(name)));
         create(b"plain").unwrap();
         create("café".as_bytes()).unwrap();

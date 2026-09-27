@@ -12,13 +12,15 @@
 //! ] }
 //! ```
 //!
-//! - `op` is one [`Op`]: an [`Fs`](crate::fs::Fs) method, or `read`,
-//!   `write` or `sync` on an open file.
+//! - `op` is one [`Op`]: an [`Fs`](crate::fs::Fs) method, `open_root` for
+//!   [`Folder::open`](crate::fs::Folder::open), or `read`, `write` or `sync`
+//!   on an open file.
 //! - `path` is a [`Pattern`](super::pattern::Pattern) over the path,
-//!   relative to the folder root as the [`Fs`](crate::fs::Fs) takes it. A
-//!   rename matches if either of its paths does; a symlink matches on the
-//!   link, not the target; a read, write or sync on the path the file was
-//!   opened with.
+//!   relative to the folder root as the [`Fs`](crate::fs::Fs) takes it; the
+//!   root itself is the empty path, which `open_root` always has and the
+//!   pattern `""` matches alone. A rename matches if either of its paths
+//!   does; a symlink matches on the link, not the target; a read, write or
+//!   sync on the path the file was opened with.
 //! - `at` is `{"call": n}`, the rule's nth matching call only, counting from
 //!   1; `{"from_call": n}`, its nth matching call and every one after; or
 //!   `{"offset": n}`, for `read` and `write` only: a call that would cross
@@ -62,6 +64,9 @@ pub struct Rule {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Op {
+    /// [`Folder::open`](crate::fs::Folder::open), at the start of each
+    /// operation.
+    OpenRoot,
     ReadDir,
     Lstat,
     ReadLink,
@@ -181,9 +186,6 @@ impl Spec {
                     reason,
                 })
             };
-            if rule.path.is_empty() {
-                return invalid("the path pattern is empty and would match nothing");
-            }
             match rule.at {
                 Trigger::Call(0) | Trigger::FromCall(0) => {
                     return invalid("calls count from 1");
@@ -244,6 +246,7 @@ mod tests {
     #[test]
     fn every_op_has_its_snake_case_name() {
         let names = [
+            (Op::OpenRoot, "open_root"),
             (Op::ReadDir, "read_dir"),
             (Op::Lstat, "lstat"),
             (Op::ReadLink, "read_link"),
@@ -295,13 +298,11 @@ mod tests {
             invalid(rule("write", r#"{"call": 1}"#, "EXDEV")),
             "EXDEV applies to rename only"
         );
-        assert_eq!(
-            invalid(
-                r#"{"rules": [{"op": "lstat", "path": "", "at": {"call": 1}, "fail": "EIO"}]}"#
-                    .into()
-            ),
-            "the path pattern is empty and would match nothing"
-        );
+        // The empty pattern is the root alone.
+        Spec::parse(
+            r#"{"rules": [{"op": "open_root", "path": "", "at": {"call": 1}, "fail": "EIO"}]}"#,
+        )
+        .unwrap();
 
         for json in [
             rule("stat", r#"{"call": 1}"#, "EIO"),

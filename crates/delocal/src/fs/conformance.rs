@@ -1,7 +1,9 @@
-//! The contract of [`Fs`] as tests (DESIGN.md §14.2). Each check takes an
-//! implementation, makes its own temporary directory and asserts what the
-//! scanner and the commit path will rely on. [`conformance_tests!`] turns
-//! the whole list into one `#[test]` per check for an implementation.
+//! The contract of [`Folder`] and [`Fs`] as tests (DESIGN.md §14.2). Each
+//! check runs in its own temporary directory and asserts what the scanner
+//! and the commit path will rely on. [`conformance_tests!`] turns the whole
+//! list into one `#[test]` per check for an implementation, given how to
+//! make its `Folder`: most checks work through one operation's `Fs`, and the
+//! folder checks through the `Folder` itself.
 //!
 //! `RealFs` runs them on the machine's real filesystem, which CI does on
 //! Linux and macOS. The set-mtime check also asserts that nanoseconds
@@ -12,22 +14,25 @@
 //! directories, one of them a symlink to a directory outside the folder
 //! that must come through untouched; and a file swapped for a symlink or a
 //! FIFO before it is opened, which must be seen for what it is, neither
-//! followed nor waited on.
+//! followed nor waited on. Then the root opened afresh for every operation,
+//! so a folder renamed away between two operations is left alone by the
+//! second.
 
 use std::ffi::OsString;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::{FileKind, Fs, NotAFile, ParentNotADirectory};
+use super::{FileKind, Folder, Fs, NotAFile, ParentNotADirectory};
 
 /// One `#[test]` per check. Each makes a temporary directory holding
-/// `folder`, the root it passes to `$make` (a closure from the root to an
-/// implementation), and room beside it for checks that need an outside.
+/// `folder`, the root it passes to `$make` (a closure from the root to a
+/// [`Folder`]), and room beside it for checks that need an outside. An `Fs`
+/// check gets one operation's `Fs`; a folder check gets the `Folder`.
 macro_rules! conformance_tests {
     ($make:expr) => {
         $crate::fs::conformance::conformance_tests!(
-            $make;
+            @fs $make;
             read_dir_gives_raw_names_sorted_by_bytes,
             lstat_reports_kind_size_and_mode_without_following,
             read_link_gives_the_raw_target,
@@ -49,16 +54,33 @@ macro_rules! conformance_tests {
             a_parent_swapped_for_a_symlink_keeps_everything_inside_the_folder,
             a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is,
         );
+        $crate::fs::conformance::conformance_tests!(
+            @folder $make;
+            the_root_is_opened_afresh_for_each_operation,
+        );
     };
-    ($make:expr; $($check:ident),* $(,)?) => {
+    (@fs $make:expr; $($check:ident),* $(,)?) => {
         $(
             #[test]
             fn $check() {
                 let tmp = tempfile::tempdir().unwrap();
                 let root = tmp.path().join("folder");
                 std::fs::create_dir(&root).unwrap();
-                let fs = ($make)(root.as_path());
-                $crate::fs::conformance::$check(&fs, &root);
+                let folder = ($make)(root.as_path());
+                let fs = $crate::fs::Folder::open(&folder).unwrap();
+                $crate::fs::conformance::$check(&*fs, &root);
+            }
+        )*
+    };
+    (@folder $make:expr; $($check:ident),* $(,)?) => {
+        $(
+            #[test]
+            fn $check() {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path().join("folder");
+                std::fs::create_dir(&root).unwrap();
+                let folder = ($make)(root.as_path());
+                $crate::fs::conformance::$check(&folder, &root);
             }
         )*
     };
@@ -629,4 +651,47 @@ pub fn a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is(fs: &dyn Fs, 
     let _socket = std::os::unix::net::UnixListener::bind(root.join("sock")).unwrap();
     assert_eq!(not_a_file(fs.open_read(p("sock"))), FileKind::Other);
     assert_eq!(not_a_file(fs.open_append(p("sock"))), FileKind::Other);
+}
+
+pub fn the_root_is_opened_afresh_for_each_operation(folder: &dyn Folder, root: &Path) {
+    // One operation: the marker is made and seen, and the root closed again.
+    let fs = folder.open().unwrap();
+    fs.create_dir(p(".delocal")).unwrap();
+    write(&*fs, p(".delocal/folder.json"), b"{}");
+    assert_eq!(
+        fs.lstat(p(".delocal/folder.json")).unwrap().kind,
+        FileKind::File
+    );
+    drop(fs);
+
+    // Between operations the user renames the folder away and makes an
+    // empty one in its place.
+    let renamed = root.parent().unwrap().join("renamed");
+    std::fs::rename(root, &renamed).unwrap();
+    std::fs::create_dir(root).unwrap();
+    let before = snapshot(&renamed);
+
+    // The next operation opens what is at the configured path now: no
+    // marker, which is what the root guard must see, and its writes land
+    // there, never in the folder that was renamed away.
+    let fs = folder.open().unwrap();
+    assert_eq!(
+        kind_of(fs.lstat(p(".delocal/folder.json"))),
+        ErrorKind::NotFound
+    );
+    assert!(fs.read_dir(p("")).unwrap().is_empty());
+    write(&*fs, p("new"), b"x");
+    drop(fs);
+    assert_eq!(std::fs::read(root.join("new")).unwrap(), b"x");
+    assert_eq!(
+        snapshot(&renamed),
+        before,
+        "the renamed folder is untouched"
+    );
+
+    // With no folder at the configured path at all, an operation cannot
+    // start.
+    std::fs::remove_file(root.join("new")).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    assert_eq!(kind_of(folder.open()), ErrorKind::NotFound);
 }

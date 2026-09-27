@@ -1,9 +1,11 @@
-//! [`RealFs`]: the filesystem layer on the real filesystem (DESIGN.md §14.2),
-//! reaching every path from the open folder root (§7.3).
+//! [`RealFolder`] and [`RealFs`]: the filesystem layer on the real filesystem
+//! (DESIGN.md §14.2), reaching every path from the folder root (§7.3).
 //!
-//! A `RealFs` holds one folder root open. Every operation walks its path one
-//! component at a time from there, opening each parent with `O_DIRECTORY |
-//! O_NOFOLLOW`, and then acts on the last component with a
+//! A `RealFolder` is a configured path and nothing else. Its
+//! [`open`](Folder::open) opens the root for one operation and returns a
+//! `RealFs`, which holds the root until it is dropped. Every call on it walks
+//! its path one component at a time from there, opening each parent with
+//! `O_DIRECTORY | O_NOFOLLOW`, and then acts on the last component with a
 //! directory-relative call (`openat`, `fstatat`, `renameat`, `unlinkat`,
 //! `mkdirat`, `symlinkat`, `readlinkat`, `utimensat`). The kernel
 //! never sees a whole path, so `PATH_MAX` (4,096 bytes on Linux, 1,024 on
@@ -14,12 +16,9 @@
 //! Files are opened with `O_NOFOLLOW | O_NONBLOCK` and checked with `fstat`
 //! on the descriptor, so a symlink is never followed, a FIFO never waited
 //! on, and either is refused with [`NotAFile`]. `set_mode` opens the same
-//! way and uses `fchmod` on the descriptor. §7.3 names `fchmodat`, but Linux
-//! cannot tell `fchmodat` not to follow a symlink (rustix answers
-//! `EOPNOTSUPP` for `AT_SYMLINK_NOFOLLOW` there), so a check before it would
-//! leave a window in which a swapped-in symlink is followed. Until DESIGN.md
-//! settles which gives way, this keeps §7.3's rule that nothing is followed
-//! over the name of the call, at the cost of needing read permission.
+//! way and uses `fchmod` on the descriptor, never `fchmodat`, which on Linux
+//! cannot refuse a symlink (§7.3); a file its owner made unreadable
+//! therefore cannot have its mode set.
 //!
 //! The system calls come from `rustix` (Appendix A), which wraps them
 //! safely; `std` has no directory-relative calls at all. A walk costs one
@@ -35,7 +34,7 @@ use std::path::{Component, Path, PathBuf};
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, Timespec, Timestamps};
 use rustix::io::Errno;
 
-use super::{FileKind, Fs, NotAFile, ParentNotADirectory, ReadFile, Stat, WriteFile};
+use super::{FileKind, Folder, Fs, NotAFile, ParentNotADirectory, ReadFile, Stat, WriteFile};
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
@@ -46,8 +45,34 @@ const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
-/// The real filesystem, under one folder root it holds open. Paths are
-/// relative to that root (see [`Fs`]).
+/// A folder on the real filesystem, by its configured path. It holds
+/// nothing open (§7.3); each operation calls [`open`](Folder::open).
+#[derive(Clone, Debug)]
+pub struct RealFolder {
+    root: PathBuf,
+}
+
+impl RealFolder {
+    /// The folder whose root is at `root`. Nothing is opened, or even
+    /// checked, until an operation calls [`open`](Folder::open).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The configured path.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl Folder for RealFolder {
+    fn open(&self) -> io::Result<Box<dyn Fs>> {
+        Ok(Box::new(RealFs::open(&self.root)?))
+    }
+}
+
+/// One operation on a [`RealFolder`]: the folder root, held open until this
+/// is dropped. Paths are relative to that root (see [`Fs`]).
 #[derive(Debug)]
 pub struct RealFs {
     root: OwnedFd,
@@ -60,8 +85,9 @@ type Walked<'p> = (Option<OwnedFd>, Option<&'p OsStr>);
 impl RealFs {
     /// Open the folder at `root`, which must be a directory. `root` itself
     /// is the path the user gave, so symlinks in it are followed; nothing
-    /// below it ever is.
-    pub fn open(root: &Path) -> io::Result<Self> {
+    /// below it ever is. Private: [`RealFolder::open`] is the way in, so a
+    /// root is only ever held for one operation.
+    fn open(root: &Path) -> io::Result<Self> {
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
         Ok(Self {
             root: rustix::fs::open(root, flags, Mode::empty())?,
@@ -383,7 +409,7 @@ fn mtime_ns(secs: i64, nanos: i64) -> i64 {
 mod tests {
     use super::*;
 
-    crate::fs::conformance::conformance_tests!(|root: &Path| RealFs::open(root).unwrap());
+    crate::fs::conformance::conformance_tests!(|root: &Path| RealFolder::new(root));
 
     #[test]
     fn mtime_ns_handles_the_epoch_and_saturates() {
@@ -407,9 +433,11 @@ mod tests {
     fn the_root_must_be_a_directory() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("file"), "x").unwrap();
-        let err = RealFs::open(&tmp.path().join("file")).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
-        let err = RealFs::open(&tmp.path().join("missing")).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        let kind = |root: &Path| match RealFolder::new(root).open() {
+            Ok(_) => panic!("expected an error"),
+            Err(e) => e.kind(),
+        };
+        assert_eq!(kind(&tmp.path().join("file")), io::ErrorKind::NotADirectory);
+        assert_eq!(kind(&tmp.path().join("missing")), io::ErrorKind::NotFound);
     }
 }
