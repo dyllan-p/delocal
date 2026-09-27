@@ -9,16 +9,31 @@
 //! vanish after the daemon had already acted on them.
 //!
 //! [`Store::open`] opens the file and brings its schema up to date, and
-//! refuses one written by a newer delocal.
+//! refuses one written by a newer delocal. [`Store::load`] reads back every
+//! folder's parts for `Engine::restore`; the other readers return the
+//! host's tables. Writes arrive as [`Group`]s, one per event, each holding
+//! the persistence hooks the engine returned for it and the host's writes
+//! that go with them ([`write`] maps each hook to its table), and
+//! [`Store::commit`] commits them.
 
 use std::fmt;
 use std::path::Path;
 
 use rusqlite::Connection;
 
+mod codec;
+pub mod host;
+mod load;
+#[cfg(test)]
+mod sample;
 pub mod schema;
+pub mod write;
 
+pub use host::{
+    DiskName, FolderRow, HistoryRow, JournalRow, Machine, Member, Mode, Shim, TrashRow,
+};
 pub use schema::SCHEMA_VERSION;
+pub use write::{Group, HostWrite};
 
 /// The daemon's database. See the module docs.
 pub struct Store {
@@ -63,6 +78,10 @@ pub enum StoreError {
     /// SQLite would not put the file in WAL mode, which the durability of a
     /// commit depends on; `mode` is the journal mode it kept.
     NotWal { mode: String },
+    /// A row in `table` holds something the store could not have written.
+    Corrupt { table: &'static str, detail: String },
+    /// A value for `table` could not be encoded as JSON.
+    Encode { table: &'static str, detail: String },
 }
 
 impl fmt::Display for StoreError {
@@ -78,6 +97,10 @@ impl fmt::Display for StoreError {
                 f,
                 "the database could not be put in WAL mode (it stayed in {mode} mode)"
             ),
+            Self::Corrupt { table, detail } => write!(f, "a corrupt row in {table}: {detail}"),
+            Self::Encode { table, detail } => {
+                write!(f, "a value for {table} could not be encoded: {detail}")
+            }
         }
     }
 }
@@ -86,7 +109,10 @@ impl std::error::Error for StoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Sqlite(e) => Some(e),
-            Self::UnknownSchema { .. } | Self::NotWal { .. } => None,
+            Self::UnknownSchema { .. }
+            | Self::NotWal { .. }
+            | Self::Corrupt { .. }
+            | Self::Encode { .. } => None,
         }
     }
 }
