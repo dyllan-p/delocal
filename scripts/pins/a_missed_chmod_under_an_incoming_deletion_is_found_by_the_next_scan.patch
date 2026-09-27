@@ -4,7 +4,7 @@ chmod whose watcher event was dropped is invisible to every later scan. Only
 Entry::unchanged_by_stat, the fast path's test, changes: the commit guard
 keeps comparing the exec bit.
 
-test: delocal-sim regressions::a_missed_chmod_of_a_conflict_copy_is_found_by_the_next_scan
+test: delocal-sim regressions::a_missed_chmod_under_an_incoming_deletion_is_found_by_the_next_scan
 
 diff --git a/crates/engine/src/entry.rs b/crates/engine/src/entry.rs
 index 864d5c4..fcd0187 100644

@@ -2146,13 +2146,16 @@ fn a_chmod_the_watcher_missed_is_found_by_the_next_scan() {
     );
 }
 
-/// Same class as above, found on a conflict copy. At the current defaults
-/// its history reaches a missed chmod of an ordinary file instead (d2/f11):
-/// with the fix disabled the scan never sees the chmod, the commit guard,
-/// which does compare the exec bit, refuses every commit there, and the run
-/// fails quiescence.
+/// Same class as above, found on a conflict copy and pinned as
+/// `a_missed_chmod_of_a_conflict_copy_is_found_by_the_next_scan`. At the
+/// current defaults its history reaches a missed chmod of an ordinary file,
+/// d2/f11, under an incoming deletion: with the fix disabled the scan never
+/// sees the chmod, the commit guard, which does compare the exec bit,
+/// reports the deletion's commit changed underneath, the tombstone waits
+/// for an observation of the path that never comes (§7.5 step 6), and the
+/// run fails quiescence.
 #[test]
-fn a_missed_chmod_of_a_conflict_copy_is_found_by_the_next_scan() {
+fn a_missed_chmod_under_an_incoming_deletion_is_found_by_the_next_scan() {
     passes(
         37,
         &[
