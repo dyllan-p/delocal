@@ -24,6 +24,11 @@ blake3 = "1.8.7"
 rustix = { version = "1.1.5", features = ["fs"] }
 tempfile = "3.27.0"
 unicode-normalization = "0.1.25"
+# `bundled` compiles SQLite from source into the binary, so it is static on
+# musl and needs no system library (DESIGN.md Appendix A, §16). `cache` keeps
+# prepared statements across a transaction's rows. The default features also
+# pull in a WebAssembly build of SQLite, which no target here needs.
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
