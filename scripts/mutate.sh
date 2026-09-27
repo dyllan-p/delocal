@@ -12,15 +12,20 @@
 # (default HEAD) with its own target directory and an equal share of the
 # cores. Each builds, runs the pinned regression seeds as CI does, and then
 # sweeps seeds S to S+N-1 with --keep-going (default 0 to 999, CI's sweep;
-# --seeds 0 skips the sweep). REV must have `delocal-sim --jobs`.
+# --seeds 0 skips the sweep). REV must have `delocal-sim --jobs`. The
+# worktrees are made one at a time before any mutation starts, and a
+# mutation whose worktree could not be made is not run.
 #
 # The logs of mutation NAME (the patch's file name without .patch or .diff)
 # go to DIR/NAME, by default target/mutate/NAME, beside its target
 # directory, which is kept so the next run builds incrementally. The
 # worktrees are removed at the end. Exit status 0 means the simulator
-# caught every mutation; a mutation that does not apply or does not build
-# counts as not caught, since it tested nothing. Nothing times out: if a
-# mutation makes the engine loop forever, stop the script with Ctrl-C.
+# caught every mutation, and 1 that it did not catch some; a mutation that
+# does not apply or does not build counts as not caught, since it tested
+# nothing. Exit status 3 means some mutation was not run, which says
+# nothing about the simulator, so the run did not finish. Nothing times
+# out: if a mutation makes the engine loop forever, stop the script with
+# Ctrl-C.
 
 set -euo pipefail
 
@@ -118,16 +123,17 @@ trap remove_trees EXIT
 trap stop INT TERM
 remove_trees
 
-# check NAME PATCH: build and run one mutation, and write its outcome to
-# DIR/NAME/result as "VERDICT PINNED_FAILED PINNED_TOTAL SWEEP_FAILED",
-# with "-" for what did not run.
+# check NAME PATCH: build and run one mutation in its worktree, and write
+# its outcome to DIR/NAME/result as "VERDICT PINNED_FAILED PINNED_TOTAL
+# SWEEP_FAILED", with "-" for what did not run.
 check() {
   local name=$1 patch=$2 dir=$out/$1
   local tree=$dir/tree
-  mkdir -p "$dir"
-  rm -f "$dir"/*.log "$dir/result"
-  if ! git -C "$repo" worktree add --quiet --detach "$tree" "$commit" 2> "$dir/apply.log" ||
-    ! git -C "$tree" apply "$patch" 2>> "$dir/apply.log"; then
+  if [ ! -d "$tree" ]; then
+    echo "not-run - - -" > "$dir/result"
+    return
+  fi
+  if ! git -C "$tree" apply "$patch" 2> "$dir/apply.log"; then
     echo "does-not-apply - - -" > "$dir/result"
     return
   fi
@@ -174,6 +180,17 @@ check() {
 noun=mutations
 [ "${#names[@]}" -gt 1 ] || noun=mutation
 echo "mutate: ${#names[@]} $noun of $(git -C "$repo" rev-parse --short "$commit"), $jobs threads each, in $out"
+# Every worktree is made before any check starts, one at a time: two `git
+# worktree add` at once can read the other's half-made entry under
+# .git/worktrees and fail ("failed to read .../commondir"). A mutation
+# whose worktree cannot be made is not run; it is never counted as one the
+# simulator did not catch.
+for name in "${names[@]}"; do
+  mkdir -p "$out/$name"
+  rm -f "$out/$name"/*.log "$out/$name/result"
+  git -C "$repo" worktree add --quiet --detach "$out/$name/tree" "$commit" 2> "$out/$name/worktree.log" ||
+    rm -rf "$out/$name/tree"
+done
 for i in "${!names[@]}"; do
   (
     check "${names[$i]}" "${patches[$i]}"
@@ -187,7 +204,7 @@ wait
 # test panics with "FAILED <invariant>: ...", and the sweep's summary has a
 # line per invariant that failed.
 printf '\n%-24s %-16s %-16s %s\n' mutation "pinned failed" "sweep failed" verdict
-status=0
+status=0 not_run=0
 for name in "${names[@]}"; do
   # A check that stopped on an unexpected error left no result.
   [ -f "$out/$name/result" ] || echo "error - - -" > "$out/$name/result"
@@ -199,13 +216,20 @@ for name in "${names[@]}"; do
     *) sweep="$sf of $seeds" ;;
   esac
   printf '%-24s %-16s %-16s %s\n' "$name" "$pinned" "$sweep" "$(echo "$verdict" | tr - ' ')"
-  [ "$verdict" = caught ] || status=1
+  case $verdict in
+    caught) ;;
+    not-run) not_run=$(( not_run + 1 )) ;;
+    *) status=1 ;;
+  esac
 done
 echo
 for name in "${names[@]}"; do
   dir=$out/$name
   read -r verdict _ < "$dir/result"
-  if [ "$verdict" != caught ]; then
+  if [ "$verdict" = not-run ]; then
+    echo "$name: not run, since its worktree could not be made; see $dir/worktree.log"
+    continue
+  elif [ "$verdict" != caught ]; then
     echo "$name: see $dir"
     continue
   fi
@@ -220,4 +244,9 @@ for name in "${names[@]}"; do
   )
   echo "$name: ${by:-the sweep crashed; see $dir/sweep.log}"
 done
+if [ "$not_run" -gt 0 ]; then
+  echo
+  echo "The run did not finish: $not_run of ${#names[@]} $noun not run."
+  exit 3
+fi
 exit "$status"
