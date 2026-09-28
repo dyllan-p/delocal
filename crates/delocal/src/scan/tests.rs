@@ -608,14 +608,122 @@ fn a_missing_marker_aborts_the_scan_before_anything_is_observed() {
         },
         |abort| matches!(abort, Abort::Root(e) if e.kind() == io::ErrorKind::NotFound),
     );
-    // `.delocalignore` cannot be read, so which paths are ignored is
-    // unknown.
-    guarded(
-        |disk| {
-            std::fs::remove_file(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
-            std::fs::create_dir(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
-        },
-        |abort| matches!(abort, Abort::IgnoreFile(e) if NotAFile::of(e).is_some()),
+}
+
+/// The top-level paths of [`tracked_tree`], plus `new`: what skipping its
+/// root reports.
+const TOP: [&str; 5] = [".delocalignore", "d", "e", "new", "top"];
+
+/// An unreadable `.delocalignore` at the root makes the root `Skipped`,
+/// covering the whole folder (§7.3): every top-level path is reported
+/// `Skipped` with the reason, nothing else is observed, and nothing is
+/// taken for deleted, not even a tracked file that really has gone. Once
+/// the file can be read again, the next scan sees the folder as it is.
+#[test]
+fn an_unreadable_delocalignore_skips_the_whole_folder() {
+    let (disk, mut engine) = tracked_tree();
+    let before = live(&engine);
+    std::fs::remove_file(disk.at("top")).unwrap();
+    std::fs::remove_file(disk.at("e/h")).unwrap();
+    disk.file("new", b"new", OLD, false);
+    let rules = std::fs::read(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+    std::fs::remove_file(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+    std::fs::create_dir(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+
+    let (events, report) = scan(&disk.folder(), &index(&engine));
+    assert!(finished(&events), "skipped, not aborted: {events:?}");
+    // Something other than a file at that name counts as an I/O error.
+    let reported: Vec<(RelPath, ScanState)> = TOP
+        .iter()
+        .map(|path| (p(path), skip(SkipReason::Io)))
+        .collect();
+    assert_eq!(reports(&events), reported);
+    let why = report.ignore_file.as_ref().expect("the file is named");
+    assert_eq!(
+        NotAFile::of(why),
+        Some(NotAFile {
+            kind: FileKind::Dir
+        })
+    );
+    assert_eq!(report.skipped, BTreeMap::from([(SkipReason::Io, 5)]));
+    assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+    assert_eq!(live(&engine), before, "`top` and `e/h` are still tracked");
+
+    // Readable again: the deletions are seen, and the new file.
+    std::fs::remove_dir(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+    std::fs::write(disk.at(ignore_rules::IGNORE_FILE), rules).unwrap();
+    let (events, report) = scan(&disk.folder(), &index(&engine));
+    assert!(report.ignore_file.is_none());
+    let (written, tombstoned) = written(&feed(&mut engine, events));
+    assert_eq!(tombstoned, [p("e/h"), p("top")]);
+    assert!(written.contains(&p("new")));
+}
+
+/// Rules come only from the root's `.delocalignore` (§7.3). A file of that
+/// name in a subdirectory ignores nothing and is synced like any other
+/// file, and one that cannot be read is skipped alone, as any file would
+/// be, while the rest of its directory is scanned.
+#[test]
+fn a_delocalignore_in_a_subdirectory_is_an_ordinary_file() {
+    let disk = Disk::new();
+    disk.dir("d/sub");
+    disk.file("d/.delocalignore", b"*\nf\n", OLD, false);
+    disk.file("d/f", b"f", OLD, false);
+    disk.file("d/sub/g", b"g", OLD, false);
+    let mut engine = engine();
+    let (events, report) = scan(&disk.folder(), &BTreeMap::new());
+    assert_eq!(
+        reports(&events),
+        [
+            (p("d"), observed_dir()),
+            (p("d/.delocalignore"), observed_file(b"*\nf\n", OLD, false)),
+            (p("d/f"), observed_file(b"f", OLD, false)),
+            (p("d/sub"), observed_dir()),
+            (p("d/sub/g"), observed_file(b"g", OLD, false)),
+        ]
+    );
+    assert!(report.ignore_file.is_none() && report.invalid_rules.is_empty());
+    feed(&mut engine, events);
+
+    // Unreadable, and in need of hashing: it alone is skipped, and nothing
+    // is tombstoned. Only where permissions mean something: not as root.
+    use std::os::unix::fs::PermissionsExt;
+    disk.touch("d/.delocalignore", OLD + SECOND);
+    let chmod = |mode| {
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(disk.at("d/.delocalignore"), permissions).unwrap();
+    };
+    chmod(0o000);
+    let denied = std::fs::read(disk.at("d/.delocalignore")).is_err();
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    chmod(0o644);
+    if denied {
+        let changed: Vec<(RelPath, ScanState)> = reports(&events)
+            .into_iter()
+            .filter(|(_, state)| *state != ScanState::Unchanged)
+            .collect();
+        assert_eq!(
+            changed,
+            [(p("d/.delocalignore"), skip(SkipReason::PermissionDenied))]
+        );
+        assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+    }
+
+    // And a directory of that name is a directory like any other.
+    std::fs::remove_file(disk.at("d/.delocalignore")).unwrap();
+    disk.dir("d/.delocalignore");
+    disk.file("d/.delocalignore/x", b"x", OLD, false);
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    let under: Vec<(RelPath, ScanState)> = reports(&events)
+        .into_iter()
+        .filter(|(path, _)| path.as_str().starts_with("d/.delocalignore"))
+        .collect();
+    assert_eq!(
+        under,
+        [
+            (p("d/.delocalignore"), observed_dir()),
+            (p("d/.delocalignore/x"), observed_file(b"x", OLD, false)),
+        ]
     );
 }
 
@@ -1056,6 +1164,46 @@ mod faults {
                 .filter(|(path, _)| path.as_str().starts_with('d'))
                 .collect();
             assert_eq!(under_d, [(p("d"), skip(reason))], "{op:?}");
+        }
+    }
+
+    /// EIO or EACCES opening or reading the root's `.delocalignore` skips
+    /// the root with that reason (§7.3): every top-level path, and nothing
+    /// taken for deleted.
+    #[test]
+    fn a_root_delocalignore_that_cannot_be_read_skips_the_whole_folder() {
+        let (disk, mut engine) = touched_tree();
+        let before = live(&engine);
+        std::fs::remove_file(disk.at("top")).unwrap();
+        let cases = [
+            (
+                Op::OpenRead,
+                Trigger::Call(1),
+                Fault::Eacces,
+                SkipReason::PermissionDenied,
+            ),
+            (Op::OpenRead, Trigger::Call(1), Fault::Eio, SkipReason::Io),
+            (Op::Read, Trigger::Offset(0), Fault::Eio, SkipReason::Io),
+        ];
+        for (op, at, fail, reason) in cases {
+            let rule = Rule {
+                op,
+                path: ignore_rules::IGNORE_FILE.into(),
+                at,
+                fail,
+            };
+            let folder = FaultyFolder::new(disk.folder(), Spec { rules: vec![rule] }).unwrap();
+            let (events, report) = scan(&folder, &index(&engine));
+            assert!(finished(&events), "{op:?} {fail:?}");
+            let expected: Vec<(RelPath, ScanState)> = [".delocalignore", "d", "e", "top"]
+                .iter()
+                .map(|path| (p(path), skip(reason)))
+                .collect();
+            assert_eq!(reports(&events), expected, "{op:?} {fail:?}");
+            let why = report.ignore_file.expect("the file is named");
+            assert_eq!(why.raw_os_error(), fail.errno());
+            assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+            assert_eq!(live(&engine), before);
         }
     }
 
