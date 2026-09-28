@@ -16,14 +16,17 @@
 //! FIFO before it is opened, which must be seen for what it is, neither
 //! followed nor waited on. Then §7.5's rename that never replaces, and the
 //! root opened afresh for every operation, so a folder renamed away between
-//! two operations is left alone by the second.
+//! two operations is left alone by the second. Last, the held directories a
+//! scan walks with (§7.3): each call through one does what the call on the
+//! whole path does, in the directory it opened even after a rename, and it
+//! follows nothing and takes only names.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use super::{FileKind, Folder, Fs, NoReplaceUnsupported, NotAFile, ParentNotADirectory};
+use super::{Dir, FileKind, Folder, Fs, NoReplaceUnsupported, NotAFile, ParentNotADirectory};
 
 /// One `#[test]` per check. Each makes a temporary directory holding
 /// `folder`, the root it passes to `$make` (a closure from the root to a
@@ -54,6 +57,9 @@ macro_rules! conformance_tests {
             a_parent_swapped_for_a_symlink_keeps_everything_inside_the_folder,
             a_file_swapped_for_a_symlink_or_a_fifo_is_observed_as_it_is,
             rename_noreplace_refuses_to_replace,
+            a_held_directory_answers_as_the_whole_path_does,
+            a_held_directory_stays_the_one_it_opened,
+            a_held_directory_follows_nothing_and_takes_only_names,
         );
         $crate::fs::conformance::conformance_tests!(
             @folder $make;
@@ -748,4 +754,144 @@ pub fn the_root_is_opened_afresh_for_each_operation(folder: &dyn Folder, root: &
     std::fs::remove_file(root.join("new")).unwrap();
     std::fs::remove_dir(root).unwrap();
     assert_eq!(kind_of(folder.open()), ErrorKind::NotFound);
+}
+
+fn n(name: &str) -> &OsStr {
+    OsStr::new(name)
+}
+
+fn read_held(dir: &dyn Dir, name: &str) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    dir.open_read(n(name))
+        .unwrap()
+        .read_to_end(&mut bytes)
+        .unwrap();
+    bytes
+}
+
+pub fn a_held_directory_answers_as_the_whole_path_does(fs: &dyn Fs, _root: &Path) {
+    fs.create_dir(p("d")).unwrap();
+    write(fs, p("d/f"), b"held");
+    fs.set_mode(p("d/f"), 0o751).unwrap();
+    fs.symlink(p("../elsewhere"), p("d/s")).unwrap();
+    fs.create_dir(p("d/sub")).unwrap();
+    write(fs, p("d/sub/g"), b"deeper");
+    write(fs, p("top"), b"t");
+
+    let d = fs.open_dir(p("d")).unwrap();
+    assert_eq!(d.read_dir().unwrap(), fs.read_dir(p("d")).unwrap());
+    assert_eq!(
+        d.read_dir().unwrap(),
+        ["f", "s", "sub"],
+        "every listing starts over"
+    );
+    for name in ["f", "s", "sub"] {
+        let whole = Path::new("d").join(name);
+        assert_eq!(
+            d.lstat(n(name)).unwrap(),
+            fs.lstat(&whole).unwrap(),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        d.read_link(n("s")).unwrap(),
+        fs.read_link(p("d/s")).unwrap()
+    );
+    assert_eq!(read_held(&*d, "f"), b"held");
+    assert_eq!(kind_of(d.lstat(n("missing"))), ErrorKind::NotFound);
+    assert_eq!(kind_of(d.open_read(n("missing"))), ErrorKind::NotFound);
+
+    // A child opened from the held directory, and a path opened whole.
+    let sub = d.open_dir(n("sub")).unwrap();
+    assert_eq!(sub.read_dir().unwrap(), ["g"]);
+    assert_eq!(read_held(&*sub, "g"), b"deeper");
+    let whole = fs.open_dir(p("d/sub")).unwrap();
+    assert_eq!(whole.lstat(n("g")).unwrap(), sub.lstat(n("g")).unwrap());
+
+    // The empty path is the root.
+    let root = fs.open_dir(p("")).unwrap();
+    assert_eq!(root.read_dir().unwrap(), fs.read_dir(p("")).unwrap());
+    assert_eq!(root.lstat(n("top")).unwrap(), fs.lstat(p("top")).unwrap());
+    assert_eq!(kind_of(fs.open_dir(p("missing"))), ErrorKind::NotFound);
+}
+
+pub fn a_held_directory_stays_the_one_it_opened(fs: &dyn Fs, root: &Path) {
+    fs.create_dir(p("d")).unwrap();
+    write(fs, p("d/f"), b"x");
+    let d = fs.open_dir(p("d")).unwrap();
+
+    // Renamed after it was opened, and something else made in its place:
+    // the held directory still answers for the one it opened.
+    std::fs::rename(root.join("d"), root.join("moved")).unwrap();
+    std::fs::create_dir(root.join("d")).unwrap();
+    assert_eq!(d.read_dir().unwrap(), ["f"]);
+    assert_eq!(d.lstat(n("f")).unwrap().kind, FileKind::File);
+    assert_eq!(read_held(&*d, "f"), b"x");
+    assert!(fs.read_dir(p("d")).unwrap().is_empty());
+
+    // An entry made through the whole path after the listing is seen by the
+    // next one.
+    write(fs, p("moved/g"), b"y");
+    assert_eq!(d.read_dir().unwrap(), ["f", "g"]);
+}
+
+pub fn a_held_directory_follows_nothing_and_takes_only_names(fs: &dyn Fs, root: &Path) {
+    let outside = root.parent().unwrap().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("f"), "outside").unwrap();
+
+    fs.create_dir(p("d")).unwrap();
+    write(fs, p("d/f"), b"x");
+    fs.create_dir(p("d/sub")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("d/out")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("out")).unwrap();
+
+    // A symlink is not a directory to hold, at the end of a path or by name,
+    // and neither is a file.
+    assert_eq!(kind_of(fs.open_dir(p("out"))), ErrorKind::NotADirectory);
+    assert_eq!(kind_of(fs.open_dir(p("d/f"))), ErrorKind::NotADirectory);
+    assert_stopped_at(fs.open_dir(p("out/sub")), "out");
+    let d = fs.open_dir(p("d")).unwrap();
+    assert_eq!(kind_of(d.open_dir(n("out"))), ErrorKind::NotADirectory);
+    assert_eq!(kind_of(d.open_dir(n("f"))), ErrorKind::NotADirectory);
+
+    // Opened as a file by name, a symlink or a directory is refused for what
+    // it is, and a symlink is described, not followed.
+    assert_eq!(not_a_file(d.open_read(n("out"))), FileKind::Symlink);
+    assert_eq!(not_a_file(d.open_read(n("sub"))), FileKind::Dir);
+    assert_eq!(d.lstat(n("out")).unwrap().kind, FileKind::Symlink);
+
+    // A FIFO is refused without waiting on it.
+    let fifo = root.join("d/fifo");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success(), "mkfifo");
+    assert_eq!(
+        not_a_file(without_waiting(&fifo, || d.open_read(n("fifo")))),
+        FileKind::Other
+    );
+
+    // Only names: nothing that would reach past the directory.
+    for name in ["", ".", "..", "sub/x", "/f", "../outside"] {
+        assert_eq!(
+            kind_of(d.lstat(n(name))),
+            ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+        assert_eq!(
+            kind_of(d.read_link(n(name))),
+            ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+        assert_eq!(
+            kind_of(d.open_read(n(name))),
+            ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+        assert_eq!(
+            kind_of(d.open_dir(n(name))),
+            ErrorKind::InvalidInput,
+            "{name:?}"
+        );
+    }
+    assert_eq!(std::fs::read(outside.join("f")).unwrap(), b"outside");
 }
