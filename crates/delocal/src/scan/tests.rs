@@ -10,6 +10,10 @@ use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules};
 use super::*;
 use crate::fs::RealFolder;
 
+mod spy;
+
+use spy::Spy;
+
 const SECOND: i64 = 1_000_000_000;
 /// The tests' now: early 2027.
 const NOW: i64 = 1_800_000_000 * SECOND;
@@ -680,4 +684,167 @@ fn a_directory_that_cannot_be_listed_is_skipped_once_for_all_beneath() {
         assert!(reports(&events).contains(&(p("e/h"), skip(SkipReason::PermissionDenied))));
         assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
     }
+}
+
+#[test]
+fn a_file_is_hashed_only_once_its_mtime_has_settled() {
+    let disk = Disk::new();
+    disk.file("recent", b"r", NOW - SECOND, false);
+    disk.file("ahead", b"a", NOW + 60 * SECOND, false);
+    let spy = Spy::new(disk.root());
+
+    let (events, report) = scan(&spy, &BTreeMap::new());
+    assert_eq!(
+        reports(&events),
+        [
+            (p("ahead"), skip(SkipReason::Unstable)),
+            (p("recent"), skip(SkipReason::Unstable)),
+        ]
+    );
+    assert_eq!(report.skipped, BTreeMap::from([(SkipReason::Unstable, 2)]));
+    let opened = spy.calls("dir.open_read");
+    assert_eq!(
+        opened,
+        [PathBuf::from(ignore_rules::IGNORE_FILE)],
+        "neither file even opened"
+    );
+
+    // Two seconds after its mtime, it is hashed; the one from the future
+    // waits until the clock passes it.
+    let (events, _) = scan_at(&spy, &BTreeMap::new(), NOW + SECOND, 1);
+    assert_eq!(
+        reports(&events),
+        [
+            (p("ahead"), skip(SkipReason::Unstable)),
+            (p("recent"), observed_file(b"r", NOW - SECOND, false)),
+        ]
+    );
+}
+
+/// A file changed while it is hashed, in each way the re-stat can see, is
+/// `Skipped { Unstable }`: its record stands, no torn hash is recorded, and
+/// the next scan sees it as it now is.
+#[test]
+fn a_file_changed_while_it_is_hashed_is_unstable() {
+    let size = 2 * hash::CHUNK + 5;
+    /// A change made to the file at a path, mid-hash.
+    type Change = fn(&Path);
+    let cases: [(&str, Change); 3] = [
+        // Appended to: size and mtime move.
+        ("appended", |path| {
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, b"more").unwrap();
+        }),
+        // Rewritten in place, and its mtime put back: only the change time
+        // moves.
+        ("rewritten", |path| {
+            let mtime = std::fs::symlink_metadata(path).unwrap().modified().unwrap();
+            let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            std::io::Write::write_all(&mut file, &vec![0xee; 2 * hash::CHUNK + 5]).unwrap();
+            file.set_modified(mtime).unwrap();
+        }),
+        // Replaced by a rename with a file of the same size and mtime: only
+        // the inode moves.
+        ("swapped", |path| {
+            let mtime = std::fs::symlink_metadata(path).unwrap().modified().unwrap();
+            let other = path.with_extension("new");
+            std::fs::write(&other, vec![0xdd; 2 * hash::CHUNK + 5]).unwrap();
+            let file = std::fs::File::options().write(true).open(&other).unwrap();
+            file.set_modified(mtime).unwrap();
+            std::fs::rename(&other, path).unwrap();
+        }),
+    ];
+    for (name, change) in cases {
+        let (disk, mut engine) = tracked_tree();
+        disk.file("big", &vec![1; size], OLD, false);
+        let (events, _) = scan(&disk.folder(), &index(&engine));
+        feed(&mut engine, events);
+        let recorded = live(&engine)[&p("big")].clone();
+
+        // Touched, so the next scan must hash it; the change time has to
+        // move on a coarse clock before the change is made.
+        disk.touch("big", OLD + SECOND);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let spy = Spy::new(disk.root());
+        let path = disk.at("big");
+        spy.meddle("big", move || change(&path));
+        let (events, _) = scan(&spy, &index(&engine));
+        assert!(spy.meddled(), "{name}: the change was made mid-hash");
+        let found: Vec<ScanState> = reports(&events)
+            .into_iter()
+            .filter(|(p, _)| p.as_str() == "big")
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(found, [skip(SkipReason::Unstable)], "{name}");
+        let (written, _) = written(&feed(&mut engine, events));
+        assert!(!written.contains(&p("big")), "{name}: the record stands");
+        assert_eq!(live(&engine)[&p("big")], recorded, "{name}");
+
+        // The next scan sees it as it is now. The append's mtime is the
+        // real clock's, so this scan's clock is later than any.
+        let now = std::fs::read(disk.at("big")).unwrap();
+        let (events, _) = scan_at(&disk.folder(), &index(&engine), i64::MAX, 4);
+        let state = reports(&events)
+            .into_iter()
+            .find(|(p, _)| p.as_str() == "big")
+            .map(|(_, s)| s);
+        match state {
+            Some(ScanState::Observed(seen)) => assert_eq!(seen.hash, blake3_of(&now), "{name}"),
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn the_walk_opens_each_directory_once() {
+    let disk = Disk::new();
+    // A deep chain, a wide directory, files and symlinks everywhere.
+    let mut deep = String::from("deep");
+    for _ in 0..100 {
+        disk.dir(&deep);
+        disk.file(&format!("{deep}/f"), b"f", OLD, false);
+        deep.push_str("/d");
+    }
+    for i in 0..50 {
+        disk.dir(&format!("wide/w{i:02}"));
+        disk.file(&format!("wide/w{i:02}/f"), b"f", OLD, false);
+        disk.symlink(&format!("wide/w{i:02}/l"), "f");
+    }
+    let spy = Spy::new(disk.root());
+    let (events, _) = scan(&spy, &BTreeMap::new());
+    assert!(finished(&events));
+
+    let mut dirs: Vec<PathBuf> = reports(&events)
+        .into_iter()
+        .filter(|(_, state)| *state == observed_dir())
+        .map(|(path, _)| PathBuf::from(path.as_str()))
+        .collect();
+    assert_eq!(dirs.len(), 100 + 51);
+    // The root, and `.delocal` for the marker, are held too.
+    dirs.push(PathBuf::new());
+    dirs.push(PathBuf::from(RESERVED_DIR));
+    dirs.sort();
+    let mut opened: Vec<PathBuf> = spy.calls("fs.open_dir");
+    opened.extend(spy.calls("dir.open_dir"));
+    opened.sort();
+    assert_eq!(opened, dirs, "each directory opened exactly once");
+    assert_eq!(spy.calls("open_root"), [PathBuf::new()]);
+    // Nothing reached by a whole path: the root is held as it is, and
+    // everything else is reached from the directory it is in.
+    assert_eq!(spy.calls("fs.open_dir"), [PathBuf::new()]);
+    let by_path: Vec<_> = spy
+        .all()
+        .into_iter()
+        .filter(|(op, _)| op.starts_with("fs.") && *op != "fs.open_dir")
+        .collect();
+    assert!(by_path.is_empty(), "{by_path:?}");
+    // And each directory listed once.
+    let mut listed = spy.calls("dir.read_dir");
+    listed.sort();
+    let mut walked: Vec<PathBuf> = dirs
+        .into_iter()
+        .filter(|d| d.as_os_str() != RESERVED_DIR)
+        .collect();
+    walked.sort();
+    assert_eq!(listed, walked);
 }
