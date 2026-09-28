@@ -5,11 +5,12 @@
 
 use std::collections::BTreeMap;
 
-use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules};
+use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules, Version};
 
 use super::*;
 use crate::fs::RealFolder;
 
+mod reference;
 mod spy;
 
 use spy::Spy;
