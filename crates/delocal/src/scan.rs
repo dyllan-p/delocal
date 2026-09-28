@@ -3,10 +3,12 @@
 //!
 //! So far:
 //!
+//! - [`hash`]: BLAKE3 of a file, streamed, and the stability check
 //! - [`ignore_rules`]: the defaults and `.delocalignore`, and which paths
 //!   they ignore
 //! - [`ordered`]: work on several threads, results in the order it was
 //!   handed out
 
+pub mod hash;
 pub mod ignore_rules;
 pub mod ordered;
