@@ -16,16 +16,25 @@
 # worktrees are made one at a time before any mutation starts, and a
 # mutation whose worktree could not be made is not run.
 #
+# A mutation is caught if a pinned test or a seed of the sweep fails, or
+# if the test process or the sweep dies of its own accord (a panic, an
+# abort, a stack overflow), which is a failure too. A mutation that does
+# not apply or does not build counts as not caught, since it tested
+# nothing. A mutation the harness could not check is not run, never not
+# caught: its worktree could not be made, its pinned tests or its sweep
+# never started or were stopped from outside (SIGHUP, SIGINT, SIGKILL,
+# SIGTERM: a user, the OOM killer, a runner shutting down), or its check
+# stopped without leaving a result. What did not run says nothing about
+# the simulator, unless what did run caught the mutation anyway.
+#
 # The logs of mutation NAME (the patch's file name without .patch or .diff)
 # go to DIR/NAME, by default target/mutate/NAME, beside its target
 # directory, which is kept so the next run builds incrementally. The
 # worktrees are removed at the end. Exit status 0 means the simulator
-# caught every mutation, and 1 that it did not catch some; a mutation that
-# does not apply or does not build counts as not caught, since it tested
-# nothing. Exit status 3 means some mutation was not run, which says
-# nothing about the simulator, so the run did not finish. Nothing times
-# out: if a mutation makes the engine loop forever, stop the script with
-# Ctrl-C.
+# caught every mutation, and 1 that it did not catch some. Exit status 3
+# means some mutation was not run, so the run did not finish. Nothing
+# times out: if a mutation makes the engine loop forever, stop the script
+# with Ctrl-C.
 
 set -euo pipefail
 
@@ -123,13 +132,43 @@ trap remove_trees EXIT
 trap stop INT TERM
 remove_trees
 
+# ended_by LOG: how the test process of LOG ended, if it started (libtest's
+# "running N tests") and did not exit successfully: "signal: 6, SIGABRT:
+# process abort signal", say, or "exit status: 101", as cargo's "process
+# didn't exit successfully" line gives it. Nothing if it never started.
+# The same as in pins.sh.
+ended_by() {
+  [ -f "$1" ] && grep -qE '^running [0-9]+ tests?$' "$1" || return 0
+  sed -nE "s/^ *process didn't exit successfully: .* \\((signal: [0-9]+[^)]*|exit status: [0-9]+)\\)\$/\\1/p" "$1" | tail -1
+}
+
+# died_of LOG: how the test process of LOG died, if it died of its own
+# accord; nothing if it never started or was stopped from outside. The
+# same as in pins.sh.
+died_of() {
+  local how
+  how=$(ended_by "$1")
+  case $how in
+    "signal: 1,"* | "signal: 2,"* | "signal: 9,"* | "signal: 15,"*) ;;
+    *) echo "$how" ;;
+  esac
+}
+
+# not_run DIR WHY: the check of the mutation in DIR could not be made.
+not_run() {
+  echo "$2" > "$1/why"
+}
+
 # check NAME PATCH: build and run one mutation in its worktree, and write
 # its outcome to DIR/NAME/result as "VERDICT PINNED_FAILED PINNED_TOTAL
-# SWEEP_FAILED", with "-" for what did not run.
+# SWEEP_FAILED", with "-" for what was not asked for, "crashed" for what
+# died of its own accord and "not-run" for what the harness could not
+# run. A mutation that is not run says why in DIR/NAME/why.
 check() {
   local name=$1 patch=$2 dir=$out/$1
   local tree=$dir/tree
   if [ ! -d "$tree" ]; then
+    not_run "$dir" "its worktree could not be made; see $dir/worktree.log"
     echo "not-run - - -" > "$dir/result"
     return
   fi
@@ -147,33 +186,63 @@ check() {
 
   (cd "$tree" && cargo test --release --locked -j "$jobs" -p delocal-sim -- regressions:: --test-threads "$jobs") \
     > "$dir/pinned.log" 2>&1 || true
-  # cargo prints one "test result:" line per test binary; add them up.
-  local pinned
+  # cargo prints one "test result:" line per test binary; add them up. A
+  # test process that died before its line reported nothing: it crashed if
+  # it died of its own accord, and otherwise the pinned tests did not run.
+  local pinned why=
   pinned=$(awk '/^test result:/ { n++; for (i = 1; i < NF; i++) { if ($(i+1) ~ /^passed;/) p += $i; if ($(i+1) ~ /^failed;/) f += $i } }
     END { if (n) print f + 0, p + f; else print "- -" }' "$dir/pinned.log")
+  if [ "$pinned" = "- -" ]; then
+    if [ -n "$(died_of "$dir/pinned.log")" ]; then
+      pinned="crashed -"
+    else
+      pinned="not-run -"
+      local how
+      how=$(ended_by "$dir/pinned.log")
+      if [ -z "$how" ]; then
+        how="never started"
+        if grep -qE '^running [0-9]+ tests?$' "$dir/pinned.log"; then
+          how="stopped before it said how it ended"
+        fi
+      fi
+      why="its pinned tests did not run to the end ($how); see $dir/pinned.log"
+    fi
+  fi
 
-  # The sweep exits 0 when every seed passed, 1 when some failed, 2 on bad
-  # arguments (a REV without --jobs), and 101 on a panic, which counts as
-  # caught. Anything else means it was stopped, by a signal for one, and
-  # says nothing about the mutation.
+  # The sweep exits 0 when every seed passed, 1 with its summary when some
+  # failed, and 101 on a panic; a signal other than one from outside
+  # (an abort, a stack overflow) also means it died of its own accord.
+  # Those count. Anything else, 2 for bad arguments (a REV without
+  # --jobs), a signal from outside, or a 1 without its summary, means the
+  # sweep did not run to the end, which says nothing about the mutation.
   local sweep=- status=0
   if [ "$seeds" -gt 0 ]; then
     "$CARGO_TARGET_DIR/release/delocal-sim" --seeds "$seeds" --start "$start" --keep-going --jobs "$jobs" \
       > "$dir/sweep.log" 2>&1 || status=$?
     case $status in
       0) sweep=0 ;;
-      1) sweep=$(sed -nE 's/^[0-9]+ of [0-9]+ seeds passed; ([0-9]+) failed:$/\1/p' "$dir/sweep.log")
-        [ -n "$sweep" ] || { echo "sweep-did-not-run $pinned -" > "$dir/result"; return; } ;;
+      1) sweep=$(sed -nE 's/^[0-9]+ of [0-9]+ seeds passed; ([0-9]+) failed:$/\1/p' "$dir/sweep.log") ;;
       101) sweep=crashed ;;
-      *) echo "sweep-did-not-run $pinned -" > "$dir/result"; return ;;
+      129 | 130 | 137 | 143) ;;
+      *) if [ "$status" -gt 128 ]; then sweep=crashed; fi ;;
     esac
+    if [ -z "$sweep" ] || [ "$sweep" = - ]; then
+      sweep=not-run
+      why=${why:+$why; }"its sweep did not run to the end (status $status); see $dir/sweep.log"
+    fi
   fi
 
-  local verdict=caught
-  case "$pinned" in
-    -*) verdict=pinned-did-not-run ;;
-    0\ *) [ "$sweep" != 0 ] && [ "$sweep" != - ] || verdict=survived ;;
-  esac
+  # Caught by whatever ran, even if something else did not run; otherwise
+  # not run if anything did not run, and survived only if everything ran.
+  # What did not run is noted either way.
+  local verdict=survived pf=${pinned%% *}
+  [ -z "$why" ] || not_run "$dir" "$why"
+  if [ "$pf" = crashed ] || [ "$sweep" = crashed ] ||
+    { [[ $pf =~ ^[0-9]+$ ]] && [ "$pf" -gt 0 ]; } || { [[ $sweep =~ ^[0-9]+$ ]] && [ "$sweep" -gt 0 ]; }; then
+    verdict=caught
+  elif [ -n "$why" ]; then
+    verdict=not-run
+  fi
   echo "$verdict $pinned $sweep" > "$dir/result"
 }
 
@@ -187,7 +256,7 @@ echo "mutate: ${#names[@]} $noun of $(git -C "$repo" rev-parse --short "$commit"
 # simulator did not catch.
 for name in "${names[@]}"; do
   mkdir -p "$out/$name"
-  rm -f "$out/$name"/*.log "$out/$name/result"
+  rm -f "$out/$name"/*.log "$out/$name/result" "$out/$name/why"
   git -C "$repo" worktree add --quiet --detach "$out/$name/tree" "$commit" 2> "$out/$name/worktree.log" ||
     rm -rf "$out/$name/tree"
 done
@@ -206,16 +275,22 @@ wait
 printf '\n%-24s %-16s %-16s %s\n' mutation "pinned failed" "sweep failed" verdict
 status=0 not_run=0
 for name in "${names[@]}"; do
-  # A check that stopped on an unexpected error left no result.
-  [ -f "$out/$name/result" ] || echo "error - - -" > "$out/$name/result"
+  # A check that stopped on an unexpected error left no result, and was
+  # not run.
+  if [ ! -f "$out/$name/result" ]; then
+    echo "not-run - - -" > "$out/$name/result"
+    not_run "$out/$name" "its check stopped before it wrote a result"
+  fi
   read -r verdict pf pt sf < "$out/$name/result"
-  pinned="$pf of $pt"
-  [ "$pf" != - ] || pinned=-
+  case $pf in
+    - | crashed | not-run) pinned=$pf ;;
+    *) pinned="$pf of $pt" ;;
+  esac
   case $sf in
-    - | crashed) sweep=$sf ;;
+    - | crashed | not-run) sweep=$sf ;;
     *) sweep="$sf of $seeds" ;;
   esac
-  printf '%-24s %-16s %-16s %s\n' "$name" "$pinned" "$sweep" "$(echo "$verdict" | tr - ' ')"
+  printf '%-24s %-16s %-16s %s\n' "$name" "${pinned/not-run/not run}" "${sweep/not-run/not run}" "$(echo "$verdict" | tr - ' ')"
   case $verdict in
     caught) ;;
     not-run) not_run=$(( not_run + 1 )) ;;
@@ -227,7 +302,7 @@ for name in "${names[@]}"; do
   dir=$out/$name
   read -r verdict _ < "$dir/result"
   if [ "$verdict" = not-run ]; then
-    echo "$name: not run, since its worktree could not be made; see $dir/worktree.log"
+    echo "$name: not run, since $(cat "$dir/why")"
     continue
   elif [ "$verdict" != caught ]; then
     echo "$name: see $dir"
@@ -242,7 +317,10 @@ for name in "${names[@]}"; do
         sed -nE 's/^ +([0-9]+)  ([^:]+): seeds .*/\2 x\1 (sweep)/p' "$dir/sweep.log"
     } | paste -sd';' - | sed 's/;/; /g'
   )
-  echo "$name: ${by:-the sweep crashed; see $dir/sweep.log}"
+  [ -n "$by" ] || by="failed without naming an invariant (a panic, or a process that died); see $dir"
+  # Caught by what ran; say what did not.
+  [ ! -f "$dir/why" ] || by="$by; though $(cat "$dir/why")"
+  echo "$name: $by"
 done
 if [ "$not_run" -gt 0 ]; then
   echo
