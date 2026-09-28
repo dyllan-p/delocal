@@ -50,15 +50,26 @@
 //! `Skipped { Ignored }`, whether or not it is on disk: the record stays,
 //! frozen, and a rule that hides a file never reads as its deletion (§7.3).
 //!
+//! **An unreadable `.delocalignore`** (an I/O error, permission denied, or
+//! something other than a file at that name) makes the root `Skipped` with
+//! that reason, covering the whole folder (§7.3): with the rules unknown the
+//! scan could announce what the user meant to leave out, and could not tell
+//! a deletion from a newly ignored path. The engine has no path for the
+//! root, so the scan reports `Skipped` at every top-level path instead, each
+//! one on disk or with a tracked path beneath it, and observes nothing else.
+//! Each skip covers everything beneath it, so together they cover the whole
+//! folder, and the bracket finishes with nothing taken for deleted.
+//! [`ScanReport::ignore_file`] says why, for `status`. Rules come only from
+//! the root's `.delocalignore`; a file of that name in a subdirectory is an
+//! ordinary entry.
+//!
 //! **The root guard** (§7.3). The scan aborts, before anything is observed,
 //! if the root cannot be opened, if `.delocal/folder.json` is not a file,
-//! if the root cannot be listed, or if `.delocalignore` is there but cannot
-//! be read, since then the scan cannot tell what the user meant to leave
-//! alone. The marker is checked again, through the same `.delocal`, before
-//! `ScanFinished`: a folder deleted wholesale while it was being scanned
-//! takes its marker with it, and must not read as a mass deletion. An
-//! aborted scan closes the bracket with `ScanAborted`, which announces no
-//! deletions (§7.3).
+//! or if the root cannot be listed. The marker is checked again, through
+//! the same `.delocal`, before `ScanFinished`: a folder deleted wholesale
+//! while it was being scanned takes its marker with it, and must not read
+//! as a mass deletion. An aborted scan closes the bracket with
+//! `ScanAborted`, which announces no deletions (§7.3).
 //!
 //! **What the host keeps** of a scan is its [`ScanReport`]: the names on
 //! disk, the unobservable names, the skips by reason, and the rules left out
@@ -189,10 +200,13 @@ pub struct ScanReport {
     pub unstable: Vec<RelPath>,
     /// The lines of `.delocalignore` that were left out.
     pub invalid_rules: Vec<InvalidRule>,
+    /// Why `.delocalignore` at the root could not be read, if it could not.
+    /// The whole folder was skipped (see the module docs), and `status`
+    /// names the file.
+    pub ignore_file: Option<io::Error>,
 }
 
-/// Why a scan was aborted (§7.3): each is a case of the root guard, and
-/// none observed anything.
+/// Why a scan was aborted (§7.3): each is a case of the root guard.
 #[derive(Debug)]
 pub enum Abort {
     /// The folder root could not be opened: the folder, or the disk it is
@@ -204,9 +218,6 @@ pub enum Abort {
     Marker(io::Error),
     /// The folder root could not be listed.
     List(io::Error),
-    /// `.delocalignore` is at the root but could not be read, or is not a
-    /// file, so the scan cannot tell which paths are ignored.
-    IgnoreFile(io::Error),
 }
 
 /// A report for one path, or nothing (the path is absent).
@@ -234,9 +245,25 @@ impl Scan<'_> {
         let fs = self.folder.open().map_err(Abort::Root)?;
         let root: Arc<dyn Dir> = Arc::from(fs.open_dir(Path::new("")).map_err(Abort::Root)?);
         let delocal = marker(&*root)?;
-        let rules = IgnoreRules::read(&*root).map_err(Abort::IgnoreFile)?;
-        report.invalid_rules = rules.invalid().to_vec();
         let names = root.read_dir().map_err(Abort::List)?;
+        let rules = match IgnoreRules::read(&*root) {
+            Ok(rules) => rules,
+            Err(e) => {
+                let reason = ignore_file_reason(&e);
+                report.ignore_file = Some(e);
+                let mut out = Out {
+                    folder: self.id,
+                    emit,
+                    skipped: &mut report.skipped,
+                    unstable: &mut report.unstable,
+                };
+                for path in top_level(&names, self.records) {
+                    out.take(Some(Some((path, ScanState::Skipped { reason }))));
+                }
+                return check_marker(&*delocal);
+            }
+        };
+        report.invalid_rules = rules.invalid().to_vec();
 
         std::thread::scope(|scope| {
             let mut walker = Walker {
@@ -262,6 +289,42 @@ impl Scan<'_> {
         // bracket is never finished, and its unreported path is never taken
         // for absent.
         check_marker(&*delocal)
+    }
+}
+
+/// Every top-level path that is on disk, as the root lists `names`, or has
+/// a tracked path at or beneath it, in order: what skipping the root
+/// reports (see the module docs). A name with no index path has nothing
+/// tracked beneath it to cover.
+fn top_level(names: &[OsString], records: &dyn Records) -> BTreeSet<RelPath> {
+    let mut top = BTreeSet::new();
+    for (_, name) in names::dir(None, names) {
+        match name {
+            Name::Path(IndexName { path, .. })
+            | Name::Unobservable(Unobservable::Coincides { path }) => {
+                top.insert(path);
+            }
+            Name::Reserved | Name::Unobservable(_) => {}
+        }
+    }
+    for entry in records.live_entries() {
+        let mut path = entry.path.clone();
+        while let Some(parent) = path.parent() {
+            path = parent;
+        }
+        top.insert(path);
+    }
+    top
+}
+
+/// The reason an unreadable `.delocalignore` skips the root with (§7.3):
+/// permission denied, or else an I/O error, which is what anything other
+/// than a file at that name counts as too.
+fn ignore_file_reason(e: &io::Error) -> SkipReason {
+    if e.kind() == io::ErrorKind::PermissionDenied {
+        SkipReason::PermissionDenied
+    } else {
+        SkipReason::Io
     }
 }
 

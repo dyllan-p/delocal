@@ -69,6 +69,9 @@ fn names() -> Vec<&'static [u8]> {
         b"top",
         NFD.as_bytes(),
         NFC.as_bytes(),
+        // Rules come only from the root's (§7.3): anywhere else this is an
+        // ordinary name, a file or a directory.
+        ignore_rules::IGNORE_FILE.as_bytes(),
     ];
     if cfg!(target_os = "linux") {
         names.push(b"\xff");
@@ -143,6 +146,8 @@ fn arb_model() -> impl Strategy<Value = Model> {
                 absent,
             };
             model.for_this_platform();
+            // At the root the name is the rules, never something generated.
+            model.root.remove(ignore_rules::IGNORE_FILE.as_bytes());
             if !model.rules.is_empty() {
                 model.root.insert(
                     ignore_rules::IGNORE_FILE.as_bytes().to_vec(),
