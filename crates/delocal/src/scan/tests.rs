@@ -1,0 +1,683 @@
+//! Tests of the scanner (DESIGN.md §7.3) on real directories. Where what
+//! matters is what the engine does with the reports (above all, that
+//! nothing a scan could not see is ever tombstoned) a real engine sits
+//! behind the scanner.
+
+use std::collections::BTreeMap;
+
+use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules};
+
+use super::*;
+use crate::fs::RealFolder;
+
+const SECOND: i64 = 1_000_000_000;
+/// The tests' now: early 2027.
+const NOW: i64 = 1_800_000_000 * SECOND;
+/// An mtime long settled at [`NOW`].
+const OLD: i64 = NOW - 3600 * SECOND;
+
+fn p(s: &str) -> RelPath {
+    RelPath::new(s).unwrap()
+}
+
+fn id() -> FolderId {
+    FolderId::from_bytes([7; 16])
+}
+
+fn at(nanos: i64) -> Timestamp {
+    Timestamp::from_unix_nanos(nanos)
+}
+
+fn blake3_of(bytes: &[u8]) -> ContentHash {
+    ContentHash::from_bytes(*blake3::hash(bytes).as_bytes())
+}
+
+/// A folder on disk: a temporary directory with the root guard's marker.
+struct Disk {
+    tmp: tempfile::TempDir,
+}
+
+impl Disk {
+    fn new() -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(RESERVED_DIR)).unwrap();
+        std::fs::write(tmp.path().join(RESERVED_DIR).join(MARKER), "{}").unwrap();
+        Self { tmp }
+    }
+
+    fn root(&self) -> &Path {
+        self.tmp.path()
+    }
+
+    fn at(&self, path: &str) -> PathBuf {
+        self.root().join(path)
+    }
+
+    fn folder(&self) -> RealFolder {
+        RealFolder::new(self.root())
+    }
+
+    fn dir(&self, path: &str) {
+        std::fs::create_dir_all(self.at(path)).unwrap();
+    }
+
+    /// A file holding `bytes`, with an mtime and an exec bit.
+    fn file(&self, path: &str, bytes: &[u8], mtime_ns: i64, exec: bool) {
+        std::fs::write(self.at(path), bytes).unwrap();
+        let fs = self.folder().open().unwrap();
+        let mode = if exec { 0o755 } else { 0o644 };
+        fs.set_mode(Path::new(path), mode).unwrap();
+        fs.set_mtime(Path::new(path), mtime_ns).unwrap();
+    }
+
+    fn symlink(&self, path: &str, target: &str) {
+        std::os::unix::fs::symlink(target, self.at(path)).unwrap();
+    }
+
+    fn touch(&self, path: &str, mtime_ns: i64) {
+        let fs = self.folder().open().unwrap();
+        fs.set_mtime(Path::new(path), mtime_ns).unwrap();
+    }
+}
+
+/// Scan `folder` against `records` with the clock at `now`, on `hashers`
+/// threads: the events, and the report.
+fn scan_at(
+    folder: &dyn Folder,
+    records: &dyn Records,
+    now: i64,
+    hashers: usize,
+) -> (Vec<Event>, ScanReport) {
+    let clock = move || at(now);
+    let mut events = Vec::new();
+    let report = Scan {
+        id: id(),
+        folder,
+        records,
+        clock: &clock,
+        hashers: NonZeroUsize::new(hashers).unwrap(),
+    }
+    .run(&mut |event| events.push(event));
+    (events, report)
+}
+
+fn scan(folder: &dyn Folder, records: &dyn Records) -> (Vec<Event>, ScanReport) {
+    scan_at(folder, records, NOW, 4)
+}
+
+/// Whether `events` are one bracket that finished.
+fn finished(events: &[Event]) -> bool {
+    events.first() == Some(&Event::ScanStarted { folder: id() })
+        && events.last() == Some(&Event::ScanFinished { folder: id() })
+}
+
+/// Whether `events` are a bracket aborted before anything was reported.
+fn aborted_at_once(events: &[Event]) -> bool {
+    events
+        == [
+            Event::ScanStarted { folder: id() },
+            Event::ScanAborted { folder: id() },
+        ]
+}
+
+/// The `Scanned` reports of one bracket, in order.
+fn reports(events: &[Event]) -> Vec<(RelPath, ScanState)> {
+    assert_eq!(events.first(), Some(&Event::ScanStarted { folder: id() }));
+    let mut out = Vec::new();
+    for event in &events[1..events.len() - 1] {
+        match event {
+            Event::Scanned {
+                folder,
+                path,
+                state,
+            } if *folder == id() => out.push((path.clone(), state.clone())),
+            other => panic!("not a report of this folder: {other:?}"),
+        }
+    }
+    out
+}
+
+fn observed_file(bytes: &[u8], mtime_ns: i64, exec: bool) -> ScanState {
+    ScanState::Observed(Observed {
+        kind: Kind::File,
+        size: bytes.len() as u64,
+        mtime_ns,
+        exec,
+        hash: blake3_of(bytes),
+    })
+}
+
+fn observed_dir() -> ScanState {
+    ScanState::Observed(Observed {
+        kind: Kind::Dir,
+        size: 0,
+        mtime_ns: 0,
+        exec: false,
+        hash: ContentHash::EMPTY,
+    })
+}
+
+fn observed_link(target: &str) -> ScanState {
+    ScanState::Observed(Observed {
+        kind: Kind::Symlink,
+        size: target.len() as u64,
+        mtime_ns: 0,
+        exec: false,
+        hash: blake3_of(target.as_bytes()),
+    })
+}
+
+fn skip(reason: SkipReason) -> ScanState {
+    ScanState::Skipped { reason }
+}
+
+/// An engine that is the only member of the folder.
+fn engine() -> Engine {
+    let own = NodeId::from_bytes([1; 16]);
+    let mut engine = Engine::new(NodeConfig {
+        node_id: own,
+        author_host: HostName::new("laptop").unwrap(),
+    });
+    engine.handle(
+        at(NOW),
+        Event::FolderJoined {
+            folder: id(),
+            rules: Rules::default(),
+            members: vec![own],
+        },
+    );
+    engine
+}
+
+/// The engine's index of the folder: the host's records.
+fn index(engine: &Engine) -> Index {
+    engine.folder(id()).unwrap().index().clone()
+}
+
+/// What the engine holds live, path by path.
+fn live(engine: &Engine) -> BTreeMap<RelPath, Observed> {
+    index(engine)
+        .live_records()
+        .map(|record| (record.entry.path.clone(), record.entry.observed()))
+        .collect()
+}
+
+/// Hand `events` to `engine` and return everything it did.
+fn feed(engine: &mut Engine, events: Vec<Event>) -> Vec<Action> {
+    events
+        .into_iter()
+        .flat_map(|event| engine.handle(at(NOW), event))
+        .collect()
+}
+
+/// The paths `actions` wrote an index record at, and those they tombstoned.
+fn written(actions: &[Action]) -> (Vec<RelPath>, Vec<RelPath>) {
+    let mut written = Vec::new();
+    let mut tombstoned = Vec::new();
+    for action in actions {
+        if let Action::IndexChanged { record, .. } = action {
+            written.push(record.entry.path.clone());
+            if record.entry.deleted {
+                tombstoned.push(record.entry.path.clone());
+            }
+        }
+        assert!(
+            !matches!(action, Action::IndexRemoved { .. }),
+            "a scan never removes a record: {action:?}"
+        );
+    }
+    (written, tombstoned)
+}
+
+/// A tree with some of everything, the engine that has scanned it once,
+/// and every path in it.
+fn tracked_tree() -> (Disk, Engine) {
+    let disk = Disk::new();
+    disk.dir("d/sub");
+    disk.dir("e");
+    disk.file("d/f", b"eff", OLD, false);
+    disk.file("d/sub/g", &vec![3; 2 * hash::CHUNK + 7], OLD, false);
+    disk.file("e/h", b"aitch", OLD, true);
+    disk.file("top", b"top", OLD, false);
+    disk.symlink("d/l", "../top");
+    std::fs::write(disk.at(ignore_rules::IGNORE_FILE), "*.tmp\n").unwrap();
+    disk.touch(ignore_rules::IGNORE_FILE, OLD);
+    let mut engine = engine();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    assert!(finished(&events));
+    feed(&mut engine, events);
+    assert_eq!(live(&engine).len(), 9);
+    (disk, engine)
+}
+
+#[test]
+fn a_tree_scans_to_what_is_on_disk_then_to_nothing_new() {
+    let disk = Disk::new();
+    let big = vec![9; 3 * hash::CHUNK + 1];
+    disk.dir("docs/empty");
+    disk.file("docs/a.txt", b"alpha", OLD, false);
+    disk.file("run.sh", b"#!/bin/sh\n", OLD - SECOND, true);
+    disk.file("big", &big, OLD, false);
+    disk.symlink("docs/link", "../run.sh");
+
+    let (events, report) = scan(&disk.folder(), &BTreeMap::new());
+    assert!(finished(&events));
+    assert!(report.aborted.is_none());
+    assert!(report.skipped.is_empty() && report.disk_names.is_empty());
+    // Depth first, each directory's names by bytes, a directory before
+    // what is in it; `.delocal` is never an entry.
+    assert_eq!(
+        reports(&events),
+        [
+            (p("big"), observed_file(&big, OLD, false)),
+            (p("docs"), observed_dir()),
+            (p("docs/a.txt"), observed_file(b"alpha", OLD, false)),
+            (p("docs/empty"), observed_dir()),
+            (p("docs/link"), observed_link("../run.sh")),
+            (
+                p("run.sh"),
+                observed_file(b"#!/bin/sh\n", OLD - SECOND, true)
+            ),
+        ]
+    );
+    // Whichever threads hash, the events are the same.
+    assert_eq!(scan_at(&disk.folder(), &BTreeMap::new(), NOW, 1).0, events);
+
+    // The engine records it all; scanned again against those records,
+    // nothing is hashed and nothing changes.
+    let mut engine = engine();
+    feed(&mut engine, events);
+    assert_eq!(live(&engine).len(), 6);
+    let (again, _) = scan(&disk.folder(), &index(&engine));
+    let states: Vec<ScanState> = reports(&again).into_iter().map(|(_, s)| s).collect();
+    assert_eq!(states, vec![ScanState::Unchanged; 6]);
+    assert_eq!(written(&feed(&mut engine, again)), (vec![], vec![]));
+}
+
+#[test]
+fn every_change_the_fast_path_must_see_is_seen() {
+    let (disk, engine) = tracked_tree();
+    // A chmod, a touch, a retarget to a target of the same length, and a
+    // file that became a directory: none changes a size.
+    let fs = disk.folder().open().unwrap();
+    fs.set_mode(Path::new("d/f"), 0o755).unwrap();
+    disk.touch("e/h", OLD + SECOND);
+    std::fs::remove_file(disk.at("d/l")).unwrap();
+    disk.symlink("d/l", "../abc");
+    std::fs::remove_file(disk.at("top")).unwrap();
+    disk.dir("top");
+
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    let changed: BTreeMap<RelPath, ScanState> = reports(&events)
+        .into_iter()
+        .filter(|(_, state)| *state != ScanState::Unchanged)
+        .collect();
+    assert_eq!(
+        changed,
+        BTreeMap::from([
+            (p("d/f"), observed_file(b"eff", OLD, true)),
+            (p("d/l"), observed_link("../abc")),
+            (p("e/h"), observed_file(b"aitch", OLD + SECOND, true)),
+            (p("top"), observed_dir()),
+        ])
+    );
+}
+
+/// The exec bit (§7.1) is the owner's execute bit, as git reads it: the
+/// group's and others' do not make a file executable, and the owner's
+/// alone does.
+#[test]
+fn the_exec_bit_is_the_owners() {
+    let disk = Disk::new();
+    let modes = [
+        ("owner", 0o700),
+        ("others", 0o655),
+        ("group", 0o610),
+        ("none", 0o644),
+    ];
+    let fs = disk.folder().open().unwrap();
+    for (name, mode) in modes {
+        disk.file(name, b"x", OLD, false);
+        fs.set_mode(Path::new(name), mode).unwrap();
+    }
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    let exec: Vec<(String, bool)> = reports(&events)
+        .into_iter()
+        .map(|(path, state)| match state {
+            ScanState::Observed(seen) => (path.to_string(), seen.exec),
+            other => panic!("{path}: {other:?}"),
+        })
+        .collect();
+    assert_eq!(
+        exec,
+        [
+            ("group".to_string(), false),
+            ("none".to_string(), false),
+            ("others".to_string(), false),
+            ("owner".to_string(), true),
+        ]
+    );
+}
+
+#[test]
+fn names_on_disk_map_to_index_paths() {
+    let disk = Disk::new();
+    // "café" as a decomposed name: its index path is NFC, and the pair is
+    // kept, for its children too.
+    disk.dir("cafe\u{301}");
+    disk.file("cafe\u{301}/menu", b"m", OLD, false);
+    let (events, report) = scan(&disk.folder(), &BTreeMap::new());
+    assert_eq!(
+        reports(&events),
+        [
+            (p("café"), observed_dir()),
+            (p("café/menu"), observed_file(b"m", OLD, false)),
+        ]
+    );
+    assert_eq!(
+        report.disk_names,
+        [DiskName {
+            path: p("café"),
+            name: "cafe\u{301}".into(),
+        }]
+    );
+
+    // Linux keeps both forms side by side, and bytes that are not UTF-8.
+    // Two names that coincide are skipped once at their index path, and
+    // the walk goes into neither; a name with no index path is not
+    // reported at all. APFS refuses both.
+    if cfg!(target_os = "linux") {
+        disk.dir("café");
+        disk.file("café/other", b"o", OLD, false);
+        std::fs::write(disk.root().join(OsStr::from_bytes(b"caf\xe9")), "x").unwrap();
+        let (events, report) = scan(&disk.folder(), &BTreeMap::new());
+        assert_eq!(
+            reports(&events),
+            [(p("café"), skip(SkipReason::CoincidingNames))]
+        );
+        let coincides = Unobservable::Coincides { path: p("café") };
+        assert_eq!(
+            report.unobservable,
+            [
+                (PathBuf::from("cafe\u{301}"), coincides.clone()),
+                (PathBuf::from("café"), coincides),
+                (
+                    PathBuf::from(OsStr::from_bytes(b"caf\xe9")),
+                    Unobservable::NotUtf8
+                ),
+            ]
+        );
+        assert_eq!(
+            report.skipped,
+            BTreeMap::from([(SkipReason::CoincidingNames, 1)])
+        );
+        assert!(report.disk_names.is_empty());
+    }
+}
+
+#[test]
+fn a_fifo_or_a_socket_is_not_an_entry() {
+    let disk = Disk::new();
+    disk.file("f", b"x", OLD, false);
+    let made = std::process::Command::new("mkfifo")
+        .arg(disk.at("fifo"))
+        .status();
+    assert!(made.unwrap().success());
+    let _socket = std::os::unix::net::UnixListener::bind(disk.at("sock")).unwrap();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    assert_eq!(
+        reports(&events),
+        [(p("f"), observed_file(b"x", OLD, false))]
+    );
+}
+
+#[test]
+fn ignored_paths_are_left_alone_and_tracked_ones_are_frozen() {
+    let disk = Disk::new();
+    disk.dir("build");
+    disk.file("build/out.o", b"o", OLD, false);
+    disk.file("a.log", b"log", OLD, false);
+    disk.file("keep.log", b"keep", OLD, false);
+    disk.file("notes", b"n", OLD, false);
+    disk.file(".DS_Store", b"ds", OLD, false);
+
+    // Tracked while nothing but the defaults ignore them.
+    let mut engine = engine();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    let paths: Vec<RelPath> = reports(&events).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        paths,
+        [
+            p("a.log"),
+            p("build"),
+            p("build/out.o"),
+            p("keep.log"),
+            p("notes")
+        ]
+    );
+    feed(&mut engine, events);
+
+    // A rule arrives: what it ignores is reported Skipped after the walk,
+    // and nothing is tombstoned.
+    disk.file(
+        ignore_rules::IGNORE_FILE,
+        b"*.log\n!keep.log\nbuild/\n",
+        OLD,
+        false,
+    );
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    assert_eq!(
+        reports(&events),
+        [
+            (
+                p(".delocalignore"),
+                observed_file(b"*.log\n!keep.log\nbuild/\n", OLD, false)
+            ),
+            (p("keep.log"), ScanState::Unchanged),
+            (p("notes"), ScanState::Unchanged),
+            (p("a.log"), skip(SkipReason::Ignored)),
+            (p("build"), skip(SkipReason::Ignored)),
+            (p("build/out.o"), skip(SkipReason::Ignored)),
+        ]
+    );
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+
+    // While ignored, a tracked path is frozen even if it goes: its
+    // deletion must not read as one.
+    std::fs::remove_file(disk.at("a.log")).unwrap();
+    std::fs::remove_dir_all(disk.at("build")).unwrap();
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+    assert!(live(&engine).contains_key(&p("build/out.o")));
+
+    // Once the rule goes, the next bracket sees the paths as they are.
+    std::fs::remove_file(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert_eq!(
+        tombstoned,
+        [
+            p(".delocalignore"),
+            p("a.log"),
+            p("build"),
+            p("build/out.o")
+        ]
+    );
+}
+
+/// Damage done to a tracked tree before a scan, which must abort before
+/// observing anything: the root guard's cases.
+fn guarded(damage: impl FnOnce(&Disk), why: fn(&Abort) -> bool) {
+    let (disk, mut engine) = tracked_tree();
+    let before = live(&engine);
+    damage(&disk);
+    let (events, report) = scan(&disk.folder(), &index(&engine));
+    assert!(aborted_at_once(&events), "{events:?}");
+    let abort = report.aborted.expect("aborted");
+    assert!(why(&abort), "{abort:?}");
+    assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+    assert_eq!(live(&engine), before);
+}
+
+#[test]
+fn a_missing_marker_aborts_the_scan_before_anything_is_observed() {
+    let delocal = |disk: &Disk| disk.root().join(RESERVED_DIR);
+    guarded(
+        |disk| std::fs::remove_file(delocal(disk).join(MARKER)).unwrap(),
+        |abort| matches!(abort, Abort::Marker(e) if e.kind() == io::ErrorKind::NotFound),
+    );
+    guarded(
+        |disk| {
+            std::fs::remove_file(delocal(disk).join(MARKER)).unwrap();
+            std::fs::create_dir(delocal(disk).join(MARKER)).unwrap();
+        },
+        |abort| matches!(abort, Abort::Marker(e) if NotAFile::of(e).is_some()),
+    );
+    // A `.delocal` that is a symlink to a directory holding a marker is not
+    // followed.
+    guarded(
+        |disk| {
+            let elsewhere = disk.root().join("elsewhere");
+            std::fs::rename(delocal(disk), &elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, delocal(disk)).unwrap();
+        },
+        |abort| matches!(abort, Abort::Marker(e) if e.kind() == io::ErrorKind::NotADirectory),
+    );
+    // The folder itself is gone, or was never mounted.
+    guarded(
+        |disk| {
+            for entry in std::fs::read_dir(disk.root()).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() && !path.is_symlink() {
+                    std::fs::remove_dir_all(path).unwrap();
+                } else {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+            std::fs::remove_dir(disk.root()).unwrap();
+        },
+        |abort| matches!(abort, Abort::Root(e) if e.kind() == io::ErrorKind::NotFound),
+    );
+    // `.delocalignore` cannot be read, so which paths are ignored is
+    // unknown.
+    guarded(
+        |disk| {
+            std::fs::remove_file(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+            std::fs::create_dir(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+        },
+        |abort| matches!(abort, Abort::IgnoreFile(e) if NotAFile::of(e).is_some()),
+    );
+}
+
+#[test]
+fn a_folder_deleted_while_it_is_scanned_is_not_a_mass_deletion() {
+    let (disk, mut engine) = tracked_tree();
+    let root = disk.root().to_path_buf();
+    let mut deleted = false;
+    let mut events = Vec::new();
+    let clock = || at(NOW);
+    let records = index(&engine);
+    let folder = disk.folder();
+    let report = Scan {
+        id: id(),
+        folder: &folder,
+        records: &records,
+        clock: &clock,
+        hashers: NonZeroUsize::MIN,
+    }
+    .run(&mut |event| {
+        // At the first report, everything goes, `.delocal` with it.
+        if matches!(event, Event::Scanned { .. }) && !deleted {
+            deleted = true;
+            for entry in std::fs::read_dir(&root).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    std::fs::remove_dir_all(path).unwrap();
+                } else {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+        events.push(event);
+    });
+    assert!(deleted);
+    assert!(
+        matches!(report.aborted, Some(Abort::Marker(_))),
+        "{report:?}"
+    );
+    assert_eq!(events.last(), Some(&Event::ScanAborted { folder: id() }));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+    assert_eq!(live(&engine).len(), 9);
+}
+
+#[test]
+fn a_directory_that_cannot_be_listed_is_skipped_once_for_all_beneath() {
+    let (disk, mut engine) = tracked_tree();
+    let before = live(&engine);
+    // Modes are set with `std`: the layer's `set_mode` needs a descriptor
+    // it can read through, which a mode of 000 refuses (§7.3).
+    let chmod = |path: &str, mode: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(disk.at(path), permissions).unwrap();
+    };
+    let unlisted = |events: &[Event]| -> Vec<(RelPath, ScanState)> {
+        reports(events)
+            .into_iter()
+            .filter(|(path, _)| path.as_str().starts_with('d'))
+            .collect()
+    };
+
+    // Only runs where permissions mean something: not as root.
+    chmod("d", 0o000);
+    let denied = std::fs::read_dir(disk.at("d")).is_err();
+    let (events, report) = scan(&disk.folder(), &index(&engine));
+    chmod("d", 0o755);
+    if denied {
+        assert_eq!(
+            unlisted(&events),
+            [(p("d"), skip(SkipReason::PermissionDenied))]
+        );
+        assert_eq!(
+            report.skipped,
+            BTreeMap::from([(SkipReason::PermissionDenied, 1)])
+        );
+        assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+        assert_eq!(live(&engine), before);
+    }
+
+    // A directory that can be listed but not entered: each name in it is
+    // skipped, and still nothing is tombstoned.
+    chmod("d", 0o444);
+    let denied = std::fs::symlink_metadata(disk.at("d/f")).is_err();
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    chmod("d", 0o755);
+    if denied {
+        let denied = skip(SkipReason::PermissionDenied);
+        assert_eq!(
+            unlisted(&events),
+            [
+                (p("d"), ScanState::Unchanged),
+                (p("d/f"), denied.clone()),
+                (p("d/l"), denied.clone()),
+                (p("d/sub"), denied),
+            ]
+        );
+        assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+        assert_eq!(live(&engine), before);
+    }
+
+    // A file that cannot be read, once it needs hashing.
+    disk.touch("e/h", OLD + SECOND);
+    chmod("e/h", 0o000);
+    let denied = std::fs::read(disk.at("e/h")).is_err();
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    chmod("e/h", 0o755);
+    if denied {
+        assert!(reports(&events).contains(&(p("e/h"), skip(SkipReason::PermissionDenied))));
+        assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+    }
+}
