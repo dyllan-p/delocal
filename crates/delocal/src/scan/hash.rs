@@ -1,26 +1,29 @@
 //! Hashing a file for a scan (DESIGN.md §7.1, §7.3): BLAKE3 of its content,
 //! streamed, and the stability check around it.
 //!
-//! **Settled first.** A file is not hashed until its mtime has been
-//! unchanged for 2 s ([`settled`]), so a file still being written is not
-//! announced half-written. `now` is the caller's, the monotonic clock of
-//! §7.8, never read here, so tests decide what is settled.
+//! **Settled first.** A file is not hashed until its inode change time is
+//! at least 2 s old ([`settled`]), so a file still being written is not
+//! announced half-written. The change time, not the mtime, because only the
+//! kernel sets it: a file copied with its mtime preserved, or carrying an
+//! mtime from the future off a device with a wrong clock, is judged by when
+//! it last changed here. `now` is the caller's, the monotonic clock of §7.8,
+//! never read here, so tests decide what has settled.
 //!
 //! **Unchanged while hashed.** After the last byte the file is stated again
 //! by name, through the directory the walk held, and the hash counts only if
-//! nothing `lstat` reports has changed (kind, size, mtime, change time,
-//! mode, device and inode) and exactly as many bytes were read as the size
-//! said. A write during hashing moves the mtime, and usually the size; one
-//! whose writer put the mtime back still moved the change time; a rename
-//! that swaps in another file with the same size and mtime changes the
-//! inode. A
-//! file that changed is [`Hashed::Unstable`], and its hash is thrown away:
-//! a torn hash would announce content that never existed. So is a file that
-//! was something else by the time it was opened (a symlink, a FIFO, a
-//! directory), which the open refuses without following or waiting.
+//! its size, mtime and change time are what they were, and exactly as many
+//! bytes were read as the size said (§7.3). A write during hashing moves the
+//! change time, whatever the writer does to the mtime afterwards, and so do
+//! a chmod and a rename; a file renamed over this one during hashing was
+//! written or moved within the last 2 s, so its change time is not this
+//! file's settled one. A file that changed is [`Hashed::Unstable`], and its
+//! hash is thrown away: a torn hash would announce content that never
+//! existed. So is a file that was something else by the time it was opened
+//! (a symlink, a FIFO, a directory), which the open refuses without
+//! following or waiting.
 //!
 //! Symlinks are hashed from their target in the walk (§7.1); they have no
-//! content to stream and no mtime to settle.
+//! content to stream, and are replaced whole.
 
 use std::ffi::OsStr;
 use std::io::{self, Read};
@@ -29,16 +32,24 @@ use delocal_engine::{ContentHash, Timestamp};
 
 use crate::fs::{Dir, NotAFile, Stat};
 
-/// How long a file's mtime must have stood before it is hashed (§7.3).
+/// How long ago a file must last have changed before it is hashed, and how
+/// long after an unstable one the host observes it again (§7.3).
 pub const SETTLE_NANOS: i64 = 2_000_000_000;
 
 /// The most read at once: the size of a transfer chunk (§7.5 step 3).
 pub const CHUNK: usize = 1 << 20;
 
-/// Whether a file whose mtime is `mtime_ns` has been left alone for 2 s at
-/// `now`. An mtime ahead of `now` has not.
-pub fn settled(mtime_ns: i64, now: Timestamp) -> bool {
-    now.since(Timestamp::from_unix_nanos(mtime_ns)) >= SETTLE_NANOS
+/// Whether a file whose inode change time is `ctime_ns` has been left
+/// alone for 2 s at `now`. A change time ahead of `now` (this machine's
+/// clock stepped back) has not.
+pub fn settled(ctime_ns: i64, now: Timestamp) -> bool {
+    now.since(Timestamp::from_unix_nanos(ctime_ns)) >= SETTLE_NANOS
+}
+
+/// Whether the re-stat after hashing shows the file as it was (§7.3): its
+/// size, mtime and change time.
+fn unchanged(before: &Stat, after: &Stat) -> bool {
+    (before.size, before.mtime_ns, before.ctime_ns) == (after.size, after.mtime_ns, after.ctime_ns)
 }
 
 /// What hashing one file found.
@@ -83,7 +94,7 @@ pub fn hash_file(dir: &dyn Dir, name: &OsStr, before: &Stat) -> Hashed {
     }
     drop(file);
     match dir.lstat(name) {
-        Ok(after) if after == *before && read == before.size => {
+        Ok(after) if unchanged(before, &after) && read == before.size => {
             Hashed::Stable(ContentHash::from_bytes(*hasher.finalize().as_bytes()))
         }
         Ok(_) => Hashed::Unstable,
@@ -120,7 +131,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_means_two_seconds_old_and_not_from_the_future() {
+    fn settled_means_changed_two_seconds_ago_and_not_in_the_future() {
         let now = Timestamp::from_unix_nanos(10 * SETTLE_NANOS);
         let at = |ago: i64| now.as_unix_nanos() - ago;
         assert!(settled(at(SETTLE_NANOS), now));
@@ -129,7 +140,7 @@ mod tests {
         assert!(!settled(at(0), now));
         assert!(
             !settled(at(-5 * 1_000_000_000), now),
-            "an mtime ahead of now"
+            "a change time ahead of now"
         );
         assert!(settled(i64::MIN, Timestamp::from_unix_nanos(i64::MAX)));
     }
@@ -159,9 +170,8 @@ mod tests {
         let unstable =
             |before: &Stat| matches!(hash_file(&*root, name("f"), before), Hashed::Unstable);
         assert!(!unstable(&before));
-        // Anything the re-stat can see: a later mtime or change time,
-        // another size (with as many bytes read as the old one said),
-        // another mode, another inode (a rename swapped a file in).
+        // What the re-stat compares (§7.3): the mtime, the change time, and
+        // the size (with as many bytes read as the old one said).
         let changed = [
             Stat {
                 mtime_ns: before.mtime_ns - 1,
@@ -175,6 +185,13 @@ mod tests {
                 size: before.size + 1,
                 ..before
             },
+        ];
+        for stat in &changed {
+            assert!(unstable(stat), "{stat:?}");
+        }
+        // And nothing else: a chmod or a rename moves the change time too,
+        // so the mode or the inode alone is never the only difference.
+        let same = [
             Stat {
                 mode: before.mode ^ 0o100,
                 ..before
@@ -184,8 +201,8 @@ mod tests {
                 ..before
             },
         ];
-        for stat in &changed {
-            assert!(unstable(stat), "{stat:?}");
+        for stat in &same {
+            assert!(!unstable(stat), "{stat:?}");
         }
 
         // A file swapped for a symlink before the open is not followed.

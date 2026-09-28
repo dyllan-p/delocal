@@ -17,7 +17,7 @@ enum Node {
     File {
         content: Vec<u8>,
         exec: bool,
-        age: Age,
+        mtime: Mtime,
     },
     Link {
         target: &'static str,
@@ -27,28 +27,25 @@ enum Node {
     },
 }
 
-/// A file's mtime, against [`NOW`].
+/// A file's mtime. It is only data to a scan (§7.3): every file here has
+/// settled by its change time, so each is hashed whatever its mtime says.
 #[derive(Clone, Copy, Debug)]
-enum Age {
-    /// This many seconds before [`OLD`]: long settled.
-    Settled(i64),
-    /// Half a second ago: not settled.
-    Recent,
-    /// Half a minute from now: not settled either.
+enum Mtime {
+    /// This many seconds before [`OLD`].
+    Past(i64),
+    /// Half a second before [`NOW`].
+    Moment,
+    /// A year after [`NOW`], as a device with a wrong clock leaves it.
     Ahead,
 }
 
-impl Age {
-    fn mtime_ns(self) -> i64 {
+impl Mtime {
+    fn ns(self) -> i64 {
         match self {
-            Self::Settled(secs) => OLD - secs * SECOND,
-            Self::Recent => NOW - SECOND / 2,
-            Self::Ahead => NOW + 30 * SECOND,
+            Self::Past(secs) => OLD - secs * SECOND,
+            Self::Moment => NOW - SECOND / 2,
+            Self::Ahead => NOW + 365 * DAY,
         }
-    }
-
-    fn settled(self) -> bool {
-        matches!(self, Self::Settled(_))
     }
 }
 
@@ -103,17 +100,21 @@ struct Model {
 }
 
 fn arb_node() -> impl Strategy<Value = Node> {
-    let age = prop_oneof![
-        6 => (0..100i64).prop_map(Age::Settled),
-        1 => Just(Age::Recent),
-        1 => Just(Age::Ahead),
+    let mtime = prop_oneof![
+        6 => (0..100i64).prop_map(Mtime::Past),
+        1 => Just(Mtime::Moment),
+        1 => Just(Mtime::Ahead),
     ];
     let file = (
         prop::collection::vec(any::<u8>(), 0..40),
         any::<bool>(),
-        age,
+        mtime,
     )
-        .prop_map(|(content, exec, age)| Node::File { content, exec, age });
+        .prop_map(|(content, exec, mtime)| Node::File {
+            content,
+            exec,
+            mtime,
+        });
     let link = prop::sample::select(vec!["a", "../b.txt", "sub/x", "abc"])
         .prop_map(|target| Node::Link { target });
     let leaf = prop_oneof![4 => file, 1 => link];
@@ -148,7 +149,7 @@ fn arb_model() -> impl Strategy<Value = Model> {
                     Node::File {
                         content: model.ignore_file(),
                         exec: false,
-                        age: Age::Settled(0),
+                        mtime: Mtime::Past(0),
                     },
                 );
             }
@@ -252,11 +253,15 @@ impl Model {
                 let path = dir.join(OsStr::from_bytes(name));
                 let on_disk = disk.root().join(&path);
                 match node {
-                    Node::File { content, exec, age } => {
+                    Node::File {
+                        content,
+                        exec,
+                        mtime,
+                    } => {
                         std::fs::write(&on_disk, content).unwrap();
                         fs.set_mode(&path, if *exec { 0o755 } else { 0o644 })
                             .unwrap();
-                        fs.set_mtime(&path, age.mtime_ns()).unwrap();
+                        fs.set_mtime(&path, mtime.ns()).unwrap();
                     }
                     Node::Link { target } => {
                         std::os::unix::fs::symlink(target, &on_disk).unwrap();
@@ -313,17 +318,31 @@ impl Model {
                 (_, 0) => continue,
                 // Unchanged by the fast path, with a hash that proves the
                 // file was not read.
-                (Node::File { content, exec, age }, 1) => (
+                (
+                    Node::File {
+                        content,
+                        exec,
+                        mtime,
+                    },
+                    1,
+                ) => (
                     Kind::File,
                     content.len() as u64,
-                    age.mtime_ns(),
+                    mtime.ns(),
                     *exec,
                     blake3_of(b"not what is on disk"),
                 ),
-                (Node::File { content, exec, age }, _) => (
+                (
+                    Node::File {
+                        content,
+                        exec,
+                        mtime,
+                    },
+                    _,
+                ) => (
                     Kind::File,
                     content.len() as u64,
-                    age.mtime_ns() - 1,
+                    mtime.ns() - 1,
                     *exec,
                     blake3_of(content),
                 ),
@@ -410,19 +429,21 @@ impl Model {
             }
             let record = records.get(&p(&path));
             let state = match node {
-                Node::File { content, exec, age } => {
+                Node::File {
+                    content,
+                    exec,
+                    mtime,
+                } => {
                     let unchanged = record.is_some_and(|r| {
                         r.kind == Kind::File
                             && r.size == content.len() as u64
-                            && r.mtime_ns == age.mtime_ns()
+                            && r.mtime_ns == mtime.ns()
                             && r.exec == *exec
                     });
                     if unchanged {
                         ScanState::Unchanged
-                    } else if !age.settled() {
-                        skip(SkipReason::Unstable)
                     } else {
-                        observed_file(content, age.mtime_ns(), *exec)
+                        observed_file(content, mtime.ns(), *exec)
                     }
                 }
                 Node::Link { target } => {
@@ -497,7 +518,8 @@ proptest! {
         let disk = Disk::new();
         model.build(&disk);
         let records = model.records();
-        let (events, report) = scan_at(&disk.folder(), &records, NOW, hashers);
+        let now = settled_now();
+        let (events, report) = scan_at(&disk.folder(), &records, now, hashers);
         prop_assert!(finished(&events), "{:?}", report.aborted);
         let expected = model.expect(&records);
 
@@ -515,6 +537,6 @@ proptest! {
         prop_assert!(report.invalid_rules.is_empty());
 
         // The same events, in the same order, on one thread.
-        prop_assert_eq!(scan_at(&disk.folder(), &records, NOW, 1).0, events);
+        prop_assert_eq!(scan_at(&disk.folder(), &records, now, 1).0, events);
     }
 }

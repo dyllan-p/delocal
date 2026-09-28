@@ -254,9 +254,10 @@ pub struct Stat {
     /// about the years 1677 and 2262.
     pub mtime_ns: i64,
     /// When the inode last changed, in the same units. No call can set it:
-    /// every write moves it, and so does setting the mtime, so a file
-    /// written while it was hashed and its mtime then put back is still
-    /// seen to have changed (§7.3).
+    /// every write moves it, and so do setting the mtime, a chmod and a
+    /// rename. A scan judges a file's stability by it (§7.3), so a file
+    /// copied with its mtime preserved, or written while it was hashed and
+    /// its mtime then put back, is still seen to have just changed.
     pub ctime_ns: i64,
     /// The permission bits (`st_mode & 0o7777`).
     pub mode: u32,

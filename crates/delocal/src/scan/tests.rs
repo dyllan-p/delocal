@@ -16,10 +16,35 @@ mod spy;
 use spy::Spy;
 
 const SECOND: i64 = 1_000_000_000;
-/// The tests' now: early 2027.
+const DAY: i64 = 86_400 * SECOND;
+/// The engine's clock in these tests, early 2027, and the instant the
+/// mtimes below are set around. An mtime is only data to a scan: whether a
+/// file has settled goes by its change time, which the real clock sets
+/// (§7.3), so scans take their clock from [`settled_now`].
 const NOW: i64 = 1_800_000_000 * SECOND;
-/// An mtime long settled at [`NOW`].
+/// An mtime an hour before [`NOW`].
 const OLD: i64 = NOW - 3600 * SECOND;
+
+/// The real clock, which sets every change time.
+fn wall() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    i64::try_from(since.as_nanos()).unwrap()
+}
+
+/// A scan's clock by which every file a test has made so far has settled:
+/// an hour past the real clock.
+fn settled_now() -> i64 {
+    wall() + 3600 * SECOND
+}
+
+/// The change time of what is at `path`, as a scan's `lstat` sees it.
+fn ctime(path: &Path) -> i64 {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    meta.ctime() * SECOND + meta.ctime_nsec()
+}
 
 fn p(s: &str) -> RelPath {
     RelPath::new(s).unwrap()
@@ -107,7 +132,7 @@ fn scan_at(
 }
 
 fn scan(folder: &dyn Folder, records: &dyn Records) -> (Vec<Event>, ScanReport) {
-    scan_at(folder, records, NOW, 4)
+    scan_at(folder, records, settled_now(), 4)
 }
 
 /// Whether `events` are one bracket that finished.
@@ -286,7 +311,8 @@ fn a_tree_scans_to_what_is_on_disk_then_to_nothing_new() {
         ]
     );
     // Whichever threads hash, the events are the same.
-    assert_eq!(scan_at(&disk.folder(), &BTreeMap::new(), NOW, 1).0, events);
+    let one_thread = scan_at(&disk.folder(), &BTreeMap::new(), settled_now(), 1);
+    assert_eq!(one_thread.0, events);
 
     // The engine records it all; scanned again against those records,
     // nothing is hashed and nothing changes.
@@ -582,7 +608,8 @@ fn a_folder_deleted_while_it_is_scanned_is_not_a_mass_deletion() {
     let root = disk.root().to_path_buf();
     let mut deleted = false;
     let mut events = Vec::new();
-    let clock = || at(NOW);
+    let now = settled_now();
+    let clock = move || at(now);
     let records = index(&engine);
     let folder = disk.folder();
     let report = Scan {
@@ -687,37 +714,52 @@ fn a_directory_that_cannot_be_listed_is_skipped_once_for_all_beneath() {
     }
 }
 
+/// A file is hashed once its change time is 2 s old by the scan's clock,
+/// whatever its mtime says (§7.3). One whose mtime is a year ahead is
+/// recorded once it has settled; one whose mtime is a year old but which
+/// changed a moment ago is skipped as unstable, and not even opened.
 #[test]
-fn a_file_is_hashed_only_once_its_mtime_has_settled() {
+fn a_file_is_hashed_once_its_change_time_has_settled_whatever_its_mtime() {
     let disk = Disk::new();
-    disk.file("recent", b"r", NOW - SECOND, false);
-    disk.file("ahead", b"a", NOW + 60 * SECOND, false);
+    disk.file("ahead", b"a", NOW + 365 * DAY, false);
+    // Over a second apart, so that one clock finds this file's change two
+    // seconds old and the next one's not.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    disk.file("fresh", b"f", NOW - 365 * DAY, false);
+    let (ahead, fresh) = (ctime(&disk.at("ahead")), ctime(&disk.at("fresh")));
+    assert!(fresh - ahead >= SECOND, "{ahead} then {fresh}");
     let spy = Spy::new(disk.root());
+    let mut engine = engine();
 
-    let (events, report) = scan(&spy, &BTreeMap::new());
+    let (events, report) = scan_at(&spy, &index(&engine), fresh + SECOND, 1);
     assert_eq!(
         reports(&events),
         [
-            (p("ahead"), skip(SkipReason::Unstable)),
-            (p("recent"), skip(SkipReason::Unstable)),
+            (p("ahead"), observed_file(b"a", NOW + 365 * DAY, false)),
+            (p("fresh"), skip(SkipReason::Unstable)),
         ]
     );
-    assert_eq!(report.skipped, BTreeMap::from([(SkipReason::Unstable, 2)]));
+    assert_eq!(report.skipped, BTreeMap::from([(SkipReason::Unstable, 1)]));
     let opened = spy.calls("dir.open_read");
     assert_eq!(
         opened,
-        [PathBuf::from(ignore_rules::IGNORE_FILE)],
-        "neither file even opened"
+        [
+            PathBuf::from(ignore_rules::IGNORE_FILE),
+            PathBuf::from("ahead")
+        ],
+        "the unsettled file is not even opened"
     );
+    feed(&mut engine, events);
+    assert_eq!(live(&engine)[&p("ahead")].mtime_ns, NOW + 365 * DAY);
+    assert!(!live(&engine).contains_key(&p("fresh")));
 
-    // Two seconds after its mtime, it is hashed; the one from the future
-    // waits until the clock passes it.
-    let (events, _) = scan_at(&spy, &BTreeMap::new(), NOW + SECOND, 1);
+    // Two seconds after its change, the other is recorded too.
+    let (events, _) = scan_at(&spy, &index(&engine), fresh + 2 * SECOND, 1);
     assert_eq!(
         reports(&events),
         [
-            (p("ahead"), skip(SkipReason::Unstable)),
-            (p("recent"), observed_file(b"r", NOW - SECOND, false)),
+            (p("ahead"), ScanState::Unchanged),
+            (p("fresh"), observed_file(b"f", NOW - 365 * DAY, false)),
         ]
     );
 }
@@ -781,10 +823,9 @@ fn a_file_changed_while_it_is_hashed_is_unstable() {
         assert!(!written.contains(&p("big")), "{name}: the record stands");
         assert_eq!(live(&engine)[&p("big")], recorded, "{name}");
 
-        // The next scan sees it as it is now. The append's mtime is the
-        // real clock's, so this scan's clock is later than any.
+        // The next scan, once it has settled, sees it as it is now.
         let now = std::fs::read(disk.at("big")).unwrap();
-        let (events, _) = scan_at(&disk.folder(), &index(&engine), i64::MAX, 4);
+        let (events, _) = scan(&disk.folder(), &index(&engine));
         let state = reports(&events)
             .into_iter()
             .find(|(p, _)| p.as_str() == "big")
