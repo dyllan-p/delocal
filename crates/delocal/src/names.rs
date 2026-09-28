@@ -5,10 +5,12 @@
 //! filesystem for an index path by name, because a normalisation-insensitive
 //! or case-insensitive filesystem would answer for a different file. A name
 //! becomes the last component of an index path by NFC normalisation. It is
-//! **unobservable** instead (nothing is synced for it, `status` names it,
-//! and a scan reports it `Skipped`) if it is not valid UTF-8, if its NFC form
-//! is over 255 bytes, if the index path would be over 4,096 bytes, or if
-//! another name in the same directory maps to the same index path.
+//! **unobservable** instead (nothing is synced for it, and `status` names
+//! it) if it is not valid UTF-8, if its NFC form is over 255 bytes, if the
+//! index path would be over 4,096 bytes, or if another name in the same
+//! directory maps to the same index path. Only the last has an index path,
+//! so only it is reported to the engine, as `Skipped`
+//! ([`Unobservable::skip_reason`]); the others are the host's to count.
 //!
 //! Where a name and its NFC form differ, [`IndexName::differs`] says so: the
 //! store keeps those pairs in `disk_names` (§11) so that commits and the
@@ -25,8 +27,8 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 
-use delocal_engine::RelPath;
 use delocal_engine::path::{MAX_COMPONENT_LEN, RelPathError};
+use delocal_engine::{RelPath, SkipReason};
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 /// The longest index path, in bytes (§7.1).
@@ -71,6 +73,23 @@ pub enum Unobservable {
     /// `.` or `..`, or holds a `/` or a NUL. `readdir` returns none of these;
     /// this keeps [`name`] total rather than panicking.
     NotAName(RelPathError),
+}
+
+impl Unobservable {
+    /// What a scan reports to the engine for the name (§7.3): `Skipped` at
+    /// the index path two names coincide at, which may be tracked and must
+    /// not read as a deletion. A name with no index path has nothing to
+    /// report it at, and nothing tracked there to protect: `None`, and the
+    /// host counts it in `status` by this reason.
+    pub fn skip_reason(&self) -> Option<SkipReason> {
+        match self {
+            Self::Coincides { .. } => Some(SkipReason::CoincidingNames),
+            Self::NotUtf8
+            | Self::NameTooLong { .. }
+            | Self::PathTooLong { .. }
+            | Self::NotAName(_) => None,
+        }
+    }
 }
 
 /// Map one name from `readdir` in the directory at `parent` (`None` for the
@@ -271,6 +290,23 @@ mod tests {
                 "{:?} in {parent:?}",
                 String::from_utf8_lossy(disk)
             );
+        }
+    }
+
+    /// §7.3: of the unobservable names, only two that coincide have an
+    /// index path, which the scan reports `Skipped`; the others have no
+    /// index path to report and are counted by the host alone.
+    #[test]
+    fn only_coinciding_names_are_reported_to_the_engine() {
+        let coincides = Unobservable::Coincides { path: p("café") };
+        assert_eq!(coincides.skip_reason(), Some(SkipReason::CoincidingNames));
+        for reason in [
+            Unobservable::NotUtf8,
+            Unobservable::NameTooLong { len: 256 },
+            Unobservable::PathTooLong { len: 4097 },
+            Unobservable::NotAName(RelPathError::DotDotComponent),
+        ] {
+            assert_eq!(reason.skip_reason(), None, "{reason:?}");
         }
     }
 

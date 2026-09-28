@@ -104,6 +104,10 @@ pub enum ScanState {
 
 /// Why the host could not inspect a path (§7.3). The reason is for the
 /// host's own counts in `status`; the engine treats every reason alike.
+/// Only reasons that can attach to an index path are here. A name that is
+/// not valid UTF-8, or whose index path or NFC form would be too long, has
+/// no index path, so nothing is tracked there and the host counts it
+/// itself, without an event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum SkipReason {
     /// A file that cannot be read, or a directory that can be entered but
@@ -113,13 +117,9 @@ pub enum SkipReason {
     Io,
     /// A file whose mtime has not been stable for 2 s.
     Unstable,
-    /// A name that is not valid UTF-8, or one of two names whose index
-    /// paths coincide (§7.3, names on disk).
-    UnobservableName,
-    /// A path over 4,096 bytes.
-    PathTooLong,
-    /// A name whose NFC form is over 255 bytes.
-    NameTooLong,
+    /// One of two names on disk whose index paths coincide (§7.3, names on
+    /// disk): the index path exists, and neither name can be observed at it.
+    CoincidingNames,
     /// A tracked path that a rule in `.delocalignore` now ignores.
     Ignored,
 }
@@ -2632,9 +2632,7 @@ mod tests {
         for reason in [
             SkipReason::Io,
             SkipReason::Unstable,
-            SkipReason::UnobservableName,
-            SkipReason::PathTooLong,
-            SkipReason::NameTooLong,
+            SkipReason::CoincidingNames,
             SkipReason::Ignored,
         ] {
             assert_eq!(
