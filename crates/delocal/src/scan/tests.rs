@@ -849,3 +849,176 @@ fn the_walk_opens_each_directory_once() {
     walked.sort();
     assert_eq!(listed, walked);
 }
+
+#[cfg(feature = "faults")]
+mod faults {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::fs::FaultyFolder;
+    use crate::fs::faulty::{Fault, Op, Rule, Spec, Trigger};
+
+    /// Every path of [`tracked_tree`], the root, `.delocal` and its marker,
+    /// and everything.
+    const PATTERNS: [&str; 13] = [
+        "",
+        ".delocal",
+        ".delocal/folder.json",
+        ".delocalignore",
+        "d",
+        "d/f",
+        "d/l",
+        "d/sub",
+        "d/sub/g",
+        "e",
+        "e/h",
+        "top",
+        "**",
+    ];
+
+    const OPS: [Op; 7] = [
+        Op::OpenRoot,
+        Op::OpenDir,
+        Op::ReadDir,
+        Op::Lstat,
+        Op::ReadLink,
+        Op::OpenRead,
+        Op::Read,
+    ];
+
+    /// The tree, tracked, then touched so every file must be hashed again.
+    fn touched_tree() -> (Disk, Engine) {
+        let (disk, engine) = tracked_tree();
+        for file in ["d/f", "d/sub/g", "e/h", "top", ".delocalignore"] {
+            disk.touch(file, OLD + SECOND);
+        }
+        (disk, engine)
+    }
+
+    /// Scan with `rules` injected. Nothing the engine holds live may be
+    /// taken away, whatever fails: the live paths are the same after.
+    /// Returns how many faults fired.
+    fn no_live_record_lost(disk: &Disk, tracked: &Engine, rules: Vec<Rule>) -> usize {
+        let mut engine = tracked.clone();
+        let before: Vec<RelPath> = live(&engine).into_keys().collect();
+        let folder = FaultyFolder::new(
+            disk.folder(),
+            Spec {
+                rules: rules.clone(),
+            },
+        )
+        .unwrap();
+        let (events, report) = scan(&folder, &index(&engine));
+        let (_, tombstoned) = written(&feed(&mut engine, events));
+        assert!(tombstoned.is_empty(), "{rules:?} tombstoned {tombstoned:?}");
+        let after: Vec<RelPath> = live(&engine).into_keys().collect();
+        assert_eq!(after, before, "{rules:?} ({report:?})");
+        folder.injected().len()
+    }
+
+    /// EIO or EACCES on any read, listing or open, at any path, once or
+    /// from then on: every live record stays live.
+    #[test]
+    fn a_fault_on_any_call_never_takes_a_live_record_away() {
+        let (disk, engine) = touched_tree();
+        let mut fired: std::collections::HashMap<Op, usize> = Default::default();
+        for op in OPS {
+            for fail in [Fault::Eio, Fault::Eacces] {
+                for path in PATTERNS {
+                    for at in [Trigger::Call(1), Trigger::FromCall(1), Trigger::Call(2)] {
+                        let rule = Rule {
+                            op,
+                            path: path.into(),
+                            at,
+                            fail,
+                        };
+                        *fired.entry(op).or_default() +=
+                            no_live_record_lost(&disk, &engine, vec![rule]);
+                    }
+                }
+            }
+        }
+        // Every kind of call was reached, so every fault was really tried.
+        for op in OPS {
+            assert!(
+                fired.get(&op).copied().unwrap_or(0) > 0,
+                "{op:?} never fired"
+            );
+        }
+    }
+
+    fn arb_rule() -> impl Strategy<Value = Rule> {
+        let op = prop::sample::select(OPS.to_vec());
+        let path = prop::sample::select(PATTERNS.to_vec());
+        let at = prop_oneof![
+            (1..6u64).prop_map(Trigger::Call),
+            (1..6u64).prop_map(Trigger::FromCall),
+        ];
+        let fail = prop::sample::select(vec![Fault::Eio, Fault::Eacces]);
+        (op, path, at, fail).prop_map(|(op, path, at, fail)| Rule {
+            op,
+            path: path.into(),
+            at,
+            fail,
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Several faults at once, anywhere: still no live record lost.
+        #[test]
+        fn several_faults_at_once_never_take_a_live_record_away(
+            rules in prop::collection::vec(arb_rule(), 1..5),
+        ) {
+            let (disk, engine) = touched_tree();
+            no_live_record_lost(&disk, &engine, rules);
+        }
+    }
+
+    #[test]
+    fn a_directory_whose_open_fails_is_skipped_once_with_its_reason() {
+        let (disk, engine) = touched_tree();
+        for (op, fail, reason) in [
+            (Op::OpenDir, Fault::Eacces, SkipReason::PermissionDenied),
+            (Op::ReadDir, Fault::Eio, SkipReason::Io),
+        ] {
+            let rule = Rule {
+                op,
+                path: "d".into(),
+                at: Trigger::Call(1),
+                fail,
+            };
+            let folder = FaultyFolder::new(disk.folder(), Spec { rules: vec![rule] }).unwrap();
+            let (events, _) = scan(&folder, &index(&engine));
+            let under_d: Vec<(RelPath, ScanState)> = reports(&events)
+                .into_iter()
+                .filter(|(path, _)| path.as_str().starts_with('d'))
+                .collect();
+            assert_eq!(under_d, [(p("d"), skip(reason))], "{op:?}");
+        }
+    }
+
+    #[test]
+    fn a_root_that_cannot_be_opened_or_listed_aborts_the_scan() {
+        let (disk, mut engine) = touched_tree();
+        for (op, path) in [(Op::OpenRoot, ""), (Op::OpenDir, ""), (Op::ReadDir, "")] {
+            let rule = Rule {
+                op,
+                path: path.into(),
+                at: Trigger::Call(1),
+                fail: Fault::Eio,
+            };
+            let folder = FaultyFolder::new(disk.folder(), Spec { rules: vec![rule] }).unwrap();
+            let (events, report) = scan(&folder, &index(&engine));
+            assert!(aborted_at_once(&events), "{op:?}");
+            let listing = op == Op::ReadDir;
+            assert_eq!(
+                matches!(report.aborted, Some(Abort::List(_))),
+                listing,
+                "{op:?}: {report:?}"
+            );
+            assert_eq!(written(&feed(&mut engine, events)), (vec![], vec![]));
+        }
+    }
+}
