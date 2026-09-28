@@ -28,10 +28,9 @@
 //!   fast path compares the target's hash (§7.3).
 //! - A file whose size, mtime and exec bit match its record is `Unchanged`,
 //!   and is not read (the fast path, [`Entry::unchanged_by_stat`]). Any other
-//!   file is hashed on one of the hashing threads, if its mtime has settled
-//!   ([`hash`]); one whose mtime has not, or that changes while it is hashed,
-//!   is `Skipped { Unstable }`, and a later scan or the watcher sees it
-//!   again.
+//!   file is hashed on one of the hashing threads, if its change time has
+//!   settled ([`hash`]); one that changed within the last 2 s, or changes
+//!   while it is hashed, is `Skipped { Unstable }`.
 //! - Anything else (a FIFO, a socket, a device) is not an entry (§3.1) and
 //!   is not reported, as if absent.
 //!
@@ -490,7 +489,7 @@ impl Walker<'_, '_> {
         };
         if self.unchanged(&path, &seen) {
             self.ready(path, ScanState::Unchanged);
-        } else if !settled(stat.mtime_ns, self.clock.now()) {
+        } else if !settled(stat.ctime_ns, self.clock.now()) {
             self.ready(path, unstable());
         } else {
             let job = Job {
