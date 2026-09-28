@@ -13,20 +13,22 @@ test: delocal-sim regressions::content_is_fetched_by_hash_from_whoever_holds_it
 test: delocal-sim sim::tests::a_source_serves_the_wanted_content_under_any_version_or_path
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
-index 4e18586..05a0c7d 100644
 --- a/crates/sim/src/sim.rs
 +++ b/crates/sim/src/sim.rs
-@@ -1875,14 +1875,16 @@ impl Sim {
+@@ -2001,16 +2001,17 @@
                  if !self.connected(node, from) {
                      return Ok(());
                  }
 -                // §7.5 step 2: the source serves the requested content from
--                // `path` if its live record there has that hash and the disk
--                // still matches the record, failing that from any live file
--                // with that hash, failing that not at all.
+-                // `path` if its live record there has that hash and what is
+-                // on disk still matches the record by the scan's fast-path
+-                // test (size, mtime and exec bit for a file, kind and target
+-                // for a symlink), failing that from any live file with that
+-                // hash, failing that not at all.
 +                // The source serves the requested version from `path` if its
-+                // live record there is exactly that version and the disk
-+                // still matches the record, failing that not at all.
++                // live record there is exactly that version and what is on
++                // disk still matches the record by the scan's fast-path test,
++                // failing that not at all.
                  let served = self.nodes.get(&from).and_then(|src| {
                      let engine = src.engine.as_ref()?;
                      let index = engine.folder(self.folder)?.index();
@@ -37,4 +39,4 @@ index 4e18586..05a0c7d 100644
 +                    exact.then_some(&path).into_iter().find_map(|at| {
                          let record = index.live(at)?;
                          let file = src.fs.get(at)?;
-                         let matches = file.kind == record.entry.kind
+                         record

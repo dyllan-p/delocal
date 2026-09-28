@@ -2002,20 +2002,21 @@ impl Sim {
                     return Ok(());
                 }
                 // §7.5 step 2: the source serves the requested content from
-                // `path` if its live record there has that hash and the disk
-                // still matches the record, failing that from any live file
-                // with that hash, failing that not at all.
+                // `path` if its live record there has that hash and what is
+                // on disk still matches the record by the scan's fast-path
+                // test (size, mtime and exec bit for a file, kind and target
+                // for a symlink), failing that from any live file with that
+                // hash, failing that not at all.
                 let served = self.nodes.get(&from).and_then(|src| {
                     let engine = src.engine.as_ref()?;
                     let index = engine.folder(self.folder)?.index();
                     index.locate(&path, &hash).find_map(|at| {
                         let record = index.live(at)?;
                         let file = src.fs.get(at)?;
-                        let matches = file.kind == record.entry.kind
-                            && (file.kind != Kind::File
-                                || (file.content.len() as u64 == record.entry.size
-                                    && file.mtime_ns == record.entry.mtime_ns));
-                        matches.then(|| file.content.clone())
+                        record
+                            .entry
+                            .unchanged_by_stat(&file.observed())
+                            .then(|| file.content.clone())
                     })
                 });
                 let report = match served {
@@ -3677,5 +3678,63 @@ mod tests {
         assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
         sim.full_scan(id, false).unwrap();
         assert!(!live(&sim), "observed gone once the rule went");
+    }
+
+    /// §7.5 step 2 (draft 46): a source serves its file only if what is on
+    /// disk still matches the record by the scan's fast-path test, size,
+    /// mtime and exec bit for a file and kind and target for a symlink. A
+    /// symlink retargeted since its record was served on its kind alone and
+    /// failed the requester's hash check, and a file chmodded since its
+    /// record was served too. Both are refused now; a file that still
+    /// matches is served.
+    #[test]
+    fn a_source_serves_only_what_still_matches_its_record_by_the_fast_path() {
+        let mut sim = world();
+        let (asker, source) = (sim.order[0], sim.order[1]);
+        let link = |target: &[u8]| File {
+            kind: Kind::Symlink,
+            content: target.to_vec(),
+            mtime_ns: 0,
+            exec: false,
+        };
+        sim.scanned(source, rel("l"), link(b"f1")).unwrap();
+        sim.scanned(source, rel("x"), file(6, false)).unwrap();
+        sim.scanned(source, rel("w"), file(7, false)).unwrap();
+        // Behind the engine's back: a retarget to a target of the same
+        // length, and a chmod.
+        let node = sim.nodes.get_mut(&source).unwrap();
+        node.fs.insert(rel("l"), link(b"f2"));
+        node.fs.get_mut(&rel("x")).unwrap().exec = true;
+        let fetch = |sim: &mut Sim, path: &str, hash: ContentHash| {
+            let version = sim
+                .engine(source)
+                .and_then(|e| e.folder(sim.folder))
+                .and_then(|f| f.index().live(&rel(path)))
+                .map(|r| r.entry.version.clone())
+                .unwrap();
+            sim.ops.push(Op::Fetch {
+                node: asker,
+                from: source,
+                path: rel(path),
+                version,
+                hash,
+                done_at: sim.clock,
+                next_progress: sim.clock,
+                corrupt: false,
+            });
+            let pos = sim.ops.len() - 1;
+            sim.progress_op(pos).unwrap();
+            sim.nodes[&asker].temp.contains_key(&rel(path))
+        };
+        let before = sim.stats.clone();
+        assert!(!fetch(&mut sim, "l", link(b"f1").hash()));
+        assert_eq!(
+            (sim.stats.not_available, sim.stats.mismatches),
+            (before.not_available + 1, before.mismatches),
+            "the retargeted symlink is refused, not served with its new target"
+        );
+        assert!(!fetch(&mut sim, "x", file(6, false).hash()), "chmodded");
+        assert_eq!(sim.stats.not_available, before.not_available + 2);
+        assert!(fetch(&mut sim, "w", file(7, false).hash()), "unchanged");
     }
 }
