@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 45 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 44: a directory that cannot be listed is skipped with everything tracked beneath it, and an aborted scan closes its bracket without a deletion pass (§7.3); §11's schema heading no longer says sketch.
+> Draft 46 · 27 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 45: a source checks a symlink's target, not its size and mtime, before serving it (§7.5); the simulator's skip model, its checker, and a nightly skip slice (§14.1).
+>
+> Changes from draft 44: a directory that cannot be listed is skipped with everything tracked beneath it, and an aborted scan closes its bracket without a deletion pass (§7.3); §11's schema heading no longer says sketch.
 >
 > Changes from draft 43: the schema sketch is replaced by the list of tables, with `schema.rs` authoritative (§11).
 >
@@ -365,7 +367,7 @@ The set of candidates is the batch's **apply set**. The brake (§8.1) is evaluat
 **Fetching a file.**
 
 1. Pick a source (prefer `lan`, then `direct`, then `relay`).
-2. Send `RequestFile { folder, path, hash, offset }`. Content is requested **by hash, not by version**. The source serves the file at `path` if its index record there is live with that hash and the file on disk still matches the record (size and mtime); failing that, any live file in the folder with that hash; failing that, `NotAvailable`. Requesting by hash is what lets a conflict's merged version `M` be fetched from the winner's holders before they have merged (`M` has `W`'s content), lets every concurrent holder of the same bytes serve them, and lets the host satisfy a fetch from its own disk when the content is already local (a rename arrives as a delete plus an add; the host may copy from the old path or the trash and report `Fetched Ok` without asking anyone) [Phase 2]. The `offset` is the size of any partial temp file from an earlier attempt, so transfers resume.
+2. Send `RequestFile { folder, path, hash, offset }`. Content is requested **by hash, not by version**. The source serves the file at `path` if its index record there is live with that hash and what is on disk still matches the record by the same test as the scan's fast path (§7.3): size, mtime and exec bit for a file, kind and target for a symlink; failing that, any live file in the folder with that hash; failing that, `NotAvailable`. Requesting by hash is what lets a conflict's merged version `M` be fetched from the winner's holders before they have merged (`M` has `W`'s content), lets every concurrent holder of the same bytes serve them, and lets the host satisfy a fetch from its own disk when the content is already local (a rename arrives as a delete plus an add; the host may copy from the old path or the trash and report `Fetched Ok` without asking anyone) [Phase 2]. The `offset` is the size of any partial temp file from an earlier attempt, so transfers resume.
 3. Data arrives as `FileData` chunks (1 MiB) into `.delocal/tmp/<hash-prefix>-<random>`. The source refuses (`NotAvailable`) if it has no live file with that hash; the receiver removes that source from the want and tries another. A source that later announces a version with the wanted content becomes a source again.
 4. On completion, verify BLAKE3 against the expected hash. Mismatch → discard, retry once from a different source, then give up on that item until the index changes.
 5. Set mtime and exec bit on the temp file.
@@ -751,6 +753,7 @@ The engine is pure, so it can be driven by an in-memory filesystem and an in-mem
 - message delay and reordering
 - clock skew per node
 - mass-delete and mass-modify events (to exercise the brake)
+- scans that cannot inspect a file or list a directory, and tracked paths that become ignored for a few scans, reported `Skipped` (§7.3), with a checker that fails the run if a bracket ever tombstones a path that was skipped in it, or a path beneath one
 
 Invariants checked at the end of every run and at random quiescent points:
 
@@ -765,7 +768,7 @@ Invariants checked at the end of every run and at random quiescent points:
 | I7 | **Vector determines content.** On every node, after every index write: two records ever seen at a path with equal vectors have equal kind, hash, exec and deletion state. The one exemption is a machine's own re-issue after `revert`, which reuses a never-announced vector (§8.3). |
 | I8 | **Adopt dominance.** Whenever the host is about to report a commit, the version being committed still dominates or equals the record at its path. It is the release-visible form of `Index::adopt`'s debug assertion: a commit that would land under a record it does not dominate means some rule let the path change beneath a commit in flight. |
 
-Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `simulate` job with its own timeout; a scheduled nightly workflow runs 100,000, sharded across parallel jobs so it fits the runners' time limit, every slice (default knobs, corruption, and a long-run slice of a few thousand seeds at 2,000 steps) run to the end with `--keep-going`, starting at a different seed each night (day of year × 100,000, printed in the report) so the nightly explores new histories while the pinned seeds and the per-push sweep guard the old ones, and a failure opening one issue that lists every failing seed. A `SEEDS` environment variable controls the count. The pinned regression seeds (§14.4) are always required to pass. The random sweep is advisory (`continue-on-error`) until the first time it passes clean at 1,000 seeds, and a required check from then on; a required check that is red for weeks teaches everyone to ignore it.
+Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `simulate` job with its own timeout; a scheduled nightly workflow runs 100,000, sharded across parallel jobs so it fits the runners' time limit, every slice (default knobs, corruption, a skip slice at ten times the default skip rate, and a long-run slice of a few thousand seeds at 2,000 steps) run to the end with `--keep-going`, starting at a different seed each night (day of year × 100,000, printed in the report) so the nightly explores new histories while the pinned seeds and the per-push sweep guard the old ones, and a failure opening one issue that lists every failing seed. A `SEEDS` environment variable controls the count. The pinned regression seeds (§14.4) are always required to pass. The random sweep is advisory (`continue-on-error`) until the first time it passes clean at 1,000 seeds, and a required check from then on; a required check that is red for weeks teaches everyone to ignore it.
 
 ### 14.2 Integration tests
 
