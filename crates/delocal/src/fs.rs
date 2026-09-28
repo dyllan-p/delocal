@@ -35,7 +35,8 @@
 //! | Operation | Serves |
 //! |---|---|
 //! | [`Folder::open`] | §7.3 the folder root, opened afresh at the start of each operation |
-//! | [`read_dir`](Fs::read_dir) | §7.3 the scan walk and names on disk; §7.5 step 6 the guard's exact-name check through the parent; §7.5 removing unclaimed `tmp/` files at start; §8.4 listing and pruning the trash |
+//! | [`open_dir`](Fs::open_dir) and [`Dir`] | §7.3 the scan walk: each directory opened once, from its parent's descriptor, and its entries listed, stated, read and opened relative to it; the root guard's marker |
+//! | [`read_dir`](Fs::read_dir) | §7.3 names on disk; §7.5 step 6 the guard's exact-name check through the parent; §7.5 removing unclaimed `tmp/` files at start; §8.4 listing and pruning the trash |
 //! | [`lstat`](Fs::lstat) | §7.3 the fast path, the stability re-stat after hashing, the root guard's marker, the shim's read-back; §7.5 step 2 a source's size and mtime check and the resume offset; §7.5 step 6 the guard; §8.4 the trash's size |
 //! | [`read_link`](Fs::read_link) | §7.3 a symlink's fast path and hash; §7.5 step 6 the guard for a symlink; §7.5 step 2 serving a symlink |
 //! | [`open_read`](Fs::open_read) | §7.3 hashing, `.delocalignore`, `folder.json`; §7.5 step 2 serving from an offset and filling a fetch from this machine's folder or trash; §8.4 restore |
@@ -77,8 +78,17 @@
 //! `set_mode`, a directory) is refused with [`NotAFile`], which says what
 //! was there: a file swapped for a symlink or a FIFO between a caller's
 //! `lstat` and the open is observed as what it has become.
+//!
+//! **Holding a directory** (§7.3). Reaching a path from the root costs one
+//! open per parent, so a walk that did it for every entry would open each
+//! directory once per entry beneath it. A scan instead walks with the
+//! descriptor of the directory it is in: [`Fs::open_dir`] opens a directory
+//! and returns a [`Dir`], whose calls take one name in it and act relative
+//! to its descriptor, and whose [`open_dir`](Dir::open_dir) opens a child
+//! from there. Each directory is opened once. A `Dir` is part of the
+//! operation that opened it and is dropped with it.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -115,6 +125,13 @@ pub trait Fs: Send + Sync {
     /// `readdir` returned, never normalised (§7.3). A symlink at `dir` is
     /// not followed: it is `NotADirectory`.
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<OsString>>;
+
+    /// Open the directory at `path` and hold it, for calls relative to it
+    /// within this operation (see the module docs). The empty path gives
+    /// the root, which the operation already holds: it is duplicated, not
+    /// opened again. A symlink at `path` is not followed: it is
+    /// `NotADirectory`, as for [`read_dir`](Fs::read_dir).
+    fn open_dir(&self, path: &Path) -> io::Result<Box<dyn Dir>>;
 
     /// What is at `path`, without following a symlink there.
     fn lstat(&self, path: &Path) -> io::Result<Stat>;
@@ -182,6 +199,39 @@ pub trait Fs: Send + Sync {
     /// Bytes an unprivileged process can still write on the filesystem that
     /// holds the directory at `path`.
     fn available_space(&self, path: &Path) -> io::Result<u64>;
+}
+
+/// A directory held open within one operation ([`Fs::open_dir`]), and the
+/// calls a walk makes relative to it (§7.3). Each call takes the `name` of
+/// one entry in the directory, as [`read_dir`](Dir::read_dir) lists it, and
+/// does what the [`Fs`] call of the same name does on the entry's whole
+/// path, without reaching the directory again: it holds the directory's
+/// descriptor, so a directory renamed after it was opened is still the one
+/// it acts in. A name that is not one component (empty, `.`, `..`, or
+/// holding a `/`) is refused with `InvalidInput`.
+///
+/// `Send + Sync`, so the hashing threads of a scan can open and re-stat the
+/// files of a directory the walk has moved on from.
+pub trait Dir: Send + Sync {
+    /// The names in this directory, as [`Fs::read_dir`] lists them: raw
+    /// bytes, without `.` and `..`, sorted by bytes. Each call lists from
+    /// the start.
+    fn read_dir(&self) -> io::Result<Vec<OsString>>;
+
+    /// What is at `name`, without following a symlink there.
+    fn lstat(&self, name: &OsStr) -> io::Result<Stat>;
+
+    /// The target of the symlink at `name`, as raw bytes.
+    fn read_link(&self, name: &OsStr) -> io::Result<PathBuf>;
+
+    /// Open the file at `name` for reading, as [`Fs::open_read`]: anything
+    /// else there is refused with [`NotAFile`], neither followed nor waited
+    /// on.
+    fn open_read(&self, name: &OsStr) -> io::Result<Box<dyn ReadFile>>;
+
+    /// Open the directory at `name` from this one and hold it. Anything else
+    /// there, a symlink included, is `NotADirectory`.
+    fn open_dir(&self, name: &OsStr) -> io::Result<Box<dyn Dir>>;
 }
 
 /// A file open for reading. `Seek` serves a request from an offset (§7.5

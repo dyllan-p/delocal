@@ -14,7 +14,8 @@
 //!
 //! - `op` is one [`Op`]: an [`Fs`](crate::fs::Fs) method, `open_root` for
 //!   [`Folder::open`](crate::fs::Folder::open), or `read`, `write` or `sync`
-//!   on an open file.
+//!   on an open file. A call through a held [`Dir`](crate::fs::Dir) is the
+//!   `Fs` method of the same name, on the entry's whole path.
 //! - `path` is a [`Pattern`](super::pattern::Pattern) over the path,
 //!   relative to the folder root as the [`Fs`](crate::fs::Fs) takes it; the
 //!   root itself is the empty path, which `open_root` always has and the
@@ -71,6 +72,9 @@ pub enum Op {
     /// [`Folder::open`](crate::fs::Folder::open), at the start of each
     /// operation.
     OpenRoot,
+    /// [`Fs::open_dir`](crate::fs::Fs::open_dir), and
+    /// [`Dir::open_dir`](crate::fs::Dir::open_dir) on a child's whole path.
+    OpenDir,
     ReadDir,
     Lstat,
     ReadLink,
@@ -269,6 +273,7 @@ mod tests {
     fn every_op_has_its_snake_case_name() {
         let names = [
             (Op::OpenRoot, "open_root"),
+            (Op::OpenDir, "open_dir"),
             (Op::ReadDir, "read_dir"),
             (Op::Lstat, "lstat"),
             (Op::ReadLink, "read_link"),

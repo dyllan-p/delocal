@@ -20,14 +20,22 @@
 //! When several rules fire on one call, of either kind, the first in the
 //! spec decides the fault. A call no rule fires on but that would cross an
 //! offset rule's byte moves only the bytes before the nearest such byte.
+//!
+//! **Every call, however it is reached.** A [`Dir`] from
+//! [`open_dir`](Fs::open_dir) is wrapped too, and its calls are checked
+//! against the same rules as the [`Fs`] call of the same name, under the
+//! entry's whole path: a rule for `lstat` on `**/private/*` fires on
+//! `Fs::lstat("a/private/x")` and on `lstat("x")` through the held `a/private`
+//! alike, and counts both. So a scan that walks with held directories
+//! (§7.3) meets exactly the faults a spec written in paths describes.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use super::{Folder, Fs, ReadFile, Stat, WriteFile};
+use super::{Dir, Folder, Fs, ReadFile, Stat, WriteFile};
 
 pub mod pattern;
 pub mod spec;
@@ -222,6 +230,15 @@ impl Fs for FaultyFs {
         self.inner.read_dir(dir)
     }
 
+    fn open_dir(&self, path: &Path) -> io::Result<Box<dyn Dir>> {
+        self.check(Op::OpenDir, &[path])?;
+        Ok(Box::new(FaultyDir {
+            inner: self.inner.open_dir(path)?,
+            path: path.to_path_buf(),
+            rules: Arc::clone(&self.rules),
+        }))
+    }
+
     fn lstat(&self, path: &Path) -> io::Result<Stat> {
         self.check(Op::Lstat, &[path])?;
         self.inner.lstat(path)
@@ -321,7 +338,54 @@ impl Fs for FaultyFs {
     }
 }
 
-/// A file from [`FaultyFs::open_read`].
+/// A directory from [`FaultyFs::open_dir`] or [`FaultyDir::open_dir`]. Its
+/// calls are checked under the entry's whole path (see the module docs).
+struct FaultyDir {
+    inner: Box<dyn Dir>,
+    /// The directory's path, relative to the folder root.
+    path: PathBuf,
+    rules: Arc<Rules>,
+}
+
+impl Dir for FaultyDir {
+    fn read_dir(&self) -> io::Result<Vec<OsString>> {
+        self.rules.fail(Op::ReadDir, &[&self.path])?;
+        self.inner.read_dir()
+    }
+
+    fn lstat(&self, name: &OsStr) -> io::Result<Stat> {
+        self.rules.fail(Op::Lstat, &[&self.path.join(name)])?;
+        self.inner.lstat(name)
+    }
+
+    fn read_link(&self, name: &OsStr) -> io::Result<PathBuf> {
+        self.rules.fail(Op::ReadLink, &[&self.path.join(name)])?;
+        self.inner.read_link(name)
+    }
+
+    fn open_read(&self, name: &OsStr) -> io::Result<Box<dyn ReadFile>> {
+        let path = self.path.join(name);
+        self.rules.fail(Op::OpenRead, &[&path])?;
+        Ok(Box::new(FaultyRead {
+            inner: self.inner.open_read(name)?,
+            path,
+            pos: 0,
+            rules: Arc::clone(&self.rules),
+        }))
+    }
+
+    fn open_dir(&self, name: &OsStr) -> io::Result<Box<dyn Dir>> {
+        let path = self.path.join(name);
+        self.rules.fail(Op::OpenDir, &[&path])?;
+        Ok(Box::new(FaultyDir {
+            inner: self.inner.open_dir(name)?,
+            path,
+            rules: Arc::clone(&self.rules),
+        }))
+    }
+}
+
+/// A file from [`FaultyFs::open_read`] or [`FaultyDir::open_read`].
 struct FaultyRead {
     inner: Box<dyn ReadFile>,
     path: PathBuf,
@@ -727,6 +791,67 @@ mod tests {
             [
                 injected(0, Op::OpenRoot, "", Fault::Eacces),
                 injected(1, Op::Lstat, "a", Fault::Eio),
+            ]
+        );
+    }
+
+    /// A held directory's calls meet the rules written for whole paths, and
+    /// are counted with the calls made by path.
+    #[test]
+    fn rules_reach_a_held_directory_by_whole_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("a/private/sub")).unwrap();
+        std::fs::write(root.join("a/private/x"), "xyz").unwrap();
+        std::os::unix::fs::symlink("x", root.join("a/private/l")).unwrap();
+        let fs = faulty(
+            root,
+            vec![
+                rule(Op::Lstat, "**/private/*", Trigger::Call(2), Fault::Eio),
+                rule(Op::ReadLink, "a/private/l", Trigger::Call(1), Fault::Eacces),
+                rule(Op::OpenRead, "a/private/x", Trigger::Call(1), Fault::Eio),
+                rule(Op::Read, "a/private/x", Trigger::Offset(1), Fault::Eio),
+                rule(Op::ReadDir, "a/private", Trigger::Call(1), Fault::Eio),
+                rule(
+                    Op::OpenDir,
+                    "a/private/sub",
+                    Trigger::Call(1),
+                    Fault::Eacces,
+                ),
+                rule(Op::OpenDir, "a", Trigger::Call(2), Fault::Eio),
+            ],
+        );
+        let name = std::ffi::OsStr::new;
+
+        fs.lstat(p("a/private/x")).unwrap();
+        let a = fs.open_dir(p("a")).unwrap();
+        let private = a.open_dir(name("private")).unwrap();
+        // The second lstat under `private`, the first by path.
+        assert_eq!(errno(private.lstat(name("x"))), Some(5));
+        private.lstat(name("x")).unwrap();
+        assert_eq!(errno(private.read_link(name("l"))), Some(13));
+        assert_eq!(private.read_link(name("l")).unwrap(), p("x"));
+        assert_eq!(errno(private.open_read(name("x"))), Some(5));
+        let mut file = private.open_read(name("x")).unwrap();
+        let mut bytes = Vec::new();
+        assert_eq!(errno(file.read_to_end(&mut bytes)), Some(5));
+        assert_eq!(bytes, b"x", "the offset rule counts from the file's start");
+        assert_eq!(errno(private.read_dir()), Some(5));
+        assert_eq!(private.read_dir().unwrap(), ["l", "sub", "x"]);
+        assert_eq!(errno(private.open_dir(name("sub"))), Some(13));
+        private.open_dir(name("sub")).unwrap();
+        assert_eq!(errno(fs.open_dir(p("a"))), Some(5));
+
+        assert_eq!(
+            fs.injected(),
+            [
+                injected(0, Op::Lstat, "a/private/x", Fault::Eio),
+                injected(1, Op::ReadLink, "a/private/l", Fault::Eacces),
+                injected(2, Op::OpenRead, "a/private/x", Fault::Eio),
+                injected(3, Op::Read, "a/private/x", Fault::Eio),
+                injected(4, Op::ReadDir, "a/private", Fault::Eio),
+                injected(5, Op::OpenDir, "a/private/sub", Fault::Eacces),
+                injected(6, Op::OpenDir, "a", Fault::Eio),
             ]
         );
     }

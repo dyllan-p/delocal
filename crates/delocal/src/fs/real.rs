@@ -21,6 +21,13 @@
 //! cannot refuse a symlink (§7.3); a file its owner made unreadable
 //! therefore cannot have its mode set.
 //!
+//! [`Fs::open_dir`] gives a `RealDir`, which holds a directory's descriptor
+//! and makes the same calls relative to it, one name at a time, so a scan
+//! opens each directory once (§7.3). The root's comes from `fcntl` with
+//! `F_DUPFD_CLOEXEC`, a second descriptor for what the operation already
+//! holds, and listing a `RealDir` reads from another such duplicate, so
+//! reading its entries moves no position the other calls depend on.
+//!
 //! The system calls come from `rustix` (Appendix A), which wraps them
 //! safely; `std` has no directory-relative calls at all. A walk costs one
 //! `openat` per parent, a few microseconds each.
@@ -31,12 +38,13 @@ use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
-use rustix::fs::{AtFlags, Dir, Mode, OFlags, Timespec, Timestamps};
+use rustix::fs::{AtFlags, Mode, OFlags, Timespec, Timestamps};
 use rustix::io::Errno;
 
 use super::{
-    FileKind, Folder, Fs, NoReplaceUnsupported, NotAFile, ParentNotADirectory, ReadFile, Stat,
+    Dir, FileKind, Folder, Fs, NoReplaceUnsupported, NotAFile, ParentNotADirectory, ReadFile, Stat,
     WriteFile,
 };
 
@@ -139,57 +147,126 @@ impl RealFs {
         dir.as_ref().map_or(self.root.as_fd(), AsFd::as_fd)
     }
 
-    /// Open the last component of `path` with `flags`, never following a
-    /// symlink or waiting on a FIFO, and return the descriptor with what it
-    /// is. What the open refuses outright is [`NotAFile`] when it is not a
-    /// file.
+    /// Open the last component of `path` with `flags`: see [`open_entry`].
     fn open_entry(&self, path: &Path, flags: OFlags) -> io::Result<(OwnedFd, FileKind)> {
         let (dir, name) = self.entry(path)?;
-        let at = self.at(&dir);
-        let flags = flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-        match rustix::fs::openat(at, name, flags, Mode::empty()) {
-            Ok(fd) => {
-                let kind = kind(&rustix::fs::fstat(&fd)?);
-                Ok((fd, kind))
-            }
-            // Refused without following or waiting: a symlink (ELOOP under
-            // O_NOFOLLOW), a directory opened for writing (EISDIR), a FIFO
-            // opened for writing with no reader, or a socket (ENXIO, or
-            // EOPNOTSUPP for a socket on macOS). Say what is there instead.
-            Err(e @ (Errno::LOOP | Errno::ISDIR | Errno::NXIO | Errno::OPNOTSUPP)) => {
-                match kind(&rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?) {
-                    FileKind::File => Err(e.into()),
-                    kind => Err(NotAFile { kind }.into()),
-                }
-            }
-            Err(e) => Err(e.into()),
-        }
+        open_entry(self.at(&dir), name, flags)
     }
 
-    /// Open the file at `path` with `flags`: anything else is [`NotAFile`].
-    /// The descriptor keeps `O_NONBLOCK`, which changes nothing about reading
-    /// or writing a file. At the open it does one thing more on Linux: a file
-    /// under a conflicting lease (a Samba or NFS server's) fails with
-    /// `EWOULDBLOCK` instead of waiting for the lease to break, an I/O error
-    /// the caller retries.
+    /// Open the file at `path` with `flags`: see [`open_file`].
     fn open_file(&self, path: &Path, flags: OFlags) -> io::Result<File> {
-        match self.open_entry(path, flags)? {
-            (fd, FileKind::File) => Ok(File::from(fd)),
-            (_, kind) => Err(NotAFile { kind }.into()),
-        }
+        let (dir, name) = self.entry(path)?;
+        open_file(self.at(&dir), name, flags)
     }
 
     /// Open the directory at `path` without following a symlink there:
     /// anything but a directory is `NotADirectory`.
-    fn open_dir(&self, path: &Path) -> io::Result<OwnedFd> {
+    fn dir_fd(&self, path: &Path) -> io::Result<OwnedFd> {
         let (dir, name) = self.walk(path)?;
-        let name = name.unwrap_or(OsStr::new("."));
-        match rustix::fs::openat(self.at(&dir), name, DIR_FLAGS, Mode::empty()) {
-            Ok(fd) => Ok(fd),
-            Err(Errno::NOTDIR | Errno::LOOP) => Err(Errno::NOTDIR.into()),
-            Err(e) => Err(e.into()),
+        open_dir(self.at(&dir), name.unwrap_or(OsStr::new(".")))
+    }
+}
+
+/// A directory held open within one operation: see [`Dir`].
+#[derive(Debug)]
+struct RealDir {
+    fd: OwnedFd,
+    /// Listing reads through a duplicate of `fd`, which shares its position
+    /// in the directory's entries. Two listings at once would read each
+    /// other's entries, so they take turns.
+    listing: Mutex<()>,
+}
+
+impl RealDir {
+    fn new(fd: OwnedFd) -> Self {
+        Self {
+            fd,
+            listing: Mutex::new(()),
         }
     }
+}
+
+/// `name`, if it is one component: a name in a directory, not a path.
+fn one_component(name: &OsStr) -> io::Result<&OsStr> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a name in a directory", name.display()),
+        ));
+    }
+    Ok(name)
+}
+
+/// Open `name` in the directory `at` with `flags`, never following a
+/// symlink or waiting on a FIFO, and return the descriptor with what it is.
+/// What the open refuses outright is [`NotAFile`] when it is not a file.
+fn open_entry(at: BorrowedFd<'_>, name: &OsStr, flags: OFlags) -> io::Result<(OwnedFd, FileKind)> {
+    let flags = flags | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    match rustix::fs::openat(at, name, flags, Mode::empty()) {
+        Ok(fd) => {
+            let kind = kind(&rustix::fs::fstat(&fd)?);
+            Ok((fd, kind))
+        }
+        // Refused without following or waiting: a symlink (ELOOP under
+        // O_NOFOLLOW), a directory opened for writing (EISDIR), a FIFO
+        // opened for writing with no reader, or a socket (ENXIO, or
+        // EOPNOTSUPP for a socket on macOS). Say what is there instead.
+        Err(e @ (Errno::LOOP | Errno::ISDIR | Errno::NXIO | Errno::OPNOTSUPP)) => {
+            match kind(&rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW)?) {
+                FileKind::File => Err(e.into()),
+                kind => Err(NotAFile { kind }.into()),
+            }
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Open the file `name` in the directory `at` with `flags`: anything else
+/// is [`NotAFile`]. The descriptor keeps `O_NONBLOCK`, which changes nothing
+/// about reading or writing a file. At the open it does one thing more on
+/// Linux: a file under a conflicting lease (a Samba or NFS server's) fails
+/// with `EWOULDBLOCK` instead of waiting for the lease to break, an I/O
+/// error the caller retries.
+fn open_file(at: BorrowedFd<'_>, name: &OsStr, flags: OFlags) -> io::Result<File> {
+    match open_entry(at, name, flags)? {
+        (fd, FileKind::File) => Ok(File::from(fd)),
+        (_, kind) => Err(NotAFile { kind }.into()),
+    }
+}
+
+/// Open the directory `name` in the directory `at` without following a
+/// symlink there: anything but a directory is `NotADirectory`.
+fn open_dir(at: BorrowedFd<'_>, name: &OsStr) -> io::Result<OwnedFd> {
+    match rustix::fs::openat(at, name, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => Ok(fd),
+        Err(Errno::NOTDIR | Errno::LOOP) => Err(Errno::NOTDIR.into()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A second descriptor for what `fd` has open, closed on exec like every
+/// descriptor here.
+fn duplicate(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    Ok(rustix::io::fcntl_dupfd_cloexec(fd, 0)?)
+}
+
+/// The names in the directory `fd` has open, from its first entry, without
+/// `.` and `..`, sorted by bytes. Takes the descriptor it reads through.
+fn list(fd: OwnedFd) -> io::Result<Vec<OsString>> {
+    let mut dir = rustix::fs::Dir::new(fd)?;
+    // A duplicate starts wherever the last listing through its original
+    // stopped.
+    dir.rewind();
+    let mut names = Vec::new();
+    for entry in dir {
+        let name = entry?.file_name().to_bytes().to_vec();
+        if name != b"." && name != b".." {
+            names.push(OsString::from_vec(name));
+        }
+    }
+    names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    Ok(names)
 }
 
 /// The components of `path`: names only, with `.` dropped, empty for the
@@ -226,17 +303,49 @@ impl WriteFile for File {
     }
 }
 
+impl Dir for RealDir {
+    fn read_dir(&self) -> io::Result<Vec<OsString>> {
+        let _turn = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
+        list(duplicate(self.fd.as_fd())?)
+    }
+
+    fn lstat(&self, name: &OsStr) -> io::Result<Stat> {
+        let flags = AtFlags::SYMLINK_NOFOLLOW;
+        Ok(stat(&rustix::fs::statat(
+            &self.fd,
+            one_component(name)?,
+            flags,
+        )?))
+    }
+
+    fn read_link(&self, name: &OsStr) -> io::Result<PathBuf> {
+        let target = rustix::fs::readlinkat(&self.fd, one_component(name)?, Vec::new())?;
+        Ok(PathBuf::from(OsString::from_vec(target.into_bytes())))
+    }
+
+    fn open_read(&self, name: &OsStr) -> io::Result<Box<dyn ReadFile>> {
+        let file = open_file(self.fd.as_fd(), one_component(name)?, OFlags::RDONLY)?;
+        Ok(Box::new(file))
+    }
+
+    fn open_dir(&self, name: &OsStr) -> io::Result<Box<dyn Dir>> {
+        let fd = open_dir(self.fd.as_fd(), one_component(name)?)?;
+        Ok(Box::new(Self::new(fd)))
+    }
+}
+
 impl Fs for RealFs {
     fn read_dir(&self, dir: &Path) -> io::Result<Vec<OsString>> {
-        let mut names = Vec::new();
-        for entry in Dir::new(self.open_dir(dir)?)? {
-            let name = entry?.file_name().to_bytes().to_vec();
-            if name != b"." && name != b".." {
-                names.push(OsString::from_vec(name));
-            }
-        }
-        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        Ok(names)
+        list(self.dir_fd(dir)?)
+    }
+
+    fn open_dir(&self, path: &Path) -> io::Result<Box<dyn Dir>> {
+        let fd = if components(path)?.is_empty() {
+            duplicate(self.root.as_fd())?
+        } else {
+            self.dir_fd(path)?
+        };
+        Ok(Box::new(RealDir::new(fd)))
     }
 
     fn lstat(&self, path: &Path) -> io::Result<Stat> {
@@ -276,7 +385,7 @@ impl Fs for RealFs {
 
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         // Through `File` for its `F_FULLFSYNC` on macOS, as `WriteFile::sync`.
-        File::from(self.open_dir(path)?).sync_all()
+        File::from(self.dir_fd(path)?).sync_all()
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -368,7 +477,7 @@ impl Fs for RealFs {
     }
 
     fn available_space(&self, path: &Path) -> io::Result<u64> {
-        let vfs = rustix::fs::fstatvfs(self.open_dir(path)?)?;
+        let vfs = rustix::fs::fstatvfs(self.dir_fd(path)?)?;
         // POSIX counts `f_bavail` in units of `f_frsize`, not `f_bsize`.
         Ok(vfs.f_bavail.saturating_mul(vfs.f_frsize))
     }
