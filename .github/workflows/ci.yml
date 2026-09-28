@@ -65,14 +65,14 @@ jobs:
       # of these crates appear, the boundary is in the wrong place. Each
       # I/O crate of Appendix A joins the list no later than the PR that
       # brings it into the workspace: filetime, rustix and tempfile touch
-      # the filesystem, and Appendix A gives unicode-normalization to the
-      # binary crate only.
+      # the filesystem, as ignore and the walkdir it wraps do, and Appendix
+      # A gives unicode-normalization to the binary crate only.
       - name: Engine boundary (dependencies)
         run: |
           set -euo pipefail
           tree="$(cargo tree -p delocal-engine -e normal --locked)"
           echo "$tree"
-          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio|rand|filetime|rustix|tempfile|unicode-normalization'; then
+          if echo "$tree" | grep -E 'tokio|notify|rusqlite|reqwest|hyper|mio|rand|filetime|rustix|tempfile|unicode-normalization|ignore|walkdir'; then
             echo "::error::delocal-engine depends on an I/O or randomness crate (see CLAUDE.md, crate boundary)"
             exit 1
           fi
