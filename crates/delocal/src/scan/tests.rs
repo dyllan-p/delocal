@@ -128,6 +128,23 @@ fn scan_at(
         hashers: NonZeroUsize::new(hashers).unwrap(),
     }
     .run(&mut |event| events.push(event));
+    // Every path skipped as unstable is listed for the host to observe
+    // again, in the order it was reported, and nothing else is.
+    let unstable: Vec<RelPath> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Scanned {
+                path,
+                state:
+                    ScanState::Skipped {
+                        reason: SkipReason::Unstable,
+                    },
+                ..
+            } => Some(path.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(report.unstable, unstable);
     (events, report)
 }
 
@@ -740,6 +757,7 @@ fn a_file_is_hashed_once_its_change_time_has_settled_whatever_its_mtime() {
         ]
     );
     assert_eq!(report.skipped, BTreeMap::from([(SkipReason::Unstable, 1)]));
+    assert_eq!(report.unstable, [p("fresh")], "to be observed again");
     let opened = spy.calls("dir.open_read");
     assert_eq!(
         opened,
@@ -811,8 +829,9 @@ fn a_file_changed_while_it_is_hashed_is_unstable() {
         let spy = Spy::new(disk.root());
         let path = disk.at("big");
         spy.meddle("big", move || change(&path));
-        let (events, _) = scan(&spy, &index(&engine));
+        let (events, report) = scan(&spy, &index(&engine));
         assert!(spy.meddled(), "{name}: the change was made mid-hash");
+        assert_eq!(report.unstable, [p("big")], "{name}: to be observed again");
         let found: Vec<ScanState> = reports(&events)
             .into_iter()
             .filter(|(p, _)| p.as_str() == "big")

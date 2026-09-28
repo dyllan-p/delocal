@@ -62,7 +62,8 @@
 //!
 //! **What the host keeps** of a scan is its [`ScanReport`]: the names on
 //! disk, the unobservable names, the skips by reason, and the rules left out
-//! of `.delocalignore`, all for `status` and the store.
+//! of `.delocalignore`, all for `status` and the store; and the unstable
+//! paths, which the host observes again once 2 s have passed (§7.3).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -164,7 +165,11 @@ pub struct Scan<'a> {
 }
 
 /// What a scan found, besides its events: what the host keeps for `status`
-/// and the store.
+/// and the store, and the paths it must look at again soon. Every path the
+/// scan reported `Skipped { Unstable }` is in [`unstable`](Self::unstable),
+/// and §7.3 has the host observe each of them again once
+/// [`hash::SETTLE_NANOS`] have passed, without waiting for a watcher event
+/// or the next scan. Scheduling that is the daemon's job, not the scan's.
 #[derive(Debug, Default)]
 pub struct ScanReport {
     /// Why the scan ended with `ScanAborted`, if it did.
@@ -177,6 +182,11 @@ pub struct ScanReport {
     pub unobservable: Vec<(PathBuf, Unobservable)>,
     /// The paths reported `Skipped`, counted by reason (§7.3).
     pub skipped: BTreeMap<SkipReason, u64>,
+    /// Every path reported `Skipped { Unstable }`, in the order reported: a
+    /// file that changed within the last 2 s, or while it was hashed, or an
+    /// entry that became something else while the scan looked at it. The
+    /// host observes each again 2 s from now (§7.3; see above).
+    pub unstable: Vec<RelPath>,
     /// The lines of `.delocalignore` that were left out.
     pub invalid_rules: Vec<InvalidRule>,
 }
@@ -203,7 +213,9 @@ pub enum Abort {
 type Found = Option<(RelPath, ScanState)>;
 
 impl Scan<'_> {
-    /// Scan the folder, handing each event to `emit` as it is ready.
+    /// Scan the folder, handing each event to `emit` as it is ready. The
+    /// report lists, among the rest, the unstable paths to observe again
+    /// after 2 s (see [`ScanReport`]).
     pub fn run(&self, emit: &mut dyn FnMut(Event)) -> ScanReport {
         let folder = self.id;
         let mut report = ScanReport::default();
@@ -238,6 +250,7 @@ impl Scan<'_> {
                     folder: self.id,
                     emit,
                     skipped: &mut report.skipped,
+                    unstable: &mut report.unstable,
                 },
             };
             walker.walk(root, names);
@@ -286,6 +299,7 @@ struct Out<'a, 'e> {
     folder: FolderId,
     emit: &'e mut dyn FnMut(Event),
     skipped: &'a mut BTreeMap<SkipReason, u64>,
+    unstable: &'a mut Vec<RelPath>,
 }
 
 impl Out<'_, '_> {
@@ -297,6 +311,9 @@ impl Out<'_, '_> {
         };
         if let ScanState::Skipped { reason } = state {
             *self.skipped.entry(reason).or_default() += 1;
+            if reason == SkipReason::Unstable {
+                self.unstable.push(path.clone());
+            }
         }
         (self.emit)(Event::Scanned {
             folder: self.folder,
