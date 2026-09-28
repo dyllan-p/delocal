@@ -6,6 +6,8 @@
 //!
 //! - [`fs`]: the filesystem layer, every operation on a folder (§14.2)
 //! - [`names`]: names on disk and the index paths they map to (§7.1, §7.3)
+//! - [`scan`]: the full scan, its fast path, hashing, ignore rules and root
+//!   guard (§7.3)
 //! - [`store`]: the SQLite database, the persisted parts and the host's
 //!   tables (§11, §8.5)
 
@@ -14,4 +16,5 @@
 
 pub mod fs;
 pub mod names;
+pub mod scan;
 pub mod store;
