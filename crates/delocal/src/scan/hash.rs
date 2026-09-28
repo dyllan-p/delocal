@@ -8,10 +8,12 @@
 //!
 //! **Unchanged while hashed.** After the last byte the file is stated again
 //! by name, through the directory the walk held, and the hash counts only if
-//! nothing `lstat` reports has changed (kind, size, mtime, mode, device and
-//! inode) and exactly as many bytes were read as the size said. A write
-//! during hashing moves the mtime, and usually the size; a rename that
-//! swaps in another file with the same size and mtime changes the inode. A
+//! nothing `lstat` reports has changed (kind, size, mtime, change time,
+//! mode, device and inode) and exactly as many bytes were read as the size
+//! said. A write during hashing moves the mtime, and usually the size; one
+//! whose writer put the mtime back still moved the change time; a rename
+//! that swaps in another file with the same size and mtime changes the
+//! inode. A
 //! file that changed is [`Hashed::Unstable`], and its hash is thrown away:
 //! a torn hash would announce content that never existed. So is a file that
 //! was something else by the time it was opened (a symlink, a FIFO, a
@@ -157,12 +159,16 @@ mod tests {
         let unstable =
             |before: &Stat| matches!(hash_file(&*root, name("f"), before), Hashed::Unstable);
         assert!(!unstable(&before));
-        // Anything the re-stat can see: a later mtime, another size (with
-        // as many bytes read as the old one said), another mode, another
-        // inode (a rename swapped a file in).
+        // Anything the re-stat can see: a later mtime or change time,
+        // another size (with as many bytes read as the old one said),
+        // another mode, another inode (a rename swapped a file in).
         let changed = [
             Stat {
                 mtime_ns: before.mtime_ns - 1,
+                ..before
+            },
+            Stat {
+                ctime_ns: before.ctime_ns - 1,
                 ..before
             },
             Stat {

@@ -492,6 +492,7 @@ fn stat(st: &rustix::fs::Stat) -> Stat {
         kind: kind(st),
         size: to_u64(st.st_size),
         mtime_ns: mtime_ns(to_i64(st.st_mtime), to_i64(st.st_mtime_nsec)),
+        ctime_ns: mtime_ns(to_i64(st.st_ctime), to_i64(st.st_ctime_nsec)),
         mode: to_u32(st.st_mode) & 0o7777,
         dev: device(st.st_dev),
         ino: to_u64(st.st_ino),
