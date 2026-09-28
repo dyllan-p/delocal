@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 delocal-engine.workspace = true
+blake3.workspace = true
 ignore.workspace = true
 rusqlite.workspace = true
 rustix.workspace = true
