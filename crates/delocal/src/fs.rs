@@ -253,6 +253,11 @@ pub struct Stat {
     /// Nanoseconds since the Unix epoch. Saturates at the ends of `i64`,
     /// about the years 1677 and 2262.
     pub mtime_ns: i64,
+    /// When the inode last changed, in the same units. No call can set it:
+    /// every write moves it, and so does setting the mtime, so a file
+    /// written while it was hashed and its mtime then put back is still
+    /// seen to have changed (§7.3).
+    pub ctime_ns: i64,
     /// The permission bits (`st_mode & 0o7777`).
     pub mode: u32,
     /// The device that holds the entry. A directory on another device than
