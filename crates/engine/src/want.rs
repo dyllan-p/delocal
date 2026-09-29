@@ -80,9 +80,9 @@ impl Tier {
 
 /// Where a want is in its life (§7.5).
 ///
-/// `Deferred` and `LocalRetry` are the reasons §7.5 gives for a want to be
-/// *deferred*. The second came later and is listed last, so that the
-/// encoding of every earlier state is unchanged.
+/// `Deferred`, `LocalRetry` and `DiskFull` are the reasons §7.5 gives for a
+/// want to be *deferred*. The last two came later and are listed last, so
+/// that the encoding of every earlier state is unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WantState {
     /// Ready to fetch (or, with content in hand, to commit) as soon as a
@@ -115,6 +115,10 @@ pub enum WantState {
     /// the backoff is classified as usual rather than ignored for up to an
     /// hour.
     LocalRetry { until: Timestamp },
+    /// Deferred with reason `disk full` (§7.5 "local failures"): a commit or
+    /// fetch in this folder found the disk full, and the folder's inbound
+    /// is paused until the host reports space recovered.
+    DiskFull,
 }
 
 impl WantState {
@@ -689,9 +693,53 @@ impl WantList {
                     until: now.plus_nanos(exclusion_backoff(want.local_retries)),
                 }
             }
+            LocalError::DiskFull => WantState::DiskFull,
         };
         self.note(path);
         self.wants.get(path)
+    }
+
+    /// The folder's inbound paused on a full disk (§7.5 "local failures"):
+    /// every want that could start a fetch or a commit is deferred with
+    /// reason `disk full`. A fetch or commit the host is performing keeps
+    /// its state until the host reports it, since a commit holds its path
+    /// until then; a want waiting on something else (a give-up, a local
+    /// retry) keeps waiting on that, and is deferred for the disk as soon
+    /// as it could start. Called before every dispatch while paused, so no
+    /// want starts until space is recovered.
+    pub fn pause_inbound(&mut self) {
+        let paths: Vec<RelPath> = self
+            .wants
+            .iter()
+            .filter(|(_, w)| {
+                matches!(
+                    w.state,
+                    WantState::Wanted
+                        | WantState::Blocked
+                        | WantState::Deferred { .. }
+                        | WantState::NoSource
+                )
+            })
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in paths {
+            self.set_state(&path, WantState::DiskFull);
+        }
+    }
+
+    /// The host reported space recovered (§7.5): every want deferred for
+    /// the disk is wanted again, and the next dispatch finds each one's
+    /// source, tier and ordering afresh.
+    pub fn resume_inbound(&mut self) {
+        let paths: Vec<RelPath> = self
+            .wants
+            .iter()
+            .filter(|(_, w)| w.state == WantState::DiskFull)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in paths {
+            self.set_state(&path, WantState::Wanted);
+        }
     }
 
     /// The host reported bytes arriving: push the stall deadline out.
@@ -1011,8 +1059,12 @@ pub enum FetchReport {
 /// failures"). Whatever the error, the host left the disk as it found it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LocalError {
-    /// An I/O error. The want is tried again after a local backoff.
+    /// An I/O error other than a full disk. The want is tried again after a
+    /// local backoff.
     Io,
+    /// The disk is full. The folder's inbound pauses until the host reports
+    /// that space has been recovered.
+    DiskFull,
 }
 
 /// What [`WantList::expire`] found: fetches that stalled and are wanted
@@ -1602,6 +1654,9 @@ mod tests {
             FetchReport::HashMismatch,
             FetchReport::Failed {
                 error: LocalError::Io,
+            },
+            FetchReport::Failed {
+                error: LocalError::DiskFull,
             },
         ];
         for late in reports.clone() {

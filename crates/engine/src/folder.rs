@@ -425,8 +425,14 @@ pub enum FolderStatus {
     /// process restarts.
     CommitOverdue { path: RelPath },
     /// A commit or fetch at `path` failed on this machine (§7.5 "local
-    /// failures"): `Io` is tried again after a backoff.
+    /// failures"): `Io` is tried again after a backoff, and `DiskFull`
+    /// pauses the folder's inbound.
     LocalFailure { path: RelPath, error: LocalError },
+    /// A full disk paused the folder's inbound (§7.5): nothing is fetched
+    /// or committed until the host reports space recovered.
+    InboundPaused,
+    /// The host reported space recovered: the folder's wants resume.
+    InboundResumed,
 }
 
 /// An open batch window (§7.4).
@@ -643,6 +649,11 @@ pub struct FolderState {
     /// True from a restart until a full scan finishes: until then the index
     /// may not know every file on disk (§8.3, §13).
     startup_scan: bool,
+    /// True while a full disk pauses the folder's inbound (§7.5 "local
+    /// failures"): from the first `DiskFull` reported by a fetch or commit
+    /// a want waited for, until the host reports space recovered. Nothing
+    /// is fetched or committed meanwhile.
+    disk_full: bool,
     /// Statuses raised outside a direct call's return value (a hold made
     /// while admitting re-classified entries); the engine drains them.
     #[serde(skip)]
@@ -686,6 +697,7 @@ impl FolderState {
             paused: None,
             queued: Vec::new(),
             startup_scan: false,
+            disk_full: false,
             statuses: Vec::new(),
         }
     }
@@ -722,6 +734,7 @@ impl FolderState {
             paused: rest.paused,
             queued: rest.queued,
             startup_scan: false,
+            disk_full: rest.disk_full,
             statuses: Vec::new(),
         }
     }
@@ -776,6 +789,7 @@ impl FolderState {
             paused,
             queued,
             startup_scan,
+            disk_full,
             statuses,
         } = self;
         differs("id", *id == other.id)
@@ -798,6 +812,7 @@ impl FolderState {
             .or_else(|| differs("paused", *paused == other.paused))
             .or_else(|| differs("queued", *queued == other.queued))
             .or_else(|| differs("startup_scan", *startup_scan == other.startup_scan))
+            .or_else(|| differs("disk_full", *disk_full == other.disk_full))
             .or_else(|| differs("statuses", *statuses == other.statuses))
     }
 
@@ -885,6 +900,7 @@ impl FolderState {
             queued: self.queued.clone(),
             arrivals: self.quarantine.arrivals(),
             winner_fallbacks: self.winner_fallbacks,
+            disk_full: self.disk_full,
         }
     }
 
@@ -930,6 +946,13 @@ impl FolderState {
     /// True from a restart until a full scan finishes (§8.3).
     pub fn startup_scan_pending(&self) -> bool {
         self.startup_scan
+    }
+
+    /// True while a full disk pauses the folder's inbound (§7.5): the host
+    /// checks for free space every 30 s while this holds, and reports
+    /// `SpaceRecovered` once there is some.
+    pub fn disk_full(&self) -> bool {
+        self.disk_full
     }
 
     /// True if the path's want is in a short-lived state (§7.5).
@@ -2110,7 +2133,8 @@ impl FolderState {
     ) -> Fetched {
         if let FetchReport::Failed { error } = report {
             // A failure of a fetch the want does not wait for is ignored like
-            // any such report.
+            // any such report, a full disk included: the next operation to
+            // find the disk full says so for itself.
             let state = self
                 .wants
                 .fetch_failed(now, path, version, &error)
@@ -2162,15 +2186,32 @@ impl FolderState {
 
     /// The fetch or commit the want at `path` waited for failed on this
     /// machine (§7.5 "local failures"), and the want-list has released it
-    /// under the rule for its error. `status` hears of the failure, and
-    /// entries that waited for the report are classified against the
-    /// record as the failure leaves it, which is as it was.
+    /// under the rule for its error. A full disk pauses the folder's
+    /// inbound; `status` hears of the failure; and entries that waited for
+    /// the report are classified against the record as the failure leaves
+    /// it, which is as it was.
     fn failed(&mut self, now: Timestamp, path: &RelPath, error: LocalError) {
+        if error == LocalError::DiskFull && !self.disk_full {
+            self.disk_full = true;
+            self.statuses.push(FolderStatus::InboundPaused);
+        }
         self.statuses.push(FolderStatus::LocalFailure {
             path: path.clone(),
             error,
         });
         self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+    }
+
+    /// The host found free space again after a full disk (§7.5): the
+    /// folder's inbound resumes, and every want deferred for the disk is
+    /// wanted again. `None` if the inbound was not paused.
+    pub fn space_recovered(&mut self) -> Option<FolderStatus> {
+        if !self.disk_full {
+            return None;
+        }
+        self.disk_full = false;
+        self.wants.resume_inbound();
+        Some(FolderStatus::InboundResumed)
     }
 
     /// The host reported bytes arriving for a fetch (§7.5).
@@ -2210,6 +2251,12 @@ impl FolderState {
         now: Timestamp,
         peers: &BTreeMap<NodeId, Tier>,
     ) -> (Vec<HostStep>, Vec<IndexRecord>) {
+        // A full disk pauses everything inbound, index-only adoptions too:
+        // "every want in the folder is deferred" (§7.5).
+        if self.disk_full {
+            self.wants.pause_inbound();
+            return (Vec::new(), Vec::new());
+        }
         let steps = self.wants.dispatch(now, &self.rules, peers);
         let mut host = Vec::new();
         let mut adopted = Vec::new();
@@ -5784,7 +5831,7 @@ mod tests {
     /// it replaces the want.
     #[test]
     fn a_version_that_waited_for_a_failed_commit_is_classified_at_once() {
-        let errors = [LocalError::Io];
+        let errors = [LocalError::DiskFull, LocalError::Io];
         for error in errors {
             let (mut a, mut b) = a_and_b(1, Rules::default());
             a.scanned(t(10.0), p("n"), file(7, 7));
@@ -5813,10 +5860,11 @@ mod tests {
     /// §7.5: a report on a fetch the want no longer waits for (reassigned
     /// after a stall, or already in hand and committing) says nothing about
     /// the want: a commit in flight keeps its path. It is ignored like any
-    /// such report, and `status` hears nothing.
+    /// such report, a full disk included: nothing pauses, and `status`
+    /// hears nothing.
     #[test]
     fn a_failure_of_a_fetch_the_want_no_longer_waits_for_leaves_it_alone() {
-        let errors = [LocalError::Io];
+        let errors = [LocalError::Io, LocalError::DiskFull];
         for error in errors {
             let (_, mut b, _, vn) = committing_n_fetching_m();
             b.take_statuses();
@@ -5828,6 +5876,7 @@ mod tests {
             let n = b.wants().get(&p("n")).unwrap();
             assert!(matches!(n.state, WantState::Committing { .. }), "{error:?}");
             assert!(n.fetched, "{error:?}");
+            assert!(!b.disk_full(), "{error:?}");
             assert!(b.take_statuses().is_empty(), "{error:?}");
         }
     }
@@ -5837,8 +5886,8 @@ mod tests {
     /// whatever it says: a failure too. Here B is committing C's copy of L
     /// at the conflict path when its own commit of W lands and records B's
     /// copy there, which re-classifies the want at the copy path into a
-    /// merge. The released commit then reports an I/O error: nothing backs
-    /// off, and the merge goes ahead.
+    /// merge. The released commit then reports a full disk: the folder's
+    /// inbound does not pause, and the merge goes ahead.
     #[test]
     fn a_released_commits_failure_is_discarded_like_any_report_of_it() {
         let (mut a, mut b) = a_and_b(3, Rules::default());
@@ -5873,12 +5922,12 @@ mod tests {
         assert!(b.wants().held_by_released(&copy_path));
         b.take_statuses();
 
-        let failed = ApplyOutcome::Failed { error: io() };
         assert!(
-            b.applied(t(18.0), &copy_path, &c_copy.version, failed)
+            b.applied(t(18.0), &copy_path, &c_copy.version, disk_full())
                 .is_empty()
         );
-        assert!(b.take_statuses().is_empty(), "discarded");
+        assert!(!b.disk_full(), "discarded: nothing pauses");
+        assert!(b.take_statuses().is_empty());
         assert!(!b.wants().held_by_released(&copy_path));
         let (steps, _) = b.dispatch(t(19.0), &lan(&[1, 3]));
         assert!(
@@ -5909,6 +5958,7 @@ mod tests {
         assert!(n.excluded.is_empty());
         assert!(!n.fetched, "the content is forgotten");
         assert!(!b.in_flight(&p("n")), "a local retry is observable");
+        assert!(!b.disk_full());
         assert_eq!(
             b.take_statuses(),
             [FolderStatus::LocalFailure {
@@ -5987,6 +6037,209 @@ mod tests {
         assert!(want.version().dominates(&vn), "re-derived: {want:?}");
         assert_eq!(want.state, WantState::Wanted);
         assert_eq!(want.local_retries, 0);
+    }
+
+    fn disk_full() -> ApplyOutcome {
+        ApplyOutcome::Failed {
+            error: LocalError::DiskFull,
+        }
+    }
+
+    /// §7.5 "local failures": a commit that finds the disk full pauses the
+    /// folder's inbound. Its want is deferred with reason `disk full`, and
+    /// observable, since the pause can last for days; nothing more is
+    /// fetched or committed, a want that arrives meanwhile included, and
+    /// `status` hears of the failure and of the pause.
+    #[test]
+    fn a_commit_that_finds_the_disk_full_pauses_the_folders_inbound() {
+        let (mut a, mut b, _, vn) = committing_n_fetching_m();
+        assert!(b.applied(t(14.0), &p("n"), &vn, disk_full()).is_empty());
+        assert!(b.disk_full());
+        assert_eq!(b.wants().get(&p("n")).unwrap().state, WantState::DiskFull);
+        assert!(!b.in_flight(&p("n")), "deferred is observable");
+        assert_eq!(
+            b.take_statuses(),
+            [
+                FolderStatus::InboundPaused,
+                FolderStatus::LocalFailure {
+                    path: p("n"),
+                    error: LocalError::DiskFull
+                }
+            ]
+        );
+        a.scanned(t(15.0), p("o"), file(8, 15));
+        let batch = a.form_batches(t(17.0), bid(4)).remove(0);
+        assert_eq!(b.receive(t(17.0), &batch).decision, Decision::Accepted);
+        let (steps, adopted) = b.dispatch(t(17.0), &lan(&[1]));
+        assert!(steps.is_empty() && adopted.is_empty(), "{steps:?}");
+        for path in ["n", "o"] {
+            assert_eq!(
+                b.wants().get(&p(path)).unwrap().state,
+                WantState::DiskFull,
+                "{path}"
+            );
+        }
+    }
+
+    /// §7.5: a full disk defers every want in the folder, the index-only
+    /// ones too: a concurrent directory both sides created is adopted as a
+    /// merge with no host action, and it waits for space like the rest.
+    #[test]
+    fn an_index_only_adoption_waits_for_space_too() {
+        let (mut a, mut b, _, vn) = committing_n_fetching_m();
+        b.applied(t(14.0), &p("n"), &vn, disk_full());
+        a.scanned(t(15.0), p("d"), observed(Kind::Dir, 0, 0, false));
+        b.scanned(t(15.0), p("d"), observed(Kind::Dir, 0, 0, false));
+        let batch = a.form_batches(t(17.0), bid(4)).remove(0);
+        b.receive(t(17.0), &batch);
+        assert_eq!(b.wants().get(&p("d")).unwrap().mode, ApplyMode::IndexOnly);
+        let (steps, adopted) = b.dispatch(t(17.0), &lan(&[1]));
+        assert!(steps.is_empty() && adopted.is_empty());
+        assert_eq!(b.wants().get(&p("d")).unwrap().state, WantState::DiskFull);
+        b.space_recovered();
+        let (_, adopted) = b.dispatch(t(18.0), &lan(&[1]));
+        assert_eq!(adopted.len(), 1, "adopted once there is space");
+    }
+
+    /// §7.5: a commit holds its path until the host reports it, and a
+    /// full disk changes nothing about that. A fetch the host is performing
+    /// when the inbound pauses keeps its state until its report, and is
+    /// then deferred for the disk like every other want; a commit in flight
+    /// that lands is adopted as usual.
+    #[test]
+    fn a_host_operation_in_flight_keeps_its_path_through_a_disk_full_pause() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("m"), file(6, 6));
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        a.scanned(t(10.0), p("o"), file(8, 8));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let v = |b: &FolderState, path: &str| b.wants().get(&p(path)).unwrap().version().clone();
+        let (vm, vn, vo) = (v(&b, "m"), v(&b, "n"), v(&b, "o"));
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("n"), &vn, FetchReport::Ok);
+        b.fetched(t(13.0), &p("o"), &vo, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert_eq!(steps.len(), 2, "n and o commit; m still fetching");
+
+        b.applied(t(14.0), &p("n"), &vn, disk_full());
+        b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(
+            b.wants().get(&p("m")).unwrap().state,
+            WantState::Fetching { .. }
+        ));
+        assert!(matches!(
+            b.wants().get(&p("o")).unwrap().state,
+            WantState::Committing { .. }
+        ));
+        assert_eq!(
+            b.applied(t(15.0), &p("o"), &vo, ApplyOutcome::Ok).len(),
+            1,
+            "o landed and is adopted"
+        );
+        b.fetched(t(15.0), &p("m"), &vm, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1]));
+        assert!(steps.is_empty());
+        let m = b.wants().get(&p("m")).unwrap();
+        assert!(m.fetched, "its content is kept for the commit");
+        assert_eq!(m.state, WantState::DiskFull);
+    }
+
+    /// §7.5: a fetch that finds the disk full pauses the inbound exactly as
+    /// a commit does, and blames no source.
+    #[test]
+    fn a_fetch_that_finds_the_disk_full_pauses_the_inbound_too() {
+        let (_, mut b, vm, _) = committing_n_fetching_m();
+        let sources = b.wants().get(&p("m")).unwrap().sources.clone();
+        b.fetched(
+            t(14.0),
+            &p("m"),
+            &vm,
+            FetchReport::Failed {
+                error: LocalError::DiskFull,
+            },
+        );
+        assert!(b.disk_full());
+        let m = b.wants().get(&p("m")).unwrap();
+        assert_eq!(m.state, WantState::DiskFull);
+        assert_eq!(m.sources, sources);
+        assert!(m.excluded.is_empty());
+        assert!(b.dispatch(t(14.0), &lan(&[1])).0.is_empty());
+    }
+
+    /// §7.5: the inbound stays paused until the host reports space
+    /// recovered, and then every want deferred for the disk is wanted
+    /// again and dispatched afresh. A report of space for a folder that
+    /// was not paused changes nothing.
+    #[test]
+    fn a_disk_full_pause_lasts_until_space_is_recovered() {
+        let (_, mut b, vm, vn) = committing_n_fetching_m();
+        b.applied(t(14.0), &p("n"), &vn, disk_full());
+        b.fetched(t(14.0), &p("m"), &vm, FetchReport::Ok);
+        b.expire(t(4000.0));
+        assert!(
+            b.dispatch(t(4000.0), &lan(&[1])).0.is_empty(),
+            "no timer resumes it"
+        );
+        assert_eq!(b.space_recovered(), Some(FolderStatus::InboundResumed));
+        assert!(!b.disk_full());
+        let (steps, _) = b.dispatch(t(4001.0), &lan(&[1]));
+        let paths: Vec<&str> = steps
+            .iter()
+            .map(|s| match s {
+                HostStep::Fetch { path, .. } | HostStep::Write { path, .. } => path.as_str(),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(paths, ["n", "m"], "n fetched again, m committed");
+        assert_eq!(b.space_recovered(), None);
+    }
+
+    /// §7.5, §11: a restart frees no space, so a paused inbound stays
+    /// paused through one, and its wants stay deferred for the disk, until
+    /// the host reports space recovered.
+    #[test]
+    fn a_disk_full_pause_survives_a_restart() {
+        let (_, mut b, _, vn) = committing_n_fetching_m();
+        b.applied(t(14.0), &p("n"), &vn, disk_full());
+        b.dispatch(t(14.0), &lan(&[1]));
+        let mut c = FolderState::from_parts(b.parts(), node(2), HostName::new("bravo").unwrap());
+        c.restarted(t(20.0));
+        assert!(c.disk_full());
+        assert!(c.dispatch(t(20.0), &lan(&[1])).0.is_empty());
+        for path in ["m", "n"] {
+            assert_eq!(
+                c.wants().get(&p(path)).unwrap().state,
+                WantState::DiskFull,
+                "{path}"
+            );
+        }
+        c.space_recovered();
+        assert_eq!(c.dispatch(t(21.0), &lan(&[1])).0.len(), 2);
+    }
+
+    /// §7.5: the local retry is a backoff, not a pause: a disk that later
+    /// fills pauses the inbound over it, and the want waits for both, its
+    /// backoff first and then the space, whichever ends first.
+    #[test]
+    fn a_local_retry_waits_out_a_disk_full_pause_too() {
+        let (_, mut b, vm, vn) = committing_n_fetching_m();
+        b.applied(t(14.0), &p("n"), &vn, ApplyOutcome::Failed { error: io() });
+        let report = FetchReport::Failed {
+            error: LocalError::DiskFull,
+        };
+        b.fetched(t(15.0), &p("m"), &vm, report);
+        b.dispatch(t(15.0), &lan(&[1]));
+        assert!(matches!(
+            b.wants().get(&p("n")).unwrap().state,
+            WantState::LocalRetry { .. }
+        ));
+        b.expire(t(80.0));
+        b.dispatch(t(80.0), &lan(&[1]));
+        assert_eq!(b.wants().get(&p("n")).unwrap().state, WantState::DiskFull);
+        b.space_recovered();
+        let (steps, _) = b.dispatch(t(81.0), &lan(&[1]));
+        assert_eq!(steps.len(), 2, "both fetch again: {steps:?}");
     }
 
     /// A scripted host for the want-list properties.

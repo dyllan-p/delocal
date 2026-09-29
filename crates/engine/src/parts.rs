@@ -50,6 +50,10 @@ pub struct Rest {
     /// Conflicts decided by the last step of the winner rule (§7.6); any
     /// count above zero is a bug to find.
     pub winner_fallbacks: u64,
+    /// Set while a full disk pauses the folder's inbound (§7.5). It lasts
+    /// until the host reports space recovered, across a restart too, since
+    /// a restart frees no space.
+    pub disk_full: bool,
 }
 
 /// A folder as persisted (§11): its metadata, from the host's `folders`

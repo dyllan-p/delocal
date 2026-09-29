@@ -173,6 +173,13 @@ pub enum Event {
     Revert {
         folder: FolderId,
     },
+
+    /// The host found free space again for a folder whose inbound a full
+    /// disk paused (§7.5 "local failures"). It checks every 30 s while the
+    /// folder is paused ([`FolderState::disk_full`]).
+    SpaceRecovered {
+        folder: FolderId,
+    },
 }
 
 /// Everything the engine can ask the host to do.
@@ -565,6 +572,14 @@ impl Engine {
                     folder,
                     status: FolderStatus::UnknownBatch { batch },
                 }),
+                None => out.push(unknown_folder(folder)),
+            },
+            Event::SpaceRecovered { folder } => match self.folders.get_mut(&folder) {
+                Some(f) => {
+                    if let Some(status) = f.space_recovered() {
+                        out.push(Action::StatusChanged { folder, status });
+                    }
+                }
                 None => out.push(unknown_folder(folder)),
             },
             Event::Revert { folder } => match self.folders.get_mut(&folder) {
@@ -3081,6 +3096,87 @@ mod tests {
             )
         );
         assert!(b.folder(folder()).unwrap().wants().is_empty());
+    }
+
+    /// §7.5 "local failures", through the engine: a commit that finds the
+    /// disk full reports the failure and the pause to `status` and in the
+    /// small rest (§11), asks the host for nothing more, and resumes with a
+    /// fetch once the host reports space recovered, since the failure may
+    /// have taken the temp file.
+    #[test]
+    fn a_full_disk_pauses_the_inbound_until_the_host_reports_space() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        deliver(t(12.0), node(1), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        let version = b
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .get(&p("n"))
+            .unwrap()
+            .version()
+            .clone();
+        b.handle(
+            t(13.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                hash: hash(7),
+                version: version.clone(),
+                outcome: FetchReport::Ok,
+            },
+        );
+        let out = b.handle(
+            t(14.0),
+            Event::Applied {
+                folder: folder(),
+                path: p("n"),
+                version: version.clone(),
+                outcome: ApplyOutcome::Failed {
+                    error: LocalError::DiskFull,
+                },
+            },
+        );
+        assert_eq!(
+            statuses(&out),
+            [
+                &FolderStatus::InboundPaused,
+                &FolderStatus::LocalFailure {
+                    path: p("n"),
+                    error: LocalError::DiskFull
+                }
+            ]
+        );
+        assert!(rest_of(&out).unwrap().disk_full);
+        assert!(
+            !out.iter()
+                .any(|a| matches!(a, Action::Fetch { .. } | Action::Write { .. }))
+        );
+        let out = b.handle(t(15.0), Event::SpaceRecovered { folder: folder() });
+        assert_eq!(statuses(&out), [&FolderStatus::InboundResumed]);
+        assert!(!rest_of(&out).unwrap().disk_full);
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::Fetch { path, .. } if path == &p("n"))),
+            "{out:?}"
+        );
+        let out = b.handle(t(16.0), Event::SpaceRecovered { folder: folder() });
+        assert!(statuses(&out).is_empty(), "not paused: nothing to resume");
     }
 
     /// §7.5 "local failures", through the engine: a fetch that fails with
