@@ -82,7 +82,7 @@ use crate::quarantine::{HeldItem, HeldRow, HeldState, Quarantine};
 use crate::rules::Rules;
 use crate::time::{DEBOUNCE_NANOS, Timestamp, WINDOW_NANOS};
 use crate::version::Version;
-use crate::want::{Expired, FetchReport, Tier, Want, WantList, WantState, WantStep};
+use crate::want::{Expired, FetchReport, LocalError, Tier, Want, WantList, WantState, WantStep};
 
 /// What the host reports for one path (§7.3). `Unchanged` is the fast path:
 /// size and mtime matched the record the host holds, so no hash was
@@ -125,7 +125,7 @@ pub enum SkipReason {
 }
 
 /// The result of a host's commit attempt (§7.5 step 6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ApplyOutcome {
     /// Displaced, renamed in, index may adopt.
     Ok,
@@ -133,6 +133,9 @@ pub enum ApplyOutcome {
     /// target appeared. Nothing was written. The engine keeps the entry and
     /// re-evaluates it after the next observation of the path (§7.5).
     ChangedUnderneath,
+    /// The commit failed on this machine (§7.5 "local failures"). The host
+    /// undid any displacement before reporting, so nothing was written.
+    Failed { error: LocalError },
 }
 
 /// Why an incoming entry is waiting.
@@ -421,6 +424,9 @@ pub enum FolderStatus {
     /// only: the commit holds its path until the host reports it or the
     /// process restarts.
     CommitOverdue { path: RelPath },
+    /// A commit or fetch at `path` failed on this machine (§7.5 "local
+    /// failures"): `Io` is tried again after a backoff.
+    LocalFailure { path: RelPath, error: LocalError },
 }
 
 /// An open batch window (§7.4).
@@ -1966,6 +1972,7 @@ impl FolderState {
                         excluded: BTreeMap::new(),
                         strikes: BTreeMap::new(),
                         mismatches: 0,
+                        local_retries: 0,
                         fetched: false,
                         restoring: false,
                         answered: BTreeSet::new(),
@@ -1997,6 +2004,7 @@ impl FolderState {
                     excluded: BTreeMap::new(),
                     strikes: BTreeMap::new(),
                     mismatches: 0,
+                    local_retries: 0,
                     fetched: false,
                     restoring: true,
                     answered: BTreeSet::new(),
@@ -2100,7 +2108,23 @@ impl FolderState {
         version: &Version,
         report: FetchReport,
     ) -> Fetched {
+        if let FetchReport::Failed { error } = report {
+            // A failure of a fetch the want does not wait for is ignored like
+            // any such report.
+            let state = self
+                .wants
+                .fetch_failed(now, path, version, &error)
+                .map(|w| w.state.clone());
+            if state.is_some() {
+                self.failed(now, path, error);
+            }
+            return Fetched {
+                state,
+                unrecoverable: None,
+            };
+        }
         let own = self.index.own();
+        let not_available = report == FetchReport::NotAvailable;
         // A report the want-list ignored (§7.5: the want was not fetching)
         // settles nothing, and says nothing about the want's state.
         let Some(want) = self.wants.fetched(now, path, version, report) else {
@@ -2110,12 +2134,12 @@ impl FolderState {
             };
         };
         let unrecoverable = want.restoring
-            && report == FetchReport::NotAvailable
+            && not_available
             && self
                 .members
                 .iter()
                 .all(|m| *m == own || want.answered.contains(m));
-        let state = Some(want.state);
+        let state = Some(want.state.clone());
         if !unrecoverable {
             return Fetched {
                 state,
@@ -2134,6 +2158,19 @@ impl FolderState {
             state: None,
             unrecoverable: change,
         }
+    }
+
+    /// The fetch or commit the want at `path` waited for failed on this
+    /// machine (§7.5 "local failures"), and the want-list has released it
+    /// under the rule for its error. `status` hears of the failure, and
+    /// entries that waited for the report are classified against the
+    /// record as the failure leaves it, which is as it was.
+    fn failed(&mut self, now: Timestamp, path: &RelPath, error: LocalError) {
+        self.statuses.push(FolderStatus::LocalFailure {
+            path: path.clone(),
+            error,
+        });
+        self.reconsider(now, path, DeferredReason::ChangedUnderneath);
     }
 
     /// The host reported bytes arriving for a fetch (§7.5).
@@ -2261,12 +2298,13 @@ impl FolderState {
     /// conflict copy, the displaced file is recorded at the conflict path
     /// as this machine's local add (§7.6). On `ChangedUnderneath` the entry
     /// is kept in the deferred set until the path is observed again. Either
-    /// way the want ends. A reset (§8.3 step 2) that lands adopts the record
-    /// `revert` restored under a new `seq`, so its landing is announced
-    /// (§7.1); one whose file changed underneath writes and keeps nothing,
-    /// and the next observation of the path is a local change like any
-    /// other. Returns every record written, in order; empty if nothing
-    /// matched or the commit did not happen.
+    /// way the want ends. On `Failed` it stays, released under the rule for
+    /// its error (§7.5 "local failures"). A reset (§8.3 step 2) that lands
+    /// adopts the record `revert` restored under a new `seq`, so its
+    /// landing is announced (§7.1); one whose file changed underneath
+    /// writes and keeps nothing, and the next observation of the path is a
+    /// local change like any other. Returns every record written, in order;
+    /// empty if nothing matched or the commit did not happen.
     pub fn applied(
         &mut self,
         now: Timestamp,
@@ -2283,6 +2321,17 @@ impl FolderState {
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
         }
+        let landed = match outcome {
+            ApplyOutcome::Ok => true,
+            ApplyOutcome::ChangedUnderneath => false,
+            // The host left the disk as it found it; the want stays, under
+            // the rule for its error (§7.5 "local failures").
+            ApplyOutcome::Failed { error } => {
+                self.wants.failed(now, path, version, &error);
+                self.failed(now, path, error);
+                return Vec::new();
+            }
+        };
         let Some(want) = self.wants.remove(path) else {
             return Vec::new();
         };
@@ -2294,46 +2343,41 @@ impl FolderState {
             // what tells a refused peer to ask again. Entries deferred at
             // the path are then classified against it; if the file changed
             // underneath, they wait for the next observation instead.
-            if outcome != ApplyOutcome::Ok {
+            if !landed {
                 return Vec::new();
             }
             let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
             return written;
         }
-        match outcome {
-            ApplyOutcome::Ok => {
-                let Some(record) = self.adopt(now, want.entry.clone()) else {
-                    // The record moved on under the commit (release-build
-                    // fallback of Index::adopt): keep the entry for the next
-                    // observation rather than overwrite a local write.
-                    self.defer_changed_underneath(want);
-                    return Vec::new();
-                };
-                let mut written = vec![record];
-                if let Some(copy) = want.conflict {
-                    let copy_path = copy.path.clone();
-                    let change = self.index.record_conflict_copy(copy.path, &copy.loser);
-                    self.touched(now);
-                    written.push(change.record);
-                    // Every index write re-classifies the wants at its path: a
-                    // want for a peer's copy of the same loser now meets this
-                    // machine's own copy, an identical-content merge rather
-                    // than a fetch that would land over it.
-                    self.reclassify_want(now, &copy_path);
-                }
-                // The disk now holds what the record says: whatever mark a
-                // deferred entry carried here is gone with the fact it
-                // recorded (§8.3).
-                self.clear_carriers(path);
-                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
-                written
-            }
-            ApplyOutcome::ChangedUnderneath => {
-                self.defer_changed_underneath(want);
-                Vec::new()
-            }
+        if !landed {
+            self.defer_changed_underneath(want);
+            return Vec::new();
         }
+        let Some(record) = self.adopt(now, want.entry.clone()) else {
+            // The record moved on under the commit (release-build fallback
+            // of Index::adopt): keep the entry for the next observation
+            // rather than overwrite a local write.
+            self.defer_changed_underneath(want);
+            return Vec::new();
+        };
+        let mut written = vec![record];
+        if let Some(copy) = want.conflict {
+            let copy_path = copy.path.clone();
+            let change = self.index.record_conflict_copy(copy.path, &copy.loser);
+            self.touched(now);
+            written.push(change.record);
+            // Every index write re-classifies the wants at its path: a want
+            // for a peer's copy of the same loser now meets this machine's
+            // own copy, an identical-content merge rather than a fetch that
+            // would land over it.
+            self.reclassify_want(now, &copy_path);
+        }
+        // The disk now holds what the record says: whatever mark a deferred
+        // entry carried here is gone with the fact it recorded (§8.3).
+        self.clear_carriers(path);
+        self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+        written
     }
 
     /// Keep a want's received entry in the deferred set until the next
@@ -3109,7 +3153,7 @@ mod tests {
             let in_flight: Vec<(RelPath, Version, WantState)> = f
                 .wants()
                 .iter()
-                .map(|w| (w.path().clone(), w.version().clone(), w.state))
+                .map(|w| (w.path().clone(), w.version().clone(), w.state.clone()))
                 .collect();
             for (path, version, state) in in_flight {
                 match state {
@@ -3147,7 +3191,7 @@ mod tests {
             "commit_all left work in flight: {:?}",
             f.wants()
                 .iter()
-                .map(|w| (w.path().as_str(), w.state))
+                .map(|w| (w.path().as_str(), w.state.clone()))
                 .collect::<Vec<_>>()
         );
         out
@@ -5711,6 +5755,240 @@ mod tests {
         assert!(matches!(&steps[0], HostStep::Fetch { path, .. } if path == &p("n")));
     }
 
+    /// B with new files `n` and `m` from A: `n` fetched and committing, `m`
+    /// still fetching. Returns both versions.
+    fn committing_n_fetching_m() -> (FolderState, FolderState, Version, Version) {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("m"), file(6, 6));
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert_eq!(b.receive(t(12.0), &batch).decision, Decision::Accepted);
+        let vm = b.wants().get(&p("m")).unwrap().version().clone();
+        let vn = b.wants().get(&p("n")).unwrap().version().clone();
+        let (steps, _) = b.dispatch(t(12.0), &lan(&[1]));
+        assert_eq!(steps.len(), 2, "both fetched: {steps:?}");
+        b.fetched(t(13.0), &p("n"), &vn, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        assert!(matches!(&steps[..], [HostStep::Write { path, .. }] if path == &p("n")));
+        (a, b, vm, vn)
+    }
+
+    fn io() -> LocalError {
+        LocalError::Io
+    }
+
+    /// §7.5 "local failures": in every case the commit is released. A
+    /// version that arrived while the commit was in flight waited for its
+    /// report (§7.5), and is classified as soon as the failure is reported,
+    /// against the record the failure left as it was: here it dominates, so
+    /// it replaces the want.
+    #[test]
+    fn a_version_that_waited_for_a_failed_commit_is_classified_at_once() {
+        let errors = [LocalError::Io];
+        for error in errors {
+            let (mut a, mut b) = a_and_b(1, Rules::default());
+            a.scanned(t(10.0), p("n"), file(7, 7));
+            let first = a.form_batches(t(12.0), bid(3)).remove(0);
+            b.receive(t(12.0), &first);
+            let v1 = b.wants().get(&p("n")).unwrap().version().clone();
+            b.dispatch(t(12.0), &lan(&[1]));
+            b.fetched(t(13.0), &p("n"), &v1, FetchReport::Ok);
+            b.dispatch(t(13.0), &lan(&[1]));
+            a.scanned(t(14.0), p("n"), file(8, 14));
+            let second = a.form_batches(t(16.0), bid(4)).remove(0);
+            b.receive(t(16.0), &second);
+            assert_eq!(b.deferred().count(), 1, "waits for the commit's report");
+
+            let outcome = ApplyOutcome::Failed {
+                error: error.clone(),
+            };
+            assert!(b.applied(t(17.0), &p("n"), &v1, outcome).is_empty());
+            assert_eq!(b.deferred().count(), 0, "{error:?}");
+            let want = b.wants().get(&p("n")).unwrap();
+            assert!(want.version().dominates(&v1), "{error:?}");
+            assert_eq!(want.entry.hash, hash(8), "{error:?}");
+        }
+    }
+
+    /// §7.5: a report on a fetch the want no longer waits for (reassigned
+    /// after a stall, or already in hand and committing) says nothing about
+    /// the want: a commit in flight keeps its path. It is ignored like any
+    /// such report, and `status` hears nothing.
+    #[test]
+    fn a_failure_of_a_fetch_the_want_no_longer_waits_for_leaves_it_alone() {
+        let errors = [LocalError::Io];
+        for error in errors {
+            let (_, mut b, _, vn) = committing_n_fetching_m();
+            b.take_statuses();
+            let report = FetchReport::Failed {
+                error: error.clone(),
+            };
+            let fetched = b.fetched(t(14.0), &p("n"), &vn, report);
+            assert_eq!(fetched.state, None, "{error:?}");
+            let n = b.wants().get(&p("n")).unwrap();
+            assert!(matches!(n.state, WantState::Committing { .. }), "{error:?}");
+            assert!(n.fetched, "{error:?}");
+            assert!(b.take_statuses().is_empty(), "{error:?}");
+        }
+    }
+
+    /// §7.5: a rule that releases a commit early releases the want, not the
+    /// path, and the released commit's report is discarded when it arrives,
+    /// whatever it says: a failure too. Here B is committing C's copy of L
+    /// at the conflict path when its own commit of W lands and records B's
+    /// copy there, which re-classifies the want at the copy path into a
+    /// merge. The released commit then reports an I/O error: nothing backs
+    /// off, and the merge goes ahead.
+    #[test]
+    fn a_released_commits_failure_is_discarded_like_any_report_of_it() {
+        let (mut a, mut b) = a_and_b(3, Rules::default());
+        b.scanned(t(10.0), p("f00"), file(5, 50)); // B's L
+        let loser = b.index().get(&p("f00")).unwrap().entry.clone();
+        let copy_path = crate::conflict::conflict_copy_name(&loser).unwrap();
+        a.scanned(t(11.0), p("f00"), file(6, 60)); // A's W, newer
+        let batch = a.form_batches(t(13.0), bid(6)).remove(0);
+        b.receive(t(13.0), &batch);
+        let w_version = b.wants().get(&p("f00")).unwrap().version().clone();
+        // C's copy of the same L, touched later, so the merge lands as a
+        // metadata-only apply.
+        let mut c_copy = loser.clone();
+        c_copy.path = copy_path.clone();
+        c_copy.version = Version::empty().incremented(node(3));
+        c_copy.modified_by = node(3);
+        c_copy.prev_hash = ContentHash::EMPTY;
+        c_copy.mtime_ns += 1;
+        c_copy.stamp += 1;
+        let mut c_batch = batch.clone();
+        c_batch.id = bid(7);
+        c_batch.source = node(3);
+        c_batch.entries = vec![c_copy.clone()];
+        c_batch.seq_low = 0;
+        c_batch.seq_high = 1;
+        b.receive(t(14.0), &c_batch);
+        b.dispatch(t(15.0), &lan(&[1, 3]));
+        b.fetched(t(16.0), &copy_path, &c_copy.version, FetchReport::Ok);
+        b.fetched(t(16.0), &p("f00"), &w_version, FetchReport::Ok);
+        assert_eq!(b.dispatch(t(16.0), &lan(&[1, 3])).0.len(), 2);
+        b.applied(t(17.0), &p("f00"), &w_version, ApplyOutcome::Ok);
+        assert!(b.wants().held_by_released(&copy_path));
+        b.take_statuses();
+
+        let failed = ApplyOutcome::Failed { error: io() };
+        assert!(
+            b.applied(t(18.0), &copy_path, &c_copy.version, failed)
+                .is_empty()
+        );
+        assert!(b.take_statuses().is_empty(), "discarded");
+        assert!(!b.wants().held_by_released(&copy_path));
+        let (steps, _) = b.dispatch(t(19.0), &lan(&[1, 3]));
+        assert!(
+            matches!(&steps[..], [HostStep::SetMeta { path, .. }] if path == &copy_path),
+            "{steps:?}"
+        );
+    }
+
+    /// §7.5 "local failures": a commit that fails with an I/O error defers
+    /// its want with reason `local retry` for a minute, without touching
+    /// its sources, and `status` warns. The want forgets the content it
+    /// fetched, since the failure may have taken the temp file. The path is
+    /// observable meanwhile; the engine asks to be woken when the backoff
+    /// ends, and then the want is wanted again and fetches again.
+    #[test]
+    fn an_io_failure_defers_the_want_for_a_local_retry() {
+        let (_, mut b, _, vn) = committing_n_fetching_m();
+        let sources = b.wants().get(&p("n")).unwrap().sources.clone();
+        b.take_statuses();
+        assert!(
+            b.applied(t(14.0), &p("n"), &vn, ApplyOutcome::Failed { error: io() })
+                .is_empty()
+        );
+        let n = b.wants().get(&p("n")).unwrap();
+        assert_eq!(n.state, WantState::LocalRetry { until: t(74.0) });
+        assert_eq!(n.local_retries, 1);
+        assert_eq!(n.sources, sources);
+        assert!(n.excluded.is_empty());
+        assert!(!n.fetched, "the content is forgotten");
+        assert!(!b.in_flight(&p("n")), "a local retry is observable");
+        assert_eq!(
+            b.take_statuses(),
+            [FolderStatus::LocalFailure {
+                path: p("n"),
+                error: io()
+            }]
+        );
+        assert!(b.due().is_some_and(|due| due <= t(74.0)));
+
+        b.expire(t(73.9));
+        let (steps, _) = b.dispatch(t(73.9), &lan(&[1]));
+        assert!(
+            !steps.iter().any(|s| matches!(
+                s,
+                HostStep::Fetch { path, .. } | HostStep::Write { path, .. } if path == &p("n")
+            )),
+            "not before the backoff ends: {steps:?}"
+        );
+        b.expire(t(74.0));
+        assert_eq!(b.wants().get(&p("n")).unwrap().state, WantState::Wanted);
+        let (steps, _) = b.dispatch(t(74.0), &lan(&[1]));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Fetch { path, .. } if path == &p("n"))),
+            "fetched again: {steps:?}"
+        );
+    }
+
+    /// §7.5: the local retry's backoff is the exclusions' schedule: a
+    /// minute, doubling on each repeat for the same want, capped at an
+    /// hour. A fetch that fails with an I/O error counts as a commit does,
+    /// and blames no source.
+    #[test]
+    fn a_local_retry_backs_off_on_the_exclusions_schedule() {
+        let (_, mut b, vm, _) = committing_n_fetching_m();
+        let sources = b.wants().get(&p("m")).unwrap().sources.clone();
+        let mut now = 14.0;
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let report = FetchReport::Failed { error: io() };
+            let fetched = b.fetched(t(now), &p("m"), &vm, report);
+            let Some(WantState::LocalRetry { until }) = fetched.state else {
+                panic!("{:?}", fetched.state);
+            };
+            let m = b.wants().get(&p("m")).unwrap();
+            assert_eq!(m.sources, sources);
+            assert!(m.excluded.is_empty());
+            waits.push((until.as_unix_nanos() - t(now).as_unix_nanos()) / NANOS_PER_SECOND);
+            now = until.as_unix_nanos() as f64 / NANOS_PER_SECOND as f64;
+            b.expire(t(now));
+            let (steps, _) = b.dispatch(t(now), &lan(&[1]));
+            assert!(
+                steps
+                    .iter()
+                    .any(|s| matches!(s, HostStep::Fetch { path, .. } if path == &p("m"))),
+                "{steps:?}"
+            );
+        }
+        assert_eq!(waits, [60, 120, 240, 480, 960, 1920, 3600, 3600]);
+    }
+
+    /// §7.5: while a want backs off after an I/O error its path is
+    /// observable, so a local edit made meanwhile is classified as usual,
+    /// not ignored for up to an hour: here the user's file at `n` is a
+    /// local change, announced, and the want is re-derived against it, a
+    /// fresh want with its own backoff to come.
+    #[test]
+    fn a_local_edit_during_a_local_retry_is_classified_as_usual() {
+        let (_, mut b, _, vn) = committing_n_fetching_m();
+        b.applied(t(14.0), &p("n"), &vn, ApplyOutcome::Failed { error: io() });
+        let scanned = b.scanned(t(15.0), p("n"), file(9, 15));
+        assert!(scanned.change.is_some(), "a local change");
+        assert!(b.window().is_some(), "to be announced");
+        let want = b.wants().get(&p("n")).unwrap();
+        assert!(want.version().dominates(&vn), "re-derived: {want:?}");
+        assert_eq!(want.state, WantState::Wanted);
+        assert_eq!(want.local_retries, 0);
+    }
+
     /// A scripted host for the want-list properties.
     #[derive(Clone, Debug)]
     struct Script {
@@ -6100,7 +6378,7 @@ mod tests {
                 let applied = b.index().get(&e.path).is_some_and(|r| r.entry == *e);
                 let want = b.wants().get(&e.path);
                 let parked = want.is_some_and(|w| matches!(w.state, WantState::Deferred { .. } | WantState::NoSource | WantState::GaveUp));
-                prop_assert!(applied != parked, "{}: applied={applied} parked={parked} state={:?}", e.path, want.map(|w| w.state));
+                prop_assert!(applied != parked, "{}: applied={applied} parked={parked} state={:?}", e.path, want.map(|w| w.state.clone()));
                 if let Some(w) = want {
                     prop_assert!(!w.in_flight(), "nothing left in flight when the host has answered everything");
                     match w.state {
@@ -6202,7 +6480,7 @@ mod tests {
                 let expired = b.expire(now);
                 if gap >= 60 {
                     prop_assert_eq!(expired.stalled, vec![p("n")]);
-                    prop_assert_eq!(b.wants().get(&p("n")).unwrap().state, WantState::Wanted);
+                    prop_assert_eq!(&b.wants().get(&p("n")).unwrap().state, &WantState::Wanted);
                     prop_assert!(b.expire(before.plus_nanos(60 * NANOS_PER_SECOND - 1)).stalled.is_empty());
                     expired_at = Some(now);
                     break;

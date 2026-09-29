@@ -79,7 +79,11 @@ impl Tier {
 }
 
 /// Where a want is in its life (§7.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// `Deferred` and `LocalRetry` are the reasons §7.5 gives for a want to be
+/// *deferred*. The second came later and is listed last, so that the
+/// encoding of every earlier state is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WantState {
     /// Ready to fetch (or, with content in hand, to commit) as soon as a
     /// source, a slot and the ordering gate allow.
@@ -104,11 +108,18 @@ pub enum WantState {
     /// reconnecting, a source announcing the wanted content at the path, or
     /// the index at the path changing.
     GaveUp,
+    /// Deferred with reason `local retry` (§7.5 "local failures"): a fetch
+    /// or commit failed on this machine with an I/O error, and the want
+    /// backs off until `until`, when it is wanted again. Observable
+    /// meanwhile, like every deferred want, so a local edit made during
+    /// the backoff is classified as usual rather than ignored for up to an
+    /// hour.
+    LocalRetry { until: Timestamp },
 }
 
 impl WantState {
     /// Short-lived states hide observations of the path (§7.5 "in flight").
-    pub fn in_flight(self) -> bool {
+    pub fn in_flight(&self) -> bool {
         matches!(
             self,
             Self::Wanted | Self::Blocked | Self::Fetching { .. } | Self::Committing { .. }
@@ -156,6 +167,10 @@ pub struct Want {
     pub strikes: BTreeMap<NodeId, u32>,
     /// Sources excluded right now: two give the want up.
     pub mismatches: u8,
+    /// Fetches and commits of this want that failed on this machine with
+    /// an I/O error (§7.5 "local failures"), so the backoff doubles on each
+    /// repeat, on the exclusions' schedule. A new want starts again at 0.
+    pub local_retries: u32,
     /// Content has been fetched and verified; only the commit remains.
     pub fetched: bool,
     /// Carries the path's restoring mark (§8.3): made by `revert`, or
@@ -235,6 +250,7 @@ impl Want {
             excluded: BTreeMap::new(),
             strikes: BTreeMap::new(),
             mismatches: 0,
+            local_retries: 0,
             fetched: false,
             restoring: false,
             answered: BTreeSet::new(),
@@ -615,7 +631,65 @@ impl WantList {
                     WantState::Wanted
                 };
             }
+            FetchReport::Failed { error } => {
+                return self.fetch_failed(now, path, version, &error);
+            }
         }
+        self.note(path);
+        self.wants.get(path)
+    }
+
+    /// A fetch of the want at `path` failed on this machine (§7.5 "local
+    /// failures"): see [`WantList::failed`]. A failure of a fetch the want
+    /// no longer waits for (it was reassigned after a stall, or its content
+    /// is in hand) says nothing about the want, only about the disk, and
+    /// leaves it as it is: `None`.
+    pub fn fetch_failed(
+        &mut self,
+        now: Timestamp,
+        path: &RelPath,
+        version: &Version,
+        error: &LocalError,
+    ) -> Option<&Want> {
+        let fetching = self.wants.get(path).is_some_and(|w| {
+            w.version() == version && matches!(w.state, WantState::Fetching { .. })
+        });
+        if !fetching {
+            return None;
+        }
+        self.failed(now, path, version, error)
+    }
+
+    /// A fetch or a commit of the want at `path` failed on this machine
+    /// (§7.5 "local failures"). The operation is released and the path
+    /// leaves in-flight; the sources are untouched, since no peer is to
+    /// blame. `Io` backs off a minute, doubling on each repeat for the want
+    /// up to an hour, as an exclusion does. Returns the want as it now
+    /// stands, or `None` if no want at `path` has `version`.
+    pub fn failed(
+        &mut self,
+        now: Timestamp,
+        path: &RelPath,
+        version: &Version,
+        error: &LocalError,
+    ) -> Option<&Want> {
+        let want = self.wants.get_mut(path)?;
+        if want.version() != version {
+            return None;
+        }
+        // The failure may have taken the temp file with it, and only the host
+        // could tell. The retry fetches again, which resumes from whatever
+        // the temp file still holds (§7.5), rather than commit content that
+        // may be gone.
+        want.fetched = false;
+        want.state = match error {
+            LocalError::Io => {
+                want.local_retries = want.local_retries.saturating_add(1);
+                WantState::LocalRetry {
+                    until: now.plus_nanos(exclusion_backoff(want.local_retries)),
+                }
+            }
+        };
         self.note(path);
         self.wants.get(path)
     }
@@ -636,8 +710,9 @@ impl WantList {
 
     /// Exclusions whose backoff has run out are released, a fetch whose
     /// stall deadline has passed returns to `Wanted` (the source is not
-    /// excluded, the stall may have been ours), and a commit past its
-    /// deadline becomes overdue but keeps its path (§7.5).
+    /// excluded, the stall may have been ours), a commit past its deadline
+    /// becomes overdue but keeps its path, and a local retry whose backoff
+    /// has run out is wanted again (§7.5).
     pub fn expire(&mut self, now: Timestamp) -> Expired {
         let released: Vec<(RelPath, NodeId)> = self
             .wants
@@ -667,6 +742,16 @@ impl WantList {
         }
         for path in &expired.stalled {
             self.set_state(path, WantState::Wanted);
+        }
+        // A local retry whose backoff has run out is wanted again (§7.5).
+        let retried: Vec<RelPath> = self
+            .wants
+            .iter()
+            .filter(|(_, w)| matches!(w.state, WantState::LocalRetry { until } if until <= now))
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in retried {
+            self.set_state(&path, WantState::Wanted);
         }
         for path in &expired.overdue {
             if let Some(want) = self.wants.get(path) {
@@ -698,15 +783,16 @@ impl WantList {
         }
     }
 
-    /// The earliest fetch or commit deadline or exclusion expiry, for the
-    /// engine's wake-up.
+    /// The earliest fetch or commit deadline, exclusion expiry or end of a
+    /// local retry's backoff, for the engine's wake-up.
     pub fn next_deadline(&self) -> Option<Timestamp> {
         let deadlines = self.wants.values().filter_map(|w| match w.state {
             WantState::Fetching { deadline, .. }
             | WantState::Committing {
                 deadline,
                 overdue: false,
-            } => Some(deadline),
+            }
+            | WantState::LocalRetry { until: deadline } => Some(deadline),
             _ => None,
         });
         let expiries = self
@@ -908,11 +994,25 @@ impl WantList {
 }
 
 /// The host's report on a fetch (§7.5).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FetchReport {
     Ok,
     NotAvailable,
     HashMismatch,
+    /// The fetch failed on this machine, not at the source (§7.5 "local
+    /// failures"): the source is not blamed.
+    Failed {
+        error: LocalError,
+    },
+}
+
+/// Why a commit or a fetch failed on this machine for a reason that is
+/// neither the file changing underneath nor the peer's (§7.5 "local
+/// failures"). Whatever the error, the host left the disk as it found it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalError {
+    /// An I/O error. The want is tried again after a local backoff.
+    Io,
 }
 
 /// What [`WantList::expire`] found: fetches that stalled and are wanted
@@ -1490,6 +1590,8 @@ mod tests {
     /// report, whatever it says, arrives while the commit is in flight and
     /// changes nothing. It releases nothing, and no second commit starts.
     /// A report for a want that stalled and is wanted again is ignored too.
+    /// So is a local failure (§7.5 "local failures"): it names a fetch the
+    /// want no longer waits for.
     #[test]
     fn a_fetch_report_for_a_want_that_is_not_fetching_changes_nothing() {
         let v = entry("f", Kind::File, 10, 2, false).version;
@@ -1498,8 +1600,11 @@ mod tests {
             FetchReport::Ok,
             FetchReport::NotAvailable,
             FetchReport::HashMismatch,
+            FetchReport::Failed {
+                error: LocalError::Io,
+            },
         ];
-        for late in reports {
+        for late in reports.clone() {
             let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
             l.dispatch(t(0), &Rules::default(), &lan);
             l.expire(t(60));
@@ -1510,7 +1615,10 @@ mod tests {
             assert!(matches!(&steps[..], [WantStep::Commit(_)]), "{late:?}");
             let committing = l.get(&p("f")).unwrap().clone();
 
-            assert!(l.fetched(t(62), &p("f"), &v, late).is_none(), "{late:?}");
+            assert!(
+                l.fetched(t(62), &p("f"), &v, late.clone()).is_none(),
+                "{late:?}"
+            );
             assert_eq!(l.get(&p("f")), Some(&committing), "{late:?}");
             assert!(
                 l.dispatch(t(62), &Rules::default(), &lan).is_empty(),
@@ -1523,7 +1631,10 @@ mod tests {
             l.expire(t(60));
             let wanted = l.get(&p("f")).unwrap().clone();
             assert_eq!(wanted.state, WantState::Wanted);
-            assert!(l.fetched(t(61), &p("f"), &v, late).is_none(), "{late:?}");
+            assert!(
+                l.fetched(t(61), &p("f"), &v, late.clone()).is_none(),
+                "{late:?}"
+            );
             assert_eq!(l.get(&p("f")), Some(&wanted), "{late:?}");
         }
     }

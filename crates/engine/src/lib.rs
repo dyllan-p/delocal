@@ -62,7 +62,7 @@ pub use quarantine::{HeldItem, HeldRow, HeldState, Quarantine, Quarantined};
 pub use rules::Rules;
 pub use time::Timestamp;
 pub use version::{Relation, Version};
-pub use want::{FetchReport, Tier, Want, WantList, WantState};
+pub use want::{FetchReport, LocalError, Tier, Want, WantList, WantState};
 
 /// The version of delocal, taken from the workspace at compile time.
 ///
