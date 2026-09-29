@@ -80,9 +80,9 @@ impl Default for Knobs {
             group_commit_lag: 4,
             displace_subtrees: true,
             skip: 0.002,
-            io_failure: 0.0,
-            disk_fill: 0.0,
-            case_variants: 0.0,
+            io_failure: 0.01,
+            disk_fill: 0.002,
+            case_variants: 0.02,
             nodes: None,
         }
     }
