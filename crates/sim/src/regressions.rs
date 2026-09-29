@@ -14321,3 +14321,70 @@ fn a_commit_released_at_a_marked_path_bars_a_second_one() {
         ],
     );
 }
+
+/// Found by the check for commits in flight with an index-only adoption
+/// let through at a path a released commit holds, in the default sweep at
+/// 400 steps, shrunk to 16. On one node the report of a commit that moved
+/// the losing file to d2/f8's conflict-copy path recorded the copy and
+/// re-classified the want there, releasing the commit in flight at that
+/// path. The want became a merge adopted index-only, and the next dispatch
+/// adopted it while the released commit still held the path, though it
+/// could still land its own version there (§7.5).
+#[test]
+fn a_released_commit_bars_an_adoption_at_its_path() {
+    passes(
+        16,
+        &[
+            Step::Everywhere {
+                path: 4,
+                contents: vec![Some(2), Some(5), Some(4), Some(4), None, Some(3), Some(3)],
+            },
+            Step::Touch { node: 1, path: 7 },
+            Step::Online { node: 5 },
+            Step::Chmod { node: 5, path: 11 },
+            Step::Symlink {
+                node: 4,
+                path: 1,
+                target: 7,
+            },
+            Step::Touch { node: 5, path: 0 },
+            Step::Heal { a: 3, b: 6 },
+            Step::Symlink {
+                node: 2,
+                path: 5,
+                target: 6,
+            },
+            Step::Create {
+                node: 5,
+                path: 2,
+                content: 2,
+            },
+            Step::Create {
+                node: 5,
+                path: 4,
+                content: 1,
+            },
+            Step::User {
+                node: 2,
+                action: crate::UserAction::ApproveAll,
+                delay_secs: 10,
+            },
+            Step::Create {
+                node: 7,
+                path: 7,
+                content: 5,
+            },
+            Step::Settle { secs: 3 },
+            Step::Everywhere {
+                path: 8,
+                contents: vec![Some(2), Some(1), Some(2)],
+            },
+            Step::Tier {
+                a: 1,
+                b: 3,
+                tier: 0,
+            },
+            Step::Partition { a: 5, b: 6 },
+        ],
+    );
+}

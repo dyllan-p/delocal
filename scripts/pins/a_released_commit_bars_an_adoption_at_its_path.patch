@@ -1,0 +1,35 @@
+Lets an index-only adoption through at a path a released commit holds
+again, as before "Hold an index-only adoption at a path a released commit
+holds": WantList::dispatch adopts an index-only want before it checks the
+hold, reasoning that an adoption touches nothing on disk, so the path's
+record moves on while the released commit may still land its own version
+there (DESIGN.md §7.5). The simulator's check for commits in flight fails
+the run.
+
+test: delocal-sim regressions::a_released_commit_bars_an_adoption_at_its_path
+test: delocal-engine folder::tests::a_released_commit_bars_an_index_only_adoption_until_its_report
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -884,16 +884,16 @@
+             // changes the path's record until its report, neither a new
+             // commit nor an index-only adoption, since it may still land
+             // its own version there.
+-            if self.released.contains_key(&path) {
+-                self.set_state(&path, WantState::Blocked);
+-                continue;
+-            }
+             if want.mode == ApplyMode::IndexOnly {
+                 if let Some(want) = self.remove(&path) {
+                     steps.push(WantStep::Adopt(Box::new(want)));
+                 }
+                 continue;
+             }
++            if self.released.contains_key(&path) {
++                self.set_state(&path, WantState::Blocked);
++                continue;
++            }
+             steps.push(WantStep::Commit(Box::new(want.clone())));
+             self.set_state(
+                 &path,
