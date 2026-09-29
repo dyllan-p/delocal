@@ -229,6 +229,7 @@ fn want_state() -> BoxedStrategy<WantState> {
             .prop_map(|(deadline, overdue)| WantState::Committing { deadline, overdue }),
         Just(WantState::GaveUp),
         at().prop_map(|until| WantState::LocalRetry { until }),
+        Just(WantState::DiskFull),
     ]
     .boxed()
 }
@@ -431,7 +432,7 @@ fn rest() -> BoxedStrategy<Rest> {
         btree_map(node(), any::<u64>(), 0..3),
         option::of(paused),
         vec(queued(), 0..3),
-        (any::<u64>(), any::<u64>()),
+        (any::<u64>(), any::<u64>(), any::<bool>()),
     )
         .prop_map(
             |((seq, announced_seq, announced_tracked), ranges, acked, paused, queued, counts)| {
@@ -450,6 +451,7 @@ fn rest() -> BoxedStrategy<Rest> {
                     queued,
                     arrivals: counts.0,
                     winner_fallbacks: counts.1,
+                    disk_full: counts.2,
                 }
             },
         )

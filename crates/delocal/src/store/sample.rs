@@ -204,6 +204,7 @@ pub fn rest() -> Rest {
         ],
         arrivals: 49,
         winner_fallbacks: 50,
+        disk_full: true,
     }
 }
 
