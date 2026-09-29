@@ -22,7 +22,7 @@ use std::fmt;
 
 use delocal_engine::batch::BatchRole;
 use delocal_engine::folder::{ApplyOutcome, Displace, FolderStatus, ScanState, SkipReason};
-use delocal_engine::want::{FetchReport, Tier, Want, WantState};
+use delocal_engine::want::{FetchReport, LocalError, Tier, Want, WantState};
 use delocal_engine::{
     Action, BatchId, ContentHash, Deferred, Engine, Entry, Event, FolderId, FolderParts,
     FolderState, HeldRow, HeldState, HostName, IndexRecord, Kind, NodeConfig, NodeId, Observed,
@@ -53,6 +53,10 @@ const GROUP_STREAM: u64 = 2;
 /// The PRNG stream the skip model draws from: which paths a scan cannot
 /// inspect, why, and which tracked paths become ignored (§7.3).
 const SKIP_STREAM: u64 = 3;
+/// The PRNG stream the local failures draw from (§7.5): which fetches and
+/// commits fail with an I/O error, and whether a failed rename takes its
+/// temp file with it.
+const FAIL_STREAM: u64 = 4;
 
 /// What a clean run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +101,10 @@ pub struct Stats {
     pub skipped: u64,
     /// Tracked paths that became ignored for a while (§7.3).
     pub ignores: u64,
+    /// Fetches and commits that failed with an I/O error (§7.5).
+    pub io_failures: u64,
+    /// Temp files a failed rename took with it.
+    pub temps_lost: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -577,6 +585,8 @@ pub struct Sim {
     group_rng: ChaCha8Rng,
     /// Draws for the skip model, on `SKIP_STREAM`.
     skip_rng: ChaCha8Rng,
+    /// Draws for the local failures, on `FAIL_STREAM`.
+    fail_rng: ChaCha8Rng,
     /// While a node is fed a `Skipped` report or the end of a bracket that
     /// had one, what the skip checker holds its index writes against.
     checking: Option<SkipCheck>,
@@ -621,6 +631,8 @@ pub struct Sim {
     corruption_on: bool,
     /// False in the final phase, which skips nothing and ignores nothing.
     skips_on: bool,
+    /// False in the final phase, in which no fetch or commit fails.
+    failures_on: bool,
     steps: Vec<Step>,
     steps_applied: usize,
     stats: Stats,
@@ -703,6 +715,8 @@ impl Sim {
         group_rng.set_stream(GROUP_STREAM);
         let mut skip_rng = ChaCha8Rng::seed_from_u64(seed);
         skip_rng.set_stream(SKIP_STREAM);
+        let mut fail_rng = ChaCha8Rng::seed_from_u64(seed);
+        fail_rng.set_stream(FAIL_STREAM);
         let mut sim = Self {
             seed,
             knobs,
@@ -710,6 +724,7 @@ impl Sim {
             journal_rng,
             group_rng,
             skip_rng,
+            fail_rng,
             checking: None,
             committing: BTreeMap::new(),
             next_commit: 0,
@@ -730,6 +745,7 @@ impl Sim {
             users: Vec::new(),
             corruption_on: true,
             skips_on: true,
+            failures_on: true,
             steps: Vec::new(),
             steps_applied: 0,
             stats: Stats::default(),
@@ -828,6 +844,8 @@ impl Sim {
     /// Heal everything, approve everything, scan everything, drain.
     fn final_phase(&mut self) -> Result<(), Failure> {
         self.corruption_on = false;
+        // No fetch or commit fails from now on (§7.5).
+        self.failures_on = false;
         // Every ignore rule goes, and from now on every scan can look
         // everywhere, so the final scans observe everything (§7.3).
         self.skips_on = false;
@@ -2246,17 +2264,21 @@ impl Sim {
                         if corrupt {
                             bytes.push(0xff);
                         }
-                        if hash_bytes(&bytes) == hash {
+                        if hash_bytes(&bytes) != hash {
+                            self.stats.mismatches += 1;
+                            FetchReport::HashMismatch
+                        } else if let Some(error) = self.local_failure() {
+                            // The bytes arrived and could not be written here.
+                            FetchReport::Failed { error }
+                        } else {
                             if let Some(n) = self.nodes.get_mut(&node) {
                                 put_temp(n, &path, &version, bytes);
                             }
                             FetchReport::Ok
-                        } else {
-                            self.stats.mismatches += 1;
-                            FetchReport::HashMismatch
                         }
                     }
                 };
+                let failed = matches!(report, FetchReport::Failed { .. });
                 self.feed(
                     node,
                     Event::Fetched {
@@ -2266,7 +2288,11 @@ impl Sim {
                         version,
                         outcome: report,
                     },
-                )
+                )?;
+                if failed {
+                    self.after_local_failure(node)?;
+                }
+                Ok(())
             }
             Op::Commit {
                 node,
@@ -2292,7 +2318,21 @@ impl Sim {
                 if !self.nodes.get(&node).is_some_and(Node::alive) {
                     return Ok(());
                 }
-                let (committed, created) = self.commit(node, &path, &version, &action);
+                // Drawn before the commit starts, and used where it would
+                // strike: at the rename for a `Write`, before anything is
+                // changed for a `Remove` or `SetMeta`.
+                let fail = self.local_failure();
+                // What the disk held, for the check that a failed commit left
+                // it so; only a commit drawn to fail needs it.
+                let before = self
+                    .nodes
+                    .get(&node)
+                    .filter(|_| fail.is_some())
+                    .map(|n| (n.fs.clone(), n.trash.clone()));
+                let (committed, created) = self.commit(node, &path, &version, &action, fail);
+                if let Committed::Report(ApplyOutcome::Failed { error }) = &committed {
+                    self.left_as_found(node, &path, error, before)?;
+                }
                 let outcome = match committed {
                     Committed::Report(outcome) => outcome,
                     // The process died with the path displaced. Nothing is
@@ -2313,6 +2353,7 @@ impl Sim {
                 if outcome == ApplyOutcome::ChangedUnderneath {
                     self.stats.changed_underneath += 1;
                 }
+                let failed = matches!(outcome, ApplyOutcome::Failed { .. });
                 // §13: the rename happened but the report is lost to a crash.
                 if outcome == ApplyOutcome::Ok
                     && self.rng.random::<f64>() < self.knobs.crash_after_rename
@@ -2367,24 +2408,83 @@ impl Sim {
                     },
                 );
                 self.copy_recorded = None;
-                fed
+                fed?;
+                if failed {
+                    self.after_local_failure(node)?;
+                }
+                Ok(())
             }
         }
     }
 
+    /// Whether a fetch or a commit on `id` fails on this machine (§7.5
+    /// "local failures"): with an I/O error, at the knob's rate. The draw is
+    /// on `FAIL_STREAM`, and none is made with the knob at 0 or in the final
+    /// phase.
+    fn local_failure(&mut self) -> Option<LocalError> {
+        if !self.failures_on {
+            return None;
+        }
+        if self.knobs.io_failure > 0.0 && self.fail_rng.random::<f64>() < self.knobs.io_failure {
+            self.stats.io_failures += 1;
+            return Some(LocalError::Io);
+        }
+        None
+    }
+
+    /// §7.5: a failed commit leaves the disk as it found it. The host
+    /// undid its displacement and removed the directories it made, so the
+    /// node's folder and trash are exactly as they were before the commit
+    /// (`before`), and no journal row is left open.
+    fn left_as_found(
+        &self,
+        id: NodeId,
+        path: &RelPath,
+        error: &LocalError,
+        before: Option<(BTreeMap<RelPath, File>, Vec<ContentHash>)>,
+    ) -> Result<(), Failure> {
+        let Some(node) = self.nodes.get(&id) else {
+            return Ok(());
+        };
+        let as_found = before.is_some_and(|(fs, trash)| fs == node.fs && trash == node.trash);
+        if as_found && node.journal.is_empty() {
+            return Ok(());
+        }
+        Err(self.fail(
+            "failed commit",
+            format!(
+                "{}: the commit of {path} failed with {error:?} but changed the disk",
+                Self::short(id)
+            ),
+        ))
+    }
+
+    /// After a fetch or a commit on `id` failed (§7.5), I2 must still hold
+    /// on that node: every content sync adopted there is in its folder or
+    /// its trash, a failure having moved nothing anywhere.
+    fn after_local_failure(&mut self, id: NodeId) -> Result<(), Failure> {
+        invariants::i2_node(self, id)
+    }
+
     /// §7.5 steps 6 to 9 against the simulated filesystem. Also returns the
-    /// parent directories the host had to create for a write.
+    /// parent directories the host had to create for a write. `fail` is the
+    /// local failure drawn for this commit, if any: a `Write` meets it at
+    /// its rename, a `Remove` or `SetMeta` before it changes anything.
     fn commit(
         &mut self,
         id: NodeId,
         path: &RelPath,
         version: &Version,
         action: &Action,
+        fail: Option<LocalError>,
     ) -> (Committed, Vec<RelPath>) {
         let now = self.clock;
         let crash_between = self.knobs.crash_between_renames;
         let subtrees = self.knobs.displace_subtrees;
         let changed = || Committed::Report(ApplyOutcome::ChangedUnderneath);
+        // A failure at the rename may take the temp file with it, which only
+        // the host can tell (§7.5): half do, on `FAIL_STREAM`.
+        let loses_temp = fail.is_some() && self.fail_rng.random::<bool>();
         let Some(node) = self.nodes.get_mut(&id) else {
             return (changed(), Vec::new());
         };
@@ -2397,6 +2497,16 @@ impl Sim {
         };
         if !expected_matches(node.fs.get(path), expected) {
             return (changed(), Vec::new());
+        }
+        // A `Remove` or `SetMeta` fails, if it does, before it has moved or
+        // changed anything.
+        if let Some(error) = fail.clone()
+            && !matches!(action, Action::Write { .. })
+        {
+            return (
+                Committed::Report(ApplyOutcome::Failed { error }),
+                Vec::new(),
+            );
         }
         let mut created = Vec::new();
         if let Action::Write { .. } = action {
@@ -2446,15 +2556,35 @@ impl Sim {
                 {
                     return (Committed::CrashedBetweenRenames, created);
                 }
-                // Step 8. The rename needs a verified temp file (a directory
-                // is made in place instead); a real host learns there is
-                // none when the rename fails, and undoes step 7 before it
-                // reports, so a failed commit leaves the disk as it was.
+                let row = node.journal.pop();
+                // Step 8. A drawn failure strikes the rename itself (§7.5):
+                // the host undoes step 7 and removes the directories it made,
+                // so the disk is as it found it, and reports the failure. The
+                // temp file stays for resumption, unless the failure took it.
+                if let Some(error) = fail {
+                    if let Some(row) = row {
+                        self.stats.displacements_undone += 1;
+                        undo(node, row, now);
+                    }
+                    for dir in created.iter().rev() {
+                        node.fs.remove(dir);
+                    }
+                    if loses_temp && take_temp(node, path, version).is_some() {
+                        self.stats.temps_lost += 1;
+                    }
+                    return (
+                        Committed::Report(ApplyOutcome::Failed { error }),
+                        Vec::new(),
+                    );
+                }
+                // The rename needs a verified temp file (a directory is made
+                // in place instead); a real host learns there is none when
+                // the rename fails, and undoes step 7 before it reports, so a
+                // failed commit leaves the disk as it was.
                 let content = match entry.kind {
                     Kind::Dir => Some(Vec::new()),
                     _ => take_temp(node, path, version),
                 };
-                let row = node.journal.pop();
                 let Some(content) = content else {
                     if let Some(row) = row {
                         self.stats.displacements_undone += 1;
@@ -4031,6 +4161,38 @@ mod tests {
             None,
             "not watching"
         );
+    }
+
+    /// §7.5: a failed commit leaves the disk as it found it. The checker
+    /// compares the folder and trash with what they were before the commit,
+    /// and wants no journal row left open.
+    #[test]
+    fn the_failed_commit_checker_flags_a_disk_it_changed() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let snapshot = |sim: &Sim| {
+            let n = &sim.nodes[&id];
+            Some((n.fs.clone(), n.trash.clone()))
+        };
+        let path = rel("n");
+        let io = LocalError::Io;
+        let before = snapshot(&sim);
+        sim.left_as_found(id, &path, &io, before.clone()).unwrap();
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(path.clone(), file(1, false));
+        let failure = sim.left_as_found(id, &path, &io, before).unwrap_err();
+        assert_eq!(failure.invariant, "failed commit");
+        let before = snapshot(&sim);
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .trash
+            .push(file(2, false).hash());
+        assert!(sim.left_as_found(id, &path, &io, before).is_err());
+        assert!(sim.left_as_found(id, &path, &io, None).is_err());
     }
 
     /// §7.5: a commit is in flight from the moment the engine asks for it

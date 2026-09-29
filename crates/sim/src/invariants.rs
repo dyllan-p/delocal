@@ -182,7 +182,8 @@ fn i2_no_loss(sim: &Sim) -> Result<(), Failure> {
 }
 
 /// I2 on one node. Nothing in it waits for the end of a run, so it holds
-/// between any two events as well.
+/// between any two events as well, and the simulator also checks it after
+/// every local failure (§7.5).
 pub(crate) fn i2_node(sim: &Sim, id: NodeId) -> Result<(), Failure> {
     let mut present: BTreeSet<ContentHash> = BTreeSet::new();
     if let Some(fs) = sim.fs(id) {
