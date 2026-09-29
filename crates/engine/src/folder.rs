@@ -1098,7 +1098,7 @@ impl FolderState {
     fn unmark(&mut self, path: &RelPath) -> Option<Want> {
         self.clear_carriers(path);
         if self.wants.restoring(path) {
-            self.wants.remove(path)
+            self.wants.take(path)
         } else {
             None
         }
@@ -1134,7 +1134,7 @@ impl FolderState {
     /// (keeping its sources when the version is unchanged); anything else
     /// ends it.
     fn reclassify_want(&mut self, now: Timestamp, path: &RelPath) {
-        let Some(old) = self.wants.remove(path) else {
+        let Some(old) = self.wants.take(path) else {
             return;
         };
         self.rederive(now, old);
@@ -1866,16 +1866,17 @@ impl FolderState {
                 self.wants
                     .iter()
                     .find(|w| w.committing())
-                    .map(|w| WaitReason::Committing {
-                        path: w.path().clone(),
-                    })
+                    .map(Want::path)
+                    .or_else(|| self.wants.released_paths().next())
+                    .map(|path| WaitReason::Committing { path: path.clone() })
             }
         }
     }
 
-    /// True if a commit is in flight at `path` (see [`Want::committing`]).
+    /// True if a commit is in flight at `path` (see [`Want::committing`]),
+    /// a released one included (§7.5).
     fn committing(&self, path: &RelPath) -> bool {
-        self.wants.get(path).is_some_and(Want::committing)
+        self.wants.get(path).is_some_and(Want::committing) || self.wants.held_by_released(path)
     }
 
     /// `deny <batch>` (§8.2): this machine's copies win. Every quarantined
@@ -2273,6 +2274,12 @@ impl FolderState {
         version: &Version,
         outcome: ApplyOutcome,
     ) -> Vec<IndexRecord> {
+        // The report of a commit a rule released early: discarded, and the
+        // path is free for a new commit (§7.5). No other commit of the path
+        // started meanwhile, so the report can be no one else's.
+        if self.wants.released_reported(path, version) {
+            return Vec::new();
+        }
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
         }
@@ -3901,6 +3908,96 @@ mod tests {
         let record = b.index().get(&copy_path).unwrap();
         assert!(record.entry.version.dominates(&c_copy.version));
         assert!(b.wants().get(&copy_path).is_none());
+    }
+
+    /// §7.5: a rule that releases a commit early releases the want, not the
+    /// path. Here the rule is the conflict-copy re-classification: B is
+    /// committing C's copy of L at the conflict path when its own commit of
+    /// W lands and records B's copy there, which re-classifies the want at
+    /// the copy path into a merge. The released commit keeps the path until
+    /// its own report: the path stays in flight, the merge's `SetMeta` waits,
+    /// and so would a `revert`. The report, when it comes, is discarded,
+    /// though it names the version of a want no longer there, and only then
+    /// does the merge commit. A restart ends the released commit too.
+    #[test]
+    fn a_commit_a_rule_released_keeps_its_path_until_its_own_report() {
+        let (mut a, mut b) = a_and_b(3, Rules::default());
+        b.scanned(t(10.0), p("f00"), file(5, 50)); // B's L
+        let loser = b.index().get(&p("f00")).unwrap().entry.clone();
+        let copy_path = crate::conflict::conflict_copy_name(&loser).unwrap();
+        a.scanned(t(11.0), p("f00"), file(6, 60)); // A's W, newer
+        let batch = a.form_batches(t(13.0), bid(6)).remove(0);
+        b.receive(t(13.0), &batch);
+        let w_version = b.wants().get(&p("f00")).unwrap().version().clone();
+        // C's copy of the same L, touched later, so the merge takes its
+        // mtime and lands as a metadata-only apply, a commit of the path.
+        let mut c_copy = loser.clone();
+        c_copy.path = copy_path.clone();
+        c_copy.version = Version::empty().incremented(node(3));
+        c_copy.modified_by = node(3);
+        c_copy.prev_hash = ContentHash::EMPTY;
+        c_copy.mtime_ns += 1;
+        c_copy.stamp += 1;
+        let mut c_batch = batch.clone();
+        c_batch.id = bid(7);
+        c_batch.source = node(3);
+        c_batch.entries = vec![c_copy.clone()];
+        c_batch.seq_low = 0;
+        c_batch.seq_high = 1;
+        b.receive(t(14.0), &c_batch);
+
+        // Both fetch; both commit.
+        b.dispatch(t(15.0), &lan(&[1, 3]));
+        b.fetched(t(16.0), &copy_path, &c_copy.version, FetchReport::Ok);
+        b.fetched(t(16.0), &p("f00"), &w_version, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1, 3]));
+        assert_eq!(steps.len(), 2, "{steps:?}");
+        assert_eq!(
+            b.applied(t(17.0), &p("f00"), &w_version, ApplyOutcome::Ok)
+                .len(),
+            2
+        );
+
+        let merge = b.wants().get(&copy_path).unwrap().clone();
+        assert_eq!(merge.mode, ApplyMode::MetadataOnly, "re-classified");
+        assert!(
+            b.in_flight(&copy_path),
+            "the released commit holds the path"
+        );
+        assert_eq!(
+            b.unsettled(UserDecision::Revert { batch: bid(9) }),
+            Some(WaitReason::Committing {
+                path: copy_path.clone()
+            })
+        );
+        let (steps, _) = b.dispatch(t(18.0), &lan(&[1, 3]));
+        assert!(steps.is_empty(), "no new commit of the path yet: {steps:?}");
+        assert_eq!(b.wants().get(&copy_path).unwrap().state, WantState::Blocked);
+
+        let mut restarted = b.clone();
+        restarted.restarted(t(30.0));
+        assert!(
+            !restarted.wants().held_by_released(&copy_path),
+            "a restart ends it"
+        );
+
+        // Its report is discarded: no deferral, the merge untouched.
+        let outcome = ApplyOutcome::ChangedUnderneath;
+        assert!(
+            b.applied(t(19.0), &copy_path, &c_copy.version, outcome)
+                .is_empty()
+        );
+        assert!(b.deferred().next().is_none());
+        assert!(!b.wants().held_by_released(&copy_path));
+        assert_eq!(
+            b.wants().get(&copy_path).unwrap().version(),
+            merge.version()
+        );
+        let (steps, _) = b.dispatch(t(20.0), &lan(&[1, 3]));
+        assert!(
+            matches!(&steps[..], [HostStep::SetMeta { path, .. }] if path == &copy_path),
+            "{steps:?}"
+        );
     }
 
     #[test]

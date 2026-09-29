@@ -84,7 +84,8 @@ pub enum WantState {
     /// Ready to fetch (or, with content in hand, to commit) as soon as a
     /// source, a slot and the ordering gate allow.
     Wanted,
-    /// Content in hand or not needed, waiting on the ordering gate.
+    /// Content in hand or not needed, waiting on the ordering gate, or
+    /// for a commit a rule released to leave the path (§7.5).
     Blocked,
     /// Every available source is on a tier whose §6.5 limit the file
     /// exceeds; `need` is the least demanding tier that would allow it.
@@ -274,6 +275,15 @@ pub struct WantList {
     /// Paths whose want changed or vanished since the last drain, in order.
     #[serde(skip)]
     changed: Vec<RelPath>,
+    /// Commits a rule released early, by the path each still holds, with
+    /// the version it was committing (§7.5). A rule that releases a commit
+    /// early releases the want, not the path: the commit keeps the path
+    /// until its own report or a restart, the report is discarded, and only
+    /// then may a new commit of the path start. A host operation does not
+    /// outlive the process, so these are no persisted part (§11), and like
+    /// the change log they are not encoded.
+    #[serde(skip)]
+    released: BTreeMap<RelPath, Version>,
 }
 
 impl WantList {
@@ -296,7 +306,40 @@ impl WantList {
 
     /// True if the path has a want in a short-lived state (§7.5).
     pub fn in_flight(&self, path: &RelPath) -> bool {
-        self.wants.get(path).is_some_and(Want::in_flight)
+        self.wants.get(path).is_some_and(Want::in_flight) || self.released.contains_key(path)
+    }
+
+    /// True if a commit a rule released early still holds `path` (§7.5).
+    pub fn held_by_released(&self, path: &RelPath) -> bool {
+        self.released.contains_key(path)
+    }
+
+    /// The paths released commits still hold, in path order.
+    pub fn released_paths(&self) -> impl Iterator<Item = &RelPath> {
+        self.released.keys()
+    }
+
+    /// A rule takes the want at `path` off the list, whatever its state
+    /// (§7.5): the conflict-copy re-classification, or revert at a marked
+    /// path (§8.3). If its commit is in flight, the rule releases the want,
+    /// not the path: the commit keeps the path until its own report.
+    pub fn take(&mut self, path: &RelPath) -> Option<Want> {
+        let want = self.remove(path)?;
+        if matches!(want.state, WantState::Committing { .. }) {
+            self.released.insert(path.clone(), want.version().clone());
+        }
+        Some(want)
+    }
+
+    /// The host reported the commit of `version` at `path`: if it is one a
+    /// rule released, its report is discarded and the path is free again
+    /// (§7.5). True if it was.
+    pub fn released_reported(&mut self, path: &RelPath, version: &Version) -> bool {
+        if self.released.get(path) != Some(version) {
+            return false;
+        }
+        self.released.remove(path);
+        true
     }
 
     /// True if the want at `path` carries the restoring mark (§8.3).
@@ -485,6 +528,7 @@ impl WantList {
     /// The process restarted: every transient state is *wanted* again, the
     /// host's operations having died with it.
     pub fn restarted(&mut self) {
+        self.released.clear();
         let paths: Vec<RelPath> = self.wants.keys().cloned().collect();
         for path in paths {
             if let Some(w) = self.wants.remove(&path) {
@@ -500,6 +544,7 @@ impl WantList {
         Self {
             wants: wants.into_iter().map(|w| (w.path().clone(), w)).collect(),
             changed: Vec::new(),
+            released: BTreeMap::new(),
         }
     }
 
@@ -838,6 +883,13 @@ impl WantList {
                 if let Some(want) = self.remove(&path) {
                     steps.push(WantStep::Adopt(Box::new(want)));
                 }
+                continue;
+            }
+            // A commit a rule released still holds the path (§7.5): the
+            // new one waits for its report. An index-only adoption above
+            // is no commit of the path; it touches nothing on disk.
+            if self.released.contains_key(&path) {
+                self.set_state(&path, WantState::Blocked);
                 continue;
             }
             steps.push(WantStep::Commit(Box::new(want.clone())));
