@@ -230,6 +230,7 @@ fn want_state() -> BoxedStrategy<WantState> {
         Just(WantState::GaveUp),
         at().prop_map(|until| WantState::LocalRetry { until }),
         Just(WantState::DiskFull),
+        (path(), any::<u64>()).prop_map(|(with, seq)| WantState::Collides { with, seq }),
     ]
     .boxed()
 }
