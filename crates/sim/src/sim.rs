@@ -572,6 +572,9 @@ enum Committed {
     /// The node crashed after the displacement and before the rename, with
     /// the journal row still open (§7.5).
     CrashedBetweenRenames,
+    /// A `Write` found no temp file of its version: the engine asked to
+    /// commit content it did not have.
+    NoTemp,
 }
 
 /// The whole simulated world. See the module docs.
@@ -2344,6 +2347,21 @@ impl Sim {
                         let gap = self.journal_rng.random_range(NANOS..60 * NANOS);
                         return self.crash(node, gap);
                     }
+                    // §7.5: the engine commits fetched content only once the
+                    // host has reported the fetch, and forgets it at every
+                    // failure that may have taken the temp file and at every
+                    // restart. A temp file goes only with those, so a `Write`
+                    // without one is a commit of content the engine could not
+                    // know it had.
+                    Committed::NoTemp => {
+                        return Err(self.fail(
+                            "missing temp",
+                            format!(
+                                "{}: asked to commit {path} at {version:?} with no temp file of that version",
+                                Self::short(node)
+                            ),
+                        ));
+                    }
                 };
                 // The host's mkdir of missing parents is a filesystem event
                 // like any other: the watcher may report it, the scan will.
@@ -2578,19 +2596,13 @@ impl Sim {
                     );
                 }
                 // The rename needs a verified temp file (a directory is made
-                // in place instead); a real host learns there is none when
-                // the rename fails, and undoes step 7 before it reports, so a
-                // failed commit leaves the disk as it was.
+                // in place instead).
                 let content = match entry.kind {
                     Kind::Dir => Some(Vec::new()),
                     _ => take_temp(node, path, version),
                 };
                 let Some(content) = content else {
-                    if let Some(row) = row {
-                        self.stats.displacements_undone += 1;
-                        undo(node, row, now);
-                    }
-                    return (changed(), created);
+                    return (Committed::NoTemp, created);
                 };
                 node.fs.insert(
                     path.clone(),
