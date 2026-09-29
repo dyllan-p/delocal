@@ -10,14 +10,15 @@ test: delocal-sim regressions::a_conflict_copy_its_user_removed_with_its_directo
 test: delocal-sim sim::tests::an_adoption_follows_its_content_to_the_conflict_copy
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
-index 4e18586..3d91713 100644
+index 69cd22c..4dbc4b0 100644
 --- a/crates/sim/src/sim.rs
 +++ b/crates/sim/src/sim.rs
-@@ -2760,14 +2760,7 @@ fn restart_difference(
- /// `to` (§7.6). The node's adoptions of that content follow it there, dated
+@@ -3886,15 +3886,7 @@ fn restart_difference(
+ /// (§7.5). The node's adoptions of that content follow it there, dated
  /// now, so that its user's later edit or deletion of the copy counts as the
  /// user's own change and not as sync's loss (I2, §14.1).
 -fn follow(node: &mut Node, from: &RelPath, to: &RelPath, hash: ContentHash, now: Timestamp) {
+-    node.moves.push((hash, from.clone(), to.clone(), now));
 -    for (h, path, at) in &mut node.synced {
 -        if *h == hash && path == from {
 -            *path = to.clone();
