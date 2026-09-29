@@ -1,0 +1,58 @@
+Takes a fetch report for a want in any state again, as before "Take a
+fetch report only for a want that is fetching":
+WantList::fetched checks only the report's version, so a late report for
+a want whose commit is in flight sets it wanted again, and the next
+dispatch starts a second commit of the path while the first is still in
+flight (DESIGN.md §7.5). The simulator's check for commits in flight then
+fails the run.
+
+test: delocal-sim regressions::a_late_fetch_report_starts_no_second_commit
+test: delocal-engine want::tests::a_fetch_report_for_a_want_that_is_not_fetching_changes_nothing
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -541,27 +541,34 @@
+         outcome: FetchReport,
+     ) -> Option<&Want> {
+         let want = self.wants.get_mut(path)?;
+-        let WantState::Fetching { from, .. } = want.state else {
+-            return None;
+-        };
+         if want.version() != version {
+             return None;
+         }
++        let from = match want.state {
++            WantState::Fetching { from, .. } => Some(from),
++            _ => None,
++        };
+         match outcome {
+             FetchReport::Ok => {
+                 want.fetched = true;
+                 want.state = WantState::Wanted;
+             }
+             FetchReport::NotAvailable => {
+-                want.sources.remove(&from);
+-                want.answered.insert(from);
++                if let Some(from) = from {
++                    want.sources.remove(&from);
++                    want.answered.insert(from);
++                }
+                 want.state = WantState::Wanted;
+             }
+             FetchReport::HashMismatch => {
+-                let strikes = want.strikes.entry(from).or_insert(0);
+-                *strikes = strikes.saturating_add(1);
+-                want.excluded
+-                    .insert(from, now.plus_nanos(exclusion_backoff(*strikes)));
++                // A report that no longer names the source it came from (the
++                // fetch was reassigned after a stall) excludes nobody.
++                if let Some(from) = from {
++                    let strikes = want.strikes.entry(from).or_insert(0);
++                    *strikes = strikes.saturating_add(1);
++                    want.excluded
++                        .insert(from, now.plus_nanos(exclusion_backoff(*strikes)));
++                }
+                 want.mismatches = u8::try_from(want.excluded.len()).unwrap_or(u8::MAX);
+                 want.state = if want.mismatches >= 2 {
+                     WantState::GaveUp

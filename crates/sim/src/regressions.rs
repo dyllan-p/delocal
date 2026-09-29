@@ -17545,3 +17545,24 @@ fn a_denied_item_returned_into_a_held_id_loses_nothing() {
         ],
     );
 }
+
+/// One file edited on one node. On a peer, the fetch waited in an open
+/// group of writes (§11) long enough to stall and be asked for again, so
+/// two fetches of one version were in flight. The first report handed over
+/// the content and the commit started; the second arrived while that commit
+/// was in flight, set the want wanted again, and the next dispatch started
+/// a second commit of the path (§7.5: at most one commit is in flight per
+/// path, and it holds its path until the host reports it). The guard made
+/// the second commit write nothing, so no invariant saw it; the checker
+/// for commits in flight does.
+#[test]
+fn a_late_fetch_report_starts_no_second_commit() {
+    passes(
+        13,
+        &[Step::Modify {
+            node: 0,
+            path: 0,
+            content: 5,
+        }],
+    );
+}
