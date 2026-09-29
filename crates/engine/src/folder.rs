@@ -2100,18 +2100,21 @@ impl FolderState {
         report: FetchReport,
     ) -> Fetched {
         let own = self.index.own();
-        let unrecoverable = {
-            let want = self.wants.fetched(now, path, version, report);
-            want.is_some_and(|w| {
-                w.restoring
-                    && report == FetchReport::NotAvailable
-                    && self
-                        .members
-                        .iter()
-                        .all(|m| *m == own || w.answered.contains(m))
-            })
+        // A report the want-list ignored (§7.5: the want was not fetching)
+        // settles nothing, and says nothing about the want's state.
+        let Some(want) = self.wants.fetched(now, path, version, report) else {
+            return Fetched {
+                state: None,
+                unrecoverable: None,
+            };
         };
-        let state = self.wants.get(path).map(|w| w.state);
+        let unrecoverable = want.restoring
+            && report == FetchReport::NotAvailable
+            && self
+                .members
+                .iter()
+                .all(|m| *m == own || want.answered.contains(m));
+        let state = Some(want.state);
         if !unrecoverable {
             return Fetched {
                 state,
@@ -4060,6 +4063,13 @@ mod tests {
         let f08 = b.wants().iter().find(|w| w.path() == &p("f08")).unwrap();
         assert!(b.index().live(&p("f08")).is_some(), "the record says live");
         let version = f08.version().clone();
+        // Slots for all nine refetches at once, so f08's is in flight.
+        let roomy = Rules {
+            max_fetches_per_peer: 16,
+            ..tight()
+        };
+        assert!(b.rules_changed(roomy).is_empty());
+        b.dispatch(t(13.5), &lan(&[1]));
         b.fetched(t(13.5), &p("f08"), &version, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(13.5), &lan(&[1]));
         assert!(
@@ -4104,6 +4114,7 @@ mod tests {
         let f00 = b.wants().get(&p("f00")).unwrap().clone();
         assert!(f00.restoring);
         assert!(b.index().live(&p("f00")).is_some(), "the record says live");
+        b.dispatch(t(14.0), &lan(&[1]));
         b.fetched(t(14.0), &p("f00"), f00.version(), FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         let expected: Vec<&Option<Observed>> = steps
@@ -4686,6 +4697,12 @@ mod tests {
         assert_eq!(want.entry.hash, hash(7), "A's edit, wanted now");
         assert!(want.reset.is_none() && !want.restoring);
         let v = want.version().clone();
+        // The four refetches hold node 1's slots; make room for f09's.
+        let roomy = Rules {
+            max_fetches_per_peer: 16,
+            ..tight()
+        };
+        assert!(b.rules_changed(roomy).is_empty());
         b.dispatch(t(17.0), &lan(&[1, 3]));
         b.fetched(t(18.0), &p("f09"), &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(18.0), &lan(&[1, 3]));

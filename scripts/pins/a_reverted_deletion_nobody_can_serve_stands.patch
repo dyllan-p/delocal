@@ -8,26 +8,28 @@ test: delocal-sim regressions::a_reverted_deletion_nobody_can_serve_stands
 test: delocal-engine engine::tests::an_unrecoverable_revert_ends_in_a_tombstone_once_every_member_answered
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..b9a4560 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2013,36 +2013,13 @@ impl FolderState {
+@@ -2099,39 +2099,13 @@
          version: &Version,
          report: FetchReport,
      ) -> Fetched {
 -        let own = self.index.own();
--        let unrecoverable = {
--            let want = self.wants.fetched(now, path, version, report);
--            want.is_some_and(|w| {
--                w.restoring
--                    && report == FetchReport::NotAvailable
--                    && self
--                        .members
--                        .iter()
--                        .all(|m| *m == own || w.answered.contains(m))
--            })
+-        // A report the want-list ignored (§7.5: the want was not fetching)
+-        // settles nothing, and says nothing about the want's state.
+-        let Some(want) = self.wants.fetched(now, path, version, report) else {
+-            return Fetched {
+-                state: None,
+-                unrecoverable: None,
+-            };
 -        };
--        let state = self.wants.get(path).map(|w| w.state);
+-        let unrecoverable = want.restoring
+-            && report == FetchReport::NotAvailable
+-            && self
+-                .members
+-                .iter()
+-                .all(|m| *m == own || want.answered.contains(m));
+-        let state = Some(want.state);
 -        if !unrecoverable {
 -            return Fetched {
 -                state,

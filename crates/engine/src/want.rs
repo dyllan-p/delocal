@@ -523,6 +523,16 @@ impl WantList {
 
     /// The host reports on a fetch (§7.5 steps 3 and 4). A mismatch
     /// excludes the source until `now` plus its backoff.
+    ///
+    /// Only a want that is fetching takes a report. A report for a want in
+    /// any other state is ignored and changes nothing: the want no longer
+    /// waits for that fetch (it stalled and is wanted again, or its content
+    /// is in hand), and a commit in flight holds its path until the host
+    /// reports the commit itself (§7.5). Taking a late report would set a
+    /// committing want wanted again, and the next dispatch would start a
+    /// second commit for the path while the first was still in flight.
+    /// Returns the want as the report leaves it, or `None` if it was
+    /// ignored.
     pub fn fetched(
         &mut self,
         now: Timestamp,
@@ -531,34 +541,27 @@ impl WantList {
         outcome: FetchReport,
     ) -> Option<&Want> {
         let want = self.wants.get_mut(path)?;
+        let WantState::Fetching { from, .. } = want.state else {
+            return None;
+        };
         if want.version() != version {
             return None;
         }
-        let from = match want.state {
-            WantState::Fetching { from, .. } => Some(from),
-            _ => None,
-        };
         match outcome {
             FetchReport::Ok => {
                 want.fetched = true;
                 want.state = WantState::Wanted;
             }
             FetchReport::NotAvailable => {
-                if let Some(from) = from {
-                    want.sources.remove(&from);
-                    want.answered.insert(from);
-                }
+                want.sources.remove(&from);
+                want.answered.insert(from);
                 want.state = WantState::Wanted;
             }
             FetchReport::HashMismatch => {
-                // A report that no longer names the source it came from (the
-                // fetch was reassigned after a stall) excludes nobody.
-                if let Some(from) = from {
-                    let strikes = want.strikes.entry(from).or_insert(0);
-                    *strikes = strikes.saturating_add(1);
-                    want.excluded
-                        .insert(from, now.plus_nanos(exclusion_backoff(*strikes)));
-                }
+                let strikes = want.strikes.entry(from).or_insert(0);
+                *strikes = strikes.saturating_add(1);
+                want.excluded
+                    .insert(from, now.plus_nanos(exclusion_backoff(*strikes)));
                 want.mismatches = u8::try_from(want.excluded.len()).unwrap_or(u8::MAX);
                 want.state = if want.mismatches >= 2 {
                     WantState::GaveUp
@@ -1312,12 +1315,6 @@ mod tests {
             ("old/x", Kind::File, 0, ApplyMode::Direct, true),
             ("old", Kind::Dir, 0, ApplyMode::Direct, true),
         ]);
-        l.fetched(
-            t(0),
-            &p("d/inner"),
-            &entry("d/inner", Kind::File, 1, 2, false).version,
-            FetchReport::Ok,
-        );
         let steps = l.dispatch(t(0), &Rules::default(), &peers(&[(2, Tier::Lan)]));
         let committed: Vec<&str> = steps
             .iter()
@@ -1330,6 +1327,18 @@ mod tests {
             committed,
             ["d", "old/x"],
             "the directory first, the child delete first"
+        );
+        assert_eq!(l.get(&p("old")).unwrap().state, WantState::Blocked);
+        // d/inner's content arrives while d is still committing.
+        l.fetched(
+            t(0),
+            &p("d/inner"),
+            &entry("d/inner", Kind::File, 1, 2, false).version,
+            FetchReport::Ok,
+        );
+        assert!(
+            l.dispatch(t(0), &Rules::default(), &peers(&[(2, Tier::Lan)]))
+                .is_empty()
         );
         assert_eq!(l.get(&p("d/inner")).unwrap().state, WantState::Blocked);
         assert_eq!(l.get(&p("old")).unwrap().state, WantState::Blocked);
@@ -1391,9 +1400,13 @@ mod tests {
             l.get(&p("f")).unwrap().excluded.is_empty(),
             "a stall does not exclude the source"
         );
-        // A late Ok is still taken.
-        l.fetched(t(0), &p("f"), &v, FetchReport::Ok);
-        assert!(l.get(&p("f")).unwrap().fetched);
+        // The want no longer waits for that fetch, so its late report is
+        // ignored, and the want fetches again.
+        assert!(l.fetched(t(0), &p("f"), &v, FetchReport::Ok).is_none());
+        assert!(!l.get(&p("f")).unwrap().fetched);
+        let steps = l.dispatch(t(111), &Rules::default(), &peers(&[(2, Tier::Lan)]));
+        assert!(matches!(&steps[0], WantStep::Fetch { .. }));
+        l.fetched(t(111), &p("f"), &v, FetchReport::Ok);
         let steps = l.dispatch(t(111), &Rules::default(), &peers(&[(2, Tier::Lan)]));
         assert!(matches!(&steps[0], WantStep::Commit(_)));
         assert_eq!(l.next_deadline(), Some(t(141)));
@@ -1414,6 +1427,51 @@ mod tests {
         assert_eq!(l.expire(t(1000)), Expired::default());
         l.restarted();
         assert_eq!(l.get(&p("f")).unwrap().state, WantState::Wanted);
+    }
+
+    /// §7.5: a commit in flight holds its path until the host reports the
+    /// commit itself, and only a want that is fetching takes a fetch
+    /// report. Two fetches for one want are in flight after a stall: the
+    /// first report hands over the content and the commit starts; the other
+    /// report, whatever it says, arrives while the commit is in flight and
+    /// changes nothing. It releases nothing, and no second commit starts.
+    /// A report for a want that stalled and is wanted again is ignored too.
+    #[test]
+    fn a_fetch_report_for_a_want_that_is_not_fetching_changes_nothing() {
+        let v = entry("f", Kind::File, 10, 2, false).version;
+        let lan = peers(&[(2, Tier::Lan)]);
+        let reports = [
+            FetchReport::Ok,
+            FetchReport::NotAvailable,
+            FetchReport::HashMismatch,
+        ];
+        for late in reports {
+            let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+            l.dispatch(t(0), &Rules::default(), &lan);
+            l.expire(t(60));
+            let steps = l.dispatch(t(60), &Rules::default(), &lan);
+            assert!(matches!(&steps[..], [WantStep::Fetch { .. }]), "{late:?}");
+            l.fetched(t(61), &p("f"), &v, FetchReport::Ok);
+            let steps = l.dispatch(t(61), &Rules::default(), &lan);
+            assert!(matches!(&steps[..], [WantStep::Commit(_)]), "{late:?}");
+            let committing = l.get(&p("f")).unwrap().clone();
+
+            assert!(l.fetched(t(62), &p("f"), &v, late).is_none(), "{late:?}");
+            assert_eq!(l.get(&p("f")), Some(&committing), "{late:?}");
+            assert!(
+                l.dispatch(t(62), &Rules::default(), &lan).is_empty(),
+                "no second commit: {late:?}"
+            );
+        }
+        for late in reports {
+            let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+            l.dispatch(t(0), &Rules::default(), &peers(&[(2, Tier::Lan)]));
+            l.expire(t(60));
+            let wanted = l.get(&p("f")).unwrap().clone();
+            assert_eq!(wanted.state, WantState::Wanted);
+            assert!(l.fetched(t(61), &p("f"), &v, late).is_none(), "{late:?}");
+            assert_eq!(l.get(&p("f")), Some(&wanted), "{late:?}");
+        }
     }
 
     #[test]
