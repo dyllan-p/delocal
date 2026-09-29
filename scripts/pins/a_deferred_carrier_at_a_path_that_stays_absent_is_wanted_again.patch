@@ -3,9 +3,11 @@ Removes the bracket end's re-want of deferred carriers from
 unused. A deferred entry that carries the restoring mark at a path the
 scan did not see then waits for an occupant that never comes, since
 absence at a marked path is ignored (DESIGN.md §8.3 step 2, the third
-rule for a marked path).
+rule for a marked path). The pinned seed reached this through a commit
+that found no temp file of its version, the overwrite the simulator's temp
+files keyed by version ended; no seed in 0 to 9,999 now fails with this
+patch, nor any of 500 at 2,000 steps, so it names the rule's unit test.
 
-test: delocal-sim regressions::a_deferred_carrier_at_a_path_that_stays_absent_is_wanted_again
 test: delocal-engine folder::tests::a_bracket_end_wants_a_deferred_carrier_again_as_it_stands
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
