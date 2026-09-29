@@ -1,13 +1,13 @@
-Turns off the two rules this pin needs off together; with either one alone it
-passes. The in-flight occupant rule of f566b64 (Look at an occupant of a
-marked path while its want is in flight) is undone: FolderState::scanned again
-ignores every observation of a path whose want is in flight, marked or not, so
-an occupant at a marked path no longer clears the mark while its restoring
-want is wanted, fetching or committing. And a deny no longer waits while a
-path of its held item carries the restoring mark: the Restoring branch of the
-deny arm of FolderState::unsettled, added by f6cff50 (Queue deny and revert
-until the folder settles), is removed. DESIGN.md §8.3, and §7.5's revert
-exception.
+Turns off two rules. The pin was found needing both off; at its current seed
+the second alone fails it and the first alone does not. The in-flight occupant
+rule of f566b64 (Look at an occupant of a marked path while its want is in
+flight) is undone: FolderState::scanned again ignores every observation of a
+path whose want is in flight, marked or not, so an occupant at a marked path
+no longer clears the mark while its restoring want is wanted, fetching or
+committing. And a deny no longer waits while a path of its held item carries
+the restoring mark: the Restoring branch of the deny arm of
+FolderState::unsettled, added by f6cff50 (Queue deny and revert until the
+folder settles), is removed. DESIGN.md §8.3, and §7.5's revert exception.
 
 test: delocal-sim regressions::a_deny_after_revert_over_an_unobserved_occupant
 test: delocal-engine folder::tests::an_occupant_at_a_marked_path_counts_while_its_want_is_in_flight
