@@ -2419,7 +2419,7 @@ impl Sim {
                 if subtrees && has_children(node, path) {
                     self.stats.subtrees_displaced += 1;
                 }
-                if displace_journalled(node, path, displace, subtrees)
+                if displace_journalled(node, path, displace, subtrees, now)
                     && crash_between > 0.0
                     && self.journal_rng.random::<f64>() < crash_between
                 {
@@ -2441,9 +2441,6 @@ impl Sim {
                     }
                     return (changed(), created);
                 };
-                if let Some(row) = row {
-                    moved_by_sync(node, &row, now);
-                }
                 node.fs.insert(
                     path.clone(),
                     File {
@@ -3295,8 +3292,9 @@ fn restart_difference(
     rebuilt.first_difference(&crashed)
 }
 
-/// Sync moved the file with `hash` from `from` to the conflict-copy path
-/// `to` (§7.6). The node's adoptions of that content follow it there, dated
+/// Sync moved the file with `hash` from `from` to `to`: to a conflict-copy
+/// path (§7.6), or back from one when the journal undoes a displacement
+/// (§7.5). The node's adoptions of that content follow it there, dated
 /// now, so that its user's later edit or deletion of the copy counts as the
 /// user's own change and not as sync's loss (I2, §14.1).
 fn follow(node: &mut Node, from: &RelPath, to: &RelPath, hash: ContentHash, now: Timestamp) {
@@ -3382,12 +3380,26 @@ fn displace_path(
 /// `path` and where it goes is made durable, then it moves there with one
 /// rename (the row is written after the move here, which is the same thing
 /// in a step no crash can split). False, and no row, if the path is empty.
-fn displace_journalled(node: &mut Node, path: &RelPath, to: &Displace, subtree: bool) -> bool {
+///
+/// Content moved to a conflict-copy path is followed there at once (I2,
+/// see `follow`), not when the row goes: while it is open the node may
+/// crash, and its user may edit or delete the moved file before the
+/// restart undoes the row, which is then the user's own change.
+fn displace_journalled(
+    node: &mut Node,
+    path: &RelPath,
+    to: &Displace,
+    subtree: bool,
+    now: Timestamp,
+) -> bool {
     if !node.fs.contains_key(path) {
         return false;
     }
     let trash_at = node.trash.len();
     let moved = displace_path(node, path, to, subtree);
+    if let Displace::ConflictCopy(target) = to {
+        follow_moved(node, path, target, &moved, now);
+    }
     node.journal.push(JournalRow {
         path: path.clone(),
         to: to.clone(),
@@ -3402,9 +3414,10 @@ fn displace_journalled(node: &mut Node, path: &RelPath, to: &Displace, subtree: 
 /// replacing anything, so if the path was taken meanwhile (a user can edit
 /// a folder while its daemon is down) whatever moved stays where it went,
 /// in the trash or at the conflict-copy path, and the next scan sees both.
+/// What comes back from a conflict-copy path, as it now is, takes the
+/// adoptions of its content back with it (I2).
 fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
     if node.fs.contains_key(&row.path) {
-        moved_by_sync(node, &row, now);
         return;
     }
     match &row.to {
@@ -3440,18 +3453,11 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
                     continue;
                 };
                 if let Some(file) = node.fs.remove(&at) {
+                    follow(node, &at, &back, file.hash(), now);
                     node.fs.insert(back, file);
                 }
             }
         }
-    }
-}
-
-/// The adoptions of content a journalled displacement moved to a
-/// conflict-copy path follow it there (I2; see `follow`).
-fn moved_by_sync(node: &mut Node, row: &JournalRow, now: Timestamp) {
-    if let Displace::ConflictCopy(target) = &row.to {
-        follow_moved(node, &row.path, target, &row.moved, now);
     }
 }
 
@@ -3629,6 +3635,55 @@ mod tests {
                 (moved.hash(), elsewhere, before),
             ]
         );
+    }
+
+    /// A journalled displacement moves the content to its conflict-copy
+    /// path at once, so the adoption follows it then (I2, §7.5): the node
+    /// may crash with the row open, and its user may rewrite or delete the
+    /// moved file before the restart undoes the row, which is the user's own
+    /// change. What the undo brings back takes the adoption back with it.
+    #[test]
+    fn an_adoption_follows_a_journalled_displacement_and_its_undo() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let (at, copy) = (rel("d1/f2"), rel("d1/f2.conflict-20231114-221320-n1"));
+        let adopted = file(4, false);
+        let (before, displaced, undone) = (
+            Timestamp::from_unix_nanos(1_700_000_000 * NANOS),
+            Timestamp::from_unix_nanos(1_700_000_010 * NANOS),
+            Timestamp::from_unix_nanos(1_700_000_020 * NANOS),
+        );
+        let to = Displace::ConflictCopy(copy.clone());
+        let displace = |sim: &mut Sim| {
+            let node = sim.nodes.get_mut(&id).unwrap();
+            node.fs.insert(at.clone(), adopted.clone());
+            node.synced = vec![(adopted.hash(), at.clone(), before)];
+            assert!(displace_journalled(node, &at, &to, false, displaced));
+            node.journal.pop().unwrap()
+        };
+
+        // Undone untouched: the content and its adoption are back.
+        let row = displace(&mut sim);
+        assert_eq!(
+            sim.synced(id).0,
+            [(adopted.hash(), copy.clone(), displaced)]
+        );
+        undo(sim.nodes.get_mut(&id).unwrap(), row, undone);
+        assert_eq!(sim.synced(id).0, [(adopted.hash(), at.clone(), undone)]);
+        crate::invariants::i2_node(&sim, id).unwrap();
+
+        // Deleted by its user while the row was open: the user's change.
+        let row = displace(&mut sim);
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.fs.remove(&copy);
+        node.local_edit_at
+            .insert(copy.clone(), displaced.plus_nanos(NANOS));
+        undo(node, row, undone);
+        assert_eq!(
+            sim.synced(id).0,
+            [(adopted.hash(), copy.clone(), displaced)]
+        );
+        crate::invariants::i2_node(&sim, id).unwrap_or_else(|f| panic!("{f}"));
     }
 
     /// A revert discards only the versions its node wrote above the record
