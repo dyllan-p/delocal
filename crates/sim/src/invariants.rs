@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use delocal_engine::conflict::{Side, conflict_copy_name, winner};
-use delocal_engine::{ContentHash, Entry, Kind, RelPath};
+use delocal_engine::{ContentHash, Entry, Kind, NodeId, RelPath};
 
 use crate::sim::{Failure, Sim};
 
@@ -176,31 +176,38 @@ fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
 fn i2_no_loss(sim: &Sim) -> Result<(), Failure> {
     let _ = sim.announced(); // kept for statistics
     for id in sim.node_ids() {
-        let mut present: BTreeSet<ContentHash> = BTreeSet::new();
-        if let Some(fs) = sim.fs(*id) {
-            for f in fs.values() {
-                if f.kind != Kind::Dir {
-                    present.insert(crate::sim::hash_bytes(&f.content));
-                }
+        i2_node(sim, *id)?;
+    }
+    Ok(())
+}
+
+/// I2 on one node. Nothing in it waits for the end of a run, so it holds
+/// between any two events as well.
+pub(crate) fn i2_node(sim: &Sim, id: NodeId) -> Result<(), Failure> {
+    let mut present: BTreeSet<ContentHash> = BTreeSet::new();
+    if let Some(fs) = sim.fs(id) {
+        for f in fs.values() {
+            if f.kind != Kind::Dir {
+                present.insert(crate::sim::hash_bytes(&f.content));
             }
         }
-        present.extend(sim.trash(*id).iter().copied());
-        let (synced, local_edit_at) = sim.synced(*id);
-        for (hash, path, at) in synced {
-            if present.contains(hash) {
-                continue;
-            }
-            if local_edit_at.get(path).is_some_and(|t| t > at) {
-                continue; // the user's own later edit; not sync's loss
-            }
-            return Err(sim.failure(
-                "I2 no loss",
-                format!(
-                    "{}: content {} adopted at {path} (at {:?}) is in neither its folder nor its trash and its user never touched the path since",
-                    id.short(), hash.short(), at
-                ),
-            ));
+    }
+    present.extend(sim.trash(id).iter().copied());
+    let (synced, local_edit_at) = sim.synced(id);
+    for (hash, path, at) in synced {
+        if present.contains(hash) {
+            continue;
         }
+        if local_edit_at.get(path).is_some_and(|t| t > at) {
+            continue; // the user's own later edit; not sync's loss
+        }
+        return Err(sim.failure(
+            "I2 no loss",
+            format!(
+                "{}: content {} adopted at {path} (at {:?}) is in neither its folder nor its trash and its user never touched the path since",
+                id.short(), hash.short(), at
+            ),
+        ));
     }
     Ok(())
 }
