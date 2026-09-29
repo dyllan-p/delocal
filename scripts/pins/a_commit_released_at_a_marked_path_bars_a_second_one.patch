@@ -1,0 +1,26 @@
+Makes a rule that releases a commit early free the path along with the
+want, as before "Keep a released commit's path until its own report":
+WantList::take removes the want and records nothing, so the engine may
+start a new commit of the path while the released one is still in flight,
+and the released commit's report can then settle the new one (DESIGN.md
+§7.5). The simulator's check for commits in flight fails the run.
+
+test: delocal-sim regressions::a_commit_released_at_a_marked_path_bars_a_second_one
+test: delocal-engine folder::tests::a_commit_a_rule_released_keeps_its_path_until_its_own_report
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -324,11 +324,7 @@
+     /// path (§8.3). If its commit is in flight, the rule releases the want,
+     /// not the path: the commit keeps the path until its own report.
+     pub fn take(&mut self, path: &RelPath) -> Option<Want> {
+-        let want = self.remove(path)?;
+-        if matches!(want.state, WantState::Committing { .. }) {
+-            self.released.insert(path.clone(), want.version().clone());
+-        }
+-        Some(want)
++        self.remove(path)
+     }
+ 
+     /// The host reported the commit of `version` at `path`: if it is one a
