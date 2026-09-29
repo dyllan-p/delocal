@@ -353,6 +353,7 @@ enum Op {
         path: RelPath,
         version: Version,
         action: Box<Action>,
+        commit: u64,
         done_at: Timestamp,
         /// It fell due while its node was offline. Offline stands for a
         /// suspended machine, whose disk operations finish when it resumes:
@@ -457,6 +458,21 @@ impl SkipCheck {
     }
 }
 
+/// A commit an engine asked for and has not had reported (§7.5).
+struct InFlight {
+    /// Which of the host's commits it is, so that only its own report ends
+    /// it: a commit the engine released may still report, later.
+    commit: u64,
+    version: Version,
+    /// Its want carried the restoring mark (§8.3).
+    restoring: bool,
+    /// The conflict-copy path it moves the losing file to (§7.6), if any.
+    copy_to: Option<RelPath>,
+    /// A rule released its want early (§7.5): the commit still holds the
+    /// path until its own report, and its want may be anything meanwhile.
+    released: bool,
+}
+
 /// True if a rule on `node` ignores `path`: a rule for the path itself, or
 /// for a directory above it (§7.3).
 fn ignores(node: &Node, path: &RelPath) -> bool {
@@ -506,11 +522,12 @@ enum Held {
         from: NodeId,
     },
     /// `Write`, `Remove` or `SetMeta`, with the version of the want it
-    /// commits as the engine asked for it.
+    /// commits as the engine asked for it, and its number.
     Commit {
         path: RelPath,
         version: Version,
         action: Box<Action>,
+        commit: u64,
     },
     MoveToTrash {
         path: RelPath,
@@ -554,6 +571,17 @@ pub struct Sim {
     /// While a node is fed a `Skipped` report or the end of a bracket that
     /// had one, what the skip checker holds its index writes against.
     checking: Option<SkipCheck>,
+    /// Every commit an engine asked for whose report it has not been fed,
+    /// by node and path: what the in-flight checker holds the engine to
+    /// (§7.5).
+    committing: BTreeMap<(NodeId, RelPath), InFlight>,
+    /// The number the next commit a host is asked for gets.
+    next_commit: u64,
+    /// While a commit's report is fed, the conflict-copy path it displaced
+    /// the losing file to, if it landed and did (§7.6).
+    copy_recorded: Option<(NodeId, RelPath)>,
+    /// While an observation is fed, the node and path it observes.
+    observing: Option<(NodeId, RelPath)>,
     clock: Timestamp,
     folder: FolderId,
     rules: Rules,
@@ -673,6 +701,10 @@ impl Sim {
             group_rng,
             skip_rng,
             checking: None,
+            committing: BTreeMap::new(),
+            next_commit: 0,
+            copy_recorded: None,
+            observing: None,
             clock,
             folder,
             rules,
@@ -1049,6 +1081,11 @@ impl Sim {
     /// is open depends on nothing unwritten, and its effects happen at once.
     fn feed(&mut self, id: NodeId, event: Event) -> Result<(), Failure> {
         let now = self.now_for(id);
+        let what = event_name(&event);
+        let observing = match &event {
+            Event::Scanned { path, .. } => Some((id, path.clone())),
+            _ => None,
+        };
         let actions = {
             let Some(node) = self.nodes.get_mut(&id) else {
                 return Ok(());
@@ -1066,10 +1103,133 @@ impl Sim {
         if actions.iter().any(is_table_write) {
             self.open_group(id);
         }
-        for action in actions {
-            self.act(id, action)?;
-        }
+        let outer = std::mem::replace(&mut self.observing, observing);
+        let acted = actions
+            .into_iter()
+            .try_for_each(|action| self.act(id, action))
+            .and_then(|()| self.holds_its_commits(id, &what));
+        self.observing = outer;
+        acted?;
         self.event_done(id)
+    }
+
+    /// §7.5: at most one commit is in flight per path, and a commit holds
+    /// its path until the host reports it or the process restarts. So after
+    /// every event, each commit `id` asked for and has not had reported is
+    /// still what its want waits for: the want is there, committing that
+    /// version. Two rules may release the want early (see
+    /// [`Sim::release_allowed`]), but not the path: the released commit is
+    /// tracked until its own report like any other, and no second commit of
+    /// the path may start meanwhile ([`Sim::commit_started`]).
+    fn holds_its_commits(&mut self, id: NodeId, event: &str) -> Result<(), Failure> {
+        let Some(folder) = self.engine(id).and_then(|e| e.folder(self.folder)) else {
+            return Ok(());
+        };
+        let mut released = Vec::new();
+        for ((node, path), c) in &self.committing {
+            if *node != id || c.released {
+                continue;
+            }
+            let held = folder.wants().get(path).is_some_and(|w| {
+                w.version() == &c.version && matches!(w.state, WantState::Committing { .. })
+            });
+            if held {
+                continue;
+            }
+            if self.release_allowed(id, path, c) {
+                released.push(path.clone());
+                continue;
+            }
+            let now = folder
+                .wants()
+                .get(path)
+                .map(|w| format!("{:?} at {:?}", w.state, w.version()));
+            return Err(self.fail(
+                "commit in flight",
+                format!(
+                    "{} released its commit of {path} at {:?} on {event}, before the host reported it; the want is now {}",
+                    Self::short(id),
+                    c.version,
+                    now.unwrap_or_else(|| "gone".to_owned())
+                ),
+            ));
+        }
+        for path in released {
+            if let Some(c) = self.committing.get_mut(&(id, path)) {
+                c.released = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// The two rules that may release the want of a commit in flight early
+    /// (§7.5), which the in-flight checker lets through. They release the
+    /// want, not the path:
+    ///
+    /// - §7.5, conflict-copy re-classification: the report of a commit that
+    ///   moved the losing file to its conflict-copy path records that copy,
+    ///   and the want at the copy path is re-classified against it,
+    ///   releasing a commit in flight there. That commit was asked for
+    ///   before the copy existed, so its guard almost always fails, and its
+    ///   report is discarded whatever it says.
+    /// - §7.5's revert exception, §8.3: an observation of an occupant at a
+    ///   path carrying the restoring mark clears the mark and cancels the
+    ///   want, whatever state it is in.
+    fn release_allowed(&self, id: NodeId, path: &RelPath, c: &InFlight) -> bool {
+        let at = Some((id, path.clone()));
+        self.copy_recorded == at || (c.restoring && self.observing == at)
+    }
+
+    /// §7.5: the engine asks `id`'s host for a commit of `path` at
+    /// `version`, which is in flight until the host reports it. Returns the
+    /// commit's number. A second commit of the path while one is in flight
+    /// is a failure, whether or not a rule released the first one's want.
+    fn commit_started(
+        &mut self,
+        id: NodeId,
+        path: &RelPath,
+        version: &Version,
+        action: &Action,
+    ) -> Result<u64, Failure> {
+        let key = (id, path.clone());
+        if let Some(earlier) = self.committing.get(&key) {
+            let detail = format!(
+                "{} started a commit of {path} at {version:?} while its commit at {:?} was in flight{}",
+                Self::short(id),
+                earlier.version,
+                if earlier.released {
+                    ", released early"
+                } else {
+                    ""
+                }
+            );
+            return Err(self.fail("commit in flight", detail));
+        }
+        let restoring = self
+            .engine(id)
+            .and_then(|e| e.folder(self.folder))
+            .and_then(|f| f.wants().get(path))
+            .is_some_and(|w| w.restoring);
+        let copy_to = match action {
+            Action::Write { displace, .. } | Action::Remove { displace, .. } => match displace {
+                Displace::ConflictCopy(to) => Some(to.clone()),
+                Displace::Trash => None,
+            },
+            _ => None,
+        };
+        let commit = self.next_commit;
+        self.next_commit += 1;
+        self.committing.insert(
+            key,
+            InFlight {
+                commit,
+                version: version.clone(),
+                restoring,
+                copy_to,
+                released: false,
+            },
+        );
+        Ok(commit)
     }
 
     /// Open a group of writes on `id` unless one is open (§11), and draw how
@@ -1272,12 +1432,14 @@ impl Sim {
                 ..
             } => {
                 let (path, version) = (path.clone(), entry.version.clone());
+                let commit = self.commit_started(id, &path, &version, &action)?;
                 self.hold(
                     id,
                     Held::Commit {
                         path,
                         version,
                         action: Box::new(action),
+                        commit,
                     },
                 )?;
             }
@@ -1293,12 +1455,14 @@ impl Sim {
                     .and_then(|f| f.wants().get(&path))
                     .map(|w| w.version().clone())
                     .unwrap_or_default();
+                let commit = self.commit_started(id, &path, &version, &action)?;
                 self.hold(
                     id,
                     Held::Commit {
                         path,
                         version,
                         action: Box::new(action),
+                        commit,
                     },
                 )?;
             }
@@ -1675,6 +1839,7 @@ impl Sim {
                 path,
                 version,
                 action,
+                commit,
             } => {
                 let done_at = self
                     .clock
@@ -1684,6 +1849,7 @@ impl Sim {
                     path,
                     version,
                     action,
+                    commit,
                     done_at,
                     suspended: false,
                 });
@@ -1880,6 +2046,8 @@ impl Sim {
         }
         self.ops
             .retain(|op| op.node() != id && !matches!(op, Op::Fetch { from, .. } if *from == id));
+        // The node's commits die with it; the restart wants their paths again.
+        self.committing.retain(|(node, _), _| *node != id);
         let folder = self.folder;
         let lag = self.knobs.group_commit_lag;
         if let Some(n) = self.nodes.get_mut(&id) {
@@ -2059,6 +2227,7 @@ impl Sim {
                 path,
                 version,
                 action,
+                commit,
                 ..
             } => {
                 // A suspended node's commit waits for it to resume; a crashed
@@ -2130,7 +2299,19 @@ impl Sim {
                         ),
                     ));
                 }
-                self.feed(
+                // The report is in: the commit is no longer in flight, a
+                // released one included.
+                let key = (node, path.clone());
+                let copy_to = match self.committing.get(&key) {
+                    Some(c) if c.commit == commit => {
+                        self.committing.remove(&key).and_then(|c| c.copy_to)
+                    }
+                    _ => None,
+                };
+                self.copy_recorded = copy_to
+                    .filter(|_| outcome == ApplyOutcome::Ok)
+                    .map(|to| (node, to));
+                let fed = self.feed(
                     node,
                     Event::Applied {
                         folder: self.folder,
@@ -2138,7 +2319,9 @@ impl Sim {
                         version,
                         outcome,
                     },
-                )
+                );
+                self.copy_recorded = None;
+                fed
             }
         }
     }
@@ -3006,6 +3189,28 @@ fn rel(s: &str) -> RelPath {
     })
 }
 
+/// An event's kind and the path it names, if any, for a failure's detail.
+fn event_name(event: &Event) -> String {
+    match event {
+        Event::Scanned { path, state, .. } => {
+            let state = match state {
+                ScanState::Absent => "Absent",
+                ScanState::Unchanged => "Unchanged",
+                ScanState::Observed(_) => "Observed",
+                ScanState::Skipped { .. } => "Skipped",
+            };
+            format!("Scanned {path} {state}")
+        }
+        Event::Fetched { path, outcome, .. } => format!("Fetched {path} {outcome:?}"),
+        Event::FetchProgress { path, .. } => format!("FetchProgress {path}"),
+        Event::Applied { path, outcome, .. } => format!("Applied {path} {outcome:?}"),
+        other => {
+            let name = format!("{other:?}");
+            name.split([' ', '{', '(']).next().unwrap_or("").to_owned()
+        }
+    }
+}
+
 /// A verified fetch of `version` at `path` lands in its own temp file,
 /// replacing only an earlier fetch of the same version.
 fn put_temp(node: &mut Node, path: &RelPath, version: &Version, bytes: Vec<u8>) {
@@ -3676,6 +3881,74 @@ mod tests {
             flagged(&sim, record("f1", 11, id, true)),
             None,
             "not watching"
+        );
+    }
+
+    /// §7.5: a commit is in flight from the moment the engine asks for it
+    /// until the host reports it, and at most one is in flight per path. The
+    /// checker flags a second commit of a path while one is in flight, and a
+    /// commit whose want stopped committing before its report, unless one of
+    /// the two rules that release a want early did it: the re-classification
+    /// of a conflict-copy path while the commit that made the copy is
+    /// reported (§7.5), or an observation of a path carrying the restoring
+    /// mark (§7.5's revert exception, §8.3). They release the want, not the
+    /// path: a second commit is flagged after them too. Another path or
+    /// another node is no second commit.
+    #[test]
+    fn the_in_flight_checker_flags_a_second_commit_and_a_release() {
+        let mut sim = world();
+        let (id, other) = (sim.order[0], sim.order[1]);
+        let folder = sim.folder;
+        let write = |path: &str, n: u64| Action::Write {
+            folder,
+            path: rel(path),
+            entry: written(&rel(path), other, Version::from_iter([(other, n)]), 1, 0),
+            expected: None,
+            displace: Displace::Trash,
+        };
+        let v = |n: u64| Version::from_iter([(other, n)]);
+        for (node, path) in [(id, "n"), (id, "m"), (id, "k"), (other, "n")] {
+            sim.commit_started(node, &rel(path), &v(1), &write(path, 1))
+                .unwrap();
+        }
+        let twice = sim
+            .commit_started(id, &rel("n"), &v(2), &write("n", 2))
+            .unwrap_err();
+        assert_eq!(twice.invariant, "commit in flight");
+        assert!(
+            twice.detail.contains("started a commit of n"),
+            "{}",
+            twice.detail
+        );
+
+        // The engine has no want at all, so every commit above is released.
+        let released = sim.holds_its_commits(id, "Tick").unwrap_err();
+        assert!(
+            released.detail.contains("released its commit of k"),
+            "{}",
+            released.detail
+        );
+        sim.committing.remove(&(id, rel("k")));
+        sim.committing.get_mut(&(id, rel("n"))).unwrap().restoring = true;
+        sim.observing = Some((id, rel("n")));
+        assert!(
+            sim.holds_its_commits(id, "Scanned").is_err(),
+            "m's want carried no mark"
+        );
+        sim.copy_recorded = Some((id, rel("m")));
+        sim.holds_its_commits(id, "Scanned").unwrap();
+        sim.copy_recorded = None;
+        sim.observing = None;
+        assert!(sim.committing[&(id, rel("n"))].released);
+        assert!(sim.committing[&(id, rel("m"))].released);
+        sim.holds_its_commits(id, "Tick").unwrap();
+        let after = sim
+            .commit_started(id, &rel("m"), &v(2), &write("m", 2))
+            .unwrap_err();
+        assert!(after.detail.contains("released early"), "{}", after.detail);
+        assert!(
+            !sim.committing[&(other, rel("n"))].released,
+            "another node's"
         );
     }
 
