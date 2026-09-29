@@ -54,9 +54,12 @@ const GROUP_STREAM: u64 = 2;
 /// inspect, why, and which tracked paths become ignored (§7.3).
 const SKIP_STREAM: u64 = 3;
 /// The PRNG stream the local failures draw from (§7.5): which fetches and
-/// commits fail with an I/O error, and whether a failed rename takes its
-/// temp file with it.
+/// commits fail with an I/O error, whether a failed rename takes its temp
+/// file with it, and when a disk fills and for how long.
 const FAIL_STREAM: u64 = 4;
+/// How often a host whose folder's inbound is paused checks for free
+/// space (§7.5).
+const SPACE_CHECK_NANOS: i64 = 30 * NANOS;
 
 /// What a clean run reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,6 +106,12 @@ pub struct Stats {
     pub ignores: u64,
     /// Fetches and commits that failed with an I/O error (§7.5).
     pub io_failures: u64,
+    /// Times a disk filled up.
+    pub disk_fills: u64,
+    /// Fetches and commits that failed with `DiskFull`.
+    pub disk_full_reports: u64,
+    /// `SpaceRecovered` reports.
+    pub spaces_recovered: u64,
     /// Temp files a failed rename took with it.
     pub temps_lost: u64,
 }
@@ -308,6 +317,16 @@ struct Node {
     /// them, and how many more of this node's full scans the rule lasts
     /// (§7.3). On disk, so a restart keeps them.
     ignored: BTreeMap<RelPath, u32>,
+    /// The disk has no free space until then (§7.5).
+    full_until: Option<Timestamp>,
+    /// When the host next checks for free space, while the folder's inbound
+    /// is paused (§7.5).
+    space_check_at: Option<Timestamp>,
+    /// The engine has paused the folder's inbound on a full disk, as the
+    /// host learned it (see `Sim::note_pause`), and the host has not yet
+    /// reported `SpaceRecovered`: the engine must start nothing inbound
+    /// meanwhile (§7.5).
+    paused_inbound: bool,
     // ---- invariant tracking ----
     /// Every version this node has ever sent in a batch, per path.
     sent: BTreeMap<RelPath, Vec<Version>>,
@@ -487,6 +506,19 @@ struct InFlight {
     released: bool,
 }
 
+/// What the disk-full checker needs of the event a node is being fed
+/// (§7.5): see [`Sim::starts_inbound_while_paused`].
+struct Feeding {
+    node: NodeId,
+    /// A commit's report or a scan's observation, the two events that may
+    /// put another node's version in the index while the inbound is
+    /// paused: the report of a commit asked for before the pause, and a
+    /// landing an observation finds (§8.3).
+    may_adopt: bool,
+    /// The index's `seq` as the event began; a write above it is new.
+    seq: u64,
+}
+
 /// True if a rule on `node` ignores `path`: a rule for the path itself, or
 /// for a directory above it (§7.3).
 fn ignores(node: &Node, path: &RelPath) -> bool {
@@ -590,6 +622,9 @@ pub struct Sim {
     skip_rng: ChaCha8Rng,
     /// Draws for the local failures, on `FAIL_STREAM`.
     fail_rng: ChaCha8Rng,
+    /// While a node is fed an event: which node, what kind of event, and
+    /// its index's `seq` as the event began, for the disk-full checker.
+    feeding: Option<Feeding>,
     /// While a node is fed a `Skipped` report or the end of a bracket that
     /// had one, what the skip checker holds its index writes against.
     checking: Option<SkipCheck>,
@@ -634,7 +669,8 @@ pub struct Sim {
     corruption_on: bool,
     /// False in the final phase, which skips nothing and ignores nothing.
     skips_on: bool,
-    /// False in the final phase, in which no fetch or commit fails.
+    /// False in the final phase, in which no fetch or commit fails and no
+    /// disk fills.
     failures_on: bool,
     steps: Vec<Step>,
     steps_applied: usize,
@@ -691,6 +727,9 @@ impl Sim {
                 temp: BTreeMap::new(),
                 journal: Vec::new(),
                 ignored: BTreeMap::new(),
+                full_until: None,
+                space_check_at: None,
+                paused_inbound: false,
                 sent: BTreeMap::new(),
                 synced: Vec::new(),
                 moves: Vec::new(),
@@ -728,6 +767,7 @@ impl Sim {
             group_rng,
             skip_rng,
             fail_rng,
+            feeding: None,
             checking: None,
             committing: BTreeMap::new(),
             next_commit: 0,
@@ -847,8 +887,12 @@ impl Sim {
     /// Heal everything, approve everything, scan everything, drain.
     fn final_phase(&mut self) -> Result<(), Failure> {
         self.corruption_on = false;
-        // No fetch or commit fails from now on (§7.5).
+        // No fetch or commit fails from now on, and every disk has room
+        // again; a paused inbound resumes at its host's next check (§7.5).
         self.failures_on = false;
+        for node in self.nodes.values_mut() {
+            node.full_until = None;
+        }
         // Every ignore rule goes, and from now on every scan can look
         // everywhere, so the final scans observe everything (§7.3).
         self.skips_on = false;
@@ -911,6 +955,7 @@ impl Sim {
             n.online
                 && n.restart_at.is_none()
                 && n.group.as_ref().is_none_or(|g| g.effects.is_empty())
+                && !f.disk_full()
                 && f.window().is_none()
                 && f.due().is_none()
                 && f.quarantine().is_empty()
@@ -947,6 +992,7 @@ impl Sim {
                 || f.window().is_some()
                 || !f.quarantine().is_empty()
                 || f.paused().is_some()
+                || f.disk_full()
                 || f.deferred().next().is_some()
             {
                 let deferred: Vec<String> = f
@@ -965,11 +1011,12 @@ impl Sim {
                     })
                     .collect();
                 out.push_str(&format!(
-                    " {}: window={:?} held={} paused={} deferred=[{}] wants=[{}];",
+                    " {}: window={:?} held={} paused={} disk_full={} deferred=[{}] wants=[{}];",
                     Self::short(n.id),
                     f.window().map(|w| w.due()),
                     f.quarantine().len(),
                     f.paused().is_some(),
+                    f.disk_full(),
                     deferred.join(", "),
                     wants.join(", ")
                 ));
@@ -1028,6 +1075,7 @@ impl Sim {
             if n.alive() {
                 consider(n.wake_at);
                 consider(Some(n.next_scan_at));
+                consider(n.space_check_at);
             }
         }
         consider(self.messages.iter().map(|m| m.deliver_at).min());
@@ -1082,6 +1130,15 @@ impl Sim {
         if let Some(pos) = self.ops.iter().position(|op| op.next_at() <= now) {
             return self.progress_op(pos);
         }
+        // 4b. checks for free space (§7.5)
+        if let Some(id) = self
+            .nodes
+            .values()
+            .find(|n| n.alive() && n.space_check_at.is_some_and(|t| t <= now))
+            .map(|n| n.id)
+        {
+            return self.check_space(id);
+        }
         // 5. scans
         if let Some(id) = self
             .nodes
@@ -1117,14 +1174,17 @@ impl Sim {
             Event::Scanned { path, .. } => Some((id, path.clone())),
             _ => None,
         };
-        let actions = {
+        let folder = self.folder;
+        let may_adopt = matches!(event, Event::Applied { .. } | Event::Scanned { .. });
+        let (actions, seq) = {
             let Some(node) = self.nodes.get_mut(&id) else {
                 return Ok(());
             };
             let Some(engine) = node.engine.as_mut() else {
                 return Ok(());
             };
-            engine.handle(now, event)
+            let seq = engine.folder(folder).map_or(0, |f| f.index().seq());
+            (engine.handle(now, event), seq)
         };
         if let Ok(bytes) = postcard::to_stdvec(&actions) {
             self.log.update(&bytes);
@@ -1134,12 +1194,19 @@ impl Sim {
         if actions.iter().any(is_table_write) {
             self.open_group(id);
         }
+        self.note_pause(id);
         let outer = std::mem::replace(&mut self.observing, observing);
+        let outer_feeding = self.feeding.replace(Feeding {
+            node: id,
+            may_adopt,
+            seq,
+        });
         let acted = actions
             .into_iter()
             .try_for_each(|action| self.act(id, action))
             .and_then(|()| self.holds_its_commits(id, &what));
         self.observing = outer;
+        self.feeding = outer_feeding;
         acted?;
         self.event_done(id)
     }
@@ -1434,12 +1501,71 @@ impl Sim {
         })
     }
 
+    /// The host learns that a full disk paused the folder's inbound from
+    /// the engine's own state, as it persists it (§7.5, §11): from then on
+    /// it checks for space every 30 s, and the disk-full checker holds the
+    /// engine to the pause, from the actions of the event that paused it
+    /// on, until the host reports space recovered.
+    fn note_pause(&mut self, id: NodeId) {
+        let folder = self.folder;
+        let clock = self.clock;
+        let Some(n) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        let paused = n
+            .engine
+            .as_ref()
+            .and_then(|e| e.folder(folder))
+            .is_some_and(FolderState::disk_full);
+        if paused && !n.paused_inbound {
+            n.paused_inbound = true;
+            n.space_check_at = Some(clock.plus_nanos(SPACE_CHECK_NANOS));
+        }
+    }
+
+    /// §7.5: from the engine's pause on a full disk until the host reports
+    /// `SpaceRecovered`, the folder's inbound is paused. The engine asks for
+    /// no fetch and no commit, and puts no other node's version in the
+    /// index, except through the report of a commit it asked for before the
+    /// pause or a landing an observation finds (§8.3). A revert's records
+    /// keep their `seq` and are not new.
+    fn starts_inbound_while_paused(&self, id: NodeId, action: &Action) -> Option<String> {
+        if !self.nodes.get(&id)?.paused_inbound {
+            return None;
+        }
+        match action {
+            Action::Fetch { path, .. }
+            | Action::Write { path, .. }
+            | Action::Remove { path, .. }
+            | Action::SetMeta { path, .. } => Some(format!(
+                "{} asked the host to fetch or commit {path} while its disk was full",
+                Self::short(id)
+            )),
+            Action::IndexChanged { record, .. } => {
+                let feeding = self.feeding.as_ref().filter(|f| f.node == id)?;
+                (!feeding.may_adopt && record.seq > feeding.seq && record.entry.modified_by != id)
+                    .then(|| {
+                        format!(
+                            "{} adopted {}'s version of {} while its disk was full",
+                            Self::short(id),
+                            Self::short(record.entry.modified_by),
+                            record.entry.path
+                        )
+                    })
+            }
+            _ => None,
+        }
+    }
+
     fn act(&mut self, id: NodeId, action: Action) -> Result<(), Failure> {
         if let Some(detail) = self.tombstones_a_skip(id, &action) {
             return Err(self.fail("Skipped", detail));
         }
         if let Some(detail) = self.changes_a_held_record(id, &action) {
             return Err(self.fail("commit in flight", detail));
+        }
+        if let Some(detail) = self.starts_inbound_while_paused(id, &action) {
+            return Err(self.fail("disk full", detail));
         }
         if let Some(path) = self.commits_held_item(id, &action) {
             return Err(self.fail(
@@ -2060,6 +2186,7 @@ impl Sim {
                 // Offline stands for a suspended machine: its timers did not
                 // run, and whatever fell due while it slept fires now.
                 n.wake_at = n.wake_at.map(|t| t.max(clock));
+                n.space_check_at = n.space_check_at.map(|t| t.max(clock));
                 n.next_scan_at = n.next_scan_at.max(clock);
             }
             for op in &mut self.ops {
@@ -2134,6 +2261,10 @@ impl Sim {
             n.engine = None;
             n.temp.clear();
             n.wake_at = None;
+            // The host's own memory of a full disk died with it; at the
+            // restart it learns the folder's state from its tables.
+            n.space_check_at = None;
+            n.paused_inbound = false;
             n.restart_at = Some(self.clock.plus_nanos(gap_ns));
         }
         Ok(())
@@ -2190,6 +2321,15 @@ impl Sim {
         let engine = Engine::restore(config, vec![parts], now);
         if self.knobs.group_commit_lag > 0 {
             node.durable = engine.folder(self.folder).cloned();
+        }
+        // §7.5: a restart frees no space. A folder whose inbound a full disk
+        // paused is still paused, and the host goes on checking.
+        if engine
+            .folder(self.folder)
+            .is_some_and(FolderState::disk_full)
+        {
+            node.paused_inbound = true;
+            node.space_check_at = Some(clock.plus_nanos(SPACE_CHECK_NANOS));
         }
         node.engine = Some(engine);
         // §7.3: a full scan runs at daemon start, so at every restart; a
@@ -2270,7 +2410,7 @@ impl Sim {
                         if hash_bytes(&bytes) != hash {
                             self.stats.mismatches += 1;
                             FetchReport::HashMismatch
-                        } else if let Some(error) = self.local_failure() {
+                        } else if let Some(error) = self.local_failure(node, true) {
                             // The bytes arrived and could not be written here.
                             FetchReport::Failed { error }
                         } else {
@@ -2281,7 +2421,20 @@ impl Sim {
                         }
                     }
                 };
-                let failed = matches!(report, FetchReport::Failed { .. });
+                let failed = match &report {
+                    FetchReport::Failed { error } => Some(error.clone()),
+                    _ => None,
+                };
+                // The fetch the want waits for, or one it has moved on from,
+                // whose report the engine ignores (§7.5).
+                let awaited = self
+                    .engine(node)
+                    .and_then(|e| e.folder(self.folder))
+                    .and_then(|f| f.wants().get(&path))
+                    .is_some_and(|w| {
+                        w.version() == &version && matches!(w.state, WantState::Fetching { .. })
+                    });
+                let what = format!("fetch of {path}");
                 self.feed(
                     node,
                     Event::Fetched {
@@ -2292,10 +2445,10 @@ impl Sim {
                         outcome: report,
                     },
                 )?;
-                if failed {
-                    self.after_local_failure(node)?;
+                match failed {
+                    Some(error) => self.after_local_failure(node, &error, awaited, &what),
+                    None => Ok(()),
                 }
-                Ok(())
             }
             Op::Commit {
                 node,
@@ -2324,7 +2477,7 @@ impl Sim {
                 // Drawn before the commit starts, and used where it would
                 // strike: at the rename for a `Write`, before anything is
                 // changed for a `Remove` or `SetMeta`.
-                let fail = self.local_failure();
+                let fail = self.local_failure(node, matches!(*action, Action::Write { .. }));
                 // What the disk held, for the check that a failed commit left
                 // it so; only a commit drawn to fail needs it.
                 let before = self
@@ -2371,7 +2524,10 @@ impl Sim {
                 if outcome == ApplyOutcome::ChangedUnderneath {
                     self.stats.changed_underneath += 1;
                 }
-                let failed = matches!(outcome, ApplyOutcome::Failed { .. });
+                let failed = match &outcome {
+                    ApplyOutcome::Failed { error } => Some(error.clone()),
+                    _ => None,
+                };
                 // §13: the rename happened but the report is lost to a crash.
                 if outcome == ApplyOutcome::Ok
                     && self.rng.random::<f64>() < self.knobs.crash_after_rename
@@ -2405,14 +2561,18 @@ impl Sim {
                     ));
                 }
                 // The report is in: the commit is no longer in flight, a
-                // released one included.
+                // released one included. Only one its want still waits for
+                // is taken as its want's report (§7.5).
                 let key = (node, path.clone());
-                let copy_to = match self.committing.get(&key) {
+                let (copy_to, awaited) = match self.committing.get(&key) {
                     Some(c) if c.commit == commit => {
-                        self.committing.remove(&key).and_then(|c| c.copy_to)
+                        let awaited = !c.released;
+                        let copy_to = self.committing.remove(&key).and_then(|c| c.copy_to);
+                        (copy_to, awaited)
                     }
-                    _ => None,
+                    _ => (None, false),
                 };
+                let what = format!("commit of {path}");
                 self.copy_recorded = copy_to
                     .filter(|_| outcome == ApplyOutcome::Ok)
                     .map(|to| (node, to));
@@ -2427,21 +2587,43 @@ impl Sim {
                 );
                 self.copy_recorded = None;
                 fed?;
-                if failed {
-                    self.after_local_failure(node)?;
+                match failed {
+                    Some(error) => self.after_local_failure(node, &error, awaited, &what),
+                    None => Ok(()),
                 }
-                Ok(())
             }
         }
     }
 
     /// Whether a fetch or a commit on `id` fails on this machine (§7.5
-    /// "local failures"): with an I/O error, at the knob's rate. The draw is
-    /// on `FAIL_STREAM`, and none is made with the knob at 0 or in the final
-    /// phase.
-    fn local_failure(&mut self) -> Option<LocalError> {
+    /// "local failures"). One that `needs_space` (a fetch writing its bytes,
+    /// a `Write`) may first fill the disk, which then stays full for 30 s to
+    /// 10 min, and fails with `DiskFull` while it is. Otherwise it fails
+    /// with an I/O error at the knob's rate. Every draw is on `FAIL_STREAM`,
+    /// and none is made with the knobs at 0 or in the final phase.
+    fn local_failure(&mut self, id: NodeId, needs_space: bool) -> Option<LocalError> {
         if !self.failures_on {
             return None;
+        }
+        let now = self.clock;
+        if needs_space {
+            if self.knobs.disk_fill > 0.0 && self.fail_rng.random::<f64>() < self.knobs.disk_fill {
+                let until = now.plus_nanos(self.fail_rng.random_range(30 * NANOS..=600 * NANOS));
+                if let Some(n) = self.nodes.get_mut(&id)
+                    && n.full_until.is_none_or(|t| t <= now)
+                {
+                    n.full_until = Some(until);
+                    self.stats.disk_fills += 1;
+                }
+            }
+            if self
+                .nodes
+                .get(&id)
+                .is_some_and(|n| n.full_until.is_some_and(|t| t > now))
+            {
+                self.stats.disk_full_reports += 1;
+                return Some(LocalError::DiskFull);
+            }
         }
         if self.knobs.io_failure > 0.0 && self.fail_rng.random::<f64>() < self.knobs.io_failure {
             self.stats.io_failures += 1;
@@ -2479,8 +2661,63 @@ impl Sim {
 
     /// After a fetch or a commit on `id` failed (§7.5), I2 must still hold
     /// on that node: every content sync adopted there is in its folder or
-    /// its trash, a failure having moved nothing anywhere.
-    fn after_local_failure(&mut self, id: NodeId) -> Result<(), Failure> {
+    /// its trash, a failure having moved nothing anywhere. And a full disk
+    /// reported by the operation its want waited for (`awaited`) must have
+    /// paused the folder's inbound; the report of one the want had moved
+    /// on from is ignored like any such report, and the next operation to
+    /// find the disk full says so for itself.
+    fn after_local_failure(
+        &mut self,
+        id: NodeId,
+        error: &LocalError,
+        awaited: bool,
+        what: &str,
+    ) -> Result<(), Failure> {
+        if *error == LocalError::DiskFull
+            && awaited
+            && !self
+                .engine(id)
+                .and_then(|e| e.folder(self.folder))
+                .is_some_and(FolderState::disk_full)
+        {
+            return Err(self.fail(
+                "disk full",
+                format!(
+                    "{}: the {what} its want waited for found the disk full, and the folder's inbound did not pause",
+                    Self::short(id)
+                ),
+            ));
+        }
+        invariants::i2_node(self, id)
+    }
+
+    /// The host of `id` checks for free space while its folder's inbound
+    /// is paused (§7.5), every 30 s, and reports `SpaceRecovered` once the
+    /// disk has room.
+    fn check_space(&mut self, id: NodeId) -> Result<(), Failure> {
+        let clock = self.clock;
+        let paused = self
+            .engine(id)
+            .and_then(|e| e.folder(self.folder))
+            .is_some_and(FolderState::disk_full);
+        let Some(n) = self.nodes.get_mut(&id) else {
+            return Ok(());
+        };
+        if !paused {
+            n.space_check_at = None;
+            n.paused_inbound = false;
+            return Ok(());
+        }
+        if n.full_until.is_some_and(|t| t > clock) {
+            n.space_check_at = Some(clock.plus_nanos(SPACE_CHECK_NANOS));
+            return Ok(());
+        }
+        n.full_until = None;
+        n.space_check_at = None;
+        n.paused_inbound = false;
+        self.stats.spaces_recovered += 1;
+        let folder = self.folder;
+        self.feed(id, Event::SpaceRecovered { folder })?;
         invariants::i2_node(self, id)
     }
 
@@ -4173,6 +4410,100 @@ mod tests {
             None,
             "not watching"
         );
+    }
+
+    /// §7.5: from the engine's pause on a full disk until the host reports
+    /// space recovered, the folder's inbound is paused. The checker flags
+    /// every fetch and commit the engine asks for meanwhile, and any record
+    /// of another node's version it writes, except in the report of a
+    /// commit asked for before the pause or an observation (a landing,
+    /// §8.3); its own versions, and a revert's records, which keep their
+    /// `seq`, are not inbound. Nothing is flagged while not paused.
+    #[test]
+    fn the_disk_full_checker_holds_a_paused_engine_to_its_pause() {
+        let mut sim = world();
+        let (id, other) = (sim.order[0], sim.order[1]);
+        let folder = sim.folder;
+        let entry = written(&rel("n"), other, Version::from_iter([(other, 1)]), 1, 0);
+        let fetch = Action::Fetch {
+            folder,
+            path: rel("n"),
+            version: entry.version.clone(),
+            hash: entry.hash,
+            size: entry.size,
+            from: other,
+        };
+        let commits = [
+            Action::Write {
+                folder,
+                path: rel("n"),
+                entry: entry.clone(),
+                expected: None,
+                displace: Displace::Trash,
+            },
+            Action::Remove {
+                folder,
+                path: rel("n"),
+                expected: None,
+                displace: Displace::Trash,
+            },
+            Action::SetMeta {
+                folder,
+                path: rel("n"),
+                expected: None,
+                mtime_ns: 1,
+                exec: false,
+            },
+        ];
+        assert_eq!(sim.starts_inbound_while_paused(id, &fetch), None);
+        sim.nodes.get_mut(&id).unwrap().paused_inbound = true;
+        for action in std::iter::once(&fetch).chain(&commits) {
+            let detail = sim.starts_inbound_while_paused(id, action);
+            assert!(
+                detail
+                    .as_ref()
+                    .is_some_and(|d| d.contains("while its disk was full")),
+                "{action:?}: {detail:?}"
+            );
+        }
+        let adopt = changed(folder, entry.clone(), 5);
+        let feeding = |may_adopt| Feeding {
+            node: id,
+            may_adopt,
+            seq: 4,
+        };
+        sim.feeding = Some(feeding(false));
+        assert!(sim.starts_inbound_while_paused(id, &adopt).is_some());
+        let own = written(&rel("n"), id, Version::from_iter([(id, 1)]), 1, 0);
+        assert_eq!(
+            sim.starts_inbound_while_paused(id, &changed(folder, own, 5)),
+            None
+        );
+        let reverted = changed(folder, entry, 4);
+        assert_eq!(sim.starts_inbound_while_paused(id, &reverted), None);
+        sim.feeding = Some(feeding(true));
+        assert_eq!(sim.starts_inbound_while_paused(id, &adopt), None);
+        assert_eq!(sim.starts_inbound_while_paused(other, &fetch), None);
+    }
+
+    /// §7.5: a full disk reported by the fetch or commit its want waited
+    /// for pauses the folder's inbound, so after such a report the engine
+    /// must be paused. A report the engine ignores (the want had moved on)
+    /// need not pause it, nor need any other error.
+    #[test]
+    fn a_full_disk_the_want_waited_for_must_pause_the_inbound() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let full = LocalError::DiskFull;
+        let failure = sim
+            .after_local_failure(id, &full, true, "commit of n")
+            .unwrap_err();
+        assert_eq!(failure.invariant, "disk full");
+        assert!(failure.detail.contains("commit of n"), "{}", failure.detail);
+        sim.after_local_failure(id, &full, false, "commit of n")
+            .unwrap();
+        sim.after_local_failure(id, &LocalError::Io, true, "commit of n")
+            .unwrap();
     }
 
     /// §7.5: a failed commit leaves the disk as it found it. The checker
