@@ -228,6 +228,7 @@ fn want_state() -> BoxedStrategy<WantState> {
         (at(), any::<bool>())
             .prop_map(|(deadline, overdue)| WantState::Committing { deadline, overdue }),
         Just(WantState::GaveUp),
+        at().prop_map(|until| WantState::LocalRetry { until }),
     ]
     .boxed()
 }
@@ -253,6 +254,7 @@ fn want() -> BoxedStrategy<Want> {
             btree_map(node(), at(), 0..3),
             btree_map(node(), any::<u32>(), 0..3),
             any::<u8>(),
+            any::<u32>(),
             any::<bool>(),
             any::<bool>(),
             btree_set(node(), 0..3),
@@ -268,6 +270,7 @@ fn want() -> BoxedStrategy<Want> {
                     excluded,
                     strikes,
                     mismatches,
+                    local_retries,
                     fetched,
                     restoring,
                     answered,
@@ -286,6 +289,7 @@ fn want() -> BoxedStrategy<Want> {
                 excluded,
                 strikes,
                 mismatches,
+                local_retries,
                 fetched,
                 restoring,
                 answered,

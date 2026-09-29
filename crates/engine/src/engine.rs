@@ -1001,7 +1001,7 @@ fn unknown_folder(folder: FolderId) -> Action {
 
 #[cfg(test)]
 mod tests {
-    use crate::want::WantState;
+    use crate::want::{LocalError, WantState};
     use proptest::prelude::*;
 
     use crate::batch::Summary;
@@ -3081,6 +3081,82 @@ mod tests {
             )
         );
         assert!(b.folder(folder()).unwrap().wants().is_empty());
+    }
+
+    /// §7.5 "local failures", through the engine: a fetch that fails with
+    /// an I/O error warns `status`, and the engine asks to be woken when
+    /// the want's backoff ends, a minute later. The tick then fetches again
+    /// from the same source, which the failure did not blame.
+    #[test]
+    fn an_io_failure_is_retried_at_the_tick_its_backoff_ends() {
+        let mut engines = two_with_ten_files();
+        let a = engines.get_mut(&node(1)).unwrap();
+        a.handle(
+            t(10.0),
+            Event::Scanned {
+                folder: folder(),
+                path: p("n"),
+                state: file(7, 7),
+            },
+        );
+        let out = a.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(3),
+            },
+        );
+        deliver(t(12.0), node(1), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        let version = b
+            .folder(folder())
+            .unwrap()
+            .wants()
+            .get(&p("n"))
+            .unwrap()
+            .version()
+            .clone();
+        let out = b.handle(
+            t(13.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("n"),
+                hash: hash(7),
+                version,
+                outcome: FetchReport::Failed {
+                    error: LocalError::Io,
+                },
+            },
+        );
+        assert_eq!(
+            statuses(&out),
+            [&FolderStatus::LocalFailure {
+                path: p("n"),
+                error: LocalError::Io
+            }]
+        );
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::WakeAt(at) if *at == t(73.0))),
+            "{out:?}"
+        );
+        let out = b.handle(
+            t(72.0),
+            Event::Tick {
+                fresh_batch_id: fresh(4),
+            },
+        );
+        assert!(!out.iter().any(|a| matches!(a, Action::Fetch { .. })));
+        let out = b.handle(
+            t(73.0),
+            Event::Tick {
+                fresh_batch_id: fresh(5),
+            },
+        );
+        assert!(
+            out.iter()
+                .any(|a| matches!(a, Action::Fetch { path, from, .. } if path == &p("n") && *from == node(1))),
+            "{out:?}"
+        );
     }
 
     #[test]

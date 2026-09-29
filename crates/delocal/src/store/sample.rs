@@ -81,6 +81,7 @@ pub fn want(p: &str) -> Want {
         excluded: [(node(3), at(99))].into_iter().collect(),
         strikes: [(node(3), 2)].into_iter().collect(),
         mismatches: 1,
+        local_retries: 3,
         fetched: true,
         restoring: true,
         answered: [node(4)].into_iter().collect(),
