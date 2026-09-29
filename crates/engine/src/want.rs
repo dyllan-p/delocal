@@ -80,9 +80,9 @@ impl Tier {
 
 /// Where a want is in its life (§7.5).
 ///
-/// `Deferred`, `LocalRetry` and `DiskFull` are the reasons §7.5 gives for a
-/// want to be *deferred*. The last two came later and are listed last, so
-/// that the encoding of every earlier state is unchanged.
+/// `Deferred`, `LocalRetry`, `DiskFull` and `Collides` are the reasons §7.5
+/// gives for a want to be *deferred*. The last three came later and are
+/// listed last, so that the encoding of every earlier state is unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WantState {
     /// Ready to fetch (or, with content in hand, to commit) as soon as a
@@ -119,6 +119,14 @@ pub enum WantState {
     /// fetch in this folder found the disk full, and the folder's inbound
     /// is paused until the host reports space recovered.
     DiskFull,
+    /// Deferred with reason `collides with <with>` (§7.5, §7.6): the host
+    /// found a live record at `with` that its filesystem treats as the same
+    /// name, and did not attempt the commit. `seq` is the `seq` of the live
+    /// record at `with` as the report found it. The want is wanted again
+    /// once the record there is written, the other half of "the index at
+    /// either path changes"; a write at its own path re-classifies it, as
+    /// it does every observable want.
+    Collides { with: RelPath, seq: u64 },
 }
 
 impl WantState {
@@ -635,8 +643,11 @@ impl WantList {
                     WantState::Wanted
                 };
             }
+            // The want-list does not know the index, so it cannot say which
+            // record a collision names; `FolderState::fetched` calls
+            // `fetch_failed` with its `seq` instead.
             FetchReport::Failed { error } => {
-                return self.fetch_failed(now, path, version, &error);
+                return self.fetch_failed(now, path, version, &error, None);
             }
         }
         self.note(path);
@@ -654,6 +665,7 @@ impl WantList {
         path: &RelPath,
         version: &Version,
         error: &LocalError,
+        with_seq: Option<u64>,
     ) -> Option<&Want> {
         let fetching = self.wants.get(path).is_some_and(|w| {
             w.version() == version && matches!(w.state, WantState::Fetching { .. })
@@ -661,31 +673,38 @@ impl WantList {
         if !fetching {
             return None;
         }
-        self.failed(now, path, version, error)
+        self.failed(now, path, version, error, with_seq)
     }
 
     /// A fetch or a commit of the want at `path` failed on this machine
     /// (§7.5 "local failures"). The operation is released and the path
     /// leaves in-flight; the sources are untouched, since no peer is to
     /// blame. `Io` backs off a minute, doubling on each repeat for the want
-    /// up to an hour, as an exclusion does. Returns the want as it now
-    /// stands, or `None` if no want at `path` has `version`.
+    /// up to an hour, as an exclusion does. `with_seq` is the `seq` of the
+    /// live record a `CaseCollision` names, if there is one: with none, the
+    /// index at that path has changed since the host looked, so the
+    /// collision is already re-evaluated and the want is wanted again.
+    /// Returns the want as it now stands, or `None` if no want at `path`
+    /// has `version`.
     pub fn failed(
         &mut self,
         now: Timestamp,
         path: &RelPath,
         version: &Version,
         error: &LocalError,
+        with_seq: Option<u64>,
     ) -> Option<&Want> {
         let want = self.wants.get_mut(path)?;
         if want.version() != version {
             return None;
         }
-        // The failure may have taken the temp file with it, and only the host
-        // could tell. The retry fetches again, which resumes from whatever
-        // the temp file still holds (§7.5), rather than commit content that
-        // may be gone.
-        want.fetched = false;
+        if !matches!(error, LocalError::CaseCollision { .. }) {
+            // The failure may have taken the temp file with it, and only the
+            // host could tell. The retry fetches again, which resumes from
+            // whatever the temp file still holds (§7.5), rather than commit
+            // content that may be gone. A collision attempted nothing.
+            want.fetched = false;
+        }
         want.state = match error {
             LocalError::Io => {
                 want.local_retries = want.local_retries.saturating_add(1);
@@ -694,6 +713,13 @@ impl WantList {
                 }
             }
             LocalError::DiskFull => WantState::DiskFull,
+            LocalError::CaseCollision { with } => match with_seq {
+                Some(seq) => WantState::Collides {
+                    with: with.clone(),
+                    seq,
+                },
+                None => WantState::Wanted,
+            },
         };
         self.note(path);
         self.wants.get(path)
@@ -704,9 +730,9 @@ impl WantList {
     /// reason `disk full`. A fetch or commit the host is performing keeps
     /// its state until the host reports it, since a commit holds its path
     /// until then; a want waiting on something else (a give-up, a local
-    /// retry) keeps waiting on that, and is deferred for the disk as soon
-    /// as it could start. Called before every dispatch while paused, so no
-    /// want starts until space is recovered.
+    /// retry, a collision) keeps waiting on that, and is deferred for the
+    /// disk as soon as it could start. Called before every dispatch while
+    /// paused, so no want starts until space is recovered.
     pub fn pause_inbound(&mut self) {
         let paths: Vec<RelPath> = self
             .wants
@@ -735,6 +761,26 @@ impl WantList {
             .wants
             .iter()
             .filter(|(_, w)| w.state == WantState::DiskFull)
+            .map(|(p, _)| p.clone())
+            .collect();
+        for path in paths {
+            self.set_state(&path, WantState::Wanted);
+        }
+    }
+
+    /// The other half of re-evaluating a case collision (§7.5): every want
+    /// deferred as colliding with a path whose record has been written
+    /// since (the live record there has another `seq`, or is live no more)
+    /// is wanted again, and its commit is tried again. `live_seq_at` says
+    /// what the index holds at a path now: the `seq` of its live record.
+    pub fn release_collisions(&mut self, live_seq_at: impl Fn(&RelPath) -> Option<u64>) {
+        let paths: Vec<RelPath> = self
+            .wants
+            .iter()
+            .filter(|(_, w)| match &w.state {
+                WantState::Collides { with, seq } => live_seq_at(with) != Some(*seq),
+                _ => false,
+            })
             .map(|(p, _)| p.clone())
             .collect();
         for path in paths {
@@ -1065,6 +1111,11 @@ pub enum LocalError {
     /// The disk is full. The folder's inbound pauses until the host reports
     /// that space has been recovered.
     DiskFull,
+    /// A live record at `with` names the same file as this path on this
+    /// machine's filesystem, which ignores case or normalisation (§7.6), so
+    /// the commit was not attempted. Only the host can tell which paths its
+    /// filesystem treats as one name, so it says which.
+    CaseCollision { with: RelPath },
 }
 
 /// What [`WantList::expire`] found: fetches that stalled and are wanted
@@ -1657,6 +1708,9 @@ mod tests {
             },
             FetchReport::Failed {
                 error: LocalError::DiskFull,
+            },
+            FetchReport::Failed {
+                error: LocalError::CaseCollision { with: p("F") },
             },
         ];
         for late in reports.clone() {

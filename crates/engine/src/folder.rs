@@ -425,8 +425,9 @@ pub enum FolderStatus {
     /// process restarts.
     CommitOverdue { path: RelPath },
     /// A commit or fetch at `path` failed on this machine (§7.5 "local
-    /// failures"): `Io` is tried again after a backoff, and `DiskFull`
-    /// pauses the folder's inbound.
+    /// failures"): `Io` is tried again after a backoff, `DiskFull` pauses
+    /// the folder's inbound, and `CaseCollision` names the other path of
+    /// the pair.
     LocalFailure { path: RelPath, error: LocalError },
     /// A full disk paused the folder's inbound (§7.5): nothing is fetched
     /// or committed until the host reports space recovered.
@@ -2135,9 +2136,10 @@ impl FolderState {
             // A failure of a fetch the want does not wait for is ignored like
             // any such report, a full disk included: the next operation to
             // find the disk full says so for itself.
+            let with_seq = self.collision_seq(&error);
             let state = self
                 .wants
-                .fetch_failed(now, path, version, &error)
+                .fetch_failed(now, path, version, &error, with_seq)
                 .map(|w| w.state.clone());
             if state.is_some() {
                 self.failed(now, path, error);
@@ -2181,6 +2183,19 @@ impl FolderState {
         Fetched {
             state: None,
             unrecoverable: change,
+        }
+    }
+
+    /// The `seq` of the live record a `CaseCollision` names, for the want
+    /// to compare against later (see [`WantState::Collides`]). The host
+    /// looked in its tables, which may be behind the index but never ahead
+    /// of it (§11: a write is durable before the effects that follow it),
+    /// so the index as it stands is the newer word: `None` if the record
+    /// there is live no more.
+    fn collision_seq(&self, error: &LocalError) -> Option<u64> {
+        match error {
+            LocalError::CaseCollision { with } => self.index.live(with).map(|r| r.seq),
+            LocalError::Io | LocalError::DiskFull => None,
         }
     }
 
@@ -2251,6 +2266,9 @@ impl FolderState {
         now: Timestamp,
         peers: &BTreeMap<NodeId, Tier>,
     ) -> (Vec<HostStep>, Vec<IndexRecord>) {
+        let index = &self.index;
+        self.wants
+            .release_collisions(|path| index.live(path).map(|r| r.seq));
         // A full disk pauses everything inbound, index-only adoptions too:
         // "every want in the folder is deferred" (§7.5).
         if self.disk_full {
@@ -2374,7 +2392,8 @@ impl FolderState {
             // The host left the disk as it found it; the want stays, under
             // the rule for its error (§7.5 "local failures").
             ApplyOutcome::Failed { error } => {
-                self.wants.failed(now, path, version, &error);
+                let with_seq = self.collision_seq(&error);
+                self.wants.failed(now, path, version, &error, with_seq);
                 self.failed(now, path, error);
                 return Vec::new();
             }
@@ -5831,7 +5850,11 @@ mod tests {
     /// it replaces the want.
     #[test]
     fn a_version_that_waited_for_a_failed_commit_is_classified_at_once() {
-        let errors = [LocalError::DiskFull, LocalError::Io];
+        let errors = [
+            LocalError::DiskFull,
+            LocalError::Io,
+            LocalError::CaseCollision { with: p("N") },
+        ];
         for error in errors {
             let (mut a, mut b) = a_and_b(1, Rules::default());
             a.scanned(t(10.0), p("n"), file(7, 7));
@@ -5864,7 +5887,11 @@ mod tests {
     /// hears nothing.
     #[test]
     fn a_failure_of_a_fetch_the_want_no_longer_waits_for_leaves_it_alone() {
-        let errors = [LocalError::Io, LocalError::DiskFull];
+        let errors = [
+            LocalError::Io,
+            LocalError::DiskFull,
+            LocalError::CaseCollision { with: p("N") },
+        ];
         for error in errors {
             let (_, mut b, _, vn) = committing_n_fetching_m();
             b.take_statuses();
@@ -6240,6 +6267,108 @@ mod tests {
         b.space_recovered();
         let (steps, _) = b.dispatch(t(81.0), &lan(&[1]));
         assert_eq!(steps.len(), 2, "both fetch again: {steps:?}");
+    }
+
+    /// B committing `n` from A while its own file `N` is live, as a
+    /// case-insensitive machine that already holds `N` would be.
+    fn colliding() -> (FolderState, FolderState, Version) {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        b.scanned(t(9.0), p("N"), file(5, 5));
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let v = b.wants().get(&p("n")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("n"), &v, FetchReport::Ok);
+        b.dispatch(t(13.0), &lan(&[1]));
+        let outcome = ApplyOutcome::Failed {
+            error: LocalError::CaseCollision { with: p("N") },
+        };
+        assert!(b.applied(t(14.0), &p("n"), &v, outcome).is_empty());
+        (a, b, v)
+    }
+
+    /// §7.5, §7.6: a commit the host did not attempt because a live record
+    /// at another path names the same file defers the want with reason
+    /// `collides with <path>`, and `status` names the pair. Nothing retries
+    /// it while both records stand, however long; the content in hand is
+    /// kept, since nothing was attempted.
+    #[test]
+    fn a_case_collision_defers_the_want_naming_the_other_path() {
+        let (_, mut b, _) = colliding();
+        let seq = b.index().live(&p("N")).unwrap().seq;
+        let want = b.wants().get(&p("n")).unwrap();
+        assert_eq!(want.state, WantState::Collides { with: p("N"), seq });
+        assert!(want.fetched);
+        assert!(!b.in_flight(&p("n")), "deferred is observable");
+        assert!(b.take_statuses().contains(&FolderStatus::LocalFailure {
+            path: p("n"),
+            error: LocalError::CaseCollision { with: p("N") }
+        }));
+        b.expire(t(10_000.0));
+        assert!(b.dispatch(t(10_000.0), &lan(&[1])).0.is_empty());
+    }
+
+    /// §7.5: a case collision is re-evaluated when the index at either path
+    /// changes. At the other path: once the record there is written (here
+    /// the user deleted `N`, and the scan made it a tombstone), the commit
+    /// is tried again.
+    #[test]
+    fn a_case_collision_is_tried_again_when_the_other_paths_record_is_written() {
+        let (_, mut b, v) = colliding();
+        b.scanned(t(15.0), p("N"), ScanState::Absent);
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1]));
+        assert!(
+            matches!(&steps[..], [HostStep::Write { path, entry, .. }] if path == &p("n") && entry.version == v),
+            "{steps:?}"
+        );
+    }
+
+    /// §7.5: and at its own path, a write re-classifies the want from the
+    /// entry it received, as it does every observable want: here the user
+    /// made a file at `n` too, concurrent with A's, which becomes a conflict.
+    #[test]
+    fn a_case_collision_is_reclassified_when_its_own_path_changes() {
+        let (_, mut b, v) = colliding();
+        b.scanned(t(15.0), p("n"), file(9, 15));
+        let want = b.wants().get(&p("n")).unwrap();
+        assert_ne!(want.version(), &v, "re-derived against the local edit");
+        assert!(want.version().dominates(&v));
+        assert_eq!(want.state, WantState::Wanted);
+    }
+
+    /// §7.5: the host looks for a collision in its tables, which may be
+    /// behind the index (§11), so the record it names may be live no more
+    /// when the report arrives: here B's user deleted `N` while the commit
+    /// of `n` was in flight. The index at that path has changed since the
+    /// host looked, so the collision is re-evaluated at once: the want is
+    /// wanted again, keeps its content, and commits at the next dispatch.
+    /// Deferred instead, it would wait for a write at `N` that may never
+    /// come.
+    #[test]
+    fn a_collision_with_a_record_already_gone_is_tried_again_at_once() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        b.scanned(t(9.0), p("N"), file(5, 5));
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let v = b.wants().get(&p("n")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("n"), &v, FetchReport::Ok);
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.scanned(t(13.5), p("N"), ScanState::Absent);
+        let outcome = ApplyOutcome::Failed {
+            error: LocalError::CaseCollision { with: p("N") },
+        };
+        assert!(b.applied(t(14.0), &p("n"), &v, outcome).is_empty());
+        let want = b.wants().get(&p("n")).unwrap();
+        assert_eq!(want.state, WantState::Wanted);
+        assert!(want.fetched);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(
+            matches!(&steps[..], [HostStep::Write { path, entry, .. }] if path == &p("n") && entry.version == v),
+            "{steps:?}"
+        );
     }
 
     /// A scripted host for the want-list properties.
