@@ -470,10 +470,10 @@ struct SkipCheck {
     skipped: BTreeSet<RelPath>,
     /// Those whose skip covers what lies beneath them (see [`Walk`]).
     beneath: BTreeSet<RelPath>,
-    /// As the watched event began: the paths with a live record, and the
-    /// index's `seq`, so a tombstone written above it is one the event
-    /// wrote.
-    live: BTreeSet<RelPath>,
+    /// As the watched event began: the paths with a live record, each with
+    /// this node's own counter in its version, and the index's `seq`, so a
+    /// tombstone written above it is one the event wrote.
+    live: BTreeMap<RelPath, u64>,
     seq: u64,
 }
 
@@ -483,7 +483,7 @@ impl SkipCheck {
             node,
             skipped: BTreeSet::new(),
             beneath: BTreeSet::new(),
-            live: BTreeSet::new(),
+            live: BTreeMap::new(),
             seq: 0,
         }
     }
@@ -1469,18 +1469,26 @@ impl Sim {
     /// §7.3: the engine keeps the record of a path a bracket reports
     /// `Skipped` and of every tracked path beneath a directory it skipped,
     /// and a skip outside a bracket changes nothing. So while the checker
-    /// watches, no index write may be a tombstone of this node's own, under
+    /// watches, no index write may be a deletion this node observes, under
     /// a new `seq`, over a record that was live at a path a skip covers.
+    /// An observed deletion raises the node's own counter above the live
+    /// record's (§7.2); a tombstone that does not is no deletion of what
+    /// was live. It is what a queued `revert` leaves when it runs at the
+    /// bracket's end: it puts back the announced tombstone under its old
+    /// `seq`, and the want it re-derives there merges a peer's tombstone
+    /// with it, a new `seq` whose metadata, this node's own included, is
+    /// the winner's.
     fn tombstones_a_skip(&self, id: NodeId, action: &Action) -> Option<String> {
         let check = self.checking.as_ref().filter(|c| c.node == id)?;
         let Action::IndexChanged { record, .. } = action else {
             return None;
         };
         let path = &record.entry.path;
+        let own = check.live.get(path)?;
         if !record.entry.deleted
             || record.entry.modified_by != id
             || record.seq <= check.seq
-            || !check.live.contains(path)
+            || record.entry.version.counter(id) <= *own
             || !check.covers(path)
         {
             return None;
@@ -3145,7 +3153,7 @@ impl Sim {
             check.live = f
                 .index()
                 .live_records()
-                .map(|r| r.entry.path.clone())
+                .map(|r| (r.entry.path.clone(), r.entry.version.counter(id)))
                 .collect();
         }
         self.checking = Some(std::mem::replace(check, SkipCheck::new(id)));
@@ -4532,19 +4540,27 @@ mod tests {
     }
 
     /// The skip checker (§7.3). While it watches a node, a tombstone of
-    /// that node's own under a new `seq`, over a record that was live at a
-    /// path reported `Skipped` or beneath a skipped directory, is a failure.
-    /// Nothing else is: a path no skip covers, a record put back by a
-    /// revert under its old `seq`, a peer's tombstone, a live record, or
-    /// another node's write.
+    /// that node's own under a new `seq`, raising its counter above the
+    /// record that was live at a path reported `Skipped` or beneath a
+    /// skipped directory, is a failure. Nothing else is: a path no skip
+    /// covers, a record put back by a revert under its old `seq`, a merge
+    /// after one that keeps the node's counter, a peer's tombstone, a live
+    /// record, or another node's write.
     #[test]
     fn the_skip_checker_flags_a_tombstone_a_skip_covers() {
         let mut sim = world();
         let (id, other) = (sim.order[0], sim.order[1]);
         let mut check = SkipCheck::new(id);
-        check.skipped = [rel("d0"), rel("f1"), rel("d1")].into();
+        check.skipped = [rel("d0"), rel("f1"), rel("d1"), rel("f3")].into();
         check.beneath = [rel("d0"), rel("d2")].into();
-        check.live = [rel("d0/f4"), rel("f1"), rel("d1/f5"), rel("f2")].into();
+        check.live = [
+            (rel("d0/f4"), 0),
+            (rel("f1"), 0),
+            (rel("d1/f5"), 0),
+            (rel("f2"), 0),
+            (rel("f3"), 1),
+        ]
+        .into();
         check.seq = 10;
         sim.checking = Some(check);
         let folder = sim.folder;
@@ -4580,6 +4596,10 @@ mod tests {
             (record("f2", 11, id, true), "no skip covers f2"),
             (record("d0/f6", 11, id, true), "d0/f6 was not live"),
             (record("f1", 10, id, true), "a revert's old seq"),
+            (
+                record("f3", 11, id, true),
+                "a merge that keeps the node's counter",
+            ),
             (record("f1", 11, other, true), "a peer's tombstone"),
             (record("f1", 11, id, false), "a live record"),
         ] {
