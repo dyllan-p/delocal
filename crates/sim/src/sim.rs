@@ -286,8 +286,12 @@ struct Node {
     persisted: Persisted,
     wake_at: Option<Timestamp>,
     next_scan_at: Timestamp,
-    /// Fetched, verified content waiting for its commit, per path.
-    temp: BTreeMap<RelPath, (Version, Vec<u8>)>,
+    /// Fetched, verified content waiting for its commit: per path, one
+    /// temp file for each version fetched there. A real host names each
+    /// temp file after the content's hash with a random suffix (§7.5 step
+    /// 3), so no fetch ever overwrites another's, a late one for an older
+    /// version included. Versions have no order, so a list.
+    temp: BTreeMap<RelPath, Vec<(Version, Vec<u8>)>>,
     /// The host's commit journal (§7.5, §11): one row per commit whose
     /// displacement has happened and whose rename has not. Durable, so a
     /// row a crash left open is still here at the restart.
@@ -2030,7 +2034,7 @@ impl Sim {
                         }
                         if hash_bytes(&bytes) == hash {
                             if let Some(n) = self.nodes.get_mut(&node) {
-                                n.temp.insert(path.clone(), (version.clone(), bytes));
+                                put_temp(n, &path, &version, bytes);
                             }
                             FetchReport::Ok
                         } else {
@@ -2219,12 +2223,7 @@ impl Sim {
                 // reports, so a failed commit leaves the disk as it was.
                 let content = match entry.kind {
                     Kind::Dir => Some(Vec::new()),
-                    _ => match node.temp.get(path) {
-                        Some((v, _)) if v == version => {
-                            node.temp.remove(path).map(|(_, bytes)| bytes)
-                        }
-                        _ => None,
-                    },
+                    _ => take_temp(node, path, version),
                 };
                 let row = node.journal.pop();
                 let Some(content) = content else {
@@ -3007,6 +3006,35 @@ fn rel(s: &str) -> RelPath {
     })
 }
 
+/// A verified fetch of `version` at `path` lands in its own temp file,
+/// replacing only an earlier fetch of the same version.
+fn put_temp(node: &mut Node, path: &RelPath, version: &Version, bytes: Vec<u8>) {
+    let files = node.temp.entry(path.clone()).or_default();
+    files.retain(|(v, _)| v != version);
+    files.push((version.clone(), bytes));
+}
+
+/// The commit of `version` at `path` takes its temp file, if there is one.
+fn take_temp(node: &mut Node, path: &RelPath, version: &Version) -> Option<Vec<u8>> {
+    let files = node.temp.get_mut(path)?;
+    let at = files.iter().position(|(v, _)| v == version)?;
+    let (_, bytes) = files.remove(at);
+    if files.is_empty() {
+        node.temp.remove(path);
+    }
+    Some(bytes)
+}
+
+/// The temp file for `version` at `path`, if there is one.
+#[cfg(test)]
+fn temp_of<'a>(node: &'a Node, path: &RelPath, version: &Version) -> Option<&'a Vec<u8>> {
+    node.temp
+        .get(path)?
+        .iter()
+        .find(|(v, _)| v == version)
+        .map(|(_, bytes)| bytes)
+}
+
 /// The commit guard (§7.5 step 6): what the engine believes is on disk
 /// against what is, by the scan fast path's predicate.
 fn expected_matches(file: Option<&File>, expected: Option<&Observed>) -> bool {
@@ -3570,8 +3598,8 @@ mod tests {
             let pos = sim.ops.len() - 1;
             sim.progress_op(pos).unwrap();
             assert_eq!(
-                sim.nodes[&asker].temp.get(&path),
-                Some(&(merged.clone(), content.content.clone())),
+                temp_of(&sim.nodes[&asker], &path, &merged),
+                Some(&content.content),
                 "{path} is served"
             );
         }
@@ -3716,7 +3744,7 @@ mod tests {
                 node: asker,
                 from: source,
                 path: rel(path),
-                version,
+                version: version.clone(),
                 hash,
                 done_at: sim.clock,
                 next_progress: sim.clock,
@@ -3724,7 +3752,7 @@ mod tests {
             });
             let pos = sim.ops.len() - 1;
             sim.progress_op(pos).unwrap();
-            sim.nodes[&asker].temp.contains_key(&rel(path))
+            temp_of(&sim.nodes[&asker], &rel(path), &version).is_some()
         };
         let before = sim.stats.clone();
         assert!(!fetch(&mut sim, "l", link(b"f1").hash()));
