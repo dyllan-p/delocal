@@ -4000,6 +4000,87 @@ mod tests {
         );
     }
 
+    /// §7.5: while a released commit holds its path, nothing changes the
+    /// path's record, an index-only adoption included, since the released
+    /// commit may still land its own version there. B is committing C's copy
+    /// of L at the conflict path when B's own commit of W lands and records
+    /// B's copy there; the want at the copy path becomes a merge, adopted
+    /// index-only. It waits: the record stays B's copy, and no batch carries
+    /// the merge. The released commit then lands C's copy after all, and its
+    /// report is discarded. Only then is the merge adopted, and a scan of
+    /// what landed finds the record matching the disk, nothing to announce.
+    #[test]
+    fn a_released_commit_bars_an_index_only_adoption_until_its_report() {
+        let (mut a, mut b) = a_and_b(3, Rules::default());
+        b.scanned(t(10.0), p("f00"), file(5, 50)); // B's L
+        let loser = b.index().get(&p("f00")).unwrap().entry.clone();
+        let copy_path = crate::conflict::conflict_copy_name(&loser).unwrap();
+        a.scanned(t(11.0), p("f00"), file(6, 60)); // A's W, newer
+        let batch = a.form_batches(t(13.0), bid(6)).remove(0);
+        b.receive(t(13.0), &batch);
+        let w_version = b.wants().get(&p("f00")).unwrap().version().clone();
+        // C's copy of the same L: same content and mtime as B's copy will
+        // have, so the two merge index-only.
+        let mut c_copy = loser.clone();
+        c_copy.path = copy_path.clone();
+        c_copy.version = Version::empty().incremented(node(3));
+        c_copy.modified_by = node(3);
+        c_copy.prev_hash = ContentHash::EMPTY;
+        let mut c_batch = batch.clone();
+        c_batch.id = bid(7);
+        c_batch.source = node(3);
+        c_batch.entries = vec![c_copy.clone()];
+        c_batch.seq_low = 0;
+        c_batch.seq_high = 1;
+        b.receive(t(14.0), &c_batch);
+        b.form_batches(t(14.5), bid(8));
+
+        b.dispatch(t(15.0), &lan(&[1, 3]));
+        b.fetched(t(16.0), &copy_path, &c_copy.version, FetchReport::Ok);
+        b.fetched(t(16.0), &p("f00"), &w_version, FetchReport::Ok);
+        assert_eq!(b.dispatch(t(16.0), &lan(&[1, 3])).0.len(), 2);
+        assert_eq!(
+            b.applied(t(17.0), &p("f00"), &w_version, ApplyOutcome::Ok)
+                .len(),
+            2
+        );
+        let own_copy = b.index().get(&copy_path).unwrap().clone();
+        assert_eq!(
+            b.wants().get(&copy_path).unwrap().mode,
+            ApplyMode::IndexOnly
+        );
+
+        let (_, adopted) = b.dispatch(t(18.0), &lan(&[1, 3]));
+        assert!(adopted.is_empty(), "the adoption waits: {adopted:?}");
+        assert_eq!(b.wants().get(&copy_path).unwrap().state, WantState::Blocked);
+        assert_eq!(b.index().get(&copy_path), Some(&own_copy));
+        let at_copy: Vec<Version> = b
+            .form_batches(t(19.0), bid(9))
+            .into_iter()
+            .flat_map(|batch| batch.entries)
+            .filter(|e| e.path == copy_path)
+            .map(|e| e.version)
+            .collect();
+        assert_eq!(
+            at_copy,
+            std::slice::from_ref(&own_copy.entry.version),
+            "only B's own copy"
+        );
+
+        // The released commit landed C's copy after all: discarded.
+        assert!(
+            b.applied(t(20.0), &copy_path, &c_copy.version, ApplyOutcome::Ok)
+                .is_empty()
+        );
+        let (_, adopted) = b.dispatch(t(21.0), &lan(&[1, 3]));
+        assert_eq!(adopted.len(), 1, "now the merge is adopted");
+        let record = b.index().get(&copy_path).unwrap().entry.clone();
+        assert!(record.version.dominates(&c_copy.version));
+        assert!(record.version.dominates(&own_copy.entry.version));
+        let landed = ScanState::Observed(c_copy.observed());
+        assert_eq!(b.scanned(t(22.0), copy_path.clone(), landed).change, None);
+    }
+
     #[test]
     fn deny_bumps_this_machines_copies_over_the_quarantine() {
         let (mut a, mut b) = a_and_b(10, tight());
