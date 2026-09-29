@@ -48,6 +48,7 @@ fn before_draft_34(knobs: &Knobs) -> Knobs {
         displace_subtrees: false,
         skip: 0.0,
         io_failure: 0.0,
+        disk_fill: 0.0,
         ..knobs.clone()
     }
 }

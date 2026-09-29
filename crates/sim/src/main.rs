@@ -4,7 +4,7 @@
 //! delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P]
 //!             [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P]
 //!             [--group-commit-lag E] [--displace-subtrees true|false] [--skip P]
-//!             [--io-failure P] [--nodes N]
+//!             [--io-failure P] [--disk-fill P] [--nodes N]
 //!             [--keep-going] [--jobs J] [--digests]
 //! ```
 //!
@@ -101,6 +101,9 @@ fn parse_args() -> Result<Args, String> {
                 args.knobs.io_failure =
                     value()?.parse().map_err(|e| format!("--io-failure: {e}"))?
             }
+            "--disk-fill" => {
+                args.knobs.disk_fill = value()?.parse().map_err(|e| format!("--disk-fill: {e}"))?
+            }
             "--nodes" => {
                 args.knobs.nodes = Some(value()?.parse().map_err(|e| format!("--nodes: {e}"))?)
             }
@@ -118,7 +121,7 @@ fn parse_args() -> Result<Args, String> {
             "--jobs" => args.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             "--digests" => args.digests = true,
             "--help" | "-h" => {
-                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--displace-subtrees true|false] [--skip P] [--io-failure P] [--nodes N] [--keep-going] [--jobs J] [--digests]".to_owned());
+                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--displace-subtrees true|false] [--skip P] [--io-failure P] [--disk-fill P] [--nodes N] [--keep-going] [--jobs J] [--digests]".to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -287,6 +290,9 @@ fn main() -> ExitCode {
                 totals.skipped += outcome.stats.skipped;
                 totals.ignores += outcome.stats.ignores;
                 totals.io_failures += outcome.stats.io_failures;
+                totals.disk_fills += outcome.stats.disk_fills;
+                totals.disk_full_reports += outcome.stats.disk_full_reports;
+                totals.spaces_recovered += outcome.stats.spaces_recovered;
                 totals.temps_lost += outcome.stats.temps_lost;
                 if args.digests {
                     println!("seed {seed} digest {}", hex(&outcome.fingerprint));

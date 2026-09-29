@@ -50,6 +50,13 @@ pub struct Knobs {
     /// reports, and half such failures take the temp file with them; a
     /// `Remove` or `SetMeta` fails before it changes anything.
     pub io_failure: f64,
+    /// Probability, per fetch or `Write` that needs space, that its node's
+    /// disk fills up (§7.5). It stays full for 30 s to 10 min, and while it
+    /// is, every fetch and every `Write` there fails with `DiskFull`, a
+    /// `Write` at its rename as above. The host checks for space every 30 s
+    /// while the folder's inbound is paused and reports `SpaceRecovered`
+    /// once there is some. The final phase frees every disk.
+    pub disk_fill: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -66,6 +73,7 @@ impl Default for Knobs {
             displace_subtrees: true,
             skip: 0.002,
             io_failure: 0.0,
+            disk_fill: 0.0,
             nodes: None,
         }
     }
@@ -75,7 +83,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -85,7 +93,8 @@ impl fmt::Display for Knobs {
             self.group_commit_lag,
             self.displace_subtrees,
             self.skip,
-            self.io_failure
+            self.io_failure,
+            self.disk_fill
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;
