@@ -9,16 +9,16 @@ test: delocal-sim regressions::a_peer_refused_during_another_reset_asks_again
 test: delocal-engine folder::tests::a_resets_landing_is_announced_under_a_new_seq
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..54e3935 100644
+index c13f56e..574d7e5 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2195,12 +2195,10 @@ impl FolderState {
+@@ -2409,12 +2409,10 @@ impl FolderState {
              // what tells a refused peer to ask again. Entries deferred at
              // the path are then classified against it; if the file changed
              // underneath, they wait for the next observation instead.
--            if outcome != ApplyOutcome::Ok {
+-            if !landed {
 -                return Vec::new();
-+            if outcome == ApplyOutcome::Ok {
++            if landed {
 +                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
              }
 -            let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
@@ -26,5 +26,5 @@ index e843412..54e3935 100644
 -            return written;
 +            return Vec::new();
          }
-         match outcome {
-             ApplyOutcome::Ok => {
+         if !landed {
+             self.defer_changed_underneath(want);

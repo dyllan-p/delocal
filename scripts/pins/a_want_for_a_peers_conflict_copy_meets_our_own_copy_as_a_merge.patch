@@ -10,22 +10,22 @@ test: delocal-sim regressions::a_want_for_a_peers_conflict_copy_meets_our_own_co
 test: delocal-engine folder::tests::writing_our_own_conflict_copy_reclassifies_a_want_for_a_peers_copy
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..f963bee 100644
+index c13f56e..50b4961 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2213,15 +2213,9 @@ impl FolderState {
-                 };
-                 let mut written = vec![record];
-                 if let Some(copy) = want.conflict {
--                    let copy_path = copy.path.clone();
-                     let change = self.index.record_conflict_copy(copy.path, &copy.loser);
-                     self.touched(now);
-                     written.push(change.record);
--                    // Every index write re-classifies the wants at its path: a
--                    // want for a peer's copy of the same loser now meets this
--                    // machine's own copy, an identical-content merge rather
--                    // than a fetch that would land over it.
--                    self.reclassify_want(now, &copy_path);
-                 }
-                 // The disk now holds what the record says: whatever mark a
-                 // deferred entry carried here is gone with the fact it
+@@ -2429,15 +2429,9 @@ impl FolderState {
+         };
+         let mut written = vec![record];
+         if let Some(copy) = want.conflict {
+-            let copy_path = copy.path.clone();
+             let change = self.index.record_conflict_copy(copy.path, &copy.loser);
+             self.touched(now);
+             written.push(change.record);
+-            // Every index write re-classifies the wants at its path: a want
+-            // for a peer's copy of the same loser now meets this machine's
+-            // own copy, an identical-content merge rather than a fetch that
+-            // would land over it.
+-            self.reclassify_want(now, &copy_path);
+         }
+         // The disk now holds what the record says: whatever mark a deferred
+         // entry carried here is gone with the fact it recorded (§8.3).

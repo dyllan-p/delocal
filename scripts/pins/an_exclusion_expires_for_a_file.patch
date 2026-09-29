@@ -12,12 +12,12 @@ test: delocal-engine want::tests::an_exclusion_expires_on_a_backoff_that_doubles
 test: delocal-engine want::tests::a_give_up_expires_with_its_first_exclusion
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
-index a48d211..497a28d 100644
+index 98628fb..69d536d 100644
 --- a/crates/engine/src/want.rs
 +++ b/crates/engine/src/want.rs
-@@ -590,19 +590,6 @@ impl WantList {
-     /// excluded, the stall may have been ours), and a commit past its
-     /// deadline becomes overdue but keeps its path (§7.5).
+@@ -808,19 +808,6 @@ impl WantList {
+     /// becomes overdue but keeps its path, and a local retry whose backoff
+     /// has run out is wanted again (§7.5).
      pub fn expire(&mut self, now: Timestamp) -> Expired {
 -        let released: Vec<(RelPath, NodeId)> = self
 -            .wants
@@ -35,8 +35,8 @@ index a48d211..497a28d 100644
          let mut expired = Expired::default();
          for (path, want) in &self.wants {
              match want.state {
-@@ -660,11 +647,7 @@ impl WantList {
-             } => Some(deadline),
+@@ -889,11 +876,7 @@ impl WantList {
+             | WantState::LocalRetry { until: deadline } => Some(deadline),
              _ => None,
          });
 -        let expiries = self
