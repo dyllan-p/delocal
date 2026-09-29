@@ -390,14 +390,15 @@ fn a_want_fetched_before_a_crash_is_fetched_again() {
 
 /// Requests named a version, and a conflict's merged version `M` exists
 /// nowhere until someone merges: the winner's holders answered
-/// `NotAvailable` for `M` although they held its content, and a path whose
-/// concurrent holders never all met stayed different across the mesh.
-/// Fetches are by hash now (§7.5 steps 2 and 3). Pinned at seed 560 with
-/// the default knobs, shrunk to 139 steps, after the late-fetch fix moved
-/// seed 30's history. With the host serving by version again it fails
-/// quiescence: entries at d2/f8 stay deferred for good. Of seeds 0-999,
-/// 556, 560 and 717 fail that way and none fails I1; seed 3389 does, but
-/// shrinks no further than 344 steps.
+/// `NotAvailable` for `M` although they held its content. Fetches are by
+/// hash now (§7.5 steps 2 and 3). The pin fails quiescence: pinned at seed
+/// 560 with the default knobs, shrunk to 139 steps, with the host serving
+/// by version again the run never settles, entries at d2/f8 staying
+/// deferred for good. It was found failing I1, a path whose concurrent
+/// holders never all met staying different across the mesh, at seed 30,
+/// until the late-fetch fix moved that history. Of seeds 0-999, 556, 560
+/// and 717 fail with the patch, all of them quiescence; the one seed found
+/// failing I1, 3389, shrinks no further than 344 steps.
 #[test]
 fn content_is_fetched_by_hash_from_whoever_holds_it() {
     passes(
