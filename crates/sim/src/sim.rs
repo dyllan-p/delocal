@@ -306,6 +306,12 @@ struct Node {
     /// Content this node adopted through sync, with the path and when (I2).
     /// An entry follows its content when sync moves it to a conflict copy.
     synced: Vec<(ContentHash, RelPath, Timestamp)>,
+    /// Every move sync made on this node of a file to a conflict-copy path
+    /// or back, in order: content, from, to and when. An adoption joins
+    /// `synced` only once its write is durable (§11), which may be after a
+    /// commit already moved the content on, so it replays the moves made
+    /// since its write.
+    moves: Vec<(ContentHash, RelPath, RelPath, Timestamp)>,
     /// When this node's own user last edited or deleted each path (I2).
     local_edit_at: BTreeMap<RelPath, Timestamp>,
     /// The highest `seq` this node's index has written. Every write takes a
@@ -498,6 +504,9 @@ struct Staged {
     write: TableWrite,
     at: Timestamp,
     event: u64,
+    /// How many moves sync had made on the node when the write was made
+    /// (see `Node::moves`).
+    moves: usize,
 }
 
 /// A write to the persisted store (§11).
@@ -669,6 +678,7 @@ impl Sim {
                 ignored: BTreeMap::new(),
                 sent: BTreeMap::new(),
                 synced: Vec::new(),
+                moves: Vec::new(),
                 local_edit_at: BTreeMap::new(),
                 max_seq: 0,
                 paused: false,
@@ -1564,6 +1574,7 @@ impl Sim {
                     write: TableWrite::Hook(Box::new(action)),
                     at: self.clock,
                     event: self.stats.events,
+                    moves: self.nodes.get(&id).map_or(0, |n| n.moves.len()),
                 };
                 match self.nodes.get_mut(&id).and_then(|n| n.group.as_mut()) {
                     Some(group) => group.writes.push(staged),
@@ -1618,6 +1629,7 @@ impl Sim {
             write,
             at: made_at,
             event,
+            moves,
         } = staged;
         let action = match write {
             TableWrite::Hook(action) => *action,
@@ -1736,8 +1748,17 @@ impl Sim {
                         && landed
                         && !reverted
                     {
-                        n.synced
-                            .push((record.entry.hash, record.entry.path.clone(), now));
+                        // Where the content is now: a commit of this node's
+                        // may have moved it to a conflict copy since the write
+                        // was made, before the write was durable.
+                        let (mut at, mut when) = (record.entry.path.clone(), now);
+                        for (hash, from, to, moved_at) in n.moves.iter().skip(moves) {
+                            if *hash == record.entry.hash && *from == at {
+                                at = to.clone();
+                                when = *moved_at;
+                            }
+                        }
+                        n.synced.push((record.entry.hash, at, when));
                     }
                     n.persisted
                         .records
@@ -3085,6 +3106,7 @@ impl Sim {
                     write: TableWrite::Rules(rules.clone()),
                     at: self.clock,
                     event: self.stats.events,
+                    moves: self.nodes.get(&id).map_or(0, |n| n.moves.len()),
                 };
                 if let Some(group) = self.nodes.get_mut(&id).and_then(|n| n.group.as_mut()) {
                     group.writes.push(staged);
@@ -3298,6 +3320,7 @@ fn restart_difference(
 /// now, so that its user's later edit or deletion of the copy counts as the
 /// user's own change and not as sync's loss (I2, §14.1).
 fn follow(node: &mut Node, from: &RelPath, to: &RelPath, hash: ContentHash, now: Timestamp) {
+    node.moves.push((hash, from.clone(), to.clone(), now));
     for (h, path, at) in &mut node.synced {
         if *h == hash && path == from {
             *path = to.clone();
@@ -3511,12 +3534,14 @@ impl Sim {
         event: u64,
     ) -> Result<(), Failure> {
         let at = self.clock;
+        let moves = self.nodes.get(&id).map_or(0, |n| n.moves.len());
         self.record(
             id,
             Staged {
                 write: TableWrite::Hook(Box::new(action)),
                 at,
                 event,
+                moves,
             },
         )
     }
@@ -3684,6 +3709,50 @@ mod tests {
             [(adopted.hash(), copy.clone(), displaced)]
         );
         crate::invariants::i2_node(&sim, id).unwrap_or_else(|f| panic!("{f}"));
+    }
+
+    /// An adoption joins `synced` once its write is durable (§11), which
+    /// can be after a commit of the node's has already moved the content to
+    /// a conflict copy with its directory (§7.6): here the adoption of `f2`
+    /// is written, the displacement of `d1` moves it, and only then is the
+    /// write durable. The entry starts where the content is, at the copy,
+    /// dated by the move, so that its user's deletion there is the user's
+    /// own change (I2). A move made before the write is not replayed, even
+    /// of the same content from the same path: the write landed it again.
+    #[test]
+    fn an_adoption_durable_after_its_content_moved_starts_where_it_went() {
+        let mut sim = world();
+        let (id, peer) = (sim.order[0], sim.order[1]);
+        let folder = sim.folder;
+        let (dir, at) = (rel("d1"), rel("d1/f2"));
+        let copy = rel("d1.conflict-20231114-221320-n1");
+        let adopted = written(&at, peer, Version::from_iter([(peer, 1)]), 4, 0);
+        let moved = File {
+            mtime_ns: adopted.mtime_ns,
+            ..file(4, false)
+        };
+        let now = Timestamp::from_unix_nanos(1_700_000_100 * NANOS);
+        let node = sim.nodes.get_mut(&id).unwrap();
+        // Earlier, the same content at the path went to a copy of its own.
+        follow(node, &at, &rel("d1/f2.conflict-x"), adopted.hash, now);
+        let staged = Staged {
+            write: TableWrite::Hook(Box::new(changed(folder, adopted.clone(), 1))),
+            at: now,
+            event: 1,
+            moves: node.moves.len(),
+        };
+        let later = now.plus_nanos(NANOS);
+        follow_moved(node, &dir, &copy, &[(at.clone(), moved)], later);
+        sim.record(id, staged).unwrap_or_else(|f| panic!("{f}"));
+        let (synced, _) = sim.synced(id);
+        assert_eq!(
+            synced,
+            [(
+                adopted.hash,
+                rel("d1.conflict-20231114-221320-n1/f2"),
+                later
+            )]
+        );
     }
 
     /// A revert discards only the versions its node wrote above the record
