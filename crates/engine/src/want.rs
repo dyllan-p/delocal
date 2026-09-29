@@ -277,11 +277,12 @@ pub struct WantList {
     changed: Vec<RelPath>,
     /// Commits a rule released early, by the path each still holds, with
     /// the version it was committing (§7.5). A rule that releases a commit
-    /// early releases the want, not the path: the commit keeps the path
-    /// until its own report or a restart, the report is discarded, and only
-    /// then may a new commit of the path start. A host operation does not
-    /// outlive the process, so these are no persisted part (§11), and like
-    /// the change log they are not encoded.
+    /// early releases the want, not the path: the commit keeps the path in
+    /// flight until its own report or a restart, nothing changes the path's
+    /// record meanwhile, not even an index-only adoption, the report is
+    /// discarded, and only then may the path move on. A host operation
+    /// does not outlive the process, so these are no persisted part (§11),
+    /// and like the change log they are not encoded.
     #[serde(skip)]
     released: BTreeMap<RelPath, Version>,
 }
@@ -879,17 +880,18 @@ impl WantList {
                 self.set_state(&path, WantState::Blocked);
                 continue;
             }
+            // A commit a rule released still holds the path (§7.5): nothing
+            // changes the path's record until its report, neither a new
+            // commit nor an index-only adoption, since it may still land
+            // its own version there.
+            if self.released.contains_key(&path) {
+                self.set_state(&path, WantState::Blocked);
+                continue;
+            }
             if want.mode == ApplyMode::IndexOnly {
                 if let Some(want) = self.remove(&path) {
                     steps.push(WantStep::Adopt(Box::new(want)));
                 }
-                continue;
-            }
-            // A commit a rule released still holds the path (§7.5): the
-            // new one waits for its report. An index-only adoption above
-            // is no commit of the path; it touches nothing on disk.
-            if self.released.contains_key(&path) {
-                self.set_state(&path, WantState::Blocked);
                 continue;
             }
             steps.push(WantStep::Commit(Box::new(want.clone())));
