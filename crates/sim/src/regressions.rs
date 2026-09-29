@@ -38,7 +38,8 @@ fn corrupting() -> Knobs {
 
 /// `knobs` without draft 34's simulator models (§14.1): no crash between a
 /// commit's two renames, no group-commit lag, a displaced directory leaves
-/// its children, and no scan skips a path (§7.3). Every pin before them was
+/// its children, and no scan skips a path (§7.3). Nor the later ones: no
+/// fetch or commit fails on its machine (§7.5). Every pin before them was
 /// found this way.
 fn before_draft_34(knobs: &Knobs) -> Knobs {
     Knobs {
@@ -46,6 +47,7 @@ fn before_draft_34(knobs: &Knobs) -> Knobs {
         group_commit_lag: 0,
         displace_subtrees: false,
         skip: 0.0,
+        io_failure: 0.0,
         ..knobs.clone()
     }
 }

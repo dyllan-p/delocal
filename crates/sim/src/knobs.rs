@@ -43,6 +43,13 @@ pub struct Knobs {
     /// `.delocalignore` and later taken out: while it is, scans and the
     /// watcher report it `Skipped`. The final phase's scans skip nothing.
     pub skip: f64,
+    /// Probability that a fetch or a commit fails on its machine with an
+    /// I/O error (§7.5 "local failures"). A fetch fails as its bytes are
+    /// written. A `Write` fails at the rename that puts the new content in
+    /// place, after the displacement, which the host undoes before it
+    /// reports, and half such failures take the temp file with them; a
+    /// `Remove` or `SetMeta` fails before it changes anything.
+    pub io_failure: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -58,6 +65,7 @@ impl Default for Knobs {
             group_commit_lag: 4,
             displace_subtrees: true,
             skip: 0.002,
+            io_failure: 0.0,
             nodes: None,
         }
     }
@@ -67,7 +75,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -76,7 +84,8 @@ impl fmt::Display for Knobs {
             self.crash_between_renames,
             self.group_commit_lag,
             self.displace_subtrees,
-            self.skip
+            self.skip,
+            self.io_failure
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;
