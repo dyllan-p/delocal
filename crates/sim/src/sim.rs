@@ -1381,9 +1381,34 @@ impl Sim {
         })
     }
 
+    /// §7.5: a released commit keeps its path in flight, and nothing may
+    /// change the path's record until its report, neither a new commit
+    /// ([`Sim::commit_started`]) nor an index-only adoption. The event that
+    /// releases the want may still write there (the conflict copy it
+    /// records, a landing an observation finds); from the next event on,
+    /// any write of the record is a failure.
+    fn changes_a_held_record(&self, id: NodeId, action: &Action) -> Option<String> {
+        let path = match action {
+            Action::IndexChanged { record, .. } => &record.entry.path,
+            Action::IndexRemoved { path, .. } => path,
+            _ => return None,
+        };
+        let held = self.committing.get(&(id, path.clone()))?;
+        held.released.then(|| {
+            format!(
+                "{} changed the record of {path} while a released commit of {:?} held it",
+                Self::short(id),
+                held.version
+            )
+        })
+    }
+
     fn act(&mut self, id: NodeId, action: Action) -> Result<(), Failure> {
         if let Some(detail) = self.tombstones_a_skip(id, &action) {
             return Err(self.fail("Skipped", detail));
+        }
+        if let Some(detail) = self.changes_a_held_record(id, &action) {
+            return Err(self.fail("commit in flight", detail));
         }
         if let Some(path) = self.commits_held_item(id, &action) {
             return Err(self.fail(
@@ -3949,6 +3974,28 @@ mod tests {
         assert!(
             !sim.committing[&(other, rel("n"))].released,
             "another node's"
+        );
+
+        // Nor may the record of a held path change, by an adoption or
+        // anything else, until the released commit's report.
+        let record = |path: &str| Action::IndexChanged {
+            folder,
+            record: IndexRecord {
+                entry: written(&rel(path), other, v(3), 1, 0),
+                seq: 9,
+            },
+        };
+        let changed = sim.changes_a_held_record(id, &record("m")).unwrap();
+        assert!(changed.contains("changed the record of m"), "{changed}");
+        assert_eq!(
+            sim.changes_a_held_record(other, &record("n")),
+            None,
+            "not released"
+        );
+        assert_eq!(
+            sim.changes_a_held_record(id, &record("j")),
+            None,
+            "not held"
         );
     }
 
