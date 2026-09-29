@@ -57,6 +57,14 @@ pub struct Knobs {
     /// while the folder's inbound is paused and reports `SpaceRecovered`
     /// once there is some. The final phase frees every disk.
     pub disk_fill: f64,
+    /// Probability that a step spells the file name it touches in upper
+    /// case (`F3` for `f3`), so that paths differing only by case exist.
+    /// Above 0 the first node's filesystem ignores case (§7.6): its user's
+    /// writes land on an existing file of either spelling, and its host
+    /// reports `CaseCollision` for a write whose path differs only by case
+    /// from a live record. In the final phase a user on a case-sensitive
+    /// node resolves every such pair, as §7.6 says the user does.
+    pub case_variants: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
 }
@@ -74,6 +82,7 @@ impl Default for Knobs {
             skip: 0.002,
             io_failure: 0.0,
             disk_fill: 0.0,
+            case_variants: 0.0,
             nodes: None,
         }
     }
@@ -83,7 +92,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -94,7 +103,8 @@ impl fmt::Display for Knobs {
             self.displace_subtrees,
             self.skip,
             self.io_failure,
-            self.disk_fill
+            self.disk_fill,
+            self.case_variants
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;

@@ -57,6 +57,9 @@ const SKIP_STREAM: u64 = 3;
 /// commits fail with an I/O error, whether a failed rename takes its temp
 /// file with it, and when a disk fills and for how long.
 const FAIL_STREAM: u64 = 4;
+/// The PRNG stream that spells file names in upper case, for the
+/// case-insensitive node (§7.6).
+const CASE_STREAM: u64 = 5;
 /// How often a host whose folder's inbound is paused checks for free
 /// space (§7.5).
 const SPACE_CHECK_NANOS: i64 = 30 * NANOS;
@@ -112,6 +115,11 @@ pub struct Stats {
     pub disk_full_reports: u64,
     /// `SpaceRecovered` reports.
     pub spaces_recovered: u64,
+    /// File names a step spelled in upper case (§7.6).
+    pub upper_spellings: u64,
+    /// Commits the case-insensitive node's host did not attempt because of
+    /// a case collision.
+    pub case_collisions: u64,
     /// Temp files a failed rename took with it.
     pub temps_lost: u64,
 }
@@ -322,6 +330,9 @@ struct Node {
     /// When the host next checks for free space, while the folder's inbound
     /// is paused (§7.5).
     space_check_at: Option<Timestamp>,
+    /// The filesystem ignores case (§7.6): two names that differ only by
+    /// case are one file.
+    case_insensitive: bool,
     /// The engine has paused the folder's inbound on a full disk, as the
     /// host learned it (see `Sim::note_pause`), and the host has not yet
     /// reported `SpaceRecovered`: the engine must start nothing inbound
@@ -622,6 +633,8 @@ pub struct Sim {
     skip_rng: ChaCha8Rng,
     /// Draws for the local failures, on `FAIL_STREAM`.
     fail_rng: ChaCha8Rng,
+    /// Draws for upper-case spellings, on `CASE_STREAM`.
+    case_rng: ChaCha8Rng,
     /// While a node is fed an event: which node, what kind of event, and
     /// its index's `seq` as the event began, for the disk-full checker.
     feeding: Option<Feeding>,
@@ -729,6 +742,7 @@ impl Sim {
                 ignored: BTreeMap::new(),
                 full_until: None,
                 space_check_at: None,
+                case_insensitive: i == 0 && knobs.case_variants > 0.0,
                 paused_inbound: false,
                 sent: BTreeMap::new(),
                 synced: Vec::new(),
@@ -759,6 +773,8 @@ impl Sim {
         skip_rng.set_stream(SKIP_STREAM);
         let mut fail_rng = ChaCha8Rng::seed_from_u64(seed);
         fail_rng.set_stream(FAIL_STREAM);
+        let mut case_rng = ChaCha8Rng::seed_from_u64(seed);
+        case_rng.set_stream(CASE_STREAM);
         let mut sim = Self {
             seed,
             knobs,
@@ -767,6 +783,7 @@ impl Sim {
             group_rng,
             skip_rng,
             fail_rng,
+            case_rng,
             feeding: None,
             checking: None,
             committing: BTreeMap::new(),
@@ -919,6 +936,7 @@ impl Sim {
             for id in &ids {
                 self.user_act(*id, UserAction::ApproveAll)?;
             }
+            self.resolve_case_pairs()?;
             for id in &ids {
                 self.full_scan(*id, false)?;
             }
@@ -2479,11 +2497,12 @@ impl Sim {
                 // changed for a `Remove` or `SetMeta`.
                 let fail = self.local_failure(node, matches!(*action, Action::Write { .. }));
                 // What the disk held, for the check that a failed commit left
-                // it so; only a commit drawn to fail needs it.
+                // it so; only a commit that can fail needs it: one drawn to,
+                // and one on a filesystem that ignores case.
                 let before = self
                     .nodes
                     .get(&node)
-                    .filter(|_| fail.is_some())
+                    .filter(|n| fail.is_some() || n.case_insensitive)
                     .map(|n| (n.fs.clone(), n.trash.clone()));
                 let (committed, created) = self.commit(node, &path, &version, &action, fail);
                 if let Committed::Report(ApplyOutcome::Failed { error }) = &committed {
@@ -2743,6 +2762,21 @@ impl Sim {
         let Some(node) = self.nodes.get_mut(&id) else {
             return (changed(), Vec::new());
         };
+        // §7.5 step 6 on a filesystem that ignores case: a live record at a
+        // path that is this one but for case names the same file, so the
+        // commit is not attempted. The host asks its own tables, which is
+        // all it knows of the index.
+        if node.case_insensitive
+            && let Action::Write { .. } = action
+            && let Some(with) = collides(node, path)
+        {
+            self.stats.case_collisions += 1;
+            let error = LocalError::CaseCollision { with };
+            return (
+                Committed::Report(ApplyOutcome::Failed { error }),
+                Vec::new(),
+            );
+        }
         // §7.5 step 6: the same guard before every commit, SetMeta included.
         let expected = match action {
             Action::Write { expected, .. }
@@ -2794,8 +2828,11 @@ impl Sim {
             Action::Write {
                 entry, displace, ..
             } => {
-                if let Displace::ConflictCopy(target) = displace
-                    && node.fs.contains_key(target)
+                // The rename in refuses to replace (§7.5), and on a
+                // filesystem that ignores case another spelling is the same
+                // name, so is the conflict-copy path's.
+                if occupied_otherwise(node, path)
+                    || matches!(displace, Displace::ConflictCopy(target) if occupied(node, target))
                 {
                     return (changed(), created);
                 }
@@ -3149,16 +3186,19 @@ impl Sim {
                 content,
             } => {
                 let id = self.node_at(node);
-                self.write_file(id, &rel(&path_name(path)), content_bytes(content), None)
+                let path = self.spell(path_name(path));
+                self.write_file(id, &path, content_bytes(content), None)
             }
             Step::Delete { node, path } => {
                 let id = self.node_at(node);
-                self.delete_path(id, &rel(&path_name(path)))
+                let path = self.spell(path_name(path));
+                self.delete_path(id, &path)
             }
             Step::Rename { node, from, to } => {
                 let id = self.node_at(node);
-                let from = rel(&path_name(from));
-                let to = rel(&path_name(to));
+                let from = self.spell(path_name(from));
+                let from = self.on_disk(id, from);
+                let to = self.spell(path_name(to));
                 if from == to {
                     return Ok(());
                 }
@@ -3176,7 +3216,8 @@ impl Sim {
             }
             Step::Touch { node, path } => {
                 let id = self.node_at(node);
-                let path = rel(&path_name(path));
+                let path = self.spell(path_name(path));
+                let path = self.on_disk(id, path);
                 let now = self.now_for(id).as_unix_nanos();
                 let touched = self
                     .nodes
@@ -3193,7 +3234,8 @@ impl Sim {
             }
             Step::Chmod { node, path } => {
                 let id = self.node_at(node);
-                let path = rel(&path_name(path));
+                let path = self.spell(path_name(path));
+                let path = self.on_disk(id, path);
                 let flipped = self
                     .nodes
                     .get_mut(&id)
@@ -3217,7 +3259,8 @@ impl Sim {
             }
             Step::Symlink { node, path, target } => {
                 let id = self.node_at(node);
-                let path = rel(&path_name(path));
+                let path = self.spell(path_name(path));
+                let path = self.on_disk(id, path);
                 let target = path_name(target).into_bytes();
                 let now = self.now_for(id).as_unix_nanos();
                 self.ensure_parent(id, &path)?;
@@ -3235,7 +3278,7 @@ impl Sim {
                 self.watch(id, path)
             }
             Step::Everywhere { path, contents } => {
-                let path = rel(&path_name(path));
+                let path = self.spell(path_name(path));
                 let ids = self.order.clone();
                 for (i, id) in ids.into_iter().enumerate() {
                     if !self.nodes.get(&id).is_some_and(Node::alive) {
@@ -3317,6 +3360,105 @@ impl Sim {
         }
     }
 
+    /// A file path a step names, as the step spells it (§7.6): with the
+    /// knob's probability its file name is in upper case, `F3` for `f3`.
+    /// Only file names vary, never directories, so the paths of a pair
+    /// differ in their last component. The draw is on `CASE_STREAM`, and
+    /// none is made with the knob at 0.
+    fn spell(&mut self, name: String) -> RelPath {
+        let p = self.knobs.case_variants;
+        if p > 0.0 && self.case_rng.random::<f64>() < p {
+            self.stats.upper_spellings += 1;
+            let leaf = name.rfind('/').map_or(0, |i| i + 1);
+            let (dir, file) = name.split_at(leaf);
+            return rel(&format!("{dir}{}", file.to_ascii_uppercase()));
+        }
+        rel(&name)
+    }
+
+    /// The name on `id`'s disk that its user reaches by `path`: `path`
+    /// itself, or, on a filesystem that ignores case, the spelling already
+    /// there (§7.6). Writing to `F3` where `f3` exists changes `f3`.
+    fn on_disk(&self, id: NodeId, path: RelPath) -> RelPath {
+        self.nodes
+            .get(&id)
+            .filter(|n| n.case_insensitive && !n.fs.contains_key(&path))
+            .and_then(|n| spelled_otherwise(n, &path))
+            .unwrap_or(path)
+    }
+
+    /// §7.6: two paths that differ only by case cannot both exist on a
+    /// filesystem that ignores case, `status` names the pair, and the user
+    /// resolves it on a case-sensitive machine. In every round of the final
+    /// phase the user of the first case-sensitive node does. Of each set of
+    /// names in its folder that differ only by case, it keeps the one that
+    /// sorts last, which is the vocabulary's own lower case, and deletes
+    /// the others. And for every pair a case-insensitive node's wants name
+    /// as colliding, if its folder holds the colliding path but not the
+    /// wanted one, it deletes the colliding path: the wanted one may exist
+    /// nowhere it can see, only as a record a `revert` restored (§8.3).
+    fn resolve_case_pairs(&mut self) -> Result<(), Failure> {
+        if self.knobs.case_variants <= 0.0 {
+            return Ok(());
+        }
+        let Some(id) = self
+            .order
+            .iter()
+            .copied()
+            .find(|id| self.nodes.get(id).is_some_and(|n| !n.case_insensitive))
+        else {
+            return Ok(());
+        };
+        let mut spellings: BTreeMap<String, Vec<RelPath>> = BTreeMap::new();
+        for path in self
+            .nodes
+            .get(&id)
+            .map(|n| n.fs.keys())
+            .into_iter()
+            .flatten()
+        {
+            spellings.entry(fold(path)).or_default().push(path.clone());
+        }
+        for (_, mut paths) in spellings {
+            // In path order already; the last is kept.
+            paths.pop();
+            for path in paths {
+                self.delete_path(id, &path)?;
+            }
+        }
+        let named: Vec<(RelPath, RelPath)> = self
+            .nodes
+            .values()
+            .filter(|n| n.case_insensitive)
+            .filter_map(|n| n.engine.as_ref()?.folder(self.folder))
+            .flat_map(|f| f.wants().iter())
+            .filter_map(|w| match &w.state {
+                WantState::Collides { with, .. } => Some((w.path().clone(), with.clone())),
+                _ => None,
+            })
+            .collect();
+        for (wanted, with) in named {
+            self.resolve_named(id, &wanted, &with)?;
+        }
+        Ok(())
+    }
+
+    /// The user of case-sensitive `id` resolves the pair a case-insensitive
+    /// node names, `wanted` colliding with `with`, if its folder holds
+    /// `with` but not `wanted`: it deletes `with`, and `wanted` lands.
+    fn resolve_named(
+        &mut self,
+        id: NodeId,
+        wanted: &RelPath,
+        with: &RelPath,
+    ) -> Result<(), Failure> {
+        let holds = |p: &RelPath| self.nodes.get(&id).is_some_and(|n| n.fs.contains_key(p));
+        if holds(with) && !holds(wanted) {
+            self.delete_path(id, with)?;
+        }
+        Ok(())
+    }
+
     /// The first `fraction` percent of a node's files, in path order.
     fn files_of(&self, id: NodeId, fraction: u8) -> Vec<RelPath> {
         let Some(n) = self.nodes.get(&id) else {
@@ -3378,6 +3520,7 @@ impl Sim {
         if !self.nodes.contains_key(&id) {
             return Ok(());
         }
+        let path = &self.on_disk(id, path.clone());
         self.ensure_parent(id, path)?;
         let now = self.now_for(id).as_unix_nanos();
         if let Some(n) = self.nodes.get_mut(&id) {
@@ -3407,6 +3550,7 @@ impl Sim {
     }
 
     fn delete_path(&mut self, id: NodeId, path: &RelPath) -> Result<(), Failure> {
+        let path = &self.on_disk(id, path.clone());
         let removed: Vec<RelPath> = match self.nodes.get_mut(&id) {
             Some(n) => {
                 let mut gone: Vec<RelPath> =
@@ -3663,6 +3807,45 @@ fn temp_of<'a>(node: &'a Node, path: &RelPath, version: &Version) -> Option<&'a 
         .map(|(_, bytes)| bytes)
 }
 
+/// A path as a filesystem that ignores case sees it (§7.6): the names in
+/// the simulation are ASCII, so lower case is enough.
+fn fold(path: &RelPath) -> String {
+    path.as_str().to_ascii_lowercase()
+}
+
+/// True if a rename to `path` on `node` would find it taken: something is
+/// there, under this spelling or, on a filesystem that ignores case, any
+/// other.
+fn occupied(node: &Node, path: &RelPath) -> bool {
+    node.fs.contains_key(path) || occupied_otherwise(node, path)
+}
+
+/// True if `node` ignores case and holds `path` under another spelling.
+fn occupied_otherwise(node: &Node, path: &RelPath) -> bool {
+    node.case_insensitive && spelled_otherwise(node, path).is_some()
+}
+
+/// On a filesystem that ignores case, the other spelling of `path` that is
+/// on disk, if any.
+fn spelled_otherwise(node: &Node, path: &RelPath) -> Option<RelPath> {
+    let folded = fold(path);
+    node.fs
+        .keys()
+        .find(|p| *p != path && fold(p) == folded)
+        .cloned()
+}
+
+/// The live record in `node`'s tables at a path that differs from `path`
+/// only by case, if any (§7.5 step 6).
+fn collides(node: &Node, path: &RelPath) -> Option<RelPath> {
+    let folded = fold(path);
+    node.persisted
+        .records
+        .values()
+        .find(|r| !r.entry.deleted && r.entry.path != *path && fold(&r.entry.path) == folded)
+        .map(|r| r.entry.path.clone())
+}
+
 /// The commit guard (§7.5 step 6): what the engine believes is on disk
 /// against what is, by the scan fast path's predicate.
 fn expected_matches(file: Option<&File>, expected: Option<&Observed>) -> bool {
@@ -3819,7 +4002,7 @@ fn displace_journalled(
 /// What comes back from a conflict-copy path, as it now is, takes the
 /// adoptions of its content back with it (I2).
 fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
-    if node.fs.contains_key(&row.path) {
+    if occupied(node, &row.path) {
         return;
     }
     match &row.to {
@@ -4536,6 +4719,74 @@ mod tests {
             .push(file(2, false).hash());
         assert!(sim.left_as_found(id, &path, &io, before).is_err());
         assert!(sim.left_as_found(id, &path, &io, None).is_err());
+    }
+
+    /// §7.6 on the simulated disk: a filesystem that ignores case holds one
+    /// spelling of a name. Its user's write to another spelling changes the
+    /// file there; a rename to another spelling finds the name taken; and a
+    /// commit collides with a live record in its tables at another
+    /// spelling, never with a tombstone. A case-sensitive disk has none of
+    /// this.
+    #[test]
+    fn a_disk_that_ignores_case_holds_one_spelling_of_a_name() {
+        let mut sim = world();
+        let (id, other) = (sim.order[0], sim.order[1]);
+        let (lower, upper) = (rel("d1/f3"), rel("d1/F3"));
+        for n in [id, other] {
+            sim.nodes
+                .get_mut(&n)
+                .unwrap()
+                .fs
+                .insert(lower.clone(), file(1, false));
+        }
+        sim.nodes.get_mut(&id).unwrap().case_insensitive = true;
+        assert_eq!(sim.on_disk(id, upper.clone()), lower);
+        assert_eq!(sim.on_disk(id, rel("d1/F4")), rel("d1/F4"));
+        assert_eq!(sim.on_disk(other, upper.clone()), upper);
+        assert!(occupied(&sim.nodes[&id], &upper));
+        assert!(!occupied(&sim.nodes[&other], &upper));
+
+        let record = |deleted| IndexRecord {
+            entry: Entry {
+                deleted,
+                ..written(&lower, id, Version::from_iter([(id, 1)]), 1, 0)
+            },
+            seq: 1,
+        };
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.persisted.records.insert(lower.clone(), record(false));
+        assert_eq!(collides(node, &upper), Some(lower.clone()));
+        assert_eq!(collides(node, &lower), None, "its own spelling");
+        node.persisted.records.insert(lower.clone(), record(true));
+        assert_eq!(collides(node, &upper), None, "a tombstone");
+    }
+
+    /// §7.6: the user resolves a pair a case-insensitive node names on a
+    /// case-sensitive machine. Where that machine holds the colliding path
+    /// but not the wanted one, which may exist only as a record a revert
+    /// restored (§8.3), its user deletes the colliding path; where it holds
+    /// both, or only the wanted one, this leaves them.
+    #[test]
+    fn a_pair_named_as_colliding_is_resolved_on_a_case_sensitive_machine() {
+        let mut sim = world();
+        let id = sim.order[1];
+        let (wanted, with) = (rel("F3"), rel("f3"));
+        let holds = |sim: &Sim, p: &RelPath| sim.nodes[&id].fs.contains_key(p);
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(with.clone(), file(1, false));
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(wanted.clone(), file(2, false));
+        sim.resolve_named(id, &wanted, &with).unwrap();
+        assert!(holds(&sim, &with) && holds(&sim, &wanted), "both: left");
+        sim.nodes.get_mut(&id).unwrap().fs.remove(&wanted);
+        sim.resolve_named(id, &wanted, &with).unwrap();
+        assert!(!holds(&sim, &with), "only the colliding one: deleted");
     }
 
     /// §7.5: a commit is in flight from the moment the engine asks for it
