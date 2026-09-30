@@ -158,6 +158,10 @@ pub(crate) struct Watch {
     /// Paths whose file a displacement of a directory above them took away
     /// (§7.6), until the engine next observes them.
     moved: BTreeSet<(NodeId, RelPath)>,
+    /// When the user last edited a file somewhere else that has since come
+    /// back to a path: a conflict copy the journal's undo moved back at a
+    /// restart (§7.5), edited while the node was down.
+    edited_elsewhere: BTreeMap<(NodeId, RelPath), Timestamp>,
     /// Commits reported while their node's group of writes is open (§11),
     /// with the action each performed: a crash before the group is durable
     /// takes the record the report wrote, so the landing is lost as if the
@@ -166,7 +170,13 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
-    /// `id`'s engine is being fed an observation of `path` at `at`.
+    /// When `id`'s engine was last fed an observation of `path`.
+    #[cfg(test)]
+    pub(crate) fn last_observed(&self, id: NodeId, path: &RelPath) -> Option<Timestamp> {
+        self.last_observed.get(&(id, path.clone())).copied()
+    }
+
+    /// `id`'s engine was fed an observation of `path` at `at`.
     pub(crate) fn observed(&mut self, id: NodeId, path: &RelPath, at: Timestamp) {
         self.last_observed.insert((id, path.clone()), at);
         self.moved.remove(&(id, path.clone()));
@@ -361,6 +371,16 @@ impl Watch {
         }
     }
 
+    /// The file now at `path` on `id` came back from somewhere its user
+    /// edited it, last at `at`: for I9 that is an edit of `path`.
+    pub(crate) fn edited_elsewhere(&mut self, id: NodeId, path: &RelPath, at: Timestamp) {
+        let last = self
+            .edited_elsewhere
+            .entry((id, path.clone()))
+            .or_insert(at);
+        *last = (*last).max(at);
+    }
+
     /// A commit on `id` displaced what was at `from` to `to`, as a conflict
     /// copy (§7.6); `beneath` if it went along with a directory above it.
     pub(crate) fn displaced(&mut self, id: NodeId, from: &RelPath, to: &RelPath, beneath: bool) {
@@ -387,6 +407,11 @@ impl Watch {
     ) -> Option<(Class, String)> {
         let mark = self.marks.get(&(id, entry.path.clone()))?;
         let counter = entry.version.counter(id);
+        let elsewhere = self
+            .edited_elsewhere
+            .get(&(id, entry.path.clone()))
+            .copied();
+        let edited = edited.max(elsewhere);
         let exempt = |c: u64| mark.let_through.contains(&c);
         if counter <= mark.own
             || edited.is_some_and(|t| mark.basis.is_none_or(|b| t > b))
@@ -546,6 +571,17 @@ mod tests {
         let new = entry(path, &[(A, 2), (B, 1)], hash, Y);
         watch.note(A, &[changed(&new, 7)], 6, &cause, false, x_on_disk);
         watch.revives(A, &new, edited).map(|(class, _)| class)
+    }
+
+    /// A conflict copy the user edited while the node was down comes back
+    /// to its path when the journal is undone at the restart (§7.5): that
+    /// edit is the user's change of the path, and what it makes there is
+    /// let through.
+    #[test]
+    fn an_edit_of_a_copy_that_comes_back_is_an_edit_of_the_path() {
+        let mut watch = reverted_watch("f", "f");
+        watch.edited_elsewhere(A, &rel("f"), at(12));
+        assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
     }
 
     /// Class 1: a scan reports the file the revert moved to the trash, as a

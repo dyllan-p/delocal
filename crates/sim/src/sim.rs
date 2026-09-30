@@ -1256,13 +1256,13 @@ impl Sim {
     fn feed(&mut self, id: NodeId, event: Event) -> Result<(), Failure> {
         let now = self.now_for(id);
         let what = event_name(&event);
-        let cause = self.i9.as_mut().map(|watch| {
-            if let Some((path, state)) = observation(&event)
-                && !matches!(state, ScanState::Skipped { .. })
-            {
-                watch.observed(id, path, self.clock);
-            }
-            cause(&event)
+        // I9: what made the event's versions, and the path it observes, if
+        // it does (a skip observes nothing), noted once the engine has it.
+        let cause = self.i9.as_ref().map(|_| {
+            let observed = observation(&event)
+                .filter(|(_, state)| !matches!(state, ScanState::Skipped { .. }))
+                .map(|(path, _)| path.clone());
+            (cause(&event), observed)
         });
         let observing = match &event {
             Event::Scanned { path, .. } => Some((id, path.clone())),
@@ -1289,7 +1289,10 @@ impl Sim {
             self.open_group(id);
         }
         self.note_pause(id);
-        if let (Some(watch), Some(cause)) = (self.i9.as_mut(), cause) {
+        if let (Some(watch), Some((cause, observed))) = (self.i9.as_mut(), cause) {
+            if let Some(path) = observed {
+                watch.observed(id, &path, self.clock);
+            }
             let node = self.nodes.get(&id);
             let group_open = node.is_some_and(|n| n.group.is_some());
             watch.note(id, &actions, seq, &cause, group_open, |p| {
@@ -2438,7 +2441,14 @@ impl Sim {
         let rows = std::mem::take(&mut node.journal);
         self.stats.displacements_undone += rows.len() as u64;
         for row in rows.into_iter().rev() {
-            undo(node, row, clock);
+            for (at, back) in undo(node, row, clock) {
+                // I9: a user's edit of the copy while the node was down is
+                // an edit of the file now back at its path.
+                if let (Some(watch), Some(edited)) = (self.i9.as_mut(), node.local_edit_at.get(&at))
+                {
+                    watch.edited_elsewhere(id, &back, *edited);
+                }
+            }
         }
         // §11: the persisted parts and nothing else.
         let engine = Engine::restore(config, vec![parts], now);
@@ -3020,7 +3030,7 @@ impl Sim {
                 if let Some(error) = fail {
                     if let Some(row) = row {
                         self.stats.displacements_undone += 1;
-                        undo(node, row, now);
+                        let _ = undo(node, row, now);
                     }
                     for dir in created.iter().rev() {
                         node.fs.remove(dir);
@@ -4161,10 +4171,12 @@ fn displace_journalled(
 /// a folder while its daemon is down) whatever moved stays where it went,
 /// in the trash or at the conflict-copy path, and the next scan sees both.
 /// What comes back from a conflict-copy path, as it now is, takes the
-/// adoptions of its content back with it (I2).
-fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
+/// adoptions of its content back with it (I2). Returns what came back from
+/// a conflict-copy path, as (where it was, where it now is).
+fn undo(node: &mut Node, row: JournalRow, now: Timestamp) -> Vec<(RelPath, RelPath)> {
+    let mut back_from_copy = Vec::new();
     if occupied(node, &row.path) {
-        return;
+        return back_from_copy;
     }
     match &row.to {
         Displace::Trash => {
@@ -4180,7 +4192,7 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
             // ever not hold, the files stay in the trash rather than be
             // duplicated.
             if node.trash.get(row.trash_at..end) != Some(hashes.as_slice()) {
-                return;
+                return back_from_copy;
             }
             node.trash.drain(row.trash_at..end);
             for (from, file) in row.moved {
@@ -4200,11 +4212,13 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
                 };
                 if let Some(file) = node.fs.remove(&at) {
                     follow(node, &at, &back, file.hash(), now);
-                    node.fs.insert(back, file);
+                    node.fs.insert(back.clone(), file);
+                    back_from_copy.push((at, back));
                 }
             }
         }
     }
+    back_from_copy
 }
 
 /// `follow` for everything a rename of `path` to `target` moved.
@@ -4334,6 +4348,32 @@ mod tests {
         let expected = link(b"f1").observed();
         assert!(expected_matches(Some(&link(b"f1")), Some(&expected)));
         assert!(!expected_matches(Some(&link(b"f2")), Some(&expected)));
+    }
+
+    /// I9 (§14.1): an observation reaches the engine only on a node that is
+    /// up. The watcher's report of an edit made while a node is down dies
+    /// with it, so it is not the engine's last sight of the path, and the
+    /// edit counts as the user's change since then.
+    #[test]
+    fn a_crashed_node_observes_nothing_for_i9() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                check_i9: true,
+                ..Knobs::default()
+            },
+        );
+        let id = sim.order[0];
+        let f = rel("f");
+        sim.crash(id, NANOS).unwrap();
+        let event = Event::Scanned {
+            folder: sim.folder,
+            path: f.clone(),
+            state: ScanState::Absent,
+        };
+        sim.feed(id, event).unwrap();
+        assert_eq!(sim.i9.as_ref().unwrap().last_observed(id, &f), None);
     }
 
     /// A world of two nodes, for tests that need a `Node` or the `Sim`'s
