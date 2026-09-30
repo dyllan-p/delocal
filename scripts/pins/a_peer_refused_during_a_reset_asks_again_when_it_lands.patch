@@ -5,7 +5,10 @@ path and adopts nothing, so the record `revert` restored keeps its old
 reset was pending was refused, and it never hears that this machine can
 serve the file again (DESIGN.md §7.1, §8.3 step 2).
 
-test: delocal-sim regressions::a_peer_refused_during_a_reset_asks_again_when_it_lands
+Since drafts 52 and 53's failed-report rules no seed fails with this
+patch (0 to 9,999, and 0 to 499 at 2,000 steps), so the pinned
+seed is gone and the rule's unit tests below stand in for it.
+
 test: delocal-engine folder::tests::a_resets_landing_is_announced_under_a_new_seq
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
