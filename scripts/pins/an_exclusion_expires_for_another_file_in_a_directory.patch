@@ -12,10 +12,10 @@ test: delocal-engine want::tests::an_exclusion_expires_on_a_backoff_that_doubles
 test: delocal-engine want::tests::a_give_up_expires_with_its_first_exclusion
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
-index 98628fb..69d536d 100644
+index 9156e13..9a21c95 100644
 --- a/crates/engine/src/want.rs
 +++ b/crates/engine/src/want.rs
-@@ -808,19 +808,6 @@ impl WantList {
+@@ -819,19 +819,6 @@ impl WantList {
      /// becomes overdue but keeps its path, and a local retry whose backoff
      /// has run out is wanted again (§7.5).
      pub fn expire(&mut self, now: Timestamp) -> Expired {
@@ -35,7 +35,7 @@ index 98628fb..69d536d 100644
          let mut expired = Expired::default();
          for (path, want) in &self.wants {
              match want.state {
-@@ -889,11 +876,7 @@ impl WantList {
+@@ -900,11 +887,7 @@ impl WantList {
              | WantState::LocalRetry { until: deadline } => Some(deadline),
              _ => None,
          });
@@ -47,4 +47,4 @@ index 98628fb..69d536d 100644
 +        deadlines.min()
      }
  
-     /// True if committing `path` must wait (§7.5 ordering): a create with an
+     /// For a create the ordering gate holds (§7.5), the nearest ancestor
