@@ -6066,6 +6066,36 @@ mod tests {
         assert_eq!(want.local_retries, 0);
     }
 
+    /// §7.5: a want waiting for a parent that backs off is observable, so a
+    /// local edit at its path is classified as usual while the parent's
+    /// retry is an hour away: here B's commit of A's new directory `d`
+    /// fails with an I/O error, A's `d/f` waits for it, and B's user makes
+    /// `d/f` meanwhile, a local change that conflicts with A's.
+    #[test]
+    fn a_local_edit_beneath_a_parent_that_backs_off_is_classified_as_usual() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("d"), observed(Kind::Dir, 0, 0, false));
+        a.scanned(t(10.0), p("d/f"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let vd = b.wants().get(&p("d")).unwrap().version().clone();
+        let vf = b.wants().get(&p("d/f")).unwrap().version().clone();
+        b.dispatch(t(12.0), &lan(&[1]));
+        b.fetched(t(13.0), &p("d/f"), &vf, FetchReport::Ok);
+        b.dispatch(t(13.0), &lan(&[1]));
+        assert!(b.in_flight(&p("d/f")), "behind d's commit");
+        b.applied(t(14.0), &p("d"), &vd, ApplyOutcome::Failed { error: io() });
+        b.dispatch(t(14.0), &lan(&[1]));
+        let waiting = WantState::WaitingFor { parent: p("d") };
+        assert_eq!(b.wants().get(&p("d/f")).unwrap().state, waiting);
+        assert!(!b.in_flight(&p("d/f")), "observable");
+
+        let scanned = b.scanned(t(15.0), p("d/f"), file(9, 15));
+        assert!(scanned.change.is_some(), "a local change");
+        let want = b.wants().get(&p("d/f")).unwrap();
+        assert!(want.version().dominates(&vf), "re-derived: {want:?}");
+    }
+
     fn disk_full() -> ApplyOutcome {
         ApplyOutcome::Failed {
             error: LocalError::DiskFull,
