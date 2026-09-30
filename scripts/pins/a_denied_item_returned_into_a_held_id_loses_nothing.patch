@@ -5,7 +5,10 @@ that came before. An item revert returns into an id held meanwhile then
 replaces the entries held there, while the version index still names them
 under the id. DESIGN.md §8.2, "a batch id names one review item".
 
-test: delocal-sim regressions::a_denied_item_returned_into_a_held_id_loses_nothing
+Since drafts 52 and 53's failed-report rules no seed fails with this
+patch (0 to 9,999, and 0 to 499 at 2,000 steps, with fetch corruption on), so the pinned
+seed is gone and the rule's unit tests below stand in for it.
+
 test: delocal-engine quarantine::tests::holding_under_an_existing_id_joins_the_item
 test: delocal-engine quarantine::tests::an_item_returned_by_revert_joins_the_item_holding_its_id
 
