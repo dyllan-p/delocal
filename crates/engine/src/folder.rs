@@ -2415,6 +2415,21 @@ impl FolderState {
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
         }
+        // A failed report whose observation is exactly what the commit
+        // would have left says the commit landed and a crash took its report
+        // (§7.5 step 6, §13): the retry found its own work. It counts as the
+        // landing, adopted and announced as `Applied Ok` would have been.
+        // This matters most for a reset, which changes only metadata: once
+        // it has landed no scan sees anything new at the path, and a peer it
+        // refused would never ask again.
+        let outcome = match outcome {
+            ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. }
+                if self.would_have_left(path, &found) =>
+            {
+                ApplyOutcome::Ok
+            }
+            other => other,
+        };
         let found = match outcome {
             ApplyOutcome::Ok => None,
             ApplyOutcome::ChangedUnderneath { found } => Some(found),
@@ -2515,6 +2530,29 @@ impl FolderState {
             .into_iter()
             .chain(scanned.landed)
             .collect()
+    }
+
+    /// True if `found` is exactly what the commit of the want at `path`
+    /// would have left there, by the guard's own test (§7.5 step 6): the
+    /// entry's kind and, for a file, its size, mtime and exec bit; nothing
+    /// for a tombstone. `Unchanged` is the path as its record says. A
+    /// commit that displaces the losing file to a conflict copy (§7.6)
+    /// leaves that copy too, which an observation of `path` cannot show, so
+    /// it never counts: the path alone may look the same when the copy was
+    /// never made.
+    fn would_have_left(&self, path: &RelPath, found: &ScanState) -> bool {
+        let Some(want) = self.wants.get(path).filter(|w| w.conflict.is_none()) else {
+            return false;
+        };
+        match found {
+            ScanState::Observed(seen) => want.entry.unchanged_by_stat(seen),
+            ScanState::Absent => want.entry.deleted,
+            ScanState::Unchanged => self
+                .index
+                .live(path)
+                .is_some_and(|r| want.entry.unchanged_by_stat(&r.entry.observed())),
+            ScanState::Skipped { .. } => false,
+        }
     }
 
     /// Keep a want's received entry in the deferred set until the next
@@ -5133,6 +5171,48 @@ mod tests {
             "{:?}",
             b.wants().get(&p("f09"))
         );
+    }
+
+    /// §7.5 step 6, §13 (draft 53), seed 1113's shape: the reset lands and
+    /// a crash takes its report. After the restart the reset is sent again,
+    /// and its guard, expecting the unadjusted file, finds the file already
+    /// adjusted. That is exactly what the reset would have left, so the
+    /// failure counts as the landing: the restored record is adopted under
+    /// a new `seq` and announced, and a peer the reset's window refused
+    /// hears that it can ask again. No scan would ever have said so.
+    #[test]
+    fn a_reset_whose_retry_finds_its_own_work_has_landed() {
+        let (_, mut b, f09, v) = chmodded_then_reverted();
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1, 3]));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::SetMeta { path, .. } if path == &p("f09")))
+        );
+        let mut c = FolderState::from_parts(b.parts(), node(2), HostName::new("bravo").unwrap());
+        c.restarted(t(20.0));
+        let (steps, _) = c.dispatch(t(20.0), &lan(&[1, 3]));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::SetMeta { path, .. } if path == &p("f09")))
+        );
+
+        let adjusted = ScanState::Observed(stat(1, 1, false));
+        let outcome = ApplyOutcome::ChangedUnderneath { found: adjusted };
+        let written = c.applied(t(21.0), &p("f09"), &v, outcome);
+        let [landed] = written.as_slice() else {
+            panic!("the landing: {written:?}");
+        };
+        assert_eq!(landed.entry, f09.entry, "the restored record");
+        assert!(landed.seq > f09.seq, "under a new seq");
+        assert!(c.wants().get(&p("f09")).is_none());
+        let sent: Vec<Entry> = c
+            .form_batches(t(23.0), bid(9))
+            .into_iter()
+            .flat_map(|b| b.entries)
+            .collect();
+        assert!(sent.contains(&f09.entry), "announced");
     }
 
     /// §7.5: at most one commit is in flight per path. A version arriving
