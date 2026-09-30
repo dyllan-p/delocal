@@ -130,12 +130,16 @@ pub enum ApplyOutcome {
     /// Displaced, renamed in, index may adopt.
     Ok,
     /// The local file was not what the index said, or the displacement
-    /// target appeared. Nothing was written. The engine keeps the entry and
-    /// re-evaluates it after the next observation of the path (§7.5).
-    ChangedUnderneath,
+    /// target appeared. Nothing was written. `found` is the host's
+    /// observation of the path as the guard found it, which the engine
+    /// takes as an observation before it re-evaluates the entry (§7.5 step
+    /// 6): `Skipped` if the host could not look (§7.3), and `Unchanged` if
+    /// the fast path says the path is as its record says.
+    ChangedUnderneath { found: ScanState },
     /// The commit failed on this machine (§7.5 "local failures"). The host
-    /// undid any displacement before reporting, so nothing was written.
-    Failed { error: LocalError },
+    /// undid any displacement before reporting, so nothing was written, and
+    /// `found` is the path as it then is, taken as an observation.
+    Failed { error: LocalError, found: ScanState },
 }
 
 /// Why an incoming entry is waiting.
@@ -2385,14 +2389,16 @@ impl FolderState {
     /// opens so the adoption is announced (§7.4); if the want carried a
     /// conflict copy, the displaced file is recorded at the conflict path
     /// as this machine's local add (§7.6). On `ChangedUnderneath` the entry
-    /// is kept in the deferred set until the path is observed again. Either
-    /// way the want ends. On `Failed` it stays, released under the rule for
-    /// its error (§7.5 "local failures"). A reset (§8.3 step 2) that lands
-    /// adopts the record `revert` restored under a new `seq`, so its
-    /// landing is announced (§7.1); one whose file changed underneath
-    /// writes and keeps nothing, and the next observation of the path is a
-    /// local change like any other. Returns every record written, in order;
-    /// empty if nothing matched or the commit did not happen.
+    /// is kept in the deferred set. Either way the want ends. On `Failed` it
+    /// stays, released under the rule for its error (§7.5 "local
+    /// failures"). A failed report then gives the path as the host found
+    /// it, which is taken as an observation (§7.5 step 6): a local change
+    /// there is recorded, and the entries deferred at the path are
+    /// classified against it. A reset (§8.3 step 2) that lands adopts the
+    /// record `revert` restored under a new `seq`, so its landing is
+    /// announced (§7.1); one whose file changed underneath keeps nothing,
+    /// and the observation it carries is a local change like any other.
+    /// Returns every record written, in order; empty if nothing matched.
     pub fn applied(
         &mut self,
         now: Timestamp,
@@ -2409,16 +2415,16 @@ impl FolderState {
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
         }
-        let landed = match outcome {
-            ApplyOutcome::Ok => true,
-            ApplyOutcome::ChangedUnderneath => false,
+        let found = match outcome {
+            ApplyOutcome::Ok => None,
+            ApplyOutcome::ChangedUnderneath { found } => Some(found),
             // The host left the disk as it found it; the want stays, under
             // the rule for its error (§7.5 "local failures").
-            ApplyOutcome::Failed { error } => {
+            ApplyOutcome::Failed { error, found } => {
                 let with_seq = self.collision_seq(&error);
                 self.wants.failed(now, path, version, &error, with_seq);
                 self.failed(now, path, error);
-                return Vec::new();
+                return self.observe_found(now, path, found);
             }
         };
         let Some(want) = self.wants.remove(path) else {
@@ -2432,16 +2438,16 @@ impl FolderState {
             // what tells a refused peer to ask again. Entries deferred at
             // the path are then classified against it; if the file changed
             // underneath, they wait for the next observation instead.
-            if !landed {
-                return Vec::new();
+            if let Some(found) = found {
+                return self.observe_found(now, path, found);
             }
             let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
             return written;
         }
-        if !landed {
+        if let Some(found) = found {
             self.defer_changed_underneath(want);
-            return Vec::new();
+            return self.observe_found(now, path, found);
         }
         let Some(record) = self.adopt(now, want.entry.clone()) else {
             // The record moved on under the commit (release-build fallback
@@ -2467,6 +2473,26 @@ impl FolderState {
         self.clear_carriers(path);
         self.reconsider(now, path, DeferredReason::ChangedUnderneath);
         written
+    }
+
+    /// A failed commit's report gave `path` as the host found it, and the
+    /// engine takes that as an observation before anything else (§7.5 step
+    /// 6): the path is never left unknown, and an observation set aside
+    /// while the commit was in flight is replaced by this fresher one. The
+    /// records it writes, in order.
+    fn observe_found(
+        &mut self,
+        now: Timestamp,
+        path: &RelPath,
+        found: ScanState,
+    ) -> Vec<IndexRecord> {
+        let scanned = self.scanned(now, path.clone(), found);
+        scanned
+            .change
+            .map(|c| c.record)
+            .into_iter()
+            .chain(scanned.landed)
+            .collect()
     }
 
     /// Keep a want's received entry in the deferred set until the next
@@ -2900,8 +2926,14 @@ mod tests {
         assert!(b.wants().is_empty());
     }
 
+    /// §7.5 step 6: a commit that finds its path changed reports what it
+    /// found, and the engine takes that as an observation before anything
+    /// else. The user's file at `x` is a new local version, and the entry,
+    /// kept, is classified against it at once: concurrent, with different
+    /// content, so a conflict. A's version has the larger mtime, so A wins
+    /// and the local file becomes the copy.
     #[test]
-    fn changed_underneath_keeps_the_entry_until_the_path_is_observed() {
+    fn changed_underneath_classifies_the_entry_against_the_file_it_found() {
         let mut a = folder();
         a.scanned(t(1.0), p("x"), file(1, 1));
         let batch = a.form_batches(t(3.0), batch_id()).remove(0);
@@ -2918,32 +2950,20 @@ mod tests {
             t(5.0),
             &entry.path,
             &entry.version,
-            ApplyOutcome::ChangedUnderneath,
+            ApplyOutcome::ChangedUnderneath { found: file(9, 0) },
         );
-        assert!(out.is_empty());
-        assert!(b.wants().is_empty());
-        assert_eq!(b.index().get(&p("x")), None);
-        assert_eq!(b.due(), None);
-        // The deferred path is a persisted part (§11): its row is reported.
-        let changes = b.deferred_changes();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, p("x"));
-        assert_eq!(changes[0].1.as_deref().map(<[Deferred]>::len), Some(1));
-        assert!(b.deferred_changes().is_empty(), "reported once");
-        let kept: Vec<_> = b.deferred().collect();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].entry, entry);
+        let local = b.index().get(&p("x")).unwrap().clone();
         assert_eq!(
-            (kept[0].batch, kept[0].source, kept[0].seq_high),
-            (batch.id, node(1), 1)
+            out,
+            std::slice::from_ref(&local),
+            "the user's file, recorded"
         );
-
-        // The scan finds the file the user created underneath: a new local
-        // version, concurrent with A's and with different content. A's has
-        // the larger mtime, so A wins and the local file becomes the copy.
-        b.scanned(t(6.0), p("x"), file(9, 0));
-        assert!(b.deferred().next().is_none());
-        assert_eq!(b.deferred_changes(), [(p("x"), None)], "the row is gone");
+        assert_eq!(
+            (local.entry.hash, local.entry.modified_by),
+            (hash(9), node(2))
+        );
+        assert!(b.due().is_some(), "to be announced");
+        assert!(b.deferred().next().is_none(), "classified at once");
         assert_eq!(b.wants().len(), 1);
         let want = b.wants().get(&p("x")).unwrap();
         assert_eq!(
@@ -2962,6 +2982,60 @@ mod tests {
         assert_eq!(copy.loser.hash, hash(9));
         assert_eq!(copy.loser.modified_by, node(2));
         assert_eq!(copy.path.as_str(), "x.conflict-19700101-000000-desktop");
+    }
+
+    /// §7.5 step 6 (draft 52), seed 3657's shape: B deleted `f00`, and
+    /// A's concurrent edit wins, so B commits it, expecting the path absent.
+    /// Meanwhile a file appears there. The scan that sees it while the
+    /// commit is in flight is set aside; the commit then fails its guard
+    /// and reports the file, and that fresher observation is taken first:
+    /// the file is a local change over B's tombstone, and A's entry is
+    /// classified against it at once, not left for a scan that may never
+    /// come before a `revert` acts on the stale record.
+    #[test]
+    fn a_failed_commit_carries_the_observation_its_path_set_aside() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        b.scanned(t(10.0), p("f00"), ScanState::Absent);
+        a.scanned(t(11.0), p("f00"), file(3, 11));
+        let batch = a.form_batches(t(13.0), bid(3)).remove(0);
+        b.receive(t(13.0), &batch);
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.fetched(t(14.0), &p("f00"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
+        let tombstone = b.index().get(&p("f00")).unwrap().clone();
+        assert!(tombstone.entry.deleted);
+
+        let set_aside = b.scanned(t(15.0), p("f00"), file(9, 15));
+        assert_eq!(set_aside.change, None, "set aside while in flight");
+        assert_eq!(b.index().get(&p("f00")), Some(&tombstone));
+
+        let found = file(9, 15);
+        let out = b.applied(
+            t(16.0),
+            &p("f00"),
+            &v,
+            ApplyOutcome::ChangedUnderneath { found },
+        );
+        let local = b.index().get(&p("f00")).unwrap().clone();
+        assert_eq!(
+            out,
+            std::slice::from_ref(&local),
+            "the carried observation, recorded"
+        );
+        assert_eq!((local.entry.hash, local.entry.deleted), (hash(9), false));
+        assert!(local.entry.version.dominates(&tombstone.entry.version));
+        assert!(
+            b.deferred().next().is_none(),
+            "the entry is classified at once"
+        );
+        let want = b
+            .wants()
+            .get(&p("f00"))
+            .expect("a conflict with the new file");
+        assert!(want.version().dominates(&local.entry.version));
+        assert!(want.version().dominates(&v));
     }
 
     #[test]
@@ -2990,12 +3064,16 @@ mod tests {
         let set = b.receive(t(0.0), &batch).set;
         let entry = set.items[0].incoming().clone();
         assert!(matches!(set.items[0], ApplyItem::Apply { .. }));
-        // The user edited x meanwhile, so the commit finds it changed.
+        // The user edited x meanwhile, so the commit finds it changed, but
+        // the host cannot read it to say how, so the report observes
+        // nothing (§7.5 step 6) and the entry waits.
         b.applied(
             t(6.0),
             &entry.path,
             &entry.version,
-            ApplyOutcome::ChangedUnderneath,
+            ApplyOutcome::ChangedUnderneath {
+                found: skipped(SkipReason::PermissionDenied),
+            },
         );
         assert_eq!(b.deferred().count(), 1);
 
@@ -3022,21 +3100,23 @@ mod tests {
         assert!(m.version.dominates(&entry.version));
     }
 
+    /// §7.5 step 6: whatever made the commit fail had gone by the time the
+    /// host looked (a transient file), and it found the path empty. The
+    /// entry, which still dominates, is wanted again at once.
     #[test]
-    fn a_deferred_entry_that_still_dominates_is_re_accepted() {
+    fn an_entry_whose_commit_found_its_path_empty_is_wanted_again() {
         let mut a = folder();
         a.scanned(t(1.0), p("x"), file(1, 1));
         let batch = a.form_batches(t(3.0), batch_id()).remove(0);
         let mut b = folder();
         let entry = b.receive(t(0.0), &batch).set.items[0].incoming().clone();
+        let found = ScanState::Absent;
         b.applied(
             t(5.0),
             &entry.path,
             &entry.version,
-            ApplyOutcome::ChangedUnderneath,
+            ApplyOutcome::ChangedUnderneath { found },
         );
-        // The observation finds nothing there after all (a transient file).
-        b.scanned(t(6.0), p("x"), ScanState::Absent);
         assert_eq!(b.wants().len(), 1);
         let want = b.wants().get(&p("x")).unwrap();
         assert_eq!(want.entry, entry);
@@ -3707,11 +3787,12 @@ mod tests {
     #[test]
     fn a_deferred_entry_whose_version_was_held_meanwhile_joins_the_held_item() {
         // A edits f00; B accepts it, but the commit finds f00 changed
-        // underneath, so the entry waits in the deferred set. C relays the
-        // same version with eight deletes, and B's brake holds that batch
-        // with f00 in it. When B next observes f00 the entry is admitted
-        // again: its version is quarantined, so it joins C's held item and
-        // is not wanted (§8.2).
+        // underneath, by a file the host cannot read, so the report
+        // observes nothing (§7.5 step 6) and the entry waits in the deferred
+        // set. C relays the same version with eight deletes, and B's brake
+        // holds that batch with f00 in it. When B next observes f00 the
+        // entry is admitted again: its version is quarantined, so it joins
+        // C's held item and is not wanted (§8.2).
         let (mut a, mut b) = a_and_b(10, tight());
         a.scanned(t(10.0), p("f00"), file(3, 30));
         let batch = a.form_batches(t(12.0), bid(3)).remove(0);
@@ -3721,10 +3802,9 @@ mod tests {
         b.fetched(t(13.0), &p("f00"), &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { .. }));
-        assert!(
-            b.applied(t(15.0), &p("f00"), &v, ApplyOutcome::ChangedUnderneath)
-                .is_empty()
-        );
+        let found = skipped(SkipReason::PermissionDenied);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        assert!(b.applied(t(15.0), &p("f00"), &v, outcome).is_empty());
         assert_eq!(b.deferred().count(), 1);
 
         // C's batch: eight deletes, and A's f00 relayed.
@@ -3891,8 +3971,9 @@ mod tests {
 
     #[test]
     fn a_scan_bracket_reconsiders_a_deferred_entry_at_an_unrecorded_path() {
-        // A adds z; B's commit of it fails ChangedUnderneath (say the host
-        // lost the temp file). B has no record of z and no file at z, so no
+        // A adds z; B's commit of it fails ChangedUnderneath, and the host
+        // could not look at z to say what it found (§7.3), so the report
+        // observes nothing. B has no record of z and no file at z, so no
         // scan will ever report z; the bracket's end must stand in for the
         // observation, or the entry waits forever.
         let (mut a, mut b) = a_and_b(10, tight());
@@ -3905,10 +3986,9 @@ mod tests {
         b.fetched(t(20.0), &p("z"), &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { .. }));
-        assert!(
-            b.applied(t(15.0), &p("z"), &v, ApplyOutcome::ChangedUnderneath)
-                .is_empty()
-        );
+        let found = skipped(SkipReason::Io);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        assert!(b.applied(t(15.0), &p("z"), &v, outcome).is_empty());
         assert_eq!(b.deferred().count(), 1);
         assert!(b.wants().is_empty());
 
@@ -3945,10 +4025,10 @@ mod tests {
         b.fetched(t(13.5), &p("d/z"), &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { .. }));
-        assert!(
-            b.applied(t(15.0), &p("d/z"), &v, ApplyOutcome::ChangedUnderneath)
-                .is_empty()
-        );
+        // The host cannot list `d` any more, so it cannot say what it found.
+        let found = skipped(SkipReason::PermissionDenied);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        assert!(b.applied(t(15.0), &p("d/z"), &v, outcome).is_empty());
         assert_eq!(b.deferred().count(), 1);
 
         b.scan_started();
@@ -4114,8 +4194,11 @@ mod tests {
             "a restart ends it"
         );
 
-        // Its report is discarded: no deferral, the merge untouched.
-        let outcome = ApplyOutcome::ChangedUnderneath;
+        // Its report is discarded, what it found included: no deferral, the
+        // merge untouched.
+        let outcome = ApplyOutcome::ChangedUnderneath {
+            found: ScanState::Absent,
+        };
         assert!(
             b.applied(t(19.0), &copy_path, &c_copy.version, outcome)
                 .is_empty()
@@ -4955,7 +5038,10 @@ mod tests {
     fn a_failed_resets_unadjusted_file_is_no_local_change() {
         let (_, mut b, f09, v) = chmodded_then_reverted();
         b.dispatch(t(13.0), &lan(&[1, 3]));
-        let failed = ApplyOutcome::Failed { error: io() };
+        let failed = ApplyOutcome::Failed {
+            error: io(),
+            found: ScanState::Observed(stat(1, 1, true)),
+        };
         assert!(b.applied(t(14.0), &p("f09"), &v, failed).is_empty());
         let want = b.wants().get(&p("f09")).unwrap().clone();
         assert!(matches!(want.state, WantState::LocalRetry { .. }));
@@ -5116,7 +5202,7 @@ mod tests {
     /// index, and the next observation is a local change against the
     /// restored record like any other.
     #[test]
-    fn a_reset_whose_file_changed_underneath_leaves_the_edit_to_the_scan() {
+    fn a_reset_whose_file_changed_underneath_records_the_edit_it_found() {
         let (_, mut b) = a_and_b(10, tight());
         b.scanned(t(10.0), p("f09"), file(1, 10));
         for i in 0..4 {
@@ -5128,23 +5214,16 @@ mod tests {
         let v = b.wants().get(&p("f09")).unwrap().version().clone();
         b.dispatch(t(13.0), &lan(&[1, 3]));
 
-        let written = b.applied(t(14.0), &p("f09"), &v, ApplyOutcome::ChangedUnderneath);
-        assert!(written.is_empty());
+        let found = file(8, 15);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        let written = b.applied(t(14.0), &p("f09"), &v, outcome);
         assert!(b.wants().get(&p("f09")).is_none());
         assert_eq!(b.deferred().count(), 0, "a reset carries no incoming entry");
-        assert_eq!(b.index().get(&p("f09")), Some(&restored));
-        let change = b
-            .scanned(t(15.0), p("f09"), file(8, 15))
-            .change
-            .expect("the edit is a local change");
-        assert!(
-            change
-                .record
-                .entry
-                .version
-                .dominates(&restored.entry.version)
-        );
-        assert_eq!(change.record.entry.prev_hash, hash(1));
+        let [change] = written.as_slice() else {
+            panic!("the edit is a local change: {written:?}");
+        };
+        assert!(change.entry.version.dominates(&restored.entry.version));
+        assert_eq!(change.entry.prev_hash, hash(1));
     }
 
     /// §8.3: neither decision runs while a scan bracket is open, since it
@@ -5555,9 +5634,10 @@ mod tests {
         assert_eq!(b.index().get(&p("f01")).unwrap().entry.hash, hash(9));
     }
 
-    /// A reverted path whose refetch commit found the path occupied: the
-    /// restoring want is deferred and its entry carries the mark. The
-    /// write went to the trash-restored record at `f00`.
+    /// A reverted path whose refetch commit found the path occupied, by a
+    /// file the host could not read, so its report observes nothing (§7.3,
+    /// §7.5 step 6): the restoring want is deferred and its entry carries
+    /// the mark. The write went to the trash-restored record at `f00`.
     fn deferred_restoring_entry() -> (FolderState, IndexRecord) {
         deferred_restoring_entry_at(p("f00"))
     }
@@ -5581,10 +5661,9 @@ mod tests {
         b.fetched(t(14.0), &path, &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { expected: None, .. }));
-        assert!(
-            b.applied(t(15.0), &path, &v, ApplyOutcome::ChangedUnderneath)
-                .is_empty()
-        );
+        let found = skipped(SkipReason::PermissionDenied);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        assert!(b.applied(t(15.0), &path, &v, outcome).is_empty());
         assert!(b.wants().is_empty());
         let deferred: Vec<&Deferred> = b.deferred().collect();
         assert_eq!(deferred.len(), 1);
@@ -5765,9 +5844,10 @@ mod tests {
     }
 
     /// §8.3, fix 4: a later version replaced the restoring want, inherited
-    /// the mark, and crashed after its rename; the retry found it there and
-    /// was deferred. The occupant matches what that carrier was committing,
-    /// not the restored record, and lands the same way.
+    /// the mark, and crashed after its rename; the retry found it there but
+    /// could not read it, so its report observes nothing, and was deferred.
+    /// The occupant the next scan sees matches what that carrier was
+    /// committing, not the restored record, and lands the same way.
     #[test]
     fn an_occupant_matching_a_later_carrier_is_its_landing() {
         let (mut a, mut b) = marked_after_revert();
@@ -5777,10 +5857,9 @@ mod tests {
         b.dispatch(t(23.0), &lan(&[1]));
         b.fetched(t(24.0), &p("f00"), &v, FetchReport::Ok);
         b.dispatch(t(24.0), &lan(&[1]));
-        assert!(
-            b.applied(t(25.0), &p("f00"), &v, ApplyOutcome::ChangedUnderneath)
-                .is_empty()
-        );
+        let found = skipped(SkipReason::PermissionDenied);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        assert!(b.applied(t(25.0), &p("f00"), &v, outcome).is_empty());
         assert_eq!(
             b.deferred()
                 .find(|d| d.entry.path == p("f00"))
@@ -5939,6 +6018,7 @@ mod tests {
 
             let outcome = ApplyOutcome::Failed {
                 error: error.clone(),
+                found: ScanState::Absent,
             };
             assert!(b.applied(t(17.0), &p("n"), &v1, outcome).is_empty());
             assert_eq!(b.deferred().count(), 0, "{error:?}");
@@ -6043,8 +6123,16 @@ mod tests {
         let sources = b.wants().get(&p("n")).unwrap().sources.clone();
         b.take_statuses();
         assert!(
-            b.applied(t(14.0), &p("n"), &vn, ApplyOutcome::Failed { error: io() })
-                .is_empty()
+            b.applied(
+                t(14.0),
+                &p("n"),
+                &vn,
+                ApplyOutcome::Failed {
+                    error: io(),
+                    found: ScanState::Absent
+                }
+            )
+            .is_empty()
         );
         let n = b.wants().get(&p("n")).unwrap();
         assert_eq!(n.state, WantState::LocalRetry { until: t(74.0) });
@@ -6124,7 +6212,15 @@ mod tests {
     #[test]
     fn a_local_edit_during_a_local_retry_is_classified_as_usual() {
         let (_, mut b, _, vn) = committing_n_fetching_m();
-        b.applied(t(14.0), &p("n"), &vn, ApplyOutcome::Failed { error: io() });
+        b.applied(
+            t(14.0),
+            &p("n"),
+            &vn,
+            ApplyOutcome::Failed {
+                error: io(),
+                found: ScanState::Absent,
+            },
+        );
         let scanned = b.scanned(t(15.0), p("n"), file(9, 15));
         assert!(scanned.change.is_some(), "a local change");
         assert!(b.window().is_some(), "to be announced");
@@ -6152,7 +6248,15 @@ mod tests {
         b.fetched(t(13.0), &p("d/f"), &vf, FetchReport::Ok);
         b.dispatch(t(13.0), &lan(&[1]));
         assert!(b.in_flight(&p("d/f")), "behind d's commit");
-        b.applied(t(14.0), &p("d"), &vd, ApplyOutcome::Failed { error: io() });
+        b.applied(
+            t(14.0),
+            &p("d"),
+            &vd,
+            ApplyOutcome::Failed {
+                error: io(),
+                found: ScanState::Absent,
+            },
+        );
         b.dispatch(t(14.0), &lan(&[1]));
         let waiting = WantState::WaitingFor { path: p("d") };
         assert_eq!(b.wants().get(&p("d/f")).unwrap().state, waiting);
@@ -6167,6 +6271,7 @@ mod tests {
     fn disk_full() -> ApplyOutcome {
         ApplyOutcome::Failed {
             error: LocalError::DiskFull,
+            found: ScanState::Absent,
         }
     }
 
@@ -6349,7 +6454,15 @@ mod tests {
     #[test]
     fn a_local_retry_waits_out_a_disk_full_pause_too() {
         let (_, mut b, vm, vn) = committing_n_fetching_m();
-        b.applied(t(14.0), &p("n"), &vn, ApplyOutcome::Failed { error: io() });
+        b.applied(
+            t(14.0),
+            &p("n"),
+            &vn,
+            ApplyOutcome::Failed {
+                error: io(),
+                found: ScanState::Absent,
+            },
+        );
         let report = FetchReport::Failed {
             error: LocalError::DiskFull,
         };
@@ -6381,6 +6494,7 @@ mod tests {
         b.dispatch(t(13.0), &lan(&[1]));
         let outcome = ApplyOutcome::Failed {
             error: LocalError::CaseCollision { with: p("N") },
+            found: ScanState::Absent,
         };
         assert!(b.applied(t(14.0), &p("n"), &v, outcome).is_empty());
         (a, b, v)
@@ -6457,6 +6571,7 @@ mod tests {
         b.scanned(t(13.5), p("N"), ScanState::Absent);
         let outcome = ApplyOutcome::Failed {
             error: LocalError::CaseCollision { with: p("N") },
+            found: ScanState::Absent,
         };
         assert!(b.applied(t(14.0), &p("n"), &v, outcome).is_empty());
         let want = b.wants().get(&p("n")).unwrap();

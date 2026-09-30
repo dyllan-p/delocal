@@ -3149,6 +3149,7 @@ mod tests {
                 version: version.clone(),
                 outcome: ApplyOutcome::Failed {
                     error: LocalError::DiskFull,
+                    found: ScanState::Absent,
                 },
             },
         );
@@ -3796,7 +3797,15 @@ mod tests {
             folder: folder(),
             path: p("x"),
             version: Version::empty(),
-            outcome: ApplyOutcome::ChangedUnderneath,
+            outcome: ApplyOutcome::ChangedUnderneath {
+                found: ScanState::Observed(Observed {
+                    kind: Kind::File,
+                    size: 3,
+                    mtime_ns: 4,
+                    exec: true,
+                    hash: hash(2),
+                }),
+            },
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
