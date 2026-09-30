@@ -1,0 +1,70 @@
+Removes draft 53's landing rule from `FolderState::applied` (6077a6b): a
+failed commit whose carried observation is exactly what the commit would
+have left no longer counts as its landing. A reset that landed before a
+crash took its report then fails its retry's guard and is dropped, never
+announced, so a peer its window refused never asks again (DESIGN.md §7.5
+step 6, §13). Seeds 821 and 1113 (--nodes 2 --steps 200) showed it on
+main; with draft 52's carried observation in place their histories no
+longer reach it, and no seed does in 45,300 run with this patch (0 to
+1,999 and 76,000, 86,000 and 96,000 slices at the defaults, and 0 to
+19,999 in two-node and in three-node worlds at 200 steps), so the fix's
+unit test stands in for a pinned seed.
+
+test: delocal-engine folder::tests::a_reset_whose_retry_finds_its_own_work_has_landed
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index 18842d5..7764be4 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -2415,21 +2415,6 @@ impl FolderState {
+         if self.wants.get(path).is_none_or(|w| w.version() != version) {
+             return Vec::new();
+         }
+-        // A failed report whose observation is exactly what the commit
+-        // would have left says the commit landed and a crash took its report
+-        // (§7.5 step 6, §13): the retry found its own work. It counts as the
+-        // landing, adopted and announced as `Applied Ok` would have been.
+-        // This matters most for a reset, which changes only metadata: once
+-        // it has landed no scan sees anything new at the path, and a peer it
+-        // refused would never ask again.
+-        let outcome = match outcome {
+-            ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. }
+-                if self.would_have_left(path, &found) =>
+-            {
+-                ApplyOutcome::Ok
+-            }
+-            other => other,
+-        };
+         let found = match outcome {
+             ApplyOutcome::Ok => None,
+             ApplyOutcome::ChangedUnderneath { found } => Some(found),
+@@ -2532,29 +2517,6 @@ impl FolderState {
+             .collect()
+     }
+ 
+-    /// True if `found` is exactly what the commit of the want at `path`
+-    /// would have left there, by the guard's own test (§7.5 step 6): the
+-    /// entry's kind and, for a file, its size, mtime and exec bit; nothing
+-    /// for a tombstone. `Unchanged` is the path as its record says. A
+-    /// commit that displaces the losing file to a conflict copy (§7.6)
+-    /// leaves that copy too, which an observation of `path` cannot show, so
+-    /// it never counts: the path alone may look the same when the copy was
+-    /// never made.
+-    fn would_have_left(&self, path: &RelPath, found: &ScanState) -> bool {
+-        let Some(want) = self.wants.get(path).filter(|w| w.conflict.is_none()) else {
+-            return false;
+-        };
+-        match found {
+-            ScanState::Observed(seen) => want.entry.unchanged_by_stat(seen),
+-            ScanState::Absent => want.entry.deleted,
+-            ScanState::Unchanged => self
+-                .index
+-                .live(path)
+-                .is_some_and(|r| want.entry.unchanged_by_stat(&r.entry.observed())),
+-            ScanState::Skipped { .. } => false,
+-        }
+-    }
+-
+     /// Keep a want's received entry in the deferred set until the next
+     /// observation of its path (§7.5 step 6); it is classified again then.
+     fn defer_changed_underneath(&mut self, want: Want) {
