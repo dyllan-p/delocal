@@ -214,7 +214,10 @@ pub struct Want {
     /// its guard expects this shape rather than the record's. When it
     /// lands, the record is adopted with a new `seq` and announced like any
     /// landing (§7.1), since peers refused while it was pending need to
-    /// hear that this machine can serve the file again.
+    /// hear that this machine can serve the file again. If it fails, it
+    /// backs off observably with the record still leading the disk, and a
+    /// scan seeing exactly this file reports nothing new (§8.3 step 2).
+    /// Persisted with the want, so a restart keeps it.
     pub reset: Option<Observed>,
     pub state: WantState,
 }

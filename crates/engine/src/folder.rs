@@ -622,6 +622,16 @@ pub enum HostStep {
     },
 }
 
+/// True if `observed` is exactly the file a reset expects to find (§8.3
+/// step 2): the kind, size, mtime and exec bit of what it was sent to
+/// adjust. A reset is sent only for a file, whose content is unchanged.
+fn as_the_reset_expects(expected: &Observed, observed: &Observed) -> bool {
+    expected.kind == observed.kind
+        && expected.size == observed.size
+        && expected.mtime_ns == observed.mtime_ns
+        && expected.exec == observed.exec
+}
+
 /// State of one folder on this machine. See the module docs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FolderState {
@@ -989,11 +999,12 @@ impl FolderState {
     /// does nothing at all. `Absent` at a path carrying the restoring mark
     /// (§8.3) is ignored, since absence is the trash move there; other
     /// reports for a path in flight are ignored unless the path is marked.
-    /// A change at an observable wanted path re-classifies the want. At a
-    /// marked path, an occupant clears the mark whatever state the want is
-    /// in: one that matches the restored record leaves the index as it is
-    /// and is the landing of a refetch whose report was lost (§13);
-    /// anything else is a local change like any other.
+    /// A change at an observable wanted path re-classifies the want; the
+    /// file exactly as a reset that failed expects to find it is no change
+    /// (§8.3 step 2). At a marked path, an occupant clears the mark whatever
+    /// state the want is in: one that matches the restored record leaves
+    /// the index as it is and is the landing of a refetch whose report was
+    /// lost (§13); anything else is a local change like any other.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
         if let Some(bracket) = &mut self.scan {
             bracket.report(&path, &state);
@@ -1013,6 +1024,18 @@ impl FolderState {
         // or a local change, and the occupant rules below come first (§8.3,
         // §7.5's revert exception).
         if self.wants.in_flight(&path) && !marked {
+            return Scanned::default();
+        }
+        // A reset that failed backs off observably while the restored record
+        // still leads the disk (§8.3 step 2): the file exactly as the reset
+        // expects to find it is the disk as revert left it, nothing new.
+        if let ScanState::Observed(observed) = &state
+            && self
+                .wants
+                .get(&path)
+                .and_then(|w| w.reset.as_ref())
+                .is_some_and(|expected| as_the_reset_expects(expected, observed))
+        {
             return Scanned::default();
         }
         if state == ScanState::Unchanged && self.index.live(&path).is_none() {
@@ -4920,6 +4943,51 @@ mod tests {
             .flat_map(|batch| batch.entries)
             .collect();
         assert_eq!(sent, [f09.entry]);
+    }
+
+    /// §8.3 step 2 (draft 50): a reset that fails backs off observably, and
+    /// the restored record still leads the disk. The want carries the file
+    /// as the reset expects to find it, persisted with the want, and while
+    /// the want is at the path a scan seeing exactly that file reports
+    /// nothing new, after a restart too. Anything else is a real local
+    /// change, classified against the restored record as usual.
+    #[test]
+    fn a_failed_resets_unadjusted_file_is_no_local_change() {
+        let (_, mut b, f09, v) = chmodded_then_reverted();
+        b.dispatch(t(13.0), &lan(&[1, 3]));
+        let failed = ApplyOutcome::Failed { error: io() };
+        assert!(b.applied(t(14.0), &p("f09"), &v, failed).is_empty());
+        let want = b.wants().get(&p("f09")).unwrap().clone();
+        assert!(matches!(want.state, WantState::LocalRetry { .. }));
+        assert_eq!(want.reset, Some(stat(1, 1, true)));
+        assert!(!b.in_flight(&p("f09")), "backs off observably");
+
+        let unadjusted = ScanState::Observed(stat(1, 1, true));
+        let seq = b.index().seq();
+        assert_eq!(
+            b.scanned(t(15.0), p("f09"), unadjusted.clone()).change,
+            None
+        );
+        assert_eq!(b.index().get(&p("f09")), Some(&f09), "the restored record");
+        assert_eq!(b.index().seq(), seq, "nothing new");
+        assert_eq!(b.wants().get(&p("f09")), Some(&want));
+
+        let mut c = FolderState::from_parts(b.parts(), node(2), HostName::new("bravo").unwrap());
+        c.restarted(t(20.0));
+        assert_eq!(c.wants().get(&p("f09")).unwrap().reset, want.reset);
+        assert_eq!(c.scanned(t(21.0), p("f09"), unadjusted).change, None);
+        assert_eq!(c.index().get(&p("f09")), Some(&f09), "after a restart");
+
+        // The user touches the file again: a real change, whatever the reset
+        // expected, and the reset gives way to it.
+        let touched = ScanState::Observed(stat(1, 22, true));
+        let change = b.scanned(t(22.0), p("f09"), touched).change;
+        assert!(change.is_some(), "a real local change");
+        assert!(
+            b.wants().get(&p("f09")).is_none(),
+            "{:?}",
+            b.wants().get(&p("f09"))
+        );
     }
 
     /// §7.5: at most one commit is in flight per path. A version arriving
