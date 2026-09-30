@@ -4,7 +4,10 @@ f6cff50 (Queue deny and revert until the folder settles), is removed, so only
 a commit in flight at one of its paths still holds the deny. DESIGN.md §8.3,
 "deny and revert act only on a settled folder".
 
-test: delocal-sim regressions::a_deny_at_a_marked_path_waits_for_the_mark_to_clear
+Since drafts 52 and 53's failed-report rules no seed fails with this
+patch (0 to 9,999, and 0 to 499 at 2,000 steps), so the pinned
+seed is gone and the rule's unit tests below stand in for it.
+
 test: delocal-engine folder::tests::a_deny_waits_for_the_pause_and_then_for_the_restoring_mark
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
