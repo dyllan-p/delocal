@@ -27,10 +27,10 @@ index 027f086..28cc7d3 100644
                  for (id, folder) in &self.folders {
                      if folder.is_member(peer) {
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
-index 9156e13..f53c3dd 100644
+index ed54a7b..f51dc1b 100644
 --- a/crates/engine/src/want.rs
 +++ b/crates/engine/src/want.rs
-@@ -494,7 +494,6 @@ impl WantList {
+@@ -499,7 +499,6 @@ impl WantList {
          if want.sources.insert(by) {
              self.note(path);
          }
@@ -38,7 +38,7 @@ index 9156e13..f53c3dd 100644
      }
  
      /// A member connected (§7.5): every want it was excluded from after a
-@@ -819,19 +818,6 @@ impl WantList {
+@@ -824,19 +823,6 @@ impl WantList {
      /// becomes overdue but keeps its path, and a local retry whose backoff
      /// has run out is wanted again (§7.5).
      pub fn expire(&mut self, now: Timestamp) -> Expired {
@@ -58,7 +58,7 @@ index 9156e13..f53c3dd 100644
          let mut expired = Expired::default();
          for (path, want) in &self.wants {
              match want.state {
-@@ -900,11 +886,7 @@ impl WantList {
+@@ -905,11 +891,7 @@ impl WantList {
              | WantState::LocalRetry { until: deadline } => Some(deadline),
              _ => None,
          });
@@ -70,4 +70,4 @@ index 9156e13..f53c3dd 100644
 +        deadlines.min()
      }
  
-     /// For a create the ordering gate holds (§7.5), the nearest ancestor
+     /// The want the ordering gate holds `want` on, if it is deferred or

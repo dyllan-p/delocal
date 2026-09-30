@@ -14,10 +14,10 @@ test: delocal-engine folder::tests::an_occupant_at_a_marked_path_counts_while_it
 test: delocal-engine folder::tests::a_deny_waits_for_the_pause_and_then_for_the_restoring_mark
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..090f2b9 100644
+index 1117d41..2014f96 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -900,7 +900,7 @@ impl FolderState {
+@@ -1023,7 +1023,7 @@ impl FolderState {
          // occupant is a landing (it matches what the want was committing)
          // or a local change, and the occupant rules below come first (§8.3,
          // §7.5's revert exception).
@@ -25,8 +25,8 @@ index e843412..090f2b9 100644
 +        if self.wants.in_flight(&path) {
              return Scanned::default();
          }
-         if state == ScanState::Unchanged && self.index.live(&path).is_none() {
-@@ -1761,9 +1761,7 @@ impl FolderState {
+         // A reset that failed backs off observably while the restored record
+@@ -1900,9 +1900,7 @@ impl FolderState {
                      return Some(WaitReason::ScanOpen);
                  }
                  self.quarantine.get(batch)?.entries.keys().find_map(|path| {
