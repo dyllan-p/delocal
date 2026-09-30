@@ -6154,7 +6154,7 @@ mod tests {
         assert!(b.in_flight(&p("d/f")), "behind d's commit");
         b.applied(t(14.0), &p("d"), &vd, ApplyOutcome::Failed { error: io() });
         b.dispatch(t(14.0), &lan(&[1]));
-        let waiting = WantState::WaitingFor { parent: p("d") };
+        let waiting = WantState::WaitingFor { path: p("d") };
         assert_eq!(b.wants().get(&p("d/f")).unwrap().state, waiting);
         assert!(!b.in_flight(&p("d/f")), "observable");
 
