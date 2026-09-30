@@ -32,6 +32,7 @@ use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 
+use crate::i9;
 use crate::invariants;
 use crate::knobs::Knobs;
 use crate::steps::{Step, UserAction, dir_name, path_name};
@@ -530,6 +531,34 @@ struct Feeding {
     seq: u64,
 }
 
+/// What is at `path` on `node`'s disk, as I9 compares it.
+fn content_at(node: &Node, path: &RelPath) -> i9::Content {
+    node.fs.get(path).map(|f| (f.kind, f.hash(), f.exec))
+}
+
+/// What made an event's new local versions, as I9's classes tell them apart.
+fn cause(event: &Event) -> i9::Cause {
+    match event {
+        Event::Scanned {
+            state: ScanState::Observed(_),
+            ..
+        } => i9::Cause::Observed,
+        Event::Scanned {
+            state: ScanState::Absent,
+            ..
+        } => i9::Cause::Absent,
+        Event::ScanFinished { .. } => i9::Cause::ScanFinished,
+        Event::Applied {
+            path,
+            outcome: ApplyOutcome::Ok,
+            ..
+        } => i9::Cause::Applied { path: path.clone() },
+        Event::Applied { outcome, .. } => i9::Cause::Other(format!("Applied {outcome:?}")),
+        Event::Fetched { outcome, .. } => i9::Cause::Other(format!("Fetched {outcome:?}")),
+        other => i9::Cause::Other(event_name(other)),
+    }
+}
+
 /// True if a rule on `node` ignores `path`: a rule for the path itself, or
 /// for a directory above it (§7.3).
 fn ignores(node: &Node, path: &RelPath) -> bool {
@@ -677,6 +706,8 @@ pub struct Sim {
     /// however late they reach the want-list, even if leftovers of the same
     /// batch are held again under its id.
     approved: BTreeSet<(NodeId, BatchId)>,
+    /// I9's bookkeeping, when `--check-i9` is on.
+    i9: Option<i9::Watch>,
     ops: Vec<Op>,
     users: Vec<UserDue>,
     corruption_on: bool,
@@ -775,6 +806,7 @@ impl Sim {
         fail_rng.set_stream(FAIL_STREAM);
         let mut case_rng = ChaCha8Rng::seed_from_u64(seed);
         case_rng.set_stream(CASE_STREAM);
+        let watch = knobs.check_i9.then(i9::Watch::default);
         let mut sim = Self {
             seed,
             knobs,
@@ -801,6 +833,7 @@ impl Sim {
             reverted_at: BTreeMap::new(),
             seen_at: BTreeMap::new(),
             approved: BTreeSet::new(),
+            i9: watch,
             ops: Vec::new(),
             users: Vec::new(),
             corruption_on: true,
@@ -1188,6 +1221,14 @@ impl Sim {
     fn feed(&mut self, id: NodeId, event: Event) -> Result<(), Failure> {
         let now = self.now_for(id);
         let what = event_name(&event);
+        let cause = self.i9.as_mut().map(|watch| {
+            if let Event::Scanned { path, state, .. } = &event
+                && !matches!(state, ScanState::Skipped { .. })
+            {
+                watch.observed(id, path, self.clock);
+            }
+            cause(&event)
+        });
         let observing = match &event {
             Event::Scanned { path, .. } => Some((id, path.clone())),
             _ => None,
@@ -1213,6 +1254,13 @@ impl Sim {
             self.open_group(id);
         }
         self.note_pause(id);
+        if let (Some(watch), Some(cause)) = (self.i9.as_mut(), cause) {
+            let node = self.nodes.get(&id);
+            let group_open = node.is_some_and(|n| n.group.is_some());
+            watch.note(id, &actions, seq, &cause, group_open, |p| {
+                node.and_then(|n| content_at(n, p))
+            });
+        }
         let outer = std::mem::replace(&mut self.observing, observing);
         let outer_feeding = self.feeding.replace(Feeding {
             node: id,
@@ -1397,6 +1445,9 @@ impl Sim {
         let Some(group) = self.nodes.get_mut(&id).and_then(|n| n.group.take()) else {
             return Ok(());
         };
+        if let Some(watch) = self.i9.as_mut() {
+            watch.durable(id);
+        }
         for staged in group.writes {
             self.record(id, staged)?;
         }
@@ -1701,6 +1752,13 @@ impl Sim {
                                             .get(&e.path)
                                             .is_some_and(|r| r.entry.version == e.version)
                                 });
+                        if let Some((class, detail)) = self.i9.as_ref().and_then(|watch| {
+                            let node = self.nodes.get(&id);
+                            let edited = node.and_then(|n| n.local_edit_at.get(&e.path).copied());
+                            watch.revives(id, e, edited)
+                        }) {
+                            return Err(self.fail(&class.invariant(), detail));
+                        }
                         if leaks_pending {
                             return Err(self.fail(
                                 "paused send",
@@ -2268,6 +2326,10 @@ impl Sim {
             .retain(|op| op.node() != id && !matches!(op, Op::Fetch { from, .. } if *from == id));
         // The node's commits die with it; the restart wants their paths again.
         self.committing.retain(|(node, _), _| *node != id);
+        if let Some(watch) = self.i9.as_mut() {
+            let node = self.nodes.get(&id);
+            watch.crashed(id, |p| node.and_then(|n| content_at(n, p)));
+        }
         let folder = self.folder;
         let lag = self.knobs.group_commit_lag;
         if let Some(n) = self.nodes.get_mut(&id) {
@@ -2512,7 +2574,43 @@ impl Sim {
                     .get(&node)
                     .filter(|n| fail.is_some() || n.case_insensitive)
                     .map(|n| (n.fs.clone(), n.trash.clone()));
+                // I9: where a commit's displacement to a conflict copy would
+                // move what is at the path, and everything a rename of it
+                // takes along (§7.6).
+                let moves: Vec<(RelPath, RelPath, bool)> = match (&self.i9, &*action) {
+                    (
+                        Some(_),
+                        Action::Write {
+                            displace: Displace::ConflictCopy(to),
+                            ..
+                        }
+                        | Action::Remove {
+                            displace: Displace::ConflictCopy(to),
+                            ..
+                        },
+                    ) => self.nodes.get(&node).map_or_else(Vec::new, |n| {
+                        n.fs.keys()
+                            .filter(|p| *p == &path || path.is_ancestor_of(p))
+                            .filter_map(|p| {
+                                let to = rebase(p, &path, to)?;
+                                let was = n.fs.contains_key(&to);
+                                Some((p.clone(), to, was))
+                            })
+                            .collect()
+                    }),
+                    _ => Vec::new(),
+                };
                 let (committed, created) = self.commit(node, &path, &version, &action, fail);
+                if let Some(watch) = self.i9.as_mut() {
+                    let n = self.nodes.get(&node);
+                    // A `Write` fills the path again, so a move shows at its
+                    // target: empty before, full after.
+                    for (from, to, was) in &moves {
+                        if !was && n.is_some_and(|n| n.fs.contains_key(to)) {
+                            watch.displaced(node, from, to, from != &path);
+                        }
+                    }
+                }
                 if let Committed::Report(ApplyOutcome::Failed { error }) = &committed {
                     self.left_as_found(node, &path, error, before)?;
                 }
@@ -2559,6 +2657,10 @@ impl Sim {
                 if outcome == ApplyOutcome::Ok
                     && self.rng.random::<f64>() < self.knobs.crash_after_rename
                 {
+                    if let Some(watch) = self.i9.as_mut() {
+                        let n = self.nodes.get(&node);
+                        watch.lost(node, &path, &action, |p| n.and_then(|n| content_at(n, p)));
+                    }
                     let gap = self.rng.random_range(NANOS..60 * NANOS);
                     return self.crash(node, gap);
                 }
@@ -2603,6 +2705,8 @@ impl Sim {
                 self.copy_recorded = copy_to
                     .filter(|_| outcome == ApplyOutcome::Ok)
                     .map(|to| (node, to));
+                let landing = (self.i9.is_some() && outcome == ApplyOutcome::Ok)
+                    .then(|| (path.clone(), (*action).clone()));
                 let fed = self.feed(
                     node,
                     Event::Applied {
@@ -2614,6 +2718,13 @@ impl Sim {
                 );
                 self.copy_recorded = None;
                 fed?;
+                // I9: a crash before the report's group is durable loses the
+                // landing as surely as one before the report.
+                if let (Some(watch), Some((path, action))) = (self.i9.as_mut(), landing)
+                    && self.nodes.get(&node).is_some_and(|n| n.group.is_some())
+                {
+                    watch.landed_undurably(node, &path, action);
+                }
                 match failed {
                     Some(error) => self.after_local_failure(node, &error, awaited, &what),
                     None => Ok(()),

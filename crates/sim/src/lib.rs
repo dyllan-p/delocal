@@ -18,6 +18,7 @@
 // matter and boxing it would only obscure every signature in the crate.
 #![allow(clippy::result_large_err)]
 
+mod i9;
 pub mod invariants;
 pub mod knobs;
 #[cfg(test)]

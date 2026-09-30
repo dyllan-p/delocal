@@ -67,6 +67,12 @@ pub struct Knobs {
     pub case_variants: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
+    /// Check I9, what revert discards stays discarded (§14.1), and fail a
+    /// run that breaks it with the failure's class (see `i9.rs`). Off by
+    /// default, and in the required CI jobs, while the engine still breaks
+    /// it for reasons older than the invariant. It changes nothing a run
+    /// does, only what it checks.
+    pub check_i9: bool,
 }
 
 impl Default for Knobs {
@@ -84,6 +90,7 @@ impl Default for Knobs {
             disk_fill: 0.002,
             case_variants: 0.02,
             nodes: None,
+            check_i9: false,
         }
     }
 }
@@ -92,7 +99,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {} --check-i9 {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -104,7 +111,8 @@ impl fmt::Display for Knobs {
             self.skip,
             self.io_failure,
             self.disk_fill,
-            self.case_variants
+            self.case_variants,
+            self.check_i9
         )?;
         if let Some(n) = self.nodes {
             write!(f, " --nodes {n}")?;
