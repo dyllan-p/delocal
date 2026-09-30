@@ -27,9 +27,10 @@
 //! **Ordering gate** (§7.5): a create or modify commits only after every
 //! ancestor directory's create in the list has committed; a directory
 //! delete commits only after every descendant's delete. Fetches are not
-//! gated, only commits. A create whose ancestor's want is deferred or
-//! backing off is not held in flight behind it but deferred itself, waiting
-//! for that ancestor, until the ancestor's want ends.
+//! gated, only commits. A want whose gate is held by a want that is
+//! deferred or backing off, an ancestor's create or a deletion beneath a
+//! directory's, is not held in flight behind it but deferred itself,
+//! waiting for that want, until it ends.
 //!
 //! **In flight** (§7.5): a path whose want is *wanted*, *blocked*,
 //! *fetching* or *committing* is in flight; *deferred*, *without source* and
@@ -130,14 +131,15 @@ pub enum WantState {
     /// either path changes"; a write at its own path re-classifies it, as
     /// it does every observable want.
     Collides { with: RelPath, seq: u64 },
-    /// Deferred with reason `waiting for <parent>` (§7.5 "local failures"):
-    /// the want creates something beneath `parent`, the nearest directory
-    /// whose create the ordering gate waits on, and the want there is
+    /// Deferred with reason `waiting for <path>` (§7.5 "local failures"):
+    /// the ordering gate holds the want on the want at `path`, which is
     /// deferred or backing off itself, for as long as a local retry or a
-    /// collision lasts. Observable meanwhile, like every deferred want,
-    /// rather than held in flight behind it; wanted again when the want at
-    /// `parent` ends.
-    WaitingFor { parent: RelPath },
+    /// collision lasts. For a create, `path` is the nearest ancestor whose
+    /// directory create it waits on; for a directory's deletion, the
+    /// nearest deletion beneath it that it waits on. Observable meanwhile,
+    /// like every deferred want, rather than held in flight behind it;
+    /// wanted again when the want at `path` ends.
+    WaitingFor { path: RelPath },
 }
 
 impl WantState {
@@ -910,34 +912,38 @@ impl WantList {
         deadlines.chain(expiries).min()
     }
 
-    /// For a create the ordering gate holds (§7.5), the nearest ancestor
-    /// whose directory create it waits on, if the want there is deferred or
-    /// backing off rather than in flight: the create then waits for it
+    /// The want the ordering gate holds `want` on, if it is deferred or
+    /// backing off rather than in flight (§7.5): `want` then waits for it
     /// deferred, not held in flight behind a want that can last an hour or
-    /// more. Creates are dispatched parents first, so an ancestor itself
-    /// waiting for one further up is found waiting already.
+    /// more. For a create, the nearest ancestor whose directory create it
+    /// waits on; creates are dispatched parents first, so an ancestor
+    /// waiting for one further up is found waiting already. For a
+    /// directory's deletion, the nearest deletion beneath it, first in path
+    /// order among the nearest; deletes are dispatched children first, so
+    /// a directory waiting for something further down is found waiting.
     fn waits_for(&self, want: &Want) -> Option<RelPath> {
-        if want.is_delete() {
-            return None;
-        }
-        self.wants
+        let waiting_on = self
+            .wants
             .values()
-            .filter(|other| other.is_dir_create() && other.path().is_ancestor_of(want.path()))
-            .filter(|other| !other.in_flight())
-            .map(|other| other.path().clone())
-            .max_by_key(|p| p.as_str().len())
+            .filter(|other| gates(want, other) && !other.in_flight())
+            .map(|other| other.path());
+        if want.is_delete() {
+            waiting_on.min_by_key(|p| p.as_str().len()).cloned()
+        } else {
+            waiting_on.max_by_key(|p| p.as_str().len()).cloned()
+        }
     }
 
-    /// The want waiting for `parent` (see [`WantState::WaitingFor`]) is
-    /// wanted again once the want there has ended: no want at `parent`
-    /// still creates the directory.
+    /// A want waiting for `path` (see [`WantState::WaitingFor`]) is wanted
+    /// again once the want there has ended: no want at `path` gates it any
+    /// more.
     fn release_waiting(&mut self) {
         let paths: Vec<RelPath> = self
             .wants
             .iter()
             .filter(|(_, w)| match &w.state {
-                WantState::WaitingFor { parent } => {
-                    !self.wants.get(parent).is_some_and(Want::is_dir_create)
+                WantState::WaitingFor { path } => {
+                    !self.wants.get(path).is_some_and(|other| gates(w, other))
                 }
                 _ => false,
             })
@@ -952,17 +958,7 @@ impl WantList {
     /// ancestor directory still to be created, or a directory delete with a
     /// descendant still to be deleted.
     fn gated(&self, want: &Want) -> bool {
-        if want.is_delete() {
-            want.entry.kind == Kind::Dir
-                && self
-                    .wants
-                    .values()
-                    .any(|other| other.is_delete() && want.path().is_ancestor_of(other.path()))
-        } else {
-            self.wants
-                .values()
-                .any(|other| other.is_dir_create() && other.path().is_ancestor_of(want.path()))
-        }
+        self.wants.values().any(|other| gates(want, other))
     }
 
     /// The sources a want may fetch from under the peers' tiers (§7.5,
@@ -1109,8 +1105,8 @@ impl WantList {
             let Some(want) = self.wants.get(&path) else {
                 continue;
             };
-            if let Some(parent) = self.waits_for(want) {
-                self.set_state(&path, WantState::WaitingFor { parent });
+            if let Some(on) = self.waits_for(want) {
+                self.set_state(&path, WantState::WaitingFor { path: on });
                 continue;
             }
             if self.gated(want) {
@@ -1181,6 +1177,19 @@ pub enum LocalError {
 pub struct Expired {
     pub stalled: Vec<RelPath>,
     pub overdue: Vec<RelPath>,
+}
+
+/// True if the ordering gate holds `want` until `other` has committed
+/// (§7.5): a create or modify beneath a directory `other` creates, or a
+/// directory's deletion above a deletion `other` makes.
+fn gates(want: &Want, other: &Want) -> bool {
+    if want.is_delete() {
+        want.entry.kind == Kind::Dir
+            && other.is_delete()
+            && want.path().is_ancestor_of(other.path())
+    } else {
+        other.is_dir_create() && other.path().is_ancestor_of(want.path())
+    }
 }
 
 /// How long a source stays excluded after its `strikes`-th mismatch for
@@ -1696,7 +1705,7 @@ mod tests {
 
         l.failed(t(1), &p("d"), &d, &LocalError::Io, None);
         assert!(l.dispatch(t(1), &Rules::default(), &lan).is_empty());
-        let waiting = |parent: &str| WantState::WaitingFor { parent: p(parent) };
+        let waiting = |on: &str| WantState::WaitingFor { path: p(on) };
         for (path, parent) in [("d/e", "d"), ("d/e/g", "d/e"), ("d/f", "d")] {
             assert_eq!(l.get(&p(path)).unwrap().state, waiting(parent), "{path}");
             assert!(!l.in_flight(&p(path)), "{path} is observable");
@@ -1727,6 +1736,91 @@ mod tests {
         l.remove(&p("d/e"));
         let steps = l.dispatch(t(63), &Rules::default(), &lan);
         assert_eq!(committed(steps), ["d/e/g"]);
+    }
+
+    /// §7.5 (draft 50): the same downwards. A directory's deletion waiting
+    /// on a deletion beneath it whose want is deferred or backing off is
+    /// deferred itself, waiting for that path, and observable; it is wanted
+    /// again when that want ends, and waits next for whatever still holds
+    /// it. Behind a deletion that is only committing the gate blocks as
+    /// before.
+    #[test]
+    fn a_directory_delete_whose_child_backs_off_waits_for_it_out_of_flight() {
+        let mut l = list_with(&[
+            ("old", Kind::Dir, 0, ApplyMode::Direct, true),
+            ("old/sub", Kind::Dir, 0, ApplyMode::Direct, true),
+            ("old/sub/y", Kind::File, 0, ApplyMode::Direct, true),
+            ("old/x", Kind::File, 0, ApplyMode::Direct, true),
+        ]);
+        let lan = peers(&[(2, Tier::Lan)]);
+        let v = |path: &str, kind| entry(path, kind, 0, 2, true).version;
+        let committed = |steps: Vec<WantStep>| -> Vec<String> {
+            steps
+                .iter()
+                .filter_map(|s| match s {
+                    WantStep::Commit(w) => Some(w.path().as_str().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let steps = l.dispatch(t(0), &Rules::default(), &lan);
+        assert_eq!(committed(steps), ["old/x", "old/sub/y"]);
+        for path in ["old", "old/sub"] {
+            assert_eq!(l.get(&p(path)).unwrap().state, WantState::Blocked, "{path}");
+            assert!(l.in_flight(&p(path)), "{path}: behind a commit");
+        }
+
+        let waiting = |on: &str| WantState::WaitingFor { path: p(on) };
+        l.failed(
+            t(1),
+            &p("old/x"),
+            &v("old/x", Kind::File),
+            &LocalError::Io,
+            None,
+        );
+        assert!(l.dispatch(t(1), &Rules::default(), &lan).is_empty());
+        assert_eq!(l.get(&p("old")).unwrap().state, waiting("old/x"));
+        assert!(!l.in_flight(&p("old")), "observable");
+        assert_eq!(
+            l.get(&p("old/sub")).unwrap().state,
+            WantState::Blocked,
+            "behind old/sub/y's commit"
+        );
+
+        let y = v("old/sub/y", Kind::File);
+        l.failed(t(2), &p("old/sub/y"), &y, &LocalError::Io, None);
+        assert!(l.dispatch(t(2), &Rules::default(), &lan).is_empty());
+        assert_eq!(l.get(&p("old/sub")).unwrap().state, waiting("old/sub/y"));
+        assert_eq!(
+            l.get(&p("old")).unwrap().state,
+            waiting("old/x"),
+            "the nearest"
+        );
+
+        // old/x's backoff ends, it commits and lands: old waits next for
+        // old/sub, which waits for old/sub/y.
+        l.expire(t(61));
+        let steps = l.dispatch(t(61), &Rules::default(), &lan);
+        assert_eq!(committed(steps), ["old/x"]);
+        assert_eq!(
+            l.get(&p("old")).unwrap().state,
+            waiting("old/x"),
+            "not ended yet"
+        );
+        l.remove(&p("old/x"));
+        assert!(l.dispatch(t(61), &Rules::default(), &lan).is_empty());
+        assert_eq!(l.get(&p("old")).unwrap().state, waiting("old/sub"));
+
+        l.expire(t(62));
+        let steps = l.dispatch(t(62), &Rules::default(), &lan);
+        assert_eq!(committed(steps), ["old/sub/y"]);
+        l.remove(&p("old/sub/y"));
+        let steps = l.dispatch(t(62), &Rules::default(), &lan);
+        assert_eq!(committed(steps), ["old/sub"]);
+        assert_eq!(l.get(&p("old")).unwrap().state, waiting("old/sub"));
+        l.remove(&p("old/sub"));
+        let steps = l.dispatch(t(63), &Rules::default(), &lan);
+        assert_eq!(committed(steps), ["old"]);
     }
 
     #[test]
