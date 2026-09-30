@@ -1207,7 +1207,8 @@ mod tests {
     #[test]
     fn a_real_engines_hooks_reload_as_its_parts() {
         use delocal_engine::{
-            ApplyOutcome, Engine, Event, FetchReport, HostName, NodeConfig, ScanState, Tier,
+            ApplyOutcome, Engine, Event, FetchReport, HostName, NodeConfig, ScanState, SkipReason,
+            Tier,
         };
         let (_dir, store) = open();
         let f = folder(1);
@@ -1282,11 +1283,16 @@ mod tests {
         // At most four at once from one peer (§7.5).
         assert_eq!(fetches.len(), 4);
         let landed: Vec<RelPath> = fetches.iter().take(2).map(|(p, ..)| p.clone()).collect();
-        // The third finds its path changed underneath and is deferred.
+        // The third finds its path changed underneath, by a file the host
+        // cannot read, so its report observes nothing and the entry is
+        // deferred (§7.5 step 6).
+        let unreadable = ScanState::Skipped {
+            reason: SkipReason::PermissionDenied,
+        };
         let outcomes = [
             ApplyOutcome::Ok,
             ApplyOutcome::Ok,
-            ApplyOutcome::ChangedUnderneath,
+            ApplyOutcome::ChangedUnderneath { found: unreadable },
         ];
         for ((path, hash, version), outcome) in fetches.into_iter().zip(outcomes) {
             pair.b(Event::Fetched {

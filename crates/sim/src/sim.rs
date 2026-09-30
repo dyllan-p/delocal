@@ -531,29 +531,64 @@ struct Feeding {
     seq: u64,
 }
 
+/// `path` as the host finds it after a failed commit, for the report
+/// (§7.5 step 6): a path a rule ignores is `Skipped`, as the watcher
+/// reports it (§7.3).
+fn found(node: &Node, path: &RelPath) -> ScanState {
+    if ignores(node, path) {
+        return ScanState::Skipped {
+            reason: SkipReason::Ignored,
+        };
+    }
+    node.fs
+        .get(path)
+        .map_or(ScanState::Absent, |f| ScanState::Observed(f.observed()))
+}
+
 /// What is at `path` on `node`'s disk, as I9 compares it.
 fn content_at(node: &Node, path: &RelPath) -> i9::Content {
     node.fs.get(path).map(|f| (f.kind, f.hash(), f.exec))
 }
 
+/// The observation an event gives the engine, if any: a scan's or the
+/// watcher's report, or the path a failed commit's report carries (§7.5
+/// step 6).
+fn observation(event: &Event) -> Option<(&RelPath, &ScanState)> {
+    match event {
+        Event::Scanned { path, state, .. } => Some((path, state)),
+        Event::Applied {
+            path,
+            outcome: ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. },
+            ..
+        } => Some((path, found)),
+        _ => None,
+    }
+}
+
 /// What made an event's new local versions, as I9's classes tell them apart.
 fn cause(event: &Event) -> i9::Cause {
+    if let Some((_, state)) = observation(event) {
+        match state {
+            ScanState::Observed(_) => return i9::Cause::Observed,
+            ScanState::Absent => return i9::Cause::Absent,
+            ScanState::Unchanged | ScanState::Skipped { .. } => {}
+        }
+    }
     match event {
-        Event::Scanned {
-            state: ScanState::Observed(_),
-            ..
-        } => i9::Cause::Observed,
-        Event::Scanned {
-            state: ScanState::Absent,
-            ..
-        } => i9::Cause::Absent,
         Event::ScanFinished { .. } => i9::Cause::ScanFinished,
         Event::Applied {
             path,
             outcome: ApplyOutcome::Ok,
             ..
         } => i9::Cause::Applied { path: path.clone() },
-        Event::Applied { outcome, .. } => i9::Cause::Other(format!("Applied {outcome:?}")),
+        Event::Applied {
+            outcome: ApplyOutcome::ChangedUnderneath { .. },
+            ..
+        } => i9::Cause::Other("Applied ChangedUnderneath".to_owned()),
+        Event::Applied {
+            outcome: ApplyOutcome::Failed { error, .. },
+            ..
+        } => i9::Cause::Other(format!("Applied Failed {error:?}")),
         Event::Fetched { outcome, .. } => i9::Cause::Other(format!("Fetched {outcome:?}")),
         other => i9::Cause::Other(event_name(other)),
     }
@@ -1222,7 +1257,7 @@ impl Sim {
         let now = self.now_for(id);
         let what = event_name(&event);
         let cause = self.i9.as_mut().map(|watch| {
-            if let Event::Scanned { path, state, .. } = &event
+            if let Some((path, state)) = observation(&event)
                 && !matches!(state, ScanState::Skipped { .. })
             {
                 watch.observed(id, path, self.clock);
@@ -2611,7 +2646,7 @@ impl Sim {
                         }
                     }
                 }
-                if let Committed::Report(ApplyOutcome::Failed { error }) = &committed {
+                if let Committed::Report(ApplyOutcome::Failed { error, .. }) = &committed {
                     self.left_as_found(node, &path, error, before)?;
                 }
                 let outcome = match committed {
@@ -2646,11 +2681,11 @@ impl Sim {
                 for dir in created {
                     self.watch(node, dir)?;
                 }
-                if outcome == ApplyOutcome::ChangedUnderneath {
+                if matches!(outcome, ApplyOutcome::ChangedUnderneath { .. }) {
                     self.stats.changed_underneath += 1;
                 }
                 let failed = match &outcome {
-                    ApplyOutcome::Failed { error } => Some(error.clone()),
+                    ApplyOutcome::Failed { error, .. } => Some(error.clone()),
                     _ => None,
                 };
                 // §13: the rename happened but the report is lost to a crash.
@@ -2874,12 +2909,28 @@ impl Sim {
         let now = self.clock;
         let crash_between = self.knobs.crash_between_renames;
         let subtrees = self.knobs.displace_subtrees;
-        let changed = || Committed::Report(ApplyOutcome::ChangedUnderneath);
+        // Every failed report carries the path as the host then finds it
+        // (§7.5 step 6).
+        let changed = |node: &Node| {
+            Committed::Report(ApplyOutcome::ChangedUnderneath {
+                found: found(node, path),
+            })
+        };
+        let failed = |node: &Node, error: LocalError| {
+            Committed::Report(ApplyOutcome::Failed {
+                error,
+                found: found(node, path),
+            })
+        };
         // A failure at the rename may take the temp file with it, which only
         // the host can tell (§7.5): half do, on `FAIL_STREAM`.
         let loses_temp = fail.is_some() && self.fail_rng.random::<bool>();
         let Some(node) = self.nodes.get_mut(&id) else {
-            return (changed(), Vec::new());
+            let found = ScanState::Absent;
+            return (
+                Committed::Report(ApplyOutcome::ChangedUnderneath { found }),
+                Vec::new(),
+            );
         };
         // §7.5 step 6 on a filesystem that ignores case: a live record at a
         // path that is this one but for case names the same file, so the
@@ -2891,10 +2942,7 @@ impl Sim {
         {
             self.stats.case_collisions += 1;
             let error = LocalError::CaseCollision { with };
-            return (
-                Committed::Report(ApplyOutcome::Failed { error }),
-                Vec::new(),
-            );
+            return (failed(node, error), Vec::new());
         }
         // §7.5 step 6: the same guard before every commit, SetMeta included.
         let expected = match action {
@@ -2904,17 +2952,14 @@ impl Sim {
             _ => None,
         };
         if !expected_matches(node.fs.get(path), expected) {
-            return (changed(), Vec::new());
+            return (changed(node), Vec::new());
         }
         // A `Remove` or `SetMeta` fails, if it does, before it has moved or
         // changed anything.
         if let Some(error) = fail.clone()
             && !matches!(action, Action::Write { .. })
         {
-            return (
-                Committed::Report(ApplyOutcome::Failed { error }),
-                Vec::new(),
-            );
+            return (failed(node, error), Vec::new());
         }
         let mut created = Vec::new();
         if let Action::Write { .. } = action {
@@ -2926,7 +2971,7 @@ impl Sim {
             while let Some(dir) = ancestor {
                 match node.fs.get(&dir) {
                     Some(f) if f.kind == Kind::Dir => break,
-                    Some(_) => return (changed(), Vec::new()),
+                    Some(_) => return (changed(node), Vec::new()),
                     None => created.push(dir.clone()),
                 }
                 ancestor = dir.parent();
@@ -2953,7 +2998,7 @@ impl Sim {
                 if occupied_otherwise(node, path)
                     || matches!(displace, Displace::ConflictCopy(target) if occupied(node, target))
                 {
-                    return (changed(), created);
+                    return (changed(node), created);
                 }
                 // Step 7, behind a journal row made durable first. The row
                 // is this commit's until the rename below removes it: rows
@@ -2983,10 +3028,7 @@ impl Sim {
                     if loses_temp && take_temp(node, path, version).is_some() {
                         self.stats.temps_lost += 1;
                     }
-                    return (
-                        Committed::Report(ApplyOutcome::Failed { error }),
-                        Vec::new(),
-                    );
+                    return (failed(node, error), Vec::new());
                 }
                 // The rename needs a verified temp file (a directory is made
                 // in place instead).
@@ -3014,12 +3056,12 @@ impl Sim {
                 // rename takes its children (§7.6).
                 let renamed = subtrees && matches!(displace, Displace::ConflictCopy(_));
                 if !renamed && has_children(node, path) {
-                    return (changed(), created); // not empty
+                    return (changed(node), created); // not empty
                 }
                 if let Displace::ConflictCopy(target) = displace
                     && node.fs.contains_key(target)
                 {
-                    return (changed(), created);
+                    return (changed(node), created);
                 }
                 if has_children(node, path) {
                     self.stats.subtrees_displaced += 1;
@@ -3036,9 +3078,9 @@ impl Sim {
                     file.exec = *exec;
                     ApplyOutcome::Ok
                 }
-                _ => ApplyOutcome::ChangedUnderneath,
+                _ => return (changed(node), created),
             },
-            _ => ApplyOutcome::ChangedUnderneath,
+            _ => return (changed(node), created),
         };
         (Committed::Report(outcome), created)
     }
