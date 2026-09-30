@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 50 · 28 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 49: a revert's reset that fails backs off observably, carrying the file as it expects to find it, so an unchanged file is not a local touch (§8.3); a directory delete waiting on a child that is backing off is deferred too (§7.5).
+> Draft 51 · 28 September 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 50: I9, what revert discards stays discarded (§14.1).
+>
+> Changes from draft 49: a revert's reset that fails backs off observably, carrying the file as it expects to find it, so an unchanged file is not a local touch (§8.3); a directory delete waiting on a child that is backing off is deferred too (§7.5).
 >
 > Changes from draft 48: stale failure reports change nothing, a full disk included; a case collision is judged against the index at the report, and only a commit reports one; a want waiting on a parent that is backing off is deferred, not in flight (§7.5).
 >
@@ -779,6 +781,7 @@ Invariants checked at the end of every run and at random quiescent points:
 | I6 | **Determinism.** Same seed → byte-identical outcome. |
 | I7 | **Vector determines content.** On every node, after every index write: two records ever seen at a path with equal vectors have equal kind, hash, exec and deletion state. The one exemption is a machine's own re-issue after `revert`, which reuses a never-announced vector (§8.3). |
 | I8 | **Adopt dominance.** Whenever the host is about to report a commit, the version being committed still dominates or equals the record at its path. It is the release-visible form of `Index::adopt`'s debug assertion: a commit that would land under a record it does not dominate means some rule let the path change beneath a commit in flight. |
+| I9 | **What revert discards stays discarded.** After a `revert`, this machine announces a new local version at a path it reverted only when its user has changed that path since the revert. Landing a received version there is announced as usual; what is never announced is a local version the user did not make, such as the discarded change coming back because the scan read a not-yet-adjusted file as a touch (§8.3). |
 
 Run with `proptest` for shrinking. CI runs 1,000 seeds per push in a dedicated `simulate` job with its own timeout; a scheduled nightly workflow runs 100,000, sharded across parallel jobs so it fits the runners' time limit, every slice (default knobs, corruption, a skip slice at ten times the default skip rate, and a long-run slice of a few thousand seeds at 2,000 steps) run to the end with `--keep-going`, starting at a different seed each night (day of year × 100,000, printed in the report) so the nightly explores new histories while the pinned seeds and the per-push sweep guard the old ones, and a failure opening one issue that lists every failing seed. A `SEEDS` environment variable controls the count. The pinned regression seeds (§14.4) are always required to pass. The random sweep is advisory (`continue-on-error`) until the first time it passes clean at 1,000 seeds, and a required check from then on; a required check that is red for weeks teaches everyone to ignore it.
 
