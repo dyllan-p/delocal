@@ -2424,7 +2424,7 @@ impl FolderState {
                 let with_seq = self.collision_seq(&error);
                 self.wants.failed(now, path, version, &error, with_seq);
                 self.failed(now, path, error);
-                return self.observe_found(now, path, found);
+                return self.observe_found(now, path, &found);
             }
         };
         let Some(want) = self.wants.remove(path) else {
@@ -2439,7 +2439,7 @@ impl FolderState {
             // the path are then classified against it; if the file changed
             // underneath, they wait for the next observation instead.
             if let Some(found) = found {
-                return self.observe_found(now, path, found);
+                return self.observe_found(now, path, &found);
             }
             let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
@@ -2447,7 +2447,7 @@ impl FolderState {
         }
         if let Some(found) = found {
             self.defer_changed_underneath(want);
-            return self.observe_found(now, path, found);
+            return self.observe_found(now, path, &found);
         }
         let Some(record) = self.adopt(now, want.entry.clone()) else {
             // The record moved on under the commit (release-build fallback
@@ -2480,13 +2480,35 @@ impl FolderState {
     /// 6): the path is never left unknown, and an observation set aside
     /// while the commit was in flight is replaced by this fresher one. The
     /// records it writes, in order.
+    ///
+    /// An observation that says nothing the index does not (the path as
+    /// its record says, or nothing seen) is no news, and the entries at the
+    /// path wait for the next observation, as they did before a report
+    /// carried one. Classifying them at once would only send the same
+    /// commit again: the guard failed for a reason the path's own
+    /// observation cannot show, such as a directory that is not empty, and
+    /// the retry would fail the same way as fast as the host can report it.
     fn observe_found(
         &mut self,
         now: Timestamp,
         path: &RelPath,
-        found: ScanState,
+        found: &ScanState,
     ) -> Vec<IndexRecord> {
-        let scanned = self.scanned(now, path.clone(), found);
+        let news = match found {
+            ScanState::Skipped { .. } | ScanState::Unchanged => false,
+            ScanState::Absent => self.index.live(path).is_some() && !self.marked(path),
+            ScanState::Observed(seen) => {
+                self.marked(path)
+                    || !self
+                        .index
+                        .live(path)
+                        .is_some_and(|r| r.entry.unchanged_by_stat(seen))
+            }
+        };
+        if !news {
+            return Vec::new();
+        }
+        let scanned = self.scanned(now, path.clone(), found.clone());
         scanned
             .change
             .map(|c| c.record)
@@ -3038,6 +3060,39 @@ mod tests {
         assert!(want.version().dominates(&v));
     }
 
+    /// §7.5 step 6: a failed commit whose report finds the path exactly as
+    /// its record says has told the engine nothing new. The guard failed
+    /// for a reason the observation cannot show (a directory that is not
+    /// empty, a displacement target in the way), so the entry waits for the
+    /// next observation, as before reports carried one, rather than sending
+    /// the same commit straight back into the same failure.
+    #[test]
+    fn a_failed_commit_that_finds_its_path_as_recorded_waits_for_the_next_observation() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("f00"), ScanState::Absent);
+        let batch = a.form_batches(t(12.0), bid(3)).remove(0);
+        b.receive(t(12.0), &batch);
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        let (steps, _) = b.dispatch(t(12.0), &lan(&[1]));
+        assert!(matches!(&steps[0], HostStep::Remove { .. }));
+        let record = b.index().get(&p("f00")).unwrap().clone();
+
+        let found = file(1, 1);
+        let outcome = ApplyOutcome::ChangedUnderneath { found };
+        assert!(b.applied(t(13.0), &p("f00"), &v, outcome).is_empty());
+        assert_eq!(b.index().get(&p("f00")), Some(&record), "no news");
+        assert_eq!(b.deferred().count(), 1, "it waits");
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(steps.is_empty(), "not sent again: {steps:?}");
+
+        b.scanned(t(20.0), p("f00"), ScanState::Unchanged);
+        assert!(
+            b.deferred().next().is_none(),
+            "the next observation takes it"
+        );
+        assert!(b.wants().get(&p("f00")).is_some());
+    }
+
     #[test]
     fn a_deferred_entry_whose_path_vanishes_in_a_scan_bracket_becomes_a_conflict() {
         // B creates x and announces it; A adopts it, edits it and announces
@@ -3101,10 +3156,12 @@ mod tests {
     }
 
     /// §7.5 step 6: whatever made the commit fail had gone by the time the
-    /// host looked (a transient file), and it found the path empty. The
-    /// entry, which still dominates, is wanted again at once.
+    /// host looked (a transient file), so its report found the path empty,
+    /// as B's index already says: no news, and the entry waits for the next
+    /// observation, which finds nothing there either. The entry, which
+    /// still dominates, is wanted again.
     #[test]
-    fn an_entry_whose_commit_found_its_path_empty_is_wanted_again() {
+    fn a_deferred_entry_that_still_dominates_is_re_accepted() {
         let mut a = folder();
         a.scanned(t(1.0), p("x"), file(1, 1));
         let batch = a.form_batches(t(3.0), batch_id()).remove(0);
@@ -3117,6 +3174,8 @@ mod tests {
             &entry.version,
             ApplyOutcome::ChangedUnderneath { found },
         );
+        assert_eq!(b.deferred().count(), 1, "no news: it waits");
+        b.scanned(t(6.0), p("x"), ScanState::Absent);
         assert_eq!(b.wants().len(), 1);
         let want = b.wants().get(&p("x")).unwrap();
         assert_eq!(want.entry, entry);
