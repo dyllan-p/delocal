@@ -10,10 +10,10 @@ below 1,217 steps, so the patch names the rule's unit test.
 test: delocal-engine engine::tests::a_restart_reopens_the_window_for_unannounced_records
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..cf045d1 100644
+index 69baf27..4ce952b 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2051,25 +2051,14 @@ impl FolderState {
+@@ -2384,25 +2384,14 @@ impl FolderState {
          self.wants.progress(now, path, version);
      }
  
@@ -42,4 +42,4 @@ index e843412..cf045d1 100644
 -        }
          // A crash may have left files the index does not know about (a
          // commit's rename whose report was lost, §13); `revert` waits for
-         // the startup scan to report them (§8.3).
+         // the startup scan to report them (§8.3). That scan observes every
