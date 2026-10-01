@@ -1,0 +1,39 @@
+Removes draft 52's stale-file rule from `FolderState::scanned` (9f7dd6a):
+an observation of exactly the file revert trashed at a marked path is no
+longer stale. A scan that listed the file before the move to the trash
+ran and reports it after then clears the mark and announces, as a local
+change, the very version the revert discarded (I9, "saw trashed file";
+DESIGN.md §8.3).
+
+test: delocal-sim regressions::an_observation_of_the_trashed_file_is_not_a_local_change
+test: delocal-engine folder::tests::an_observation_of_the_file_revert_trashed_reports_nothing
+test: delocal-engine folder::tests::the_mark_remembers_the_trashed_file_wherever_it_goes
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index 8d65fc6..53b1b41 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1077,23 +1077,6 @@ impl FolderState {
+             self.unobserved.remove(&path);
+             return Scanned::default();
+         }
+-        // The file revert trashed at a marked path, listed by a scan before
+-        // the move to the trash ran and reported after: stale, so nothing
+-        // new (§8.3). "Exactly that file" by the fast path's own test
+-        // (§7.3), which for a file is its kind, size, mtime and exec bit and
+-        // for a symlink its kind and target: two targets of one length are
+-        // two files. A commit's guard looks only after the move, which the
+-        // host performed first, so what a commit report carries is never
+-        // the stale file. Any other occupant clears the mark below.
+-        if marked
+-            && observer == Observer::Scan
+-            && let ScanState::Observed(observed) = &state
+-            && self
+-                .trashed_at(&path)
+-                .is_some_and(|trashed| trashed.unchanged_by_stat(observed))
+-        {
+-            return Scanned::default();
+-        }
+         // In flight, an observation is normally the host's own work in
+         // progress. At a marked path the disk holds neither version, so an
+         // occupant is a landing (it matches what the want was committing)
