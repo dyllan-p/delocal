@@ -234,6 +234,11 @@ pub enum Action {
     },
     /// Move a local file aside with nothing to rename in: revert only (§8.3).
     MoveToTrash { folder: FolderId, path: RelPath },
+    /// Observe `path` and report it with [`Event::Scanned`], the same
+    /// observation a scan would report (§8.3): a waiting `revert` needs a
+    /// fresh observation of a path whose latest one was ignored while a
+    /// want held it in flight.
+    Observe { folder: FolderId, path: RelPath },
 
     /// History (§8.5).
     RecordBatch {
@@ -603,6 +608,7 @@ impl Engine {
         }
         self.settle(now, &mut out);
         self.pump(now, &mut out);
+        self.observe(&mut out);
         self.schedule(&mut out);
         self.persist(&mut out);
         out
@@ -670,6 +676,17 @@ impl Engine {
                         });
                     }
                 }
+            }
+        }
+    }
+
+    /// Ask the host to observe what a waiting `revert` needs observed again
+    /// (§8.3). After the want-list is driven, so a path a dispatch just put
+    /// back in flight is not asked for only to have its observation ignored.
+    fn observe(&mut self, out: &mut Vec<Action>) {
+        for (id, folder) in &mut self.folders {
+            for path in folder.observe_requests() {
+                out.push(Action::Observe { folder: *id, path });
             }
         }
     }

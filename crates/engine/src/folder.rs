@@ -59,7 +59,10 @@
 //! waits while the folder is paused or any path of its held item carries the
 //! restoring mark or has a commit in flight; a `revert` waits while any
 //! commit is in flight and, after a restart, until a full scan has finished;
-//! neither runs while a scan bracket is open.
+//! neither runs while a scan bracket is open. A `revert` also waits for a
+//! fresh observation of every path it would revert whose latest observation
+//! was ignored while a want held it in flight, and asks the host for one
+//! with `Observe` once the path is observable again (draft 55).
 //! A waiting decision is queued here, persisted with the rest of the state,
 //! and taken by [`FolderState::next_queued`] once its condition clears, or
 //! dropped once its held item or pause is gone. `approve` is never queued.
@@ -301,6 +304,11 @@ pub enum WaitReason {
     /// The folder restarted and no full scan has finished since: a crash may
     /// have left files the engine has not been told about (§13).
     StartupScan,
+    /// A path the revert would revert was last observed while a want held
+    /// it in flight, so the observation was ignored, and its record may
+    /// describe neither the disk nor anything the engine saw. The engine
+    /// asks the host to observe it again once no want holds it (§8.3).
+    Unobserved { path: RelPath },
     /// A scan bracket is open: the decision would change records the
     /// bracket is part-way through comparing.
     ScanOpen,
@@ -664,6 +672,16 @@ pub struct FolderState {
     /// True from a restart until a full scan finishes: until then the index
     /// may not know every file on disk (§8.3, §13).
     startup_scan: bool,
+    /// Paths whose latest observation was ignored because a want held them
+    /// in flight (§7.5 "In flight"). A `revert` waits for a fresh
+    /// observation of each one it would revert (§8.3). Not a persisted
+    /// part: a restart clears it, and the startup full scan, which a
+    /// `revert` waits for anyway, observes every path again.
+    unobserved: BTreeSet<RelPath>,
+    /// Paths of `unobserved` the engine has asked the host to observe with
+    /// `Observe`, until an observation of them arrives. Not persisted
+    /// either: the request dies with the process.
+    observing: BTreeSet<RelPath>,
     /// True while a full disk pauses the folder's inbound (§7.5 "local
     /// failures"): from the first `DiskFull` reported by a fetch or commit
     /// a want waited for, until the host reports space recovered. Nothing
@@ -712,6 +730,8 @@ impl FolderState {
             paused: None,
             queued: Vec::new(),
             startup_scan: false,
+            unobserved: BTreeSet::new(),
+            observing: BTreeSet::new(),
             disk_full: false,
             statuses: Vec::new(),
         }
@@ -749,6 +769,8 @@ impl FolderState {
             paused: rest.paused,
             queued: rest.queued,
             startup_scan: false,
+            unobserved: BTreeSet::new(),
+            observing: BTreeSet::new(),
             disk_full: rest.disk_full,
             statuses: Vec::new(),
         }
@@ -804,6 +826,8 @@ impl FolderState {
             paused,
             queued,
             startup_scan,
+            unobserved,
+            observing,
             disk_full,
             statuses,
         } = self;
@@ -827,6 +851,8 @@ impl FolderState {
             .or_else(|| differs("paused", *paused == other.paused))
             .or_else(|| differs("queued", *queued == other.queued))
             .or_else(|| differs("startup_scan", *startup_scan == other.startup_scan))
+            .or_else(|| differs("unobserved", *unobserved == other.unobserved))
+            .or_else(|| differs("observing", *observing == other.observing))
             .or_else(|| differs("disk_full", *disk_full == other.disk_full))
             .or_else(|| differs("statuses", *statuses == other.statuses))
     }
@@ -1018,18 +1044,25 @@ impl FolderState {
         if let ScanState::Skipped { .. } = state {
             return Scanned::default();
         }
+        // Whatever becomes of it below, this is the observation an
+        // `Observe` asked for, if one did.
+        self.observing.remove(&path);
         let marked = self.marked(&path);
         if state == ScanState::Absent && marked {
+            self.unobserved.remove(&path);
             return Scanned::default();
         }
         // In flight, an observation is normally the host's own work in
         // progress. At a marked path the disk holds neither version, so an
         // occupant is a landing (it matches what the want was committing)
         // or a local change, and the occupant rules below come first (§8.3,
-        // §7.5's revert exception).
+        // §7.5's revert exception). An ignored observation leaves the path
+        // unobserved, which a `revert` waits on (§8.3).
         if self.wants.in_flight(&path) && !marked {
+            self.unobserved.insert(path);
             return Scanned::default();
         }
+        self.unobserved.remove(&path);
         // A reset that failed backs off observably while the restored record
         // still leads the disk (§8.3 step 2): the file exactly as the reset
         // expects to find it is the disk as revert left it, nothing new.
@@ -1934,8 +1967,42 @@ impl FolderState {
                     .map(Want::path)
                     .or_else(|| self.wants.released_paths().next())
                     .map(|path| WaitReason::Committing { path: path.clone() })
+                    .or_else(|| {
+                        self.unobserved
+                            .iter()
+                            .find(|path| self.index.is_pending(path))
+                            .map(|path| WaitReason::Unobserved { path: path.clone() })
+                    })
             }
         }
+    }
+
+    /// The paths to ask the host to observe now (`Observe`, §8.3): while a
+    /// `revert` waits for fresh observations, every path it would revert
+    /// whose latest observation was ignored, that no want holds in flight
+    /// any more and that has not been asked for already. One a want still
+    /// holds is asked for once it leaves flight: asked for sooner, its
+    /// observation would only be ignored again.
+    pub fn observe_requests(&mut self) -> Vec<RelPath> {
+        let waiting = self.queued.iter().any(|q| {
+            matches!(q.decision, UserDecision::Revert { .. })
+                && matches!(q.reason, WaitReason::Unobserved { .. })
+        });
+        if !waiting {
+            return Vec::new();
+        }
+        let asks: Vec<RelPath> = self
+            .unobserved
+            .iter()
+            .filter(|path| {
+                self.index.is_pending(path)
+                    && !self.wants.in_flight(path)
+                    && !self.observing.contains(*path)
+            })
+            .cloned()
+            .collect();
+        self.observing.extend(asks.iter().cloned());
+        asks
     }
 
     /// True if a commit is in flight at `path` (see [`Want::committing`]),
@@ -2292,8 +2359,12 @@ impl FolderState {
         }
         // A crash may have left files the index does not know about (a
         // commit's rename whose report was lost, §13); `revert` waits for
-        // the startup scan to report them (§8.3).
+        // the startup scan to report them (§8.3). That scan observes every
+        // path again, so what was unobserved before is forgotten, and the
+        // host's answers to `Observe` died with it.
         self.startup_scan = true;
+        self.unobserved.clear();
+        self.observing.clear();
     }
 
     /// Decide the next host steps for the want-list (§7.5) and adopt every
@@ -2424,6 +2495,19 @@ impl FolderState {
         }
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
+        }
+        // The report says what the commit left at the path or found there:
+        // a fresh observation, for a `revert` waiting on one (§8.3), unless
+        // the host could not look. If the observation it carries is ignored
+        // below, the path is unobserved again.
+        let looked = match &outcome {
+            ApplyOutcome::Ok => true,
+            ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. } => {
+                !matches!(found, ScanState::Skipped { .. })
+            }
+        };
+        if looked {
+            self.unobserved.remove(path);
         }
         // A failed report whose observation is exactly what the commit
         // would have left says the commit landed and a crash took its report
@@ -4761,6 +4845,121 @@ mod tests {
         b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok);
         assert_eq!(b.next_queued(), Some(Next::Run(revert)));
         assert_eq!(b.revert(t(17.0)).unwrap().reverted.len(), 4);
+    }
+
+    /// Seed 96183's shape (§8.3, draft 55): B deletes f09 and three more,
+    /// A's edit of f09 wins over B's deletion so B wants A's content, the
+    /// folder pauses, and the user puts a new file at f09 while the want
+    /// is fetching, so the scan's observation of it is ignored (§7.5 "In
+    /// flight"). The record still says f09 is deleted, so a revert run now
+    /// would have nothing there to trash, and the new file would survive
+    /// it unknown to the index. Returns the paused folder, the revert and
+    /// the want's version.
+    fn unobserved_under_a_fetch() -> (FolderState, UserDecision, Version) {
+        let (mut a, mut b) = a_and_b(10, tight());
+        for i in [0, 1, 2, 9] {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        a.scanned(t(10.0), p("f09"), file(7, 10));
+        let edit = a.form_batches(t(12.0), bid(3)).remove(0);
+        assert_eq!(b.receive(t(12.0), &edit).decision, Decision::Accepted);
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1]));
+        assert!(matches!(&steps[..], [HostStep::Fetch { path, .. }] if *path == p("f09")));
+        assert_eq!(
+            b.scanned(t(17.0), p("f09"), file(9, 9)),
+            Scanned::default(),
+            "ignored while the want is fetching"
+        );
+        assert!(b.index().get(&p("f09")).unwrap().entry.deleted);
+        let revert = UserDecision::Revert {
+            batch: b.paused().unwrap().batch,
+        };
+        assert_eq!(
+            b.request(revert),
+            Requested::Queued(FolderStatus::Waiting {
+                decision: revert,
+                reason: WaitReason::Unobserved { path: p("f09") },
+            })
+        );
+        assert!(
+            b.observe_requests().is_empty(),
+            "asked for once no want holds it: asked now, it would be ignored again"
+        );
+        (b, revert, v)
+    }
+
+    /// Draft 55: the revert asks the host to observe f09 once the want is
+    /// observable again, and runs once the observation arrives, which
+    /// records the new file as part of the pending batch: it is trashed
+    /// with the rest.
+    #[test]
+    fn a_revert_asks_to_observe_a_path_a_want_held_and_waits_for_it() {
+        let (mut b, revert, v) = unobserved_under_a_fetch();
+        b.fetched(t(18.0), &p("f09"), &v, FetchReport::NotAvailable);
+        assert!(b.dispatch(t(18.0), &lan(&[1])).0.is_empty(), "A refused");
+        assert!(!b.wants().in_flight(&p("f09")));
+        assert_eq!(b.next_queued(), None);
+        assert_eq!(b.observe_requests(), [p("f09")]);
+        assert!(b.observe_requests().is_empty(), "asked once");
+        assert!(b.scanned(t(19.0), p("f09"), file(9, 9)).change.is_some());
+        assert_eq!(b.next_queued(), Some(Next::Run(revert)));
+        let out = b.revert(t(20.0)).unwrap();
+        assert!(out.trash.contains(&p("f09")), "{:?}", out.trash);
+    }
+
+    /// Draft 55: the want's own commit report is a fresh observation too.
+    /// Its guard, expecting f09 absent, finds the new file, and the report
+    /// carries it (§7.5 step 6), so no `Observe` is needed.
+    #[test]
+    fn a_commit_report_is_the_fresh_observation_a_revert_waits_for() {
+        let (mut b, revert, v) = unobserved_under_a_fetch();
+        b.fetched(t(18.0), &p("f09"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(18.0), &lan(&[1]));
+        assert!(
+            matches!(&steps[..], [HostStep::Write { expected: None, .. }]),
+            "{steps:?}"
+        );
+        let ScanState::Observed(found) = file(9, 9) else {
+            unreachable!()
+        };
+        b.applied(
+            t(19.0),
+            &p("f09"),
+            &v,
+            ApplyOutcome::ChangedUnderneath {
+                found: ScanState::Observed(found),
+            },
+        );
+        assert_eq!(b.next_queued(), Some(Next::Run(revert)));
+        assert!(b.observe_requests().is_empty());
+        let out = b.revert(t(20.0)).unwrap();
+        assert!(out.trash.contains(&p("f09")), "{:?}", out.trash);
+    }
+
+    /// Draft 55: so is a report that brings no news. The user removed the
+    /// new file again before the commit's guard looked, and the commit then
+    /// failed on an I/O error: the report finds f09 absent, as its record
+    /// says, so a revert has a record that describes the disk.
+    #[test]
+    fn a_report_that_finds_the_path_as_recorded_is_a_fresh_observation() {
+        let (mut b, revert, v) = unobserved_under_a_fetch();
+        b.fetched(t(18.0), &p("f09"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(18.0), &lan(&[1]));
+        assert!(matches!(&steps[..], [HostStep::Write { .. }]), "{steps:?}");
+        b.applied(
+            t(19.0),
+            &p("f09"),
+            &v,
+            ApplyOutcome::Failed {
+                error: LocalError::Io,
+                found: ScanState::Absent,
+            },
+        );
+        assert!(!b.wants().in_flight(&p("f09")), "backing off");
+        assert_eq!(b.next_queued(), Some(Next::Run(revert)));
+        assert!(b.observe_requests().is_empty());
     }
 
     /// §8.3, §13: after a restart `revert` waits until a full scan has

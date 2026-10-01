@@ -243,6 +243,7 @@ impl EngineWrite {
             | Action::Remove { .. }
             | Action::SetMeta { .. }
             | Action::MoveToTrash { .. }
+            | Action::Observe { .. }
             | Action::StatusChanged { .. }) => return Sorted::Effect(effect),
         };
         Sorted::Write(write)
@@ -930,6 +931,10 @@ mod tests {
                 exec: true,
             },
             Action::MoveToTrash {
+                folder: f,
+                path: path("a"),
+            },
+            Action::Observe {
                 folder: f,
                 path: path("a"),
             },
