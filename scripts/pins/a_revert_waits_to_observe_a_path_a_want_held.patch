@@ -1,0 +1,31 @@
+Removes draft 55's wait from `FolderState::unsettled` (8045510): a
+revert no longer waits for a fresh observation of a path it would revert
+whose latest observation was ignored while a want held it in flight, and
+so never asks the host to `Observe` one. A revert then decides on a
+record that describes neither the disk nor anything the engine saw: the
+user's new file at a path whose deletion was pending survives it, unknown
+to the index, and the next scan announces it (I9, "kept unknown file";
+DESIGN.md §8.3).
+
+test: delocal-sim regressions::a_revert_waits_to_observe_a_path_a_want_held
+test: delocal-engine folder::tests::a_revert_asks_to_observe_a_path_a_want_held_and_waits_for_it
+test: delocal-engine folder::tests::a_commit_report_is_the_fresh_observation_a_revert_waits_for
+test: delocal-engine folder::tests::a_report_that_finds_the_path_as_recorded_is_a_fresh_observation
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index d79ae3c..2a335e5 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1967,12 +1967,6 @@ impl FolderState {
+                     .map(Want::path)
+                     .or_else(|| self.wants.released_paths().next())
+                     .map(|path| WaitReason::Committing { path: path.clone() })
+-                    .or_else(|| {
+-                        self.unobserved
+-                            .iter()
+-                            .find(|path| self.index.is_pending(path))
+-                            .map(|path| WaitReason::Unobserved { path: path.clone() })
+-                    })
+             }
+         }
+     }
