@@ -1314,6 +1314,7 @@ mod tests {
                 folder: f,
                 path,
                 version,
+                at: pair.now(),
                 outcome,
             });
         }

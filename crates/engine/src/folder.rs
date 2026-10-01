@@ -716,9 +716,9 @@ pub struct FolderState {
     /// `Observe`, until an observation of them arrives. Not persisted
     /// either: the request dies with the process.
     observing: BTreeSet<RelPath>,
-    /// The time of each path's last commit report (§7.3, draft 56): an
-    /// `Applied` when the engine handled it, a revert's `Trashed` when the
-    /// move ran. An observation taken before it describes a state the
+    /// The time of each path's last commit report (§7.3, drafts 56 and
+    /// 58): when its operation ran on disk, an `Applied`'s or a revert's
+    /// `Trashed`. An observation taken before it describes a state the
     /// commit has since replaced. Not persisted: after a restart every
     /// observation is taken afresh.
     reported: BTreeMap<RelPath, Timestamp>,
@@ -2765,17 +2765,31 @@ impl FolderState {
         version: &Version,
         outcome: ApplyOutcome,
     ) -> Vec<IndexRecord> {
+        self.applied_at(now, path, version, now, outcome)
+    }
+
+    /// [`Self::applied`], for a commit that ran on disk at `at` (draft 58):
+    /// that is the path's last commit report for the stale rule (§7.3), and
+    /// what the guard found was seen then.
+    pub fn applied_at(
+        &mut self,
+        now: Timestamp,
+        path: &RelPath,
+        version: &Version,
+        at: Timestamp,
+        outcome: ApplyOutcome,
+    ) -> Vec<IndexRecord> {
         // The report of a commit a rule released early: discarded, and the
         // path is free for a new commit (§7.5). No other commit of the path
         // started meanwhile, so the report can be no one else's.
         if self.wants.released_reported(path, version) {
-            self.reported.insert(path.clone(), now);
+            self.reported.insert(path.clone(), at);
             return Vec::new();
         }
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
         }
-        self.reported.insert(path.clone(), now);
+        self.reported.insert(path.clone(), at);
         // The report says what the commit left at the path or found there:
         // a fresh observation, for a `revert` waiting on one (§8.3), unless
         // the host could not look. If the observation it carries is ignored
@@ -2813,7 +2827,7 @@ impl FolderState {
                 let with_seq = self.collision_seq(&error);
                 self.wants.failed(now, path, version, &error, with_seq);
                 self.failed(now, path, error);
-                return self.observe_found(now, now, path, &found);
+                return self.observe_found(now, at, path, &found);
             }
         };
         let Some(want) = self.wants.remove(path) else {
@@ -2828,7 +2842,7 @@ impl FolderState {
             // the path are then classified against it; if the file changed
             // underneath, they wait for the next observation instead.
             if let Some(found) = found {
-                return self.observe_found(now, now, path, &found);
+                return self.observe_found(now, at, path, &found);
             }
             let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
@@ -2836,7 +2850,7 @@ impl FolderState {
         }
         if let Some(found) = found {
             self.defer_changed_underneath(want);
-            return self.observe_found(now, now, path, &found);
+            return self.observe_found(now, at, path, &found);
         }
         let Some(record) = self.adopt(now, want.entry.clone()) else {
             // The record moved on under the commit (release-build fallback
@@ -6707,6 +6721,41 @@ mod tests {
             change.is_some_and(|c| c.record.entry.deleted),
             "read after the report"
         );
+    }
+
+    /// §7.3 (draft 58): a commit report carries the time its operation ran,
+    /// not the time the engine handles it. B's commit of A's f00 ran at
+    /// 15 s and is handled at 20 s; a read at 16 s, after the commit, is
+    /// fresh and the user's change it shows is a local change, while a read
+    /// at 14.5 s, before the commit, is stale.
+    #[test]
+    fn a_commit_report_is_dated_by_its_operation_not_its_handling() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        a.scanned(t(10.0), p("f00"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(2)).remove(0);
+        b.receive(t(12.0), &batch);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        let fetch = steps.iter().find_map(|s| match s {
+            HostStep::Fetch { path, version, .. } => Some((path.clone(), version.clone())),
+            _ => None,
+        });
+        let (path, v) = fetch.unwrap();
+        b.fetched(t(14.0), &path, &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(
+            steps.iter().any(|s| matches!(s, HostStep::Write { .. })),
+            "{steps:?}"
+        );
+        let written = b.applied_at(t(20.0), &p("f00"), &v, t(15.0), ApplyOutcome::Ok);
+        assert_eq!(written.len(), 1);
+        let fresh = b.observed_at(t(21.0), t(16.0), p("f00"), file(8, 8));
+        assert!(
+            fresh.change.is_some_and(|c| c.record.entry.hash == hash(8)),
+            "read after the commit ran"
+        );
+        let stale = b.observed_at(t(22.0), t(14.5), p("f00"), file(9, 9));
+        assert_eq!(stale, Scanned::default());
+        assert_eq!(b.index().get(&p("f00")).unwrap().entry.hash, hash(8));
     }
 
     /// §7.3, §8.3 step 2 (drafts 56 and 57), seed 57's shape: B adds f09,

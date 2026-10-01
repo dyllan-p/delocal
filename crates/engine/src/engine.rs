@@ -154,12 +154,13 @@ pub enum Event {
         hash: ContentHash,
         version: Version,
     },
-    /// The host finished a commit the engine asked for (§7.5). On `Ok` the
-    /// index adopts the entry.
+    /// The host finished a commit the engine asked for (§7.5), at `at`,
+    /// the time it ran on disk (draft 58). On `Ok` the index adopts the entry.
     Applied {
         folder: FolderId,
         path: RelPath,
         version: Version,
+        at: Timestamp,
         outcome: ApplyOutcome,
     },
     /// The host finished a revert's move to the trash, `MoveToTrash`, at
@@ -523,10 +524,11 @@ impl Engine {
                 folder,
                 path,
                 version,
+                at,
                 outcome,
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
-                    for record in f.applied(now, &path, &version, outcome) {
+                    for record in f.applied_at(now, &path, &version, at, outcome) {
                         out.push(Action::IndexChanged { folder, record });
                     }
                 }
@@ -1494,6 +1496,7 @@ mod tests {
                 folder: folder(),
                 path: item.path.clone(),
                 version: item.version.clone(),
+                at: t(4.0),
                 outcome: ApplyOutcome::Ok,
             },
         );
@@ -1585,6 +1588,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 version: base.version.clone(),
+                at: t(4.0),
                 outcome: ApplyOutcome::Ok,
             },
         );
@@ -1658,6 +1662,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 version: m.version.clone(),
+                at: t(13.0),
                 outcome: ApplyOutcome::Ok,
             },
         );
@@ -1685,6 +1690,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 version: m.version.clone(),
+                at: t(13.0),
                 outcome: ApplyOutcome::Ok,
             },
         );
@@ -2103,6 +2109,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     version: version.clone(),
+                    at: t(17.0),
                     outcome: ApplyOutcome::Ok,
                 },
             );
@@ -2150,6 +2157,7 @@ mod tests {
                         folder: folder(),
                         path,
                         version,
+                        at: t(22.0),
                         outcome: ApplyOutcome::Ok,
                     },
                 );
@@ -2211,6 +2219,7 @@ mod tests {
                     folder: folder(),
                     path,
                     version,
+                    at: t(4.0),
                     outcome: ApplyOutcome::Ok,
                 },
             );
@@ -2808,6 +2817,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 version: v3.clone(),
+                at: t(40.0),
                 outcome: ApplyOutcome::Ok,
             },
         );
@@ -3201,6 +3211,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 version: fetch.1.clone(),
+                at: t(51.0),
                 outcome: ApplyOutcome::Ok,
             },
         );
@@ -3265,6 +3276,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 version: version.clone(),
+                at: t(14.0),
                 outcome: ApplyOutcome::Failed {
                     error: LocalError::DiskFull,
                     found: ScanState::Absent,
@@ -3934,6 +3946,7 @@ mod tests {
             folder: folder(),
             path: p("x"),
             version: Version::empty(),
+            at: t(5.0),
             outcome: ApplyOutcome::ChangedUnderneath {
                 found: ScanState::Observed(Observed {
                     kind: Kind::File,
