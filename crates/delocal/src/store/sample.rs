@@ -78,12 +78,20 @@ pub fn want(p: &str) -> Want {
         source: node(2),
         seq_high: 41,
         sources: [node(2), node(3)].into_iter().collect(),
+        refused: [(node(2), at(98))].into_iter().collect(),
         excluded: [(node(3), at(99))].into_iter().collect(),
         strikes: [(node(3), 2)].into_iter().collect(),
         mismatches: 1,
         local_retries: 3,
         fetched: true,
         restoring: true,
+        trashed: Some(Observed {
+            kind: Kind::File,
+            size: 16,
+            mtime_ns: 17,
+            exec: false,
+            hash: hash(18),
+        }),
         answered: [node(4)].into_iter().collect(),
         reset: Some(Observed {
             kind: Kind::File,
@@ -151,6 +159,13 @@ pub fn deferred(p: &str) -> Vec<Deferred> {
             seq_high: 32,
             reason: DeferredReason::Frozen,
             restoring: Some(entry(p, 33)),
+            trashed: Some(Observed {
+                kind: Kind::Symlink,
+                size: 3,
+                mtime_ns: 37,
+                exec: false,
+                hash: hash(38),
+            }),
         },
         Deferred {
             entry: entry(p, 34),
@@ -159,6 +174,7 @@ pub fn deferred(p: &str) -> Vec<Deferred> {
             seq_high: 36,
             reason: DeferredReason::ChangedUnderneath,
             restoring: None,
+            trashed: None,
         },
     ]
 }

@@ -5,26 +5,24 @@ path and adopts nothing, so the record `revert` restored keeps its old
 reset was pending was refused, and it never hears that this machine can
 serve the file again (DESIGN.md §7.1, §8.3 step 2).
 
-test: delocal-sim regressions::a_peer_refused_during_a_reset_asks_again_when_it_lands
+Since drafts 52 and 53's failed-report rules no seed fails with this
+patch (0 to 9,999, and 0 to 499 at 2,000 steps), so the pinned
+seed is gone and the rule's unit tests below stand in for it.
+
 test: delocal-engine folder::tests::a_resets_landing_is_announced_under_a_new_seq
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index c13f56e..574d7e5 100644
+index 18842d5..5ea01f9 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2409,12 +2409,10 @@ impl FolderState {
-             // what tells a refused peer to ask again. Entries deferred at
-             // the path are then classified against it; if the file changed
-             // underneath, they wait for the next observation instead.
--            if !landed {
--                return Vec::new();
-+            if landed {
-+                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+@@ -2456,9 +2456,8 @@ impl FolderState {
+             if let Some(found) = found {
+                 return self.observe_found(now, path, &found);
              }
 -            let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
--            self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
 -            return written;
 +            return Vec::new();
          }
-         if !landed {
+         if let Some(found) = found {
              self.defer_changed_underneath(want);

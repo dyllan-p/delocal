@@ -78,11 +78,15 @@ pub enum Event {
 
     /// The scanner or watcher reports one path (§7.3). Inside a bracket it
     /// also marks the path seen. A path the host could not inspect is
-    /// reported `Skipped`: seen, and nothing more.
+    /// reported `Skipped`: seen, and nothing more. `at` is when the host
+    /// took the observation (the `stat` or the read), not when it delivers
+    /// it: one older than the path's last commit report is stale (draft
+    /// 56).
     Scanned {
         folder: FolderId,
         path: RelPath,
         state: ScanState,
+        at: Timestamp,
     },
     /// A full scan begins.
     ScanStarted {
@@ -156,6 +160,18 @@ pub enum Event {
         folder: FolderId,
         path: RelPath,
         version: Version,
+        outcome: ApplyOutcome,
+    },
+    /// The host finished a revert's move to the trash, `MoveToTrash`, at
+    /// `at` (§8.3 step 2, draft 57): `Ok` once the path is in the trash or
+    /// was already gone, `ChangedUnderneath` if its guard found something
+    /// other than the file revert trashed, `Failed` on a local failure. A
+    /// failed report carries what the guard found, as every commit's does.
+    Trashed {
+        folder: FolderId,
+        path: RelPath,
+        version: Version,
+        at: Timestamp,
         outcome: ApplyOutcome,
     },
 
@@ -232,8 +248,22 @@ pub enum Action {
         mtime_ns: i64,
         exec: bool,
     },
-    /// Move a local file aside with nothing to rename in: revert only (§8.3).
-    MoveToTrash { folder: FolderId, path: RelPath },
+    /// A revert's move to the trash (§8.3 step 2, draft 57), a commit like
+    /// any other: check `expected` against the path (an absent path is
+    /// already where the move would leave it), move what is there to the
+    /// trash, and report with [`Event::Trashed`] under `version`, the
+    /// trashed record's.
+    MoveToTrash {
+        folder: FolderId,
+        path: RelPath,
+        version: Version,
+        expected: Observed,
+    },
+    /// Observe `path` and report it with [`Event::Scanned`], the same
+    /// observation a scan would report (§8.3): a waiting `revert` needs a
+    /// fresh observation of a path whose latest one was ignored while a
+    /// want held it in flight.
+    Observe { folder: FolderId, path: RelPath },
 
     /// History (§8.5).
     RecordBatch {
@@ -398,10 +428,14 @@ impl Engine {
                 folder,
                 path,
                 state,
+                at,
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
                     let before = f.winner_fallbacks();
-                    let scanned = f.scanned(now, path, state);
+                    let scanned = f.observed_at(now, at, path, state);
+                    for record in scanned.ancestors {
+                        out.push(Action::IndexChanged { folder, record });
+                    }
                     if let Some(change) = scanned.change {
                         out.push(Action::IndexChanged {
                             folder,
@@ -493,6 +527,20 @@ impl Engine {
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
                     for record in f.applied(now, &path, &version, outcome) {
+                        out.push(Action::IndexChanged { folder, record });
+                    }
+                }
+                None => out.push(unknown_folder(folder)),
+            },
+            Event::Trashed {
+                folder,
+                path,
+                version,
+                at,
+                outcome,
+            } => match self.folders.get_mut(&folder) {
+                Some(f) => {
+                    for record in f.trashed(now, &path, &version, at, outcome) {
                         out.push(Action::IndexChanged { folder, record });
                     }
                 }
@@ -603,6 +651,7 @@ impl Engine {
         }
         self.settle(now, &mut out);
         self.pump(now, &mut out);
+        self.observe(&mut out);
         self.schedule(&mut out);
         self.persist(&mut out);
         out
@@ -674,6 +723,17 @@ impl Engine {
         }
     }
 
+    /// Ask the host to observe what a waiting `revert` needs observed again
+    /// (§8.3). After the want-list is driven, so a path a dispatch just put
+    /// back in flight is not asked for only to have its observation ignored.
+    fn observe(&mut self, out: &mut Vec<Action>) {
+        for (id, folder) in &mut self.folders {
+            for path in folder.observe_requests() {
+                out.push(Action::Observe { folder: *id, path });
+            }
+        }
+    }
+
     /// Drive every folder's want-list (§7.5): emit fetches and commits,
     /// report adoptions and want changes.
     fn pump(&mut self, now: Timestamp, out: &mut Vec<Action>) {
@@ -730,6 +790,16 @@ impl Engine {
                         expected,
                         mtime_ns,
                         exec,
+                    },
+                    HostStep::Trash {
+                        path,
+                        version,
+                        expected,
+                    } => Action::MoveToTrash {
+                        folder: folder_id,
+                        path,
+                        version,
+                        expected,
                     },
                 });
             }
@@ -977,11 +1047,8 @@ fn decide(
                         },
                     });
                 }
-                for path in &reverted.trash {
-                    out.push(Action::MoveToTrash {
-                        folder,
-                        path: path.clone(),
-                    });
+                for record in reverted.written {
+                    out.push(Action::IndexChanged { folder, record });
                 }
                 out.push(Action::StatusChanged {
                     folder,
@@ -1195,6 +1262,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(1.0),
             },
         );
         assert_eq!(
@@ -1235,6 +1303,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(10.0),
             },
         ));
         assert!(matches!(out[0], Action::IndexChanged { .. }));
@@ -1248,6 +1317,7 @@ mod tests {
                 folder: folder(),
                 path: p("other.txt"),
                 state: file(2, 5),
+                at: t(11.0),
             },
         ));
         assert_eq!(out[1], Action::WakeAt(t(13.0)));
@@ -1319,6 +1389,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = a.handle(
@@ -1383,8 +1454,9 @@ mod tests {
             t(1.0),
             Event::Scanned {
                 folder: folder(),
-                path: p("dir/note.md"),
+                path: p("note.md"),
                 state: file(4, 77),
+                at: t(1.0),
             },
         );
         let out = a.handle(
@@ -1397,7 +1469,7 @@ mod tests {
             .folder(folder())
             .unwrap()
             .index()
-            .get(&p("dir/note.md"))
+            .get(&p("note.md"))
             .unwrap()
             .entry
             .clone();
@@ -1456,7 +1528,7 @@ mod tests {
             .folder(folder())
             .unwrap()
             .wants()
-            .get(&p("dir/note.md"))
+            .get(&p("note.md"))
             .unwrap();
         assert_eq!(want.source, node(2), "arrived via B");
         let got = &want.entry;
@@ -1486,6 +1558,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = b.handle(
@@ -1529,6 +1602,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(5, 100),
+                at: t(10.0),
             },
         );
         assert!(matches!(out_a[0], Action::IndexChanged { .. }));
@@ -1538,6 +1612,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(6, 200),
+                at: t(10.0),
             },
         );
         let out_a = engines.get_mut(&node(1)).unwrap().handle(
@@ -1697,6 +1772,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i}")),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -1716,6 +1792,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -1905,6 +1982,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -1942,6 +2020,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -1996,9 +2075,8 @@ mod tests {
             }
             let f = x.folder(folder()).unwrap();
             assert!(
-                f.wants()
-                    .iter()
-                    .all(|w| w.state == WantState::NoSource && w.sources.is_empty()),
+                f.wants().iter().all(|w| w.state == WantState::NoSource
+                    && w.sources.iter().all(|s| w.refused.contains_key(s))),
                 "without source after E refused"
             );
         }
@@ -2106,6 +2184,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -2167,6 +2246,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2195,6 +2275,7 @@ mod tests {
                 folder: folder(),
                 path: p("f09"),
                 state: file(2, 2),
+                at: t(13.0),
             },
         );
         let out = b.handle(
@@ -2290,6 +2371,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2299,6 +2381,7 @@ mod tests {
                 folder: folder(),
                 path: p("junk"),
                 state: file(6, 6),
+                at: t(10.0),
             },
         );
         let out = b.handle(t(11.0), Event::Revert { folder: folder() });
@@ -2348,15 +2431,18 @@ mod tests {
             .into_iter()
             .filter(|a| !matches!(a, Action::IndexChanged { .. } | Action::IndexRemoved { .. }))
             .collect();
-        assert_eq!(
-            out[0],
-            Action::MoveToTrash {
-                folder: folder(),
-                path: p("junk")
-            }
+        // The move to the trash is a commit of its own (§8.3 step 2, draft
+        // 57), dispatched with the want-list after the revert itself.
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::MoveToTrash { path, expected, .. }
+                    if path == &p("junk") && expected.hash == hash(6)
+            )),
+            "{out:?}"
         );
         assert_eq!(
-            out[1],
+            out[0],
             Action::StatusChanged {
                 folder: folder(),
                 status: FolderStatus::Reverted {
@@ -2409,6 +2495,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     state,
+                    at: t(10.0),
                 },
             );
         }
@@ -2464,6 +2551,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -2541,6 +2629,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(8, 70),
+                at: t(22.0),
             },
         );
         let out = a.handle(
@@ -2570,6 +2659,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(26.0),
                 },
             );
         }
@@ -2594,6 +2684,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(30.0),
             },
         );
         for i in 3..10 {
@@ -2603,6 +2694,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Unchanged,
+                    at: t(30.0),
                 },
             );
         }
@@ -2630,6 +2722,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(9, 80),
+                at: t(32.0),
             },
         );
         let out = a.handle(
@@ -2663,9 +2756,28 @@ mod tests {
             out.iter()
                 .any(|a| matches!(a, Action::IndexRemoved { path, .. } if path == &p("n")))
         );
+        let moved = out
+            .iter()
+            .find_map(|a| match a {
+                Action::MoveToTrash { path, version, .. } if path == &p("n") => {
+                    Some(version.clone())
+                }
+                _ => None,
+            })
+            .expect("n is moved to the trash");
         assert!(
-            out.iter()
-                .any(|a| matches!(a, Action::MoveToTrash { path, .. } if path == &p("n")))
+            fetch_of(&tagged(out), hash(9)).is_none(),
+            "nothing at n moves on before the move's report (§8.3 step 2)"
+        );
+        let out = b.handle(
+            t(37.0),
+            Event::Trashed {
+                folder: folder(),
+                path: p("n"),
+                version: moved,
+                at: t(37.0),
+                outcome: ApplyOutcome::Ok,
+            },
         );
         let (wanted, from) = fetch_of(&tagged(out), hash(9)).expect("v3's content is fetched");
         assert_eq!((wanted, from), (v3.clone(), node(1)));
@@ -2716,6 +2828,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2821,6 +2934,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2848,6 +2962,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(13.0),
                 },
             );
         }
@@ -2911,6 +3026,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i}")),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -3013,6 +3129,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3113,6 +3230,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3149,6 +3267,7 @@ mod tests {
                 version: version.clone(),
                 outcome: ApplyOutcome::Failed {
                     error: LocalError::DiskFull,
+                    found: ScanState::Absent,
                 },
             },
         );
@@ -3193,6 +3312,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3265,6 +3385,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3309,6 +3430,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3364,6 +3486,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(10.0),
             },
         );
         let snapshot = a.folder(folder()).unwrap().clone();
@@ -3408,6 +3531,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3433,6 +3557,7 @@ mod tests {
                 folder: folder(),
                 path: p("a"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         e.handle(
@@ -3441,6 +3566,7 @@ mod tests {
                 folder: folder(),
                 path: p("b"),
                 state: file(2, 1),
+                at: t(1.0),
             },
         );
         e.handle(
@@ -3458,6 +3584,7 @@ mod tests {
                 folder: folder(),
                 path: p("a"),
                 state: ScanState::Unchanged,
+                at: t(5.0),
             },
         );
         let out = e.handle(t(5.5), Event::ScanAborted { folder: folder() });
@@ -3472,6 +3599,7 @@ mod tests {
                 folder: folder(),
                 path: p("a"),
                 state: ScanState::Unchanged,
+                at: t(6.0),
             },
         );
         let out = core(&e.handle(t(7.0), Event::ScanFinished { folder: folder() }));
@@ -3496,6 +3624,7 @@ mod tests {
                 folder: folder(),
                 path: p("ghost"),
                 state: ScanState::Unchanged,
+                at: t(8.0),
             },
         );
         assert_eq!(
@@ -3517,6 +3646,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = e.handle(
@@ -3562,6 +3692,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         other.handle(
@@ -3612,6 +3743,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let mut batch = other
@@ -3670,6 +3802,7 @@ mod tests {
                 folder: f2,
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         e.handle(
@@ -3678,6 +3811,7 @@ mod tests {
                 folder: folder(),
                 path: p("y"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = e.handle(
@@ -3732,6 +3866,7 @@ mod tests {
                         folder: folder(),
                         path: p("b"),
                         state: file(1, 1),
+                        at: t(1.0),
                     },
                 ),
                 (
@@ -3740,6 +3875,7 @@ mod tests {
                         folder: folder(),
                         path: p("a"),
                         state: file(2, 1),
+                        at: t(1.5),
                     },
                 ),
                 (
@@ -3748,6 +3884,7 @@ mod tests {
                         folder: folder(),
                         path: p("b"),
                         state: ScanState::Absent,
+                        at: t(2.0),
                     },
                 ),
                 (
@@ -3788,6 +3925,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let bytes = postcard::to_stdvec(&e).unwrap();
@@ -3796,7 +3934,15 @@ mod tests {
             folder: folder(),
             path: p("x"),
             version: Version::empty(),
-            outcome: ApplyOutcome::ChangedUnderneath,
+            outcome: ApplyOutcome::ChangedUnderneath {
+                found: ScanState::Observed(Observed {
+                    kind: Kind::File,
+                    size: 3,
+                    mtime_ns: 4,
+                    exec: true,
+                    hash: hash(2),
+                }),
+            },
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), ev);
@@ -3834,7 +3980,7 @@ mod tests {
             let mut engines = two_with_ten_files();
             let b = engines.get_mut(&node(2)).unwrap();
             for i in 0..8 {
-                b.handle(t(10.0), Event::Scanned { folder: folder(), path: p(&format!("f{i:02}")), state: ScanState::Absent });
+                b.handle(t(10.0), Event::Scanned { folder: folder(), path: p(&format!("f{i:02}")), state: ScanState::Absent, at: t(10.0) });
             }
             let out = b.handle(t(12.0), Event::Tick { fresh_batch_id: fresh(3) });
             prop_assert!(sends(&out).is_empty());
@@ -3843,7 +3989,7 @@ mod tests {
                 now = now.plus_nanos(1_500_000_000);
                 let path = p(&format!("f{:02}", i));
                 let state = if gone { ScanState::Absent } else { file(h + 1, k as i64 + 20) };
-                let out = b.handle(now, Event::Scanned { folder: folder(), path, state });
+                let out = b.handle(now, Event::Scanned { folder: folder(), path, state, at: now });
                 prop_assert!(sends(&out).is_empty());
                 if tick {
                     let out = b.handle(now.plus_nanos(12_000_000_000), Event::Tick { fresh_batch_id: fresh(100 + k as u8) });
@@ -3872,7 +4018,7 @@ mod tests {
                 if connect_c {
                     b.handle(t(0.0), Event::PeerConnected { peer: node(3), tier: Tier::Relay });
                 }
-                a.handle(t(1.0), Event::Scanned { folder: folder(), path: p("n"), state: file(seed, 1) });
+                a.handle(t(1.0), Event::Scanned { folder: folder(), path: p("n"), state: file(seed, 1), at: t(1.0) });
                 let out = a.handle(t(3.0), Event::Tick { fresh_batch_id: fresh(1) });
                 let mut engines = BTreeMap::from([(node(1), a), (node(2), b)]);
                 let mut all = deliver(t(3.0), node(1), out, &mut engines);

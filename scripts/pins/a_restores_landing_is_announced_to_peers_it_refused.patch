@@ -7,7 +7,10 @@ is, so a refetch whose report a crash took keeps that record's old
 `seq`, is never announced, and the peers this machine refused before it
 landed never ask again (DESIGN.md §8.3 step 2, §13).
 
-test: delocal-sim regressions::a_restores_landing_is_announced_to_peers_it_refused
+Since draft 54's refusal rules no seed fails with this patch (0 to 9,999,
+and 0 to 499 at 2,000 steps), so the pinned seed is gone and the rule's
+unit tests below stand in for it.
+
 test: delocal-engine folder::tests::an_occupant_matching_the_restored_record_is_the_landing
 test: delocal-engine folder::tests::an_occupant_matching_a_later_carrier_is_its_landing
 

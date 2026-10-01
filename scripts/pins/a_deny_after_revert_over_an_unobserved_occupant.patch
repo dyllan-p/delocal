@@ -9,24 +9,27 @@ the restoring mark: the Restoring branch of the deny arm of
 FolderState::unsettled, added by f6cff50 (Queue deny and revert until the
 folder settles), is removed. DESIGN.md §8.3, and §7.5's revert exception.
 
-test: delocal-sim regressions::a_deny_after_revert_over_an_unobserved_occupant
+Since drafts 52 and 53's failed-report rules no seed fails with this
+patch (0 to 9,999, and 0 to 499 at 2,000 steps), so the pinned
+seed is gone and the rule's unit tests below stand in for it.
+
 test: delocal-engine folder::tests::an_occupant_at_a_marked_path_counts_while_its_want_is_in_flight
 test: delocal-engine folder::tests::a_deny_waits_for_the_pause_and_then_for_the_restoring_mark
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index 1117d41..2014f96 100644
+index 69baf27..ceb4c8c 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -1023,7 +1023,7 @@ impl FolderState {
-         // occupant is a landing (it matches what the want was committing)
+@@ -1078,7 +1078,7 @@ impl FolderState {
          // or a local change, and the occupant rules below come first (§8.3,
-         // §7.5's revert exception).
+         // §7.5's revert exception). An ignored observation leaves the path
+         // unobserved, which a `revert` waits on (§8.3).
 -        if self.wants.in_flight(&path) && !marked {
 +        if self.wants.in_flight(&path) {
+             self.unobserved.insert(path);
              return Scanned::default();
          }
-         // A reset that failed backs off observably while the restored record
-@@ -1900,9 +1900,7 @@ impl FolderState {
+@@ -1989,9 +1989,7 @@ impl FolderState {
                      return Some(WaitReason::ScanOpen);
                  }
                  self.quarantine.get(batch)?.entries.keys().find_map(|path| {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Check that every pin guards its fix (DESIGN.md §14.4).
 #
-#   scripts/pins.sh [--rev REV] [--jobs J] [--out DIR] [NAME...]
+#   scripts/pins.sh [--rev REV] [--jobs J] [--out DIR] [--fresh] [NAME...]
 #
 # A pinned seed guards its fix only while its history still reaches the
 # bug, so every pin NAME is stored with scripts/pins/NAME.patch, a patch
@@ -39,6 +39,17 @@
 # it neither valid nor invalid. If any pin is not checked, the check did
 # not finish.
 #
+# A pin found valid is recorded in DIR/valid.tsv with a key: REV's tree
+# of each crate its tests build (crates/engine for delocal-engine, that and
+# crates/sim for delocal-sim, every crate for anything else), the build's
+# own inputs (the root Cargo.toml, Cargo.lock, rust-toolchain.toml) and
+# its patch as it stands. Those are everything both halves of its check
+# depend on, the simulator and the tests being deterministic, so a pin
+# whose key is the one recorded cannot have changed: it is skipped, and the
+# summary says so and since which commit. The shortcut is exact, and it
+# saves a run only where no crate a pin builds changed. --fresh ignores the
+# record and checks every pin.
+#
 # With NAMEs only those pins are checked, and the coverage check is
 # skipped. The logs of pin NAME go to DIR/NAME, by default
 # target/pins/NAME, and DIR/summary.md holds the table the nightly puts in
@@ -53,9 +64,10 @@ usage() {
   exit 2
 }
 
-rev=HEAD jobs= out=
+rev=HEAD jobs= out= fresh=no
 while [ $# -gt 0 ]; do
   case $1 in
+    --fresh) fresh=yes; shift ;;
     --rev | --jobs | --out)
       [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
       case $1 in
@@ -141,7 +153,39 @@ else
   done
 fi
 [ "${#names[@]}" -gt 0 ] || { echo "no patches in $pins" >&2; exit 2; }
-[ "$jobs" -le "${#names[@]}" ] || jobs=${#names[@]}
+
+# key_of I: what decides pin I's check, as one hash (see the header).
+key_of() {
+  local i=$1 package dirs=() d
+  for package in $(printf '%s\n' "${packages[@]:${first[$i]}:${count[$i]}}" | sort -u); do
+    case $package in
+      delocal-engine) dirs+=(crates/engine) ;;
+      delocal-sim) dirs+=(crates/engine crates/sim) ;;
+      *) dirs+=(crates) ;;
+    esac
+  done
+  {
+    for d in $(printf '%s\n' "${dirs[@]}" Cargo.toml Cargo.lock rust-toolchain.toml | sort -u); do
+      echo "$d $(git -C "$repo" rev-parse --verify --quiet "$commit:$d" || echo absent)"
+    done
+    echo "patch $(git -C "$repo" hash-object "$pins/${names[$i]}.patch")"
+  } | git -C "$repo" hash-object --stdin
+}
+# The pins to run (todo, in order) and the ones skipped as unchanged: a
+# skipped pin's since[I] is the commit its record was made at.
+record=$out/valid.tsv
+short=$(git -C "$repo" rev-parse --short "$commit")
+keys=() since=() todo=()
+for i in "${!names[@]}"; do
+  keys[i]=$(key_of "$i")
+  since[i]=
+  if [ "$fresh" = no ] && [ -f "$record" ]; then
+    since[i]=$(awk -F '\t' -v n="${names[$i]}" -v k="${keys[$i]}" '$1 == n && $2 == k { print $3 }' "$record")
+  fi
+  [ -n "${since[$i]}" ] || todo+=("$i")
+done
+[ "${#todo[@]}" -eq 0 ] || [ "$jobs" -le "${#todo[@]}" ] || jobs=${#todo[@]}
+[ "$jobs" -ge 1 ] || jobs=1
 threads=$(( cores / jobs ))
 [ "$threads" -ge 1 ] || threads=1
 
@@ -184,9 +228,9 @@ remove_trees
 
 # Nothing from an earlier run may stand in for a result of this one.
 rm -f "$out/summary.md" "$out"/base/*.log
-for name in "${names[@]}"; do
-  rm -rf "${out:?}/$name"
-  mkdir -p "$out/$name"
+for i in "${todo[@]}"; do
+  rm -rf "${out:?}/${names[$i]}"
+  mkdir -p "$out/${names[$i]}"
 done
 
 # result_in LOG TEST: "passes" or "fails" if libtest's log LOG has TEST's
@@ -264,7 +308,7 @@ why() {
   printf '%s\n' "$first" | cut -c1-200
 }
 
-echo "pins: ${#names[@]} of $(git -C "$repo" rev-parse --short "$commit"), $jobs workers of $threads threads, in $out"
+echo "pins: ${#names[@]} of $short, $(( ${#names[@]} - ${#todo[@]} )) unchanged since their last check, $jobs workers of $threads threads, in $out"
 
 # Every worktree is made before anything runs, one at a time: two `git
 # worktree add` at once can read the other's half-made entry under
@@ -272,30 +316,38 @@ echo "pins: ${#names[@]} of $(git -C "$repo" rev-parse --short "$commit"), $jobs
 # that cannot be made leaves its pins not checked.
 base=$out/base
 mkdir -p "$base"
-base_tree=yes
-git -C "$repo" worktree add --quiet --detach "$base/tree" "$commit" 2> "$base/worktree.log" || base_tree=no
+base_tree=no
 trees=()
-for (( w = 0; w < jobs; w++ )); do
-  mkdir -p "$out/worker-$w"
-  trees[w]=yes
-  git -C "$repo" worktree add --quiet --detach "$out/worker-$w/tree" "$commit" 2> "$out/worker-$w/worktree.log" ||
-    trees[w]=no
-done
+if [ "${#todo[@]}" -gt 0 ]; then
+  base_tree=yes
+  git -C "$repo" worktree add --quiet --detach "$base/tree" "$commit" 2> "$base/worktree.log" || base_tree=no
+  for (( w = 0; w < jobs; w++ )); do
+    mkdir -p "$out/worker-$w"
+    trees[w]=yes
+    git -C "$repo" worktree add --quiet --detach "$out/worker-$w/tree" "$commit" 2> "$out/worker-$w/worktree.log" ||
+      trees[w]=no
+  done
+fi
 
 # The unpatched half: one build of REV, every named test in it. Each test
 # must pass here.
 export CARGO_TARGET_DIR=$base/target
+# The tests of the pins to run, by index.
+run_tests=()
+for i in "${todo[@]}"; do
+  for (( j = first[i]; j < first[i] + count[i]; j++ )); do run_tests+=("$j"); done
+done
 if [ "$base_tree" = yes ]; then
-  for package in $(printf '%s\n' "${packages[@]}" | sort -u); do
+  for package in $(for j in "${run_tests[@]}"; do echo "${packages[$j]}"; done | sort -u); do
     filters=()
-    for j in "${!tests[@]}"; do
+    for j in "${run_tests[@]}"; do
       [ "${packages[$j]}" = "$package" ] && filters+=("${tests[$j]}")
     done
     (cd "$base/tree" && cargo test --release --locked -p "$package" --lib -- --exact "${filters[@]}") \
       > "$base/$package.log" 2>&1 || true
   done
 fi
-for i in "${!names[@]}"; do
+for i in "${todo[@]}"; do
   for (( j = first[i]; j < first[i] + count[i]; j++ )); do
     if [ "$base_tree" = no ]; then
       echo "not checked: the unpatched worktree could not be made"
@@ -313,13 +365,14 @@ for i in "${!names[@]}"; do
   done > "$out/${names[$i]}/unpatched"
 done
 
-# The patched half. Worker W takes pins W, W + J, W + 2J, ... A pin's
+# The patched half. Worker W takes the pins to run W, W + J, W + 2J, ... A pin's
 # results reach DIR/NAME/patched only once all its tests have run, so a
 # pin whose worker died midway has none.
 work() {
-  local w=$1 tree=$out/worker-$1/tree i j k name dir result package build
+  local w=$1 tree=$out/worker-$1/tree t i j k name dir result package build
   export CARGO_TARGET_DIR=$out/worker-$1/target
-  for (( i = w; i < ${#names[@]}; i += jobs )); do
+  for (( t = w; t < ${#todo[@]}; t += jobs )); do
+    i=${todo[$t]}
     name=${names[$i]} dir=$out/${names[$i]} result=
     git -C "$tree" checkout --quiet --force --detach "$commit"
     git -C "$tree" clean --quiet -fdx
@@ -353,7 +406,7 @@ work() {
   done
 }
 for (( w = 0; w < jobs; w++ )); do
-  [ "${trees[w]}" = yes ] || continue
+  [ "${trees[w]:-no}" = yes ] || continue
   work "$w" &
   pids[w]=$!
 done
@@ -366,7 +419,8 @@ done
 
 # Why pin I has no patched results: its worker never started or died.
 unrun() {
-  local w=$(( $1 % jobs ))
+  local t w
+  for t in "${!todo[@]}"; do [ "${todo[$t]}" = "$1" ] && w=$(( t % jobs )); done
   if [ "${trees[w]}" = no ]; then
     echo "not checked: worker $w's worktree could not be made"
   elif [ "${ended[w]}" -ne 0 ]; then
@@ -383,10 +437,19 @@ unrun() {
 # whatever happened to its other tests, since nothing they could show would
 # make it valid. A pin none of whose tests failed the check is not checked
 # if one of them was not run both ways, and valid otherwise.
-invalid=0 unchecked=0 checked=0
-rows=()
+invalid=0 unchecked=0 checked=0 skipped=0
+rows=() states=()
 for i in "${!names[@]}"; do
   name=${names[$i]} dir=$out/${names[$i]}
+  if [ -n "${since[$i]}" ]; then
+    states[i]=skipped skipped=$(( skipped + 1 )) cell="$name (unchanged since ${since[$i]})"
+    for (( k = 0; k < count[i]; k++ )); do
+      j=$(( first[i] + k ))
+      rows+=("| $cell | \`${packages[$j]} ${tests[$j]}\` | skipped | skipped |")
+      cell=
+    done
+    continue
+  fi
   [ -f "$dir/patched" ] || for (( k = 0; k < count[i]; k++ )); do unrun "$i"; done > "$dir/patched"
   state=valid
   for (( k = 0; k < count[i]; k++ )); do
@@ -399,6 +462,7 @@ for i in "${!names[@]}"; do
       *) checked=$(( checked + 1 )) ;;
     esac
   done
+  states[i]=$state
   case $state in
     invalid) cell="**$name** (invalid)"; invalid=$(( invalid + 1 )) ;;
     unchecked) cell="*$name* (not checked)"; unchecked=$(( unchecked + 1 )) ;;
@@ -428,14 +492,30 @@ total=$(( ${#names[@]} + ${#unguarded[@]} ))
   echo '|---|---|---|---|'
   printf '%s\n' "${rows[@]}"
   echo
-  seeds=$(printf '%s\n' "${tests[@]}" | grep -c '^regressions::' || true)
-  echo "$checked of ${#tests[@]} named tests checked both ways ($seeds pinned seeds, $(( ${#tests[@]} - seeds )) unit tests)."
+  seeds=$(for j in "${run_tests[@]}"; do echo "${tests[$j]}"; done | grep -c '^regressions::' || true)
+  echo "$checked of ${#run_tests[@]} named tests checked both ways ($seeds pinned seeds, $(( ${#run_tests[@]} - seeds )) unit tests)."
+  [ "$skipped" -eq 0 ] || echo "$skipped pins skipped: nothing their check depends on changed since it last found them valid."
   if [ "$unchecked" -gt 0 ]; then
     echo "The check did not finish: $unchecked of $total pins not checked, $invalid invalid, $(( total - unchecked - invalid )) guard their fix."
   else
     echo "$(( total - invalid )) of $total pins guard their fix."
   fi
 } > "$out/summary.md"
+# The record, written whole: every pin found valid now under its key, every
+# pin skipped as it was, and every pin this run did not look at as it was.
+# A pin found invalid or not checked loses its line.
+{
+  for i in "${!names[@]}"; do
+    case ${states[$i]} in
+      valid) printf '%s\t%s\t%s\n' "${names[$i]}" "${keys[$i]}" "$short" ;;
+      skipped) printf '%s\t%s\t%s\n' "${names[$i]}" "${keys[$i]}" "${since[$i]}" ;;
+    esac
+  done
+  if [ -f "$record" ]; then
+    awk -F '\t' -v seen=" ${names[*]} " 'index(seen, " " $1 " ") == 0' "$record"
+  fi
+} | sort > "$record.new"
+mv "$record.new" "$record"
 echo
 cat "$out/summary.md"
 if [ "$unchecked" -gt 0 ]; then

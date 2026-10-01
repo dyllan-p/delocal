@@ -24,6 +24,13 @@
 //! corrupted transfer is usually transient, and the only source excluded
 //! for good would strand the file.
 //!
+//! **Refusals** (§7.5 step 3): a source that answers `NotAvailable` is not
+//! asked again for that want for an hour, unless it announces the wanted
+//! content first, which ends the refusal at once. A refusal counts towards
+//! no give-up, and reconnecting does not end it. The hour is a safety net:
+//! a refusal kept for good strands the want whenever the source comes to
+//! hold the content again without announcing anything.
+//!
 //! **Ordering gate** (§7.5): a create or modify commits only after every
 //! ancestor directory's create in the list has committed; a directory
 //! delete commits only after every descendant's delete. Fetches are not
@@ -36,7 +43,9 @@
 //! *fetching* or *committing* is in flight; *deferred*, *without source* and
 //! *given up* are observable, because they can last for days. A want made
 //! by `revert` (§8.3) is `restoring`: an `Absent` observation is the trash
-//! move and is ignored in every state. A want `revert` makes at a path
+//! move and is ignored in every state, and an observation of exactly the
+//! file revert trashed (`trashed`) is stale and reports nothing. A want
+//! `revert` makes at a path
 //! whose file already holds the restored content is a `reset`: it sets the
 //! file's mtime and exec bit back to the record, which is already in place,
 //! and its landing is announced like any other.
@@ -52,7 +61,8 @@ use crate::id::{BatchId, NodeId};
 use crate::path::RelPath;
 use crate::rules::Rules;
 use crate::time::{
-    COMMIT_DEADLINE_NANOS, EXCLUSION_CAP_NANOS, EXCLUSION_NANOS, FETCH_STALL_NANOS, Timestamp,
+    COMMIT_DEADLINE_NANOS, EXCLUSION_CAP_NANOS, EXCLUSION_NANOS, FETCH_STALL_NANOS, REFUSAL_NANOS,
+    Timestamp,
 };
 use crate::version::Version;
 
@@ -178,10 +188,13 @@ pub struct Want {
     /// path (§7.5): the batch's source, the version's author, and later
     /// batches carrying a version at the path with the same hash. Fetches
     /// are by hash, so whoever announced `W` is a source for a conflict's
-    /// `M`, which has `W`'s content. One that answers `NotAvailable` has
-    /// moved on and is removed (step 3); announcing the content again puts
-    /// it back, since it now says it holds it.
+    /// `M`, which has `W`'s content. One that answers `NotAvailable` stays
+    /// a source but is refused for a while (see `refused`).
     pub sources: BTreeSet<NodeId>,
+    /// Sources that answered `NotAvailable`, each with the time it may be
+    /// asked again, an hour after (§7.5 step 3); announcing the wanted
+    /// content ends the refusal at once.
+    pub refused: BTreeMap<NodeId, Timestamp>,
     /// Sources that served a hash mismatch, each with the time its
     /// exclusion expires (§7.5). Not asked again for this want until then,
     /// or until the source reconnects, any source announces the wanted
@@ -203,6 +216,13 @@ pub struct Want {
     /// stands, absence at the path is the trash move and the commit
     /// expects the path to be absent.
     pub restoring: bool,
+    /// With the restoring mark, the file revert trashed at the path, if it
+    /// trashed one: its kind, size, mtime and exec bit (§8.3). A scan may
+    /// list that file before the move to the trash runs and report it
+    /// after, so an observation of exactly that file is stale and reports
+    /// nothing. Persisted with the want, and carried wherever the mark
+    /// goes.
+    pub trashed: Option<Observed>,
     /// Members that answered `NotAvailable`. For a restoring want, whose
     /// sources are every other member, the members not in here are the ones
     /// `status` names as not yet asked; once every member is in here the
@@ -243,14 +263,48 @@ impl Want {
         self.mode == ApplyMode::Fetch && !self.fetched
     }
 
-    /// True if this want removes the entry.
+    /// True if this want removes the entry: a tombstone's, or a revert's
+    /// move to the trash, which the ordering gate treats alike (children
+    /// first).
     pub fn is_delete(&self) -> bool {
-        self.entry.deleted
+        self.entry.deleted || self.mode == ApplyMode::Trash
     }
 
     /// True if this want creates or replaces a directory.
     pub fn is_dir_create(&self) -> bool {
-        !self.entry.deleted && self.entry.kind == Kind::Dir
+        !self.is_delete() && self.entry.kind == Kind::Dir
+    }
+
+    /// True if this want is a revert's move to the trash (§8.3 step 2).
+    pub fn is_trash(&self) -> bool {
+        self.mode == ApplyMode::Trash
+    }
+
+    /// A revert's move to the trash of the file `current` describes (§8.3
+    /// step 2, draft 57): a commit of its own, whose guard expects exactly
+    /// that file, and which adopts nothing.
+    pub fn trash(current: Entry, batch: BatchId, own: NodeId) -> Self {
+        Self {
+            received: current.clone(),
+            entry: current,
+            mode: ApplyMode::Trash,
+            conflict: None,
+            batch,
+            source: own,
+            seq_high: 0,
+            sources: BTreeSet::new(),
+            refused: BTreeMap::new(),
+            excluded: BTreeMap::new(),
+            strikes: BTreeMap::new(),
+            mismatches: 0,
+            local_retries: 0,
+            fetched: false,
+            restoring: false,
+            trashed: None,
+            answered: BTreeSet::new(),
+            reset: None,
+            state: WantState::Wanted,
+        }
     }
 
     fn from_item(
@@ -275,12 +329,14 @@ impl Want {
             source,
             seq_high,
             sources,
+            refused: BTreeMap::new(),
             excluded: BTreeMap::new(),
             strikes: BTreeMap::new(),
             mismatches: 0,
             local_retries: 0,
             fetched: false,
             restoring: false,
+            trashed: None,
             answered: BTreeSet::new(),
             reset: None,
             state: WantState::Wanted,
@@ -399,6 +455,7 @@ impl WantList {
             && want.restoring
         {
             want.restoring = false;
+            want.trashed = None;
             self.note(path);
         }
     }
@@ -456,6 +513,7 @@ impl WantList {
         let path = item.path().clone();
         let incoming = item.incoming().version.clone();
         let mut restoring = marked.is_some();
+        let mut trashed = None;
         if let Some(existing) = self.wants.get_mut(&path) {
             if incoming == *existing.version() {
                 existing.sources.insert(source);
@@ -470,9 +528,13 @@ impl WantList {
                 return Some(item);
             }
             restoring |= existing.restoring;
+            if existing.restoring {
+                trashed = existing.trashed.clone();
+            }
         }
         let mut want = Want::from_item(item, received, batch, source, seq_high);
         want.restoring = restoring;
+        want.trashed = trashed;
         if let Some(others) = marked {
             want.sources.extend(others.iter().copied());
         }
@@ -483,9 +545,9 @@ impl WantList {
 
     /// A batch carried a version at `path` with content `hash`, whether or
     /// not it produced an item: if that is the content a want is after, the
-    /// batch's source has it (§7.5), and every exclusion and give-up at the
-    /// path is released. Directories and tombstones carry the empty hash and
-    /// are never fetched, so they name no source.
+    /// batch's source has it (§7.5), its refusal ends, and every exclusion
+    /// and give-up at the path is released. Directories and tombstones carry
+    /// the empty hash and are never fetched, so they name no source.
     pub fn note_announced(&mut self, path: &RelPath, hash: &ContentHash, by: NodeId) {
         if *hash == ContentHash::EMPTY {
             return;
@@ -496,15 +558,38 @@ impl WantList {
         if want.entry.hash != *hash {
             return;
         }
-        if want.sources.insert(by) {
+        let added = want.sources.insert(by);
+        let unrefused = want.refused.remove(&by).is_some();
+        if added || unrefused {
             self.note(path);
         }
         self.release(path, None);
     }
 
+    /// A want re-derived at `path` keeps the refusals of the one it
+    /// replaced, if it is after the same content (§7.5 step 3): the
+    /// sources that refused still lack that content, and re-deriving
+    /// announces nothing.
+    pub fn keep_refusals(
+        &mut self,
+        path: &RelPath,
+        hash: &ContentHash,
+        refused: BTreeMap<NodeId, Timestamp>,
+    ) {
+        let Some(want) = self.wants.get_mut(path) else {
+            return;
+        };
+        if want.entry.hash != *hash || refused.is_empty() {
+            return;
+        }
+        want.refused.extend(refused);
+        self.note(path);
+    }
+
     /// A member connected (§7.5): every want it was excluded from after a
     /// hash mismatch may ask it again, and a want that gave up because of
-    /// it is wanted again.
+    /// it is wanted again. A refusal is not ended: the member said it does
+    /// not hold the content, and connecting again says nothing new.
     pub fn reconnected(&mut self, peer: NodeId) {
         let paths: Vec<RelPath> = self
             .wants
@@ -551,6 +636,23 @@ impl WantList {
         let path = want.path().clone();
         self.wants.insert(path.clone(), want);
         self.note(&path);
+    }
+
+    /// The want at `path`, carrying the restoring mark, remembers `trashed`
+    /// as the file revert trashed there (§8.3), unless it remembers one
+    /// already. For a mark that comes from elsewhere: a deferred carrier
+    /// wanted again, or a new want at a path the mark is on.
+    pub fn remember_trashed(&mut self, path: &RelPath, trashed: Option<Observed>) {
+        let Some(trashed) = trashed else {
+            return;
+        };
+        if let Some(want) = self.wants.get_mut(path)
+            && want.restoring
+            && want.trashed.is_none()
+        {
+            want.trashed = Some(trashed);
+            self.note(path);
+        }
     }
 
     /// A want comes back after a restart. Transient states become
@@ -643,7 +745,7 @@ impl WantList {
                 want.state = WantState::Wanted;
             }
             FetchReport::NotAvailable => {
-                want.sources.remove(&from);
+                want.refused.insert(from, now.plus_nanos(REFUSAL_NANOS));
                 want.answered.insert(from);
                 want.state = WantState::Wanted;
             }
@@ -818,7 +920,8 @@ impl WantList {
         }
     }
 
-    /// Exclusions whose backoff has run out are released, a fetch whose
+    /// Exclusions whose backoff has run out are released, refusals whose
+    /// hour is up end, a fetch whose
     /// stall deadline has passed returns to `Wanted` (the source is not
     /// excluded, the stall may have been ours), a commit past its deadline
     /// becomes overdue but keeps its path, and a local retry whose backoff
@@ -836,6 +939,17 @@ impl WantList {
             .collect();
         for (path, node) in released {
             self.release(&path, Some(node));
+        }
+        let mut unrefused = Vec::new();
+        for (path, want) in &mut self.wants {
+            let before = want.refused.len();
+            want.refused.retain(|_, until| *until > now);
+            if want.refused.len() != before {
+                unrefused.push(path.clone());
+            }
+        }
+        for path in &unrefused {
+            self.note(path);
         }
         let mut expired = Expired::default();
         for (path, want) in &self.wants {
@@ -893,8 +1007,8 @@ impl WantList {
         }
     }
 
-    /// The earliest fetch or commit deadline, exclusion expiry or end of a
-    /// local retry's backoff, for the engine's wake-up.
+    /// The earliest fetch or commit deadline, exclusion expiry, end of a
+    /// refusal or end of a local retry's backoff, for the engine's wake-up.
     pub fn next_deadline(&self) -> Option<Timestamp> {
         let deadlines = self.wants.values().filter_map(|w| match w.state {
             WantState::Fetching { deadline, .. }
@@ -908,7 +1022,7 @@ impl WantList {
         let expiries = self
             .wants
             .values()
-            .flat_map(|w| w.excluded.values().copied());
+            .flat_map(|w| w.excluded.values().chain(w.refused.values()).copied());
         deadlines.chain(expiries).min()
     }
 
@@ -968,7 +1082,7 @@ impl WantList {
         let mut candidates: Vec<(Tier, NodeId)> = want
             .sources
             .iter()
-            .filter(|n| !want.excluded.contains_key(n))
+            .filter(|n| !want.excluded.contains_key(n) && !want.refused.contains_key(n))
             .filter_map(|n| peers.get(n).map(|t| (*t, *n)))
             .collect();
         if candidates.is_empty() {
@@ -1338,6 +1452,132 @@ mod tests {
         l.note_announced(&p("f"), &hash_of(&version), node(2));
         let steps = l.dispatch(t(4), &Rules::default(), &peers);
         assert!(matches!(&steps[0], WantStep::Fetch { from, .. } if *from == node(2)));
+    }
+
+    #[test]
+    fn a_refusing_source_is_asked_again_when_its_hour_is_up() {
+        // §7.5 step 3, draft 54: `NotAvailable` excludes node 2 for an
+        // hour, not for good. Reconnecting and announcing other content
+        // end nothing; the hour does.
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        let version = entry("f", Kind::File, 10, 2, false).version;
+        let peers = peers(&[(2, Tier::Direct)]);
+        let rules = Rules::default();
+        let steps = l.dispatch(t(0), &rules, &peers);
+        assert!(matches!(&steps[..], [WantStep::Fetch { from, .. }] if *from == node(2)));
+        l.fetched(t(10), &p("f"), &version, FetchReport::NotAvailable);
+        let w = l.get(&p("f")).unwrap();
+        assert!(w.sources.contains(&node(2)), "still a source");
+        assert_eq!(w.refused.get(&node(2)), Some(&t(10 + 3600)));
+        assert!(w.answered.contains(&node(2)), "§8.3 step 4 still counts it");
+        assert_eq!(
+            l.next_deadline(),
+            Some(t(10 + 3600)),
+            "the engine wakes for it"
+        );
+        l.reconnected(node(2));
+        l.note_announced(&p("f"), &ContentHash::from_bytes([9; 32]), node(2));
+        let almost = t(10 + 3600).plus_nanos(-1);
+        l.expire(almost);
+        assert!(l.dispatch(almost, &rules, &peers).is_empty());
+        assert_eq!(l.get(&p("f")).unwrap().state, WantState::NoSource);
+        l.expire(t(10 + 3600));
+        assert!(l.get(&p("f")).unwrap().refused.is_empty());
+        let steps = l.dispatch(t(10 + 3600), &rules, &peers);
+        assert!(
+            matches!(&steps[..], [WantStep::Fetch { from, .. }] if *from == node(2)),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn announcing_the_wanted_content_ends_only_that_sources_refusal() {
+        // Both sources refuse; node 3 then announces the wanted content and
+        // is asked again at once, while node 2's hour still runs.
+        let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+        let version = entry("f", Kind::File, 10, 2, false).version;
+        let hash = hash_of(&version);
+        l.note_announced(&p("f"), &hash, node(3));
+        let peers = peers(&[(2, Tier::Direct), (3, Tier::Direct)]);
+        let rules = Rules::default();
+        for (at, asked) in [(0, 2), (1, 3)] {
+            let steps = l.dispatch(t(at), &rules, &peers);
+            assert!(matches!(&steps[..], [WantStep::Fetch { from, .. }] if *from == node(asked)));
+            l.fetched(t(at), &p("f"), &version, FetchReport::NotAvailable);
+        }
+        assert!(l.dispatch(t(2), &rules, &peers).is_empty());
+        l.drain_changes();
+        l.note_announced(&p("f"), &hash, node(3));
+        assert_eq!(l.drain_changes().len(), 1, "the ended refusal is persisted");
+        let w = l.get(&p("f")).unwrap();
+        assert_eq!(w.refused.keys().collect::<Vec<_>>(), [&node(2)]);
+        let steps = l.dispatch(t(3), &rules, &peers);
+        assert!(
+            matches!(&steps[..], [WantStep::Fetch { from, .. }] if *from == node(3)),
+            "{steps:?}"
+        );
+    }
+
+    proptest::proptest! {
+        /// No storm (§7.5 step 3, draft 54): a want whose every source
+        /// refuses asks each at most once an hour, however often the host
+        /// wakes the engine, sources reconnect or announce other content;
+        /// and, the hour being a safety net, asks each again once its hour
+        /// is up, waking the engine for it.
+        #[test]
+        fn a_want_whose_every_source_refuses_asks_each_at_most_once_an_hour(
+            sources in 1u8..4,
+            steps in proptest::collection::vec(
+                (0i64..30 * 60 * 1_000_000_000, 0u8..3, 0u8..4),
+                1..120,
+            ),
+        ) {
+            let mut l = list_with(&[("f", Kind::File, 10, ApplyMode::Fetch, false)]);
+            let version = entry("f", Kind::File, 10, 2, false).version;
+            for n in 3..2 + sources {
+                l.note_announced(&p("f"), &hash_of(&version), node(n));
+            }
+            let all: Vec<NodeId> = (2..2 + sources).map(node).collect();
+            let peers: BTreeMap<NodeId, Tier> = all.iter().map(|n| (*n, Tier::Lan)).collect();
+            let rules = Rules::default();
+            let mut asked: BTreeMap<NodeId, Vec<Timestamp>> = BTreeMap::new();
+            let mut now = t(0);
+            let max_step = 30 * 60 * 1_000_000_000;
+            for (dt, what, who) in steps {
+                now = now.plus_nanos(dt);
+                let who = node(2 + who % sources);
+                match what {
+                    1 => l.reconnected(who),
+                    2 => l.note_announced(&p("f"), &ContentHash::from_bytes([9; 32]), who),
+                    _ => {}
+                }
+                l.expire(now);
+                // However many passes the host makes at this instant, each
+                // request is refused at once.
+                for _ in 0..4 {
+                    for step in l.dispatch(now, &rules, &peers) {
+                        if let WantStep::Fetch { from, .. } = step {
+                            asked.entry(from).or_default().push(now);
+                            l.fetched(now, &p("f"), &version, FetchReport::NotAvailable);
+                        }
+                    }
+                }
+                let w = l.get(&p("f")).unwrap();
+                if let Some(end) = w.refused.values().min() {
+                    proptest::prop_assert!(l.next_deadline().is_some_and(|d| d <= *end));
+                }
+            }
+            proptest::prop_assert_eq!(asked.len(), all.len(), "every source asked");
+            for (n, times) in &asked {
+                for pair in times.windows(2) {
+                    let gap = pair[1].since(pair[0]);
+                    proptest::prop_assert!(gap >= REFUSAL_NANOS, "{n:?} asked twice within {gap} ns");
+                    proptest::prop_assert!(gap < REFUSAL_NANOS + max_step, "{n:?} not asked for {gap} ns");
+                }
+                let last = times[times.len() - 1];
+                proptest::prop_assert!(now.since(last) < REFUSAL_NANOS + max_step, "{n:?} never asked again");
+            }
+        }
     }
 
     #[test]

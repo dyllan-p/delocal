@@ -246,6 +246,7 @@ fn want() -> BoxedStrategy<Want> {
                 ApplyMode::Direct,
                 ApplyMode::MetadataOnly,
                 ApplyMode::IndexOnly,
+                ApplyMode::Trash,
             ]),
             option::of((path(), entry()).prop_map(|(path, loser)| ConflictCopy { path, loser })),
             batch_id(),
@@ -255,11 +256,13 @@ fn want() -> BoxedStrategy<Want> {
         (
             btree_set(node(), 0..3),
             btree_map(node(), at(), 0..3),
+            btree_map(node(), at(), 0..3),
             btree_map(node(), any::<u32>(), 0..3),
             any::<u8>(),
             any::<u32>(),
             any::<bool>(),
             any::<bool>(),
+            option::of(observed()),
             btree_set(node(), 0..3),
             option::of(observed()),
             want_state(),
@@ -270,12 +273,14 @@ fn want() -> BoxedStrategy<Want> {
                 (entry, received, mode, conflict, batch, source, seq_high),
                 (
                     sources,
+                    refused,
                     excluded,
                     strikes,
                     mismatches,
                     local_retries,
                     fetched,
                     restoring,
+                    trashed,
                     answered,
                     reset,
                     state,
@@ -289,12 +294,14 @@ fn want() -> BoxedStrategy<Want> {
                 source,
                 seq_high,
                 sources,
+                refused,
                 excluded,
                 strikes,
                 mismatches,
                 local_retries,
                 fetched,
                 restoring,
+                trashed,
                 answered,
                 reset,
                 state,
@@ -374,15 +381,17 @@ fn deferred() -> BoxedStrategy<Vec<Deferred>> {
             DeferredReason::Frozen,
         ]),
         option::of(entry()),
+        option::of(observed()),
     )
         .prop_map(
-            |(entry, batch, source, seq_high, reason, restoring)| Deferred {
+            |(entry, batch, source, seq_high, reason, restoring, trashed)| Deferred {
                 entry,
                 batch,
                 source,
                 seq_high,
                 reason,
                 restoring,
+                trashed,
             },
         );
     vec(one, 1..3).boxed()
@@ -409,6 +418,7 @@ fn queued() -> BoxedStrategy<Queued> {
         path().prop_map(|path| WaitReason::Restoring { path }),
         path().prop_map(|path| WaitReason::Committing { path }),
         Just(WaitReason::StartupScan),
+        path().prop_map(|path| WaitReason::Unobserved { path }),
         Just(WaitReason::ScanOpen),
     ];
     (decision, reason)

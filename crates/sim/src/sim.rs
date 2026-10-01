@@ -32,6 +32,7 @@ use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::Serialize;
 
+use crate::i9;
 use crate::invariants;
 use crate::knobs::Knobs;
 use crate::steps::{Step, UserAction, dir_name, path_name};
@@ -87,6 +88,11 @@ pub struct Stats {
     pub crashes: u64,
     pub fetches: u64,
     pub not_available: u64,
+    /// Observations the engine asked for with `Observe` (§8.3).
+    pub observes: u64,
+    /// Paths a source found out of step with its record while serving,
+    /// and reported to its engine as observations (§7.5 step 2).
+    pub serve_observations: u64,
     pub mismatches: u64,
     pub changed_underneath: u64,
     pub stalled: u64,
@@ -330,6 +336,17 @@ struct Node {
     /// When the host next checks for free space, while the folder's inbound
     /// is paused (§7.5).
     space_check_at: Option<Timestamp>,
+    /// Paths the engine asked the host to observe (`Observe`, §8.3), each
+    /// answered at the next chance with the observation a scan would
+    /// report. In the process's memory, so a crash loses them.
+    #[serde(skip)]
+    observe: BTreeSet<RelPath>,
+    /// The host's monotonic clock (§7.3, draft 56): the last time it
+    /// stamped, so that no two of its stamps are the same.
+    last_stamp: Timestamp,
+    /// When each path's last commit that changed it was reported, by the
+    /// time the engine was given: the stale-observation check's reference.
+    written: BTreeMap<RelPath, Timestamp>,
     /// The filesystem ignores case (§7.6): two names that differ only by
     /// case are one file.
     case_insensitive: bool,
@@ -530,6 +547,74 @@ struct Feeding {
     seq: u64,
 }
 
+/// `path` as the host finds it after a failed commit, for the report
+/// (§7.5 step 6): a path a rule ignores is `Skipped`, as the watcher
+/// reports it (§7.3).
+fn found(node: &Node, path: &RelPath) -> ScanState {
+    if ignores(node, path) {
+        return ScanState::Skipped {
+            reason: SkipReason::Ignored,
+        };
+    }
+    node.fs
+        .get(path)
+        .map_or(ScanState::Absent, |f| ScanState::Observed(f.observed()))
+}
+
+/// What is at `path` on `node`'s disk, as I9 compares it.
+fn content_at(node: &Node, path: &RelPath) -> i9::Content {
+    node.fs.get(path).map(|f| (f.kind, f.hash(), f.exec))
+}
+
+/// The observation an event gives the engine, if any: a scan's or the
+/// watcher's report, or the path a failed commit's report carries (§7.5
+/// step 6).
+fn observation(event: &Event) -> Option<(&RelPath, &ScanState)> {
+    match event {
+        Event::Scanned { path, state, .. } => Some((path, state)),
+        Event::Applied {
+            path,
+            outcome: ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. },
+            ..
+        }
+        | Event::Trashed {
+            path,
+            outcome: ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. },
+            ..
+        } => Some((path, found)),
+        _ => None,
+    }
+}
+
+/// What made an event's new local versions, as I9's classes tell them apart.
+fn cause(event: &Event) -> i9::Cause {
+    if let Some((_, state)) = observation(event) {
+        match state {
+            ScanState::Observed(_) => return i9::Cause::Observed,
+            ScanState::Absent => return i9::Cause::Absent,
+            ScanState::Unchanged | ScanState::Skipped { .. } => {}
+        }
+    }
+    match event {
+        Event::ScanFinished { .. } => i9::Cause::ScanFinished,
+        Event::Applied {
+            path,
+            outcome: ApplyOutcome::Ok,
+            ..
+        } => i9::Cause::Applied { path: path.clone() },
+        Event::Applied {
+            outcome: ApplyOutcome::ChangedUnderneath { .. },
+            ..
+        } => i9::Cause::Other("Applied ChangedUnderneath".to_owned()),
+        Event::Applied {
+            outcome: ApplyOutcome::Failed { error, .. },
+            ..
+        } => i9::Cause::Other(format!("Applied Failed {error:?}")),
+        Event::Fetched { outcome, .. } => i9::Cause::Other(format!("Fetched {outcome:?}")),
+        other => i9::Cause::Other(event_name(other)),
+    }
+}
+
 /// True if a rule on `node` ignores `path`: a rule for the path itself, or
 /// for a directory above it (§7.3).
 fn ignores(node: &Node, path: &RelPath) -> bool {
@@ -581,16 +666,14 @@ enum Held {
         size: u64,
         from: NodeId,
     },
-    /// `Write`, `Remove` or `SetMeta`, with the version of the want it
-    /// commits as the engine asked for it, and its number.
+    /// `Write`, `Remove`, `SetMeta` or a revert's `MoveToTrash`, with the
+    /// version of the want it commits as the engine asked for it, and its
+    /// number.
     Commit {
         path: RelPath,
         version: Version,
         action: Box<Action>,
         commit: u64,
-    },
-    MoveToTrash {
-        path: RelPath,
     },
 }
 
@@ -677,6 +760,8 @@ pub struct Sim {
     /// however late they reach the want-list, even if leftovers of the same
     /// batch are held again under its id.
     approved: BTreeSet<(NodeId, BatchId)>,
+    /// I9's bookkeeping, when `--check-i9` is on.
+    i9: Option<i9::Watch>,
     ops: Vec<Op>,
     users: Vec<UserDue>,
     corruption_on: bool,
@@ -742,6 +827,9 @@ impl Sim {
                 ignored: BTreeMap::new(),
                 full_until: None,
                 space_check_at: None,
+                observe: BTreeSet::new(),
+                last_stamp: Timestamp::default(),
+                written: BTreeMap::new(),
                 case_insensitive: i == 0 && knobs.case_variants > 0.0,
                 paused_inbound: false,
                 sent: BTreeMap::new(),
@@ -775,6 +863,7 @@ impl Sim {
         fail_rng.set_stream(FAIL_STREAM);
         let mut case_rng = ChaCha8Rng::seed_from_u64(seed);
         case_rng.set_stream(CASE_STREAM);
+        let watch = knobs.check_i9.then(i9::Watch::default);
         let mut sim = Self {
             seed,
             knobs,
@@ -801,6 +890,7 @@ impl Sim {
             reverted_at: BTreeMap::new(),
             seen_at: BTreeMap::new(),
             approved: BTreeSet::new(),
+            i9: watch,
             ops: Vec::new(),
             users: Vec::new(),
             corruption_on: true,
@@ -852,6 +942,19 @@ impl Sim {
                 .map(|n| n.host.clone())
                 .unwrap_or_else(HostName::empty),
         }
+    }
+
+    /// A stamp from the host's monotonic clock on `id` (§7.3, draft 56): the
+    /// node's time, but never a value it has stamped before, so that a read
+    /// and a commit at the same instant are ordered as they ran.
+    fn stamp(&mut self, id: NodeId) -> Timestamp {
+        let now = self.now_for(id);
+        let Some(n) = self.nodes.get_mut(&id) else {
+            return now;
+        };
+        let at = now.max(n.last_stamp.plus_nanos(1));
+        n.last_stamp = at;
+        at
     }
 
     fn now_for(&self, id: NodeId) -> Timestamp {
@@ -972,6 +1075,7 @@ impl Sim {
             };
             n.online
                 && n.restart_at.is_none()
+                && n.observe.is_empty()
                 && n.group.as_ref().is_none_or(|g| g.effects.is_empty())
                 && !f.disk_full()
                 && f.window().is_none()
@@ -1094,6 +1198,9 @@ impl Sim {
                 consider(n.wake_at);
                 consider(Some(n.next_scan_at));
                 consider(n.space_check_at);
+                if !n.observe.is_empty() {
+                    consider(Some(self.clock));
+                }
             }
         }
         consider(self.messages.iter().map(|m| m.deliver_at).min());
@@ -1157,6 +1264,31 @@ impl Sim {
         {
             return self.check_space(id);
         }
+        // 4c. observations the engine asked for (§8.3)
+        if let Some((id, path)) = self
+            .nodes
+            .values()
+            .filter(|n| n.alive())
+            .find_map(|n| n.observe.first().map(|p| (n.id, p.clone())))
+        {
+            let Some(node) = self.nodes.get_mut(&id) else {
+                return Ok(());
+            };
+            node.observe.remove(&path);
+            let state = found(node, &path);
+            self.stats.observes += 1;
+            let folder = self.folder;
+            let at = self.stamp(id);
+            return self.feed(
+                id,
+                Event::Scanned {
+                    folder,
+                    path,
+                    state,
+                    at,
+                },
+            );
+        }
         // 5. scans
         if let Some(id) = self
             .nodes
@@ -1188,8 +1320,28 @@ impl Sim {
     fn feed(&mut self, id: NodeId, event: Event) -> Result<(), Failure> {
         let now = self.now_for(id);
         let what = event_name(&event);
+        // I9: what made the event's versions, and the path it observes, if
+        // it does (a skip observes nothing), noted once the engine has it.
+        let cause = self.i9.as_ref().map(|_| {
+            let observed = observation(&event)
+                .filter(|(_, state)| !matches!(state, ScanState::Skipped { .. }))
+                .map(|(path, _)| path.clone());
+            (cause(&event), observed)
+        });
         let observing = match &event {
             Event::Scanned { path, .. } => Some((id, path.clone())),
+            _ => None,
+        };
+        // The stale-observation check (§7.3, draft 56): an observation taken
+        // before the last commit at its path was reported describes a state
+        // that no longer exists.
+        let stale = match &event {
+            Event::Scanned { path, at, .. } => self
+                .nodes
+                .get(&id)
+                .and_then(|n| n.written.get(path))
+                .filter(|written| *at < **written)
+                .map(|written| (path.clone(), *at, *written)),
             _ => None,
         };
         let folder = self.folder;
@@ -1207,12 +1359,37 @@ impl Sim {
         if let Ok(bytes) = postcard::to_stdvec(&actions) {
             self.log.update(&bytes);
         }
+        if let Some((path, at, written)) = stale
+            && actions.iter().any(|a| match a {
+                Action::IndexChanged { record, .. } => record.entry.path == path,
+                Action::IndexRemoved { path: p, .. } => *p == path,
+                _ => false,
+            })
+        {
+            return Err(self.fail(
+                "stale observation",
+                format!(
+                    "{} acted on an observation of {path} taken at {at:?}, before the commit there reported at {written:?}",
+                    Self::short(id)
+                ),
+            ));
+        }
         // Opened before any action is carried out: an event's effects wait
         // for its writes even when the engine lists the effect first.
         if actions.iter().any(is_table_write) {
             self.open_group(id);
         }
         self.note_pause(id);
+        if let (Some(watch), Some((cause, observed))) = (self.i9.as_mut(), cause) {
+            let node = self.nodes.get(&id);
+            let group_open = node.is_some_and(|n| n.group.is_some());
+            if let Some(path) = observed {
+                watch.observed(id, &path, self.clock, group_open);
+            }
+            watch.note(id, &actions, seq, &cause, group_open, |p| {
+                node.and_then(|n| content_at(n, p))
+            });
+        }
         let outer = std::mem::replace(&mut self.observing, observing);
         let outer_feeding = self.feeding.replace(Feeding {
             node: id,
@@ -1397,6 +1574,9 @@ impl Sim {
         let Some(group) = self.nodes.get_mut(&id).and_then(|n| n.group.take()) else {
             return Ok(());
         };
+        if let Some(watch) = self.i9.as_mut() {
+            watch.durable(id);
+        }
         for staged in group.writes {
             self.record(id, staged)?;
         }
@@ -1636,10 +1816,15 @@ impl Sim {
             )?,
             Action::Write {
                 ref path,
-                ref entry,
+                entry: Entry { ref version, .. },
+                ..
+            }
+            | Action::MoveToTrash {
+                ref path,
+                ref version,
                 ..
             } => {
-                let (path, version) = (path.clone(), entry.version.clone());
+                let (path, version) = (path.clone(), version.clone());
                 let commit = self.commit_started(id, &path, &version, &action)?;
                 self.hold(
                     id,
@@ -1674,7 +1859,13 @@ impl Sim {
                     },
                 )?;
             }
-            Action::MoveToTrash { path, .. } => self.hold(id, Held::MoveToTrash { path })?,
+            // Reading the disk depends on nothing unwritten, so it is not
+            // held for the group (§11).
+            Action::Observe { path, .. } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.observe.insert(path);
+                }
+            }
             Action::RecordBatch {
                 batch,
                 role,
@@ -1701,6 +1892,13 @@ impl Sim {
                                             .get(&e.path)
                                             .is_some_and(|r| r.entry.version == e.version)
                                 });
+                        if let Some((class, detail)) = self.i9.as_ref().and_then(|watch| {
+                            let node = self.nodes.get(&id);
+                            let edited = node.and_then(|n| n.local_edit_at.get(&e.path).copied());
+                            watch.revives(id, e, edited)
+                        }) {
+                            return Err(self.fail(&class.invariant(), detail));
+                        }
                         if leaks_pending {
                             return Err(self.fail(
                                 "paused send",
@@ -2073,11 +2271,6 @@ impl Sim {
                     suspended: false,
                 });
             }
-            Held::MoveToTrash { path } => {
-                if let Some(n) = self.nodes.get_mut(&id) {
-                    move_to_trash(n, &path);
-                }
-            }
         }
         Ok(())
     }
@@ -2268,6 +2461,10 @@ impl Sim {
             .retain(|op| op.node() != id && !matches!(op, Op::Fetch { from, .. } if *from == id));
         // The node's commits die with it; the restart wants their paths again.
         self.committing.retain(|(node, _), _| *node != id);
+        if let Some(watch) = self.i9.as_mut() {
+            let node = self.nodes.get(&id);
+            watch.crashed(id, |p| node.and_then(|n| content_at(n, p)));
+        }
         let folder = self.folder;
         let lag = self.knobs.group_commit_lag;
         if let Some(n) = self.nodes.get_mut(&id) {
@@ -2287,6 +2484,7 @@ impl Sim {
             n.engine = None;
             n.temp.clear();
             n.wake_at = None;
+            n.observe.clear();
             // The host's own memory of a full disk died with it; at the
             // restart it learns the folder's state from its tables.
             n.space_check_at = None;
@@ -2341,7 +2539,14 @@ impl Sim {
         let rows = std::mem::take(&mut node.journal);
         self.stats.displacements_undone += rows.len() as u64;
         for row in rows.into_iter().rev() {
-            undo(node, row, clock);
+            for (at, back) in undo(node, row, clock) {
+                // I9: a user's edit of the copy while the node was down is
+                // an edit of the file now back at its path.
+                if let (Some(watch), Some(edited)) = (self.i9.as_mut(), node.local_edit_at.get(&at))
+                {
+                    watch.edited_elsewhere(id, &back, *edited);
+                }
+            }
         }
         // §11: the persisted parts and nothing else.
         let engine = Engine::restore(config, vec![parts], now);
@@ -2411,19 +2616,43 @@ impl Sim {
                 // on disk still matches the record by the scan's fast-path
                 // test (size, mtime and exec bit for a file, kind and target
                 // for a symlink), failing that from any live file with that
-                // hash, failing that not at all.
+                // hash, failing that not at all. Every path it looked at and
+                // found out of step with its record it has observed, and it
+                // tells its engine so, as a scan would (draft 54), before it
+                // answers: the change is announced, and a refused peer is
+                // told what to ask for next.
+                let mut stale = Vec::new();
                 let served = self.nodes.get(&from).and_then(|src| {
                     let engine = src.engine.as_ref()?;
                     let index = engine.folder(self.folder)?.index();
                     index.locate(&path, &hash).find_map(|at| {
                         let record = index.live(at)?;
-                        let file = src.fs.get(at)?;
-                        record
-                            .entry
-                            .unchanged_by_stat(&file.observed())
-                            .then(|| file.content.clone())
+                        let file = src
+                            .fs
+                            .get(at)
+                            .filter(|file| record.entry.unchanged_by_stat(&file.observed()));
+                        if file.is_none() {
+                            stale.push(at.clone());
+                        }
+                        file.map(|file| file.content.clone())
                     })
                 });
+                for at in stale {
+                    let Some(state) = self.nodes.get(&from).map(|src| found(src, &at)) else {
+                        continue;
+                    };
+                    self.stats.serve_observations += 1;
+                    let stamp = self.stamp(from);
+                    self.feed(
+                        from,
+                        Event::Scanned {
+                            folder: self.folder,
+                            path: at,
+                            state,
+                            at: stamp,
+                        },
+                    )?;
+                }
                 let report = match served {
                     None => {
                         self.stats.not_available += 1;
@@ -2512,8 +2741,44 @@ impl Sim {
                     .get(&node)
                     .filter(|n| fail.is_some() || n.case_insensitive)
                     .map(|n| (n.fs.clone(), n.trash.clone()));
+                // I9: where a commit's displacement to a conflict copy would
+                // move what is at the path, and everything a rename of it
+                // takes along (§7.6).
+                let moves: Vec<(RelPath, RelPath, bool)> = match (&self.i9, &*action) {
+                    (
+                        Some(_),
+                        Action::Write {
+                            displace: Displace::ConflictCopy(to),
+                            ..
+                        }
+                        | Action::Remove {
+                            displace: Displace::ConflictCopy(to),
+                            ..
+                        },
+                    ) => self.nodes.get(&node).map_or_else(Vec::new, |n| {
+                        n.fs.keys()
+                            .filter(|p| *p == &path || path.is_ancestor_of(p))
+                            .filter_map(|p| {
+                                let to = rebase(p, &path, to)?;
+                                let was = n.fs.contains_key(&to);
+                                Some((p.clone(), to, was))
+                            })
+                            .collect()
+                    }),
+                    _ => Vec::new(),
+                };
                 let (committed, created) = self.commit(node, &path, &version, &action, fail);
-                if let Committed::Report(ApplyOutcome::Failed { error }) = &committed {
+                if let Some(watch) = self.i9.as_mut() {
+                    let n = self.nodes.get(&node);
+                    // A `Write` fills the path again, so a move shows at its
+                    // target: empty before, full after.
+                    for (from, to, was) in &moves {
+                        if !was && n.is_some_and(|n| n.fs.contains_key(to)) {
+                            watch.displaced(node, from, to, from != &path);
+                        }
+                    }
+                }
+                if let Committed::Report(ApplyOutcome::Failed { error, .. }) = &committed {
                     self.left_as_found(node, &path, error, before)?;
                 }
                 let outcome = match committed {
@@ -2548,17 +2813,21 @@ impl Sim {
                 for dir in created {
                     self.watch(node, dir)?;
                 }
-                if outcome == ApplyOutcome::ChangedUnderneath {
+                if matches!(outcome, ApplyOutcome::ChangedUnderneath { .. }) {
                     self.stats.changed_underneath += 1;
                 }
                 let failed = match &outcome {
-                    ApplyOutcome::Failed { error } => Some(error.clone()),
+                    ApplyOutcome::Failed { error, .. } => Some(error.clone()),
                     _ => None,
                 };
                 // §13: the rename happened but the report is lost to a crash.
                 if outcome == ApplyOutcome::Ok
                     && self.rng.random::<f64>() < self.knobs.crash_after_rename
                 {
+                    if let Some(watch) = self.i9.as_mut() {
+                        let n = self.nodes.get(&node);
+                        watch.lost(node, &path, &action, |p| n.and_then(|n| content_at(n, p)));
+                    }
                     let gap = self.rng.random_range(NANOS..60 * NANOS);
                     return self.crash(node, gap);
                 }
@@ -2603,17 +2872,48 @@ impl Sim {
                 self.copy_recorded = copy_to
                     .filter(|_| outcome == ApplyOutcome::Ok)
                     .map(|to| (node, to));
-                let fed = self.feed(
-                    node,
+                let landing = (self.i9.is_some()
+                    && outcome == ApplyOutcome::Ok
+                    && !matches!(*action, Action::MoveToTrash { .. }))
+                .then(|| (path.clone(), (*action).clone()));
+                // The time the engine takes the commit to have happened at: a
+                // move's own stamp, an apply's report as it is handled.
+                let at = if matches!(*action, Action::MoveToTrash { .. }) {
+                    self.stamp(node)
+                } else {
+                    self.now_for(node)
+                };
+                if outcome == ApplyOutcome::Ok
+                    && let Some(n) = self.nodes.get_mut(&node)
+                {
+                    n.written.insert(path.clone(), at);
+                }
+                let report = if matches!(*action, Action::MoveToTrash { .. }) {
+                    Event::Trashed {
+                        folder: self.folder,
+                        path,
+                        version,
+                        at,
+                        outcome,
+                    }
+                } else {
                     Event::Applied {
                         folder: self.folder,
                         path,
                         version,
                         outcome,
-                    },
-                );
+                    }
+                };
+                let fed = self.feed(node, report);
                 self.copy_recorded = None;
                 fed?;
+                // I9: a crash before the report's group is durable loses the
+                // landing as surely as one before the report.
+                if let (Some(watch), Some((path, action))) = (self.i9.as_mut(), landing)
+                    && self.nodes.get(&node).is_some_and(|n| n.group.is_some())
+                {
+                    watch.landed_undurably(node, &path, action);
+                }
                 match failed {
                     Some(error) => self.after_local_failure(node, &error, awaited, &what),
                     None => Ok(()),
@@ -2763,12 +3063,28 @@ impl Sim {
         let now = self.clock;
         let crash_between = self.knobs.crash_between_renames;
         let subtrees = self.knobs.displace_subtrees;
-        let changed = || Committed::Report(ApplyOutcome::ChangedUnderneath);
+        // Every failed report carries the path as the host then finds it
+        // (§7.5 step 6).
+        let changed = |node: &Node| {
+            Committed::Report(ApplyOutcome::ChangedUnderneath {
+                found: found(node, path),
+            })
+        };
+        let failed = |node: &Node, error: LocalError| {
+            Committed::Report(ApplyOutcome::Failed {
+                error,
+                found: found(node, path),
+            })
+        };
         // A failure at the rename may take the temp file with it, which only
         // the host can tell (§7.5): half do, on `FAIL_STREAM`.
         let loses_temp = fail.is_some() && self.fail_rng.random::<bool>();
         let Some(node) = self.nodes.get_mut(&id) else {
-            return (changed(), Vec::new());
+            let found = ScanState::Absent;
+            return (
+                Committed::Report(ApplyOutcome::ChangedUnderneath { found }),
+                Vec::new(),
+            );
         };
         // §7.5 step 6 on a filesystem that ignores case: a live record at a
         // path that is this one but for case names the same file, so the
@@ -2780,10 +3096,23 @@ impl Sim {
         {
             self.stats.case_collisions += 1;
             let error = LocalError::CaseCollision { with };
-            return (
-                Committed::Report(ApplyOutcome::Failed { error }),
-                Vec::new(),
-            );
+            return (failed(node, error), Vec::new());
+        }
+        // A revert's move to the trash (§8.3 step 2, draft 57): an absent
+        // path is already where the move would leave it; anything but the
+        // file revert decided to trash fails the guard.
+        if let Action::MoveToTrash { expected, .. } = action {
+            if !node.fs.contains_key(path) {
+                return (Committed::Report(ApplyOutcome::Ok), Vec::new());
+            }
+            if !expected_matches(node.fs.get(path), Some(expected)) {
+                return (changed(node), Vec::new());
+            }
+            if let Some(error) = fail {
+                return (failed(node, error), Vec::new());
+            }
+            move_to_trash(node, path);
+            return (Committed::Report(ApplyOutcome::Ok), Vec::new());
         }
         // §7.5 step 6: the same guard before every commit, SetMeta included.
         let expected = match action {
@@ -2793,17 +3122,14 @@ impl Sim {
             _ => None,
         };
         if !expected_matches(node.fs.get(path), expected) {
-            return (changed(), Vec::new());
+            return (changed(node), Vec::new());
         }
         // A `Remove` or `SetMeta` fails, if it does, before it has moved or
         // changed anything.
         if let Some(error) = fail.clone()
             && !matches!(action, Action::Write { .. })
         {
-            return (
-                Committed::Report(ApplyOutcome::Failed { error }),
-                Vec::new(),
-            );
+            return (failed(node, error), Vec::new());
         }
         let mut created = Vec::new();
         if let Action::Write { .. } = action {
@@ -2815,7 +3141,7 @@ impl Sim {
             while let Some(dir) = ancestor {
                 match node.fs.get(&dir) {
                     Some(f) if f.kind == Kind::Dir => break,
-                    Some(_) => return (changed(), Vec::new()),
+                    Some(_) => return (changed(node), Vec::new()),
                     None => created.push(dir.clone()),
                 }
                 ancestor = dir.parent();
@@ -2842,7 +3168,7 @@ impl Sim {
                 if occupied_otherwise(node, path)
                     || matches!(displace, Displace::ConflictCopy(target) if occupied(node, target))
                 {
-                    return (changed(), created);
+                    return (changed(node), created);
                 }
                 // Step 7, behind a journal row made durable first. The row
                 // is this commit's until the rename below removes it: rows
@@ -2864,7 +3190,7 @@ impl Sim {
                 if let Some(error) = fail {
                     if let Some(row) = row {
                         self.stats.displacements_undone += 1;
-                        undo(node, row, now);
+                        let _ = undo(node, row, now);
                     }
                     for dir in created.iter().rev() {
                         node.fs.remove(dir);
@@ -2872,10 +3198,7 @@ impl Sim {
                     if loses_temp && take_temp(node, path, version).is_some() {
                         self.stats.temps_lost += 1;
                     }
-                    return (
-                        Committed::Report(ApplyOutcome::Failed { error }),
-                        Vec::new(),
-                    );
+                    return (failed(node, error), Vec::new());
                 }
                 // The rename needs a verified temp file (a directory is made
                 // in place instead).
@@ -2903,12 +3226,12 @@ impl Sim {
                 // rename takes its children (§7.6).
                 let renamed = subtrees && matches!(displace, Displace::ConflictCopy(_));
                 if !renamed && has_children(node, path) {
-                    return (changed(), created); // not empty
+                    return (changed(node), created); // not empty
                 }
                 if let Displace::ConflictCopy(target) = displace
                     && node.fs.contains_key(target)
                 {
-                    return (changed(), created);
+                    return (changed(node), created);
                 }
                 if has_children(node, path) {
                     self.stats.subtrees_displaced += 1;
@@ -2925,9 +3248,9 @@ impl Sim {
                     file.exec = *exec;
                     ApplyOutcome::Ok
                 }
-                _ => ApplyOutcome::ChangedUnderneath,
+                _ => return (changed(node), created),
             },
-            _ => ApplyOutcome::ChangedUnderneath,
+            _ => return (changed(node), created),
         };
         (Committed::Report(outcome), created)
     }
@@ -2953,6 +3276,7 @@ impl Sim {
             let event = Event::Scanned {
                 folder: self.folder,
                 path,
+                at: self.stamp(id),
                 state: ScanState::Skipped {
                     reason: SkipReason::Ignored,
                 },
@@ -2964,12 +3288,14 @@ impl Sim {
             .get(&id)
             .and_then(|n| n.fs.get(&path))
             .map_or(ScanState::Absent, |f| ScanState::Observed(f.observed()));
+        let at = self.stamp(id);
         self.feed(
             id,
             Event::Scanned {
                 folder: self.folder,
                 path,
                 state,
+                at,
             },
         )
     }
@@ -2988,6 +3314,12 @@ impl Sim {
         if !node.alive() {
             return Ok(());
         }
+        // Every report of the scan describes the disk as read now, whenever
+        // it is delivered (§7.3, draft 56).
+        let read_at = self.stamp(id);
+        let Some(node) = self.nodes.get(&id) else {
+            return Ok(());
+        };
         let entries: Vec<(RelPath, ScanState)> = node
             .fs
             .iter()
@@ -3019,14 +3351,14 @@ impl Sim {
                 return self.bracket_end(id, Event::ScanAborted { folder }, &mut check);
             }
             if let Some(state) = state {
-                self.report(id, path, state, &mut check)?;
+                self.report(id, path, state, read_at, &mut check)?;
             }
         }
         for path in walk.unreached {
             let state = ScanState::Skipped {
                 reason: SkipReason::Ignored,
             };
-            self.report(id, path, state, &mut check)?;
+            self.report(id, path, state, read_at, &mut check)?;
         }
         self.bracket_end(id, Event::ScanFinished { folder }, &mut check)
     }
@@ -3038,6 +3370,7 @@ impl Sim {
         id: NodeId,
         path: RelPath,
         state: ScanState,
+        at: Timestamp,
         check: &mut SkipCheck,
     ) -> Result<(), Failure> {
         let skipped = matches!(state, ScanState::Skipped { .. });
@@ -3049,6 +3382,7 @@ impl Sim {
             folder,
             path,
             state,
+            at,
         };
         if skipped {
             self.checked(id, event, check)
@@ -3779,6 +4113,7 @@ fn event_name(event: &Event) -> String {
         Event::Fetched { path, outcome, .. } => format!("Fetched {path} {outcome:?}"),
         Event::FetchProgress { path, .. } => format!("FetchProgress {path}"),
         Event::Applied { path, outcome, .. } => format!("Applied {path} {outcome:?}"),
+        Event::Trashed { path, outcome, .. } => format!("Trashed {path} {outcome:?}"),
         other => {
             let name = format!("{other:?}");
             name.split([' ', '{', '(']).next().unwrap_or("").to_owned()
@@ -4008,10 +4343,12 @@ fn displace_journalled(
 /// a folder while its daemon is down) whatever moved stays where it went,
 /// in the trash or at the conflict-copy path, and the next scan sees both.
 /// What comes back from a conflict-copy path, as it now is, takes the
-/// adoptions of its content back with it (I2).
-fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
+/// adoptions of its content back with it (I2). Returns what came back from
+/// a conflict-copy path, as (where it was, where it now is).
+fn undo(node: &mut Node, row: JournalRow, now: Timestamp) -> Vec<(RelPath, RelPath)> {
+    let mut back_from_copy = Vec::new();
     if occupied(node, &row.path) {
-        return;
+        return back_from_copy;
     }
     match &row.to {
         Displace::Trash => {
@@ -4027,7 +4364,7 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
             // ever not hold, the files stay in the trash rather than be
             // duplicated.
             if node.trash.get(row.trash_at..end) != Some(hashes.as_slice()) {
-                return;
+                return back_from_copy;
             }
             node.trash.drain(row.trash_at..end);
             for (from, file) in row.moved {
@@ -4047,11 +4384,13 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) {
                 };
                 if let Some(file) = node.fs.remove(&at) {
                     follow(node, &at, &back, file.hash(), now);
-                    node.fs.insert(back, file);
+                    node.fs.insert(back.clone(), file);
+                    back_from_copy.push((at, back));
                 }
             }
         }
     }
+    back_from_copy
 }
 
 /// `follow` for everything a rename of `path` to `target` moved.
@@ -4123,12 +4462,14 @@ impl Sim {
             n.fs.insert(path.clone(), file);
         }
         let folder = self.folder;
+        let at = self.stamp(id);
         self.feed(
             id,
             Event::Scanned {
                 folder,
                 path,
                 state,
+                at,
             },
         )
     }
@@ -4181,6 +4522,33 @@ mod tests {
         let expected = link(b"f1").observed();
         assert!(expected_matches(Some(&link(b"f1")), Some(&expected)));
         assert!(!expected_matches(Some(&link(b"f2")), Some(&expected)));
+    }
+
+    /// I9 (§14.1): an observation reaches the engine only on a node that is
+    /// up. The watcher's report of an edit made while a node is down dies
+    /// with it, so it is not the engine's last sight of the path, and the
+    /// edit counts as the user's change since then.
+    #[test]
+    fn a_crashed_node_observes_nothing_for_i9() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                check_i9: true,
+                ..Knobs::default()
+            },
+        );
+        let id = sim.order[0];
+        let f = rel("f");
+        sim.crash(id, NANOS).unwrap();
+        let event = Event::Scanned {
+            folder: sim.folder,
+            path: f.clone(),
+            state: ScanState::Absent,
+            at: sim.clock,
+        };
+        sim.feed(id, event).unwrap();
+        assert_eq!(sim.i9.as_ref().unwrap().last_observed(id, &f), None);
     }
 
     /// A world of two nodes, for tests that need a `Node` or the `Sim`'s
@@ -4926,6 +5294,257 @@ mod tests {
         assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
         sim.full_scan(id, false).unwrap();
         assert!(!live(&sim), "observed gone once the rule went");
+    }
+
+    /// §7.3, draft 56: an observation the host took before the last commit
+    /// at its path was reported, and delivers after, describes a state that
+    /// no longer exists. The engine drops it; with the rule off, the stale-
+    /// observation check fails the run as soon as the engine acts on it. Here
+    /// B's commit of A's file is followed by a read of x from just before it,
+    /// which says x is absent.
+    #[test]
+    fn an_observation_older_than_the_last_commit_is_not_acted_on() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                ..Knobs::default()
+            },
+        );
+        let (a, b) = (sim.order[0], sim.order[1]);
+        let x = rel("x");
+        sim.nodes
+            .get_mut(&a)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        sim.full_scan(a, false).unwrap();
+        sim.full_scan(b, false).unwrap();
+        for n in sim.nodes.values_mut() {
+            n.next_scan_at = Timestamp::from_unix_nanos(i64::MAX);
+        }
+        for _ in 0..600 {
+            if sim.nodes[&b].written.contains_key(&x) {
+                break;
+            }
+            let next = sim.clock.plus_nanos(NANOS / 10);
+            sim.run_until(next).unwrap();
+        }
+        let written = sim.nodes[&b].written[&x];
+        let folder = sim.folder;
+        sim.feed(
+            b,
+            Event::Scanned {
+                folder,
+                path: x.clone(),
+                state: ScanState::Absent,
+                at: written.plus_nanos(-1),
+            },
+        )
+        .unwrap();
+        let live = sim
+            .engine(b)
+            .and_then(|e| e.folder(folder))
+            .is_some_and(|f| f.index().live(&x).is_some());
+        assert!(live, "the stale read is dropped");
+    }
+
+    /// §8.3 step 2, draft 57: the host performs a revert's move to the trash
+    /// as a commit, behind the same guard. Exactly the file revert decided
+    /// to trash goes to the trash; anything else fails the guard and is
+    /// reported as found; an absent path is already where the move would
+    /// leave it.
+    #[test]
+    fn the_host_moves_to_the_trash_behind_the_guard() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let folder = sim.folder;
+        let x = rel("x");
+        let edited = file(6, false);
+        let mv = |expected: &File| Action::MoveToTrash {
+            folder,
+            path: rel("x"),
+            version: Version::empty(),
+            expected: expected.observed(),
+        };
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(7, false));
+        let (other, _) = sim.commit(id, &x, &Version::empty(), &mv(&edited), None);
+        assert!(
+            matches!(&other, Committed::Report(ApplyOutcome::ChangedUnderneath { found: ScanState::Observed(o) }) if o.hash == file(7, false).hash()),
+            "another file is not the one revert trashed"
+        );
+        assert!(sim.nodes[&id].fs.contains_key(&x), "left where it was");
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(x.clone(), edited.clone());
+        let (moved, _) = sim.commit(id, &x, &Version::empty(), &mv(&edited), None);
+        assert!(matches!(moved, Committed::Report(ApplyOutcome::Ok)));
+        assert!(!sim.nodes[&id].fs.contains_key(&x));
+        assert!(
+            sim.nodes[&id].trash.contains(&edited.hash()),
+            "in the trash"
+        );
+        let (absent, _) = sim.commit(id, &x, &Version::empty(), &mv(&edited), None);
+        assert!(
+            matches!(absent, Committed::Report(ApplyOutcome::Ok)),
+            "already gone"
+        );
+    }
+
+    /// §8.3, draft 55: the host answers `Observe` with the observation a
+    /// scan would report, here of a file put on disk behind the engine's
+    /// back, which the engine then records; a crash loses a request not
+    /// yet answered.
+    #[test]
+    fn the_host_answers_observe_with_what_a_scan_would_report() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let x = rel("x");
+        let folder = sim.folder;
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        sim.act(
+            id,
+            Action::Observe {
+                folder,
+                path: x.clone(),
+            },
+        )
+        .unwrap();
+        let next = sim.clock.plus_nanos(1);
+        sim.run_until(next).unwrap();
+        assert_eq!(sim.stats.observes, 1);
+        let record = sim
+            .engine(id)
+            .and_then(|e| e.folder(folder))
+            .and_then(|f| f.index().live(&x))
+            .map(|r| r.entry.hash);
+        assert_eq!(record, Some(file(6, false).hash()));
+        sim.act(id, Action::Observe { folder, path: x }).unwrap();
+        sim.crash(id, NANOS).unwrap();
+        assert!(
+            sim.nodes[&id].observe.is_empty(),
+            "the request died with the process"
+        );
+    }
+
+    /// §7.5 step 2, draft 54, in seed 4013's shape. The source's watcher
+    /// misses a chmod, so its disk is out of step with its record when the
+    /// asker's fetch arrives, and the chmod is undone before any scan sees
+    /// it. Refusing, the source has observed the chmod and tells its engine,
+    /// which announces it; the asker wants the chmodded version and asks
+    /// again, the source's second refusal observes the undo the same way,
+    /// and the third request is served, all within a minute. Before draft 54
+    /// the refusal said nothing, the disk went back to matching the record
+    /// with nobody the wiser, and the refused asker never asked again. No
+    /// seed reaches this any more, 4013 included, so this test is what
+    /// pins.sh checks the fix against.
+    #[test]
+    fn a_source_that_refuses_a_fetch_observes_its_path() {
+        // Every group durable at once, so effects need no later events.
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                ..Knobs::default()
+            },
+        );
+        let (asker, source) = (sim.order[0], sim.order[1]);
+        let x = rel("x");
+        sim.nodes
+            .get_mut(&source)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        sim.full_scan(source, false).unwrap();
+        sim.full_scan(asker, false).unwrap();
+        // No more scans: only the refusals can see the chmod and its undo.
+        for n in sim.nodes.values_mut() {
+            n.next_scan_at = Timestamp::from_unix_nanos(i64::MAX);
+        }
+        let fetching = |sim: &Sim| {
+            sim.ops
+                .iter()
+                .position(|op| matches!(op, Op::Fetch { node, .. } if *node == asker))
+        };
+        for _ in 0..600 {
+            if fetching(&sim).is_some() {
+                break;
+            }
+            let next = sim.clock.plus_nanos(NANOS / 10);
+            sim.run_until(next).unwrap();
+        }
+        let pos = fetching(&sim).expect("the asker fetches x within a minute");
+        sim.nodes
+            .get_mut(&source)
+            .unwrap()
+            .fs
+            .get_mut(&x)
+            .unwrap()
+            .exec = true;
+        if let Op::Fetch {
+            done_at,
+            next_progress,
+            ..
+        } = &mut sim.ops[pos]
+        {
+            (*done_at, *next_progress) = (sim.clock, sim.clock);
+        }
+        let before = sim.stats.clone();
+        sim.progress_op(pos).unwrap();
+        assert_eq!(
+            (sim.stats.not_available, sim.stats.serve_observations),
+            (before.not_available + 1, before.serve_observations + 1)
+        );
+        let record = |sim: &Sim, id| {
+            sim.engine(id)
+                .and_then(|e| e.folder(sim.folder))
+                .and_then(|f| f.index().live(&x))
+                .map(|r| r.entry.clone())
+        };
+        assert!(
+            record(&sim, source).is_some_and(|e| e.exec),
+            "the refusal observed the chmod"
+        );
+        // The undo, which no scan sees either.
+        sim.nodes
+            .get_mut(&source)
+            .unwrap()
+            .fs
+            .get_mut(&x)
+            .unwrap()
+            .exec = false;
+        let end = sim.clock.plus_nanos(60 * NANOS);
+        sim.run_until(end).unwrap();
+        assert!(
+            sim.stats.serve_observations >= before.serve_observations + 2,
+            "the second refusal observed the undo"
+        );
+        let on_disk = |id| {
+            sim.nodes[&id]
+                .fs
+                .get(&x)
+                .map(|f| (f.content.clone(), f.exec))
+        };
+        assert_eq!(on_disk(asker), on_disk(source), "the asker converged");
+        assert_eq!(record(&sim, asker), record(&sim, source));
+        assert!(record(&sim, source).is_some_and(|e| !e.exec));
+        assert!(
+            sim.engine(asker)
+                .and_then(|e| e.folder(sim.folder))
+                .is_some_and(|f| f.wants().is_empty())
+        );
     }
 
     /// §7.5 step 2 (draft 46): a source serves its file only if what is on

@@ -243,6 +243,7 @@ impl EngineWrite {
             | Action::Remove { .. }
             | Action::SetMeta { .. }
             | Action::MoveToTrash { .. }
+            | Action::Observe { .. }
             | Action::StatusChanged { .. }) => return Sorted::Effect(effect),
         };
         Sorted::Write(write)
@@ -919,7 +920,7 @@ mod tests {
             Action::Remove {
                 folder: f,
                 path: path("a"),
-                expected: Some(observed),
+                expected: Some(observed.clone()),
                 displace: Displace::Trash,
             },
             Action::SetMeta {
@@ -930,6 +931,12 @@ mod tests {
                 exec: true,
             },
             Action::MoveToTrash {
+                folder: f,
+                path: path("a"),
+                version: Version::empty(),
+                expected: observed,
+            },
+            Action::Observe {
                 folder: f,
                 path: path("a"),
             },
@@ -1207,7 +1214,8 @@ mod tests {
     #[test]
     fn a_real_engines_hooks_reload_as_its_parts() {
         use delocal_engine::{
-            ApplyOutcome, Engine, Event, FetchReport, HostName, NodeConfig, ScanState, Tier,
+            ApplyOutcome, Engine, Event, FetchReport, HostName, NodeConfig, ScanState, SkipReason,
+            Tier,
         };
         let (_dir, store) = open();
         let f = folder(1);
@@ -1263,6 +1271,7 @@ mod tests {
                 folder: f,
                 path: path(&format!("f{n:02}")),
                 state: ScanState::Observed(file(n)),
+                at: pair.now(),
             });
         }
         let sent = pair.tick_a();
@@ -1282,11 +1291,16 @@ mod tests {
         // At most four at once from one peer (§7.5).
         assert_eq!(fetches.len(), 4);
         let landed: Vec<RelPath> = fetches.iter().take(2).map(|(p, ..)| p.clone()).collect();
-        // The third finds its path changed underneath and is deferred.
+        // The third finds its path changed underneath, by a file the host
+        // cannot read, so its report observes nothing and the entry is
+        // deferred (§7.5 step 6).
+        let unreadable = ScanState::Skipped {
+            reason: SkipReason::PermissionDenied,
+        };
         let outcomes = [
             ApplyOutcome::Ok,
             ApplyOutcome::Ok,
-            ApplyOutcome::ChangedUnderneath,
+            ApplyOutcome::ChangedUnderneath { found: unreadable },
         ];
         for ((path, hash, version), outcome) in fetches.into_iter().zip(outcomes) {
             pair.b(Event::Fetched {
@@ -1310,6 +1324,7 @@ mod tests {
             folder: f,
             path: path("mine"),
             state: ScanState::Observed(file(9)),
+            at: pair.now(),
         });
         pair.tick_b();
 
@@ -1320,6 +1335,7 @@ mod tests {
                 folder: f,
                 path,
                 state: ScanState::Absent,
+                at: pair.now(),
             });
         }
         let sent = pair.tick_a();
@@ -1354,12 +1370,14 @@ mod tests {
                 folder: f,
                 path,
                 state: ScanState::Absent,
+                at: pair.now(),
             });
         }
         pair.b(Event::Scanned {
             folder: f,
             path: path("new"),
             state: ScanState::Observed(file(10)),
+            at: pair.now(),
         });
         pair.tick_b();
         assert!(pair.store.parts(f).unwrap().unwrap().rest.paused.is_some());
