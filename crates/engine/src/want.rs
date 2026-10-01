@@ -43,7 +43,9 @@
 //! *fetching* or *committing* is in flight; *deferred*, *without source* and
 //! *given up* are observable, because they can last for days. A want made
 //! by `revert` (§8.3) is `restoring`: an `Absent` observation is the trash
-//! move and is ignored in every state. A want `revert` makes at a path
+//! move and is ignored in every state, and an observation of exactly the
+//! file revert trashed (`trashed`) is stale and reports nothing. A want
+//! `revert` makes at a path
 //! whose file already holds the restored content is a `reset`: it sets the
 //! file's mtime and exec bit back to the record, which is already in place,
 //! and its landing is announced like any other.
@@ -214,6 +216,13 @@ pub struct Want {
     /// stands, absence at the path is the trash move and the commit
     /// expects the path to be absent.
     pub restoring: bool,
+    /// With the restoring mark, the file revert trashed at the path, if it
+    /// trashed one: its kind, size, mtime and exec bit (§8.3). A scan may
+    /// list that file before the move to the trash runs and report it
+    /// after, so an observation of exactly that file is stale and reports
+    /// nothing. Persisted with the want, and carried wherever the mark
+    /// goes.
+    pub trashed: Option<Observed>,
     /// Members that answered `NotAvailable`. For a restoring want, whose
     /// sources are every other member, the members not in here are the ones
     /// `status` names as not yet asked; once every member is in here the
@@ -293,6 +302,7 @@ impl Want {
             local_retries: 0,
             fetched: false,
             restoring: false,
+            trashed: None,
             answered: BTreeSet::new(),
             reset: None,
             state: WantState::Wanted,
@@ -411,6 +421,7 @@ impl WantList {
             && want.restoring
         {
             want.restoring = false;
+            want.trashed = None;
             self.note(path);
         }
     }
@@ -468,6 +479,7 @@ impl WantList {
         let path = item.path().clone();
         let incoming = item.incoming().version.clone();
         let mut restoring = marked.is_some();
+        let mut trashed = None;
         if let Some(existing) = self.wants.get_mut(&path) {
             if incoming == *existing.version() {
                 existing.sources.insert(source);
@@ -482,9 +494,13 @@ impl WantList {
                 return Some(item);
             }
             restoring |= existing.restoring;
+            if existing.restoring {
+                trashed = existing.trashed.clone();
+            }
         }
         let mut want = Want::from_item(item, received, batch, source, seq_high);
         want.restoring = restoring;
+        want.trashed = trashed;
         if let Some(others) = marked {
             want.sources.extend(others.iter().copied());
         }
@@ -586,6 +602,23 @@ impl WantList {
         let path = want.path().clone();
         self.wants.insert(path.clone(), want);
         self.note(&path);
+    }
+
+    /// The want at `path`, carrying the restoring mark, remembers `trashed`
+    /// as the file revert trashed there (§8.3), unless it remembers one
+    /// already. For a mark that comes from elsewhere: a deferred carrier
+    /// wanted again, or a new want at a path the mark is on.
+    pub fn remember_trashed(&mut self, path: &RelPath, trashed: Option<Observed>) {
+        let Some(trashed) = trashed else {
+            return;
+        };
+        if let Some(want) = self.wants.get_mut(path)
+            && want.restoring
+            && want.trashed.is_none()
+        {
+            want.trashed = Some(trashed);
+            self.note(path);
+        }
     }
 
     /// A want comes back after a restart. Transient states become

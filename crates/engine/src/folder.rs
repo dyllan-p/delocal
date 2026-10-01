@@ -173,6 +173,9 @@ pub struct Deferred {
     /// entry again as it stands, and an occupant matching it is its
     /// landing.
     pub restoring: Option<Entry>,
+    /// With the mark, the file revert trashed at the path, as the want that
+    /// carried the mark remembered it (see [`Want::trashed`]).
+    pub trashed: Option<Observed>,
 }
 
 /// The deferred paths (§7.5, §8.1): entries waiting to be classified
@@ -245,6 +248,7 @@ impl DeferredSet {
         if list.iter().any(|d| d.restoring.is_some()) {
             for d in list.iter_mut() {
                 d.restoring = None;
+                d.trashed = None;
             }
             self.changed.note(path);
         }
@@ -632,6 +636,15 @@ pub enum HostStep {
         mtime_ns: i64,
         exec: bool,
     },
+}
+
+/// Who made an observation the engine takes (§7.3, §7.5 step 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observer {
+    /// A scan or the watcher.
+    Scan,
+    /// The guard of a commit, whose failed report carries what it found.
+    Guard,
 }
 
 /// True if `observed` is exactly the file a reset expects to find (§8.3
@@ -1036,6 +1049,18 @@ impl FolderState {
     /// the index as it is and is the landing of a refetch whose report was
     /// lost (§13); anything else is a local change like any other.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
+        self.take_observation(now, path, state, Observer::Scan)
+    }
+
+    /// [`Self::scanned`], for an observation made by `observer`: a scan or
+    /// the watcher, or the guard of a commit whose report carries it.
+    fn take_observation(
+        &mut self,
+        now: Timestamp,
+        path: RelPath,
+        state: ScanState,
+        observer: Observer,
+    ) -> Scanned {
         if let Some(bracket) = &mut self.scan {
             bracket.report(&path, &state);
         }
@@ -1050,6 +1075,23 @@ impl FolderState {
         let marked = self.marked(&path);
         if state == ScanState::Absent && marked {
             self.unobserved.remove(&path);
+            return Scanned::default();
+        }
+        // The file revert trashed at a marked path, listed by a scan before
+        // the move to the trash ran and reported after: stale, so nothing
+        // new (§8.3). "Exactly that file" by the fast path's own test
+        // (§7.3), which for a file is its kind, size, mtime and exec bit and
+        // for a symlink its kind and target: two targets of one length are
+        // two files. A commit's guard looks only after the move, which the
+        // host performed first, so what a commit report carries is never
+        // the stale file. Any other occupant clears the mark below.
+        if marked
+            && observer == Observer::Scan
+            && let ScanState::Observed(observed) = &state
+            && self
+                .trashed_at(&path)
+                .is_some_and(|trashed| trashed.unchanged_by_stat(observed))
+        {
             return Scanned::default();
         }
         // In flight, an observation is normally the host's own work in
@@ -1138,6 +1180,23 @@ impl FolderState {
                 .is_some_and(|list| list.iter().any(|d| d.restoring.is_some()))
     }
 
+    /// The file revert trashed at `path`, as the restoring mark remembers it
+    /// (§8.3): from the want that carries the mark, or a deferred carrier.
+    fn trashed_at(&self, path: &RelPath) -> Option<&Observed> {
+        self.wants
+            .get(path)
+            .filter(|w| w.restoring)
+            .and_then(|w| w.trashed.as_ref())
+            .or_else(|| {
+                self.deferred
+                    .get(path)?
+                    .iter()
+                    .find(|d| d.restoring.is_some())?
+                    .trashed
+                    .as_ref()
+            })
+    }
+
     /// The members other than this machine: a want at a marked path asks
     /// every one of them (§8.3).
     fn others(&self) -> BTreeSet<NodeId> {
@@ -1215,7 +1274,8 @@ impl FolderState {
                 mode: ApplyMode::Fetch,
                 conflict: None,
             };
-            self.want_as(item, d.entry, d.batch, d.source, d.seq_high, true);
+            let mark = Some(d.trashed);
+            self.want_as(item, d.entry, d.batch, d.source, d.seq_high, mark);
         }
     }
 
@@ -1422,8 +1482,10 @@ impl FolderState {
         source: NodeId,
         seq_high: u64,
     ) {
-        let marked = self.marked(item.path());
-        self.want_as(item, received, batch, source, seq_high, marked);
+        let mark = self
+            .marked(item.path())
+            .then(|| self.trashed_at(item.path()).cloned());
+        self.want_as(item, received, batch, source, seq_high, mark);
     }
 
     /// [`Self::want`], with the path's mark given. At a marked path this
@@ -1438,22 +1500,23 @@ impl FolderState {
         batch: BatchId,
         source: NodeId,
         seq_high: u64,
-        marked: bool,
+        mark: Option<Option<Observed>>,
     ) {
-        let (item, others) = if marked {
-            (neither_holder(item), Some(self.others()))
-        } else {
-            (item, None)
+        let path = item.path().clone();
+        let (item, others, trashed) = match mark {
+            Some(trashed) => (neither_holder(item), Some(self.others()), trashed),
+            None => (item, None, None),
         };
-        if let Some(item) = self.wants.insert(
+        let refused = self.wants.insert(
             item,
             received.clone(),
             batch,
             source,
             seq_high,
             others.as_ref(),
-        ) {
-            self.deferred.push(
+        );
+        match refused {
+            Some(item) => self.deferred.push(
                 item.path().clone(),
                 Deferred {
                     entry: received,
@@ -1462,8 +1525,10 @@ impl FolderState {
                     seq_high,
                     reason: DeferredReason::ChangedUnderneath,
                     restoring: None,
+                    trashed: None,
                 },
-            );
+            ),
+            None => self.wants.remember_trashed(&path, trashed),
         }
     }
 
@@ -1756,6 +1821,7 @@ impl FolderState {
                         seq_high: batch.seq_high,
                         reason: DeferredReason::Frozen,
                         restoring: None,
+                        trashed: None,
                     },
                 );
                 frozen += 1;
@@ -2102,6 +2168,7 @@ impl FolderState {
                         local_retries: 0,
                         fetched: false,
                         restoring: false,
+                        trashed: None,
                         answered: BTreeSet::new(),
                         reset: Some(current.observed()),
                         state: WantState::Wanted,
@@ -2135,6 +2202,7 @@ impl FolderState {
                     local_retries: 0,
                     fetched: false,
                     restoring: true,
+                    trashed: current.map(Entry::observed),
                     answered: BTreeSet::new(),
                     reset: None,
                     state: WantState::Wanted,
@@ -2617,7 +2685,7 @@ impl FolderState {
         if !news {
             return Vec::new();
         }
-        let scanned = self.scanned(now, path.clone(), found.clone());
+        let scanned = self.take_observation(now, path.clone(), found.clone(), Observer::Guard);
         scanned
             .change
             .map(|c| c.record)
@@ -2653,7 +2721,11 @@ impl FolderState {
     /// observation of its path (§7.5 step 6); it is classified again then.
     fn defer_changed_underneath(&mut self, want: Want) {
         let path = want.path().clone();
-        let restoring = want.restoring.then_some(want.entry);
+        let (restoring, trashed) = if want.restoring {
+            (Some(want.entry), want.trashed)
+        } else {
+            (None, None)
+        };
         self.deferred.push(
             path,
             Deferred {
@@ -2663,6 +2735,7 @@ impl FolderState {
                 seq_high: want.seq_high,
                 reason: DeferredReason::ChangedUnderneath,
                 restoring,
+                trashed,
             },
         );
     }
@@ -6085,6 +6158,127 @@ mod tests {
             "the entry carries the mark and what it was committing"
         );
         (b, restored)
+    }
+
+    /// §8.3 (draft 52), seed 34's shape: revert trashes B's edited f00,
+    /// but the move to the trash waits for its group, and a scan lists f00
+    /// before the move runs and reports it after. That observation is of
+    /// exactly the file revert trashed: stale, so it reports nothing, and
+    /// the mark stays. Any other occupant clears the mark, as before.
+    #[test]
+    fn an_observation_of_the_file_revert_trashed_reports_nothing() {
+        let (_, mut b) = marked_after_revert();
+        let restored = b.index().get(&p("f00")).unwrap().clone();
+        let ScanState::Observed(edited) = file(5, 5) else {
+            unreachable!()
+        };
+        let trashed = b.wants().get(&p("f00")).unwrap().trashed.clone();
+        assert!(
+            trashed.is_some_and(|t| as_the_reset_expects(&t, &edited)),
+            "the mark remembers the file revert trashed"
+        );
+        assert_eq!(b.scanned(t(20.0), p("f00"), file(5, 5)), Scanned::default());
+        assert!(b.wants().restoring(&p("f00")), "the mark stays");
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(b.scanned(t(21.0), p("f00"), file(8, 8)).change.is_some());
+        assert!(
+            !b.wants().restoring(&p("f00")),
+            "another occupant clears it"
+        );
+    }
+
+    /// §8.3, seed 6882's shape: "exactly that file" is the fast path's
+    /// test (§7.3), so for a symlink its target counts. A new symlink whose
+    /// target merely has the same length as the one revert trashed is
+    /// another occupant: taken as stale, the user's symlink would never be
+    /// recorded, and the restoring want's carrier would wait for it for
+    /// ever.
+    #[test]
+    fn a_symlink_with_another_target_is_not_the_one_revert_trashed() {
+        let link = |target: u8| {
+            ScanState::Observed(Observed {
+                kind: Kind::Symlink,
+                size: 5,
+                mtime_ns: 0,
+                exec: false,
+                hash: hash(target),
+            })
+        };
+        let (_, mut b) = a_and_b(
+            2,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(10.0), p("f00"), link(5));
+        b.scanned(t(10.0), p("f01"), file(6, 6));
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        b.rules_changed(Rules::default());
+        assert!(b.wants().restoring(&p("f00")));
+        assert_eq!(
+            b.scanned(t(20.0), p("f00"), link(5)),
+            Scanned::default(),
+            "the symlink revert trashed"
+        );
+        assert!(b.scanned(t(21.0), p("f00"), link(7)).change.is_some());
+        assert!(
+            !b.wants().restoring(&p("f00")),
+            "another occupant clears it"
+        );
+    }
+
+    /// §8.3: a commit's guard looks only after the move to the trash, which
+    /// the host performed before it, so an observation a commit report
+    /// carries is never the stale file, even one exactly like it: it is an
+    /// occupant, and clears the mark.
+    #[test]
+    fn a_commit_report_never_carries_the_stale_file() {
+        let (_, mut b) = marked_after_revert();
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        b.dispatch(t(20.0), &lan(&[1]));
+        b.fetched(t(21.0), &p("f00"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(21.0), &lan(&[1]));
+        assert!(
+            steps.iter().any(
+                |s| matches!(s, HostStep::Write { path, expected: None, .. } if *path == p("f00"))
+            ),
+            "{steps:?}"
+        );
+        b.applied(
+            t(22.0),
+            &p("f00"),
+            &v,
+            ApplyOutcome::ChangedUnderneath { found: file(5, 5) },
+        );
+        assert!(!b.wants().restoring(&p("f00")));
+        assert!(
+            b.deferred().all(|d| d.restoring.is_none()),
+            "the mark is gone"
+        );
+        assert_eq!(b.index().get(&p("f00")).unwrap().entry.hash, hash(5));
+    }
+
+    /// §8.3: the memory goes wherever the mark goes. A restoring want whose
+    /// commit found the path occupied hands the mark to a deferred carrier,
+    /// and a bracket end that does not see the path wants the carrier again
+    /// with the mark; at each step the trashed file is still stale.
+    #[test]
+    fn the_mark_remembers_the_trashed_file_wherever_it_goes() {
+        let (mut b, restored) = deferred_restoring_entry();
+        let d = b.deferred().next().unwrap().clone();
+        assert!(d.restoring.is_some() && d.trashed.is_some());
+        assert_eq!(b.scanned(t(16.0), p("f00"), file(5, 5)), Scanned::default());
+        assert_eq!(b.deferred().count(), 1, "still the carrier");
+        b.scan_started();
+        assert!(b.scan_finished(t(20.0)).unwrap().is_empty());
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(want.restoring);
+        assert_eq!(want.trashed, d.trashed);
+        assert_eq!(b.scanned(t(21.0), p("f00"), file(5, 5)), Scanned::default());
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
     }
 
     /// A and B hold two files A made; B's user edits both, B pauses and
