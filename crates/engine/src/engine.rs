@@ -433,6 +433,9 @@ impl Engine {
                 Some(f) => {
                     let before = f.winner_fallbacks();
                     let scanned = f.observed_at(now, at, path, state);
+                    for record in scanned.ancestors {
+                        out.push(Action::IndexChanged { folder, record });
+                    }
                     if let Some(change) = scanned.change {
                         out.push(Action::IndexChanged {
                             folder,
@@ -1044,6 +1047,9 @@ fn decide(
                         },
                     });
                 }
+                for record in reverted.written {
+                    out.push(Action::IndexChanged { folder, record });
+                }
                 out.push(Action::StatusChanged {
                     folder,
                     status: FolderStatus::Reverted {
@@ -1448,7 +1454,7 @@ mod tests {
             t(1.0),
             Event::Scanned {
                 folder: folder(),
-                path: p("dir/note.md"),
+                path: p("note.md"),
                 state: file(4, 77),
                 at: t(1.0),
             },
@@ -1463,7 +1469,7 @@ mod tests {
             .folder(folder())
             .unwrap()
             .index()
-            .get(&p("dir/note.md"))
+            .get(&p("note.md"))
             .unwrap()
             .entry
             .clone();
@@ -1522,7 +1528,7 @@ mod tests {
             .folder(folder())
             .unwrap()
             .wants()
-            .get(&p("dir/note.md"))
+            .get(&p("note.md"))
             .unwrap();
         assert_eq!(want.source, node(2), "arrived via B");
         let got = &want.entry;
