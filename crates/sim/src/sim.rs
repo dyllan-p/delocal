@@ -88,6 +88,8 @@ pub struct Stats {
     pub crashes: u64,
     pub fetches: u64,
     pub not_available: u64,
+    /// Observations the engine asked for with `Observe` (§8.3).
+    pub observes: u64,
     /// Paths a source found out of step with its record while serving,
     /// and reported to its engine as observations (§7.5 step 2).
     pub serve_observations: u64,
@@ -334,6 +336,11 @@ struct Node {
     /// When the host next checks for free space, while the folder's inbound
     /// is paused (§7.5).
     space_check_at: Option<Timestamp>,
+    /// Paths the engine asked the host to observe (`Observe`, §8.3), each
+    /// answered at the next chance with the observation a scan would
+    /// report. In the process's memory, so a crash loses them.
+    #[serde(skip)]
+    observe: BTreeSet<RelPath>,
     /// The filesystem ignores case (§7.6): two names that differ only by
     /// case are one file.
     case_insensitive: bool,
@@ -811,6 +818,7 @@ impl Sim {
                 ignored: BTreeMap::new(),
                 full_until: None,
                 space_check_at: None,
+                observe: BTreeSet::new(),
                 case_insensitive: i == 0 && knobs.case_variants > 0.0,
                 paused_inbound: false,
                 sent: BTreeMap::new(),
@@ -1043,6 +1051,7 @@ impl Sim {
             };
             n.online
                 && n.restart_at.is_none()
+                && n.observe.is_empty()
                 && n.group.as_ref().is_none_or(|g| g.effects.is_empty())
                 && !f.disk_full()
                 && f.window().is_none()
@@ -1165,6 +1174,9 @@ impl Sim {
                 consider(n.wake_at);
                 consider(Some(n.next_scan_at));
                 consider(n.space_check_at);
+                if !n.observe.is_empty() {
+                    consider(Some(self.clock));
+                }
             }
         }
         consider(self.messages.iter().map(|m| m.deliver_at).min());
@@ -1227,6 +1239,29 @@ impl Sim {
             .map(|n| n.id)
         {
             return self.check_space(id);
+        }
+        // 4c. observations the engine asked for (§8.3)
+        if let Some((id, path)) = self
+            .nodes
+            .values()
+            .filter(|n| n.alive())
+            .find_map(|n| n.observe.first().map(|p| (n.id, p.clone())))
+        {
+            let Some(node) = self.nodes.get_mut(&id) else {
+                return Ok(());
+            };
+            node.observe.remove(&path);
+            let state = found(node, &path);
+            self.stats.observes += 1;
+            let folder = self.folder;
+            return self.feed(
+                id,
+                Event::Scanned {
+                    folder,
+                    path,
+                    state,
+                },
+            );
         }
         // 5. scans
         if let Some(id) = self
@@ -1767,6 +1802,13 @@ impl Sim {
                 )?;
             }
             Action::MoveToTrash { path, .. } => self.hold(id, Held::MoveToTrash { path })?,
+            // Reading the disk depends on nothing unwritten, so it is not
+            // held for the group (§11).
+            Action::Observe { path, .. } => {
+                if let Some(n) = self.nodes.get_mut(&id) {
+                    n.observe.insert(path);
+                }
+            }
             Action::RecordBatch {
                 batch,
                 role,
@@ -2390,6 +2432,7 @@ impl Sim {
             n.engine = None;
             n.temp.clear();
             n.wake_at = None;
+            n.observe.clear();
             // The host's own memory of a full disk died with it; at the
             // restart it learns the folder's state from its tables.
             n.space_check_at = None;
@@ -5144,6 +5187,46 @@ mod tests {
         assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
         sim.full_scan(id, false).unwrap();
         assert!(!live(&sim), "observed gone once the rule went");
+    }
+
+    /// §8.3, draft 55: the host answers `Observe` with the observation a
+    /// scan would report, here of a file put on disk behind the engine's
+    /// back, which the engine then records; a crash loses a request not
+    /// yet answered.
+    #[test]
+    fn the_host_answers_observe_with_what_a_scan_would_report() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let x = rel("x");
+        let folder = sim.folder;
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        sim.act(
+            id,
+            Action::Observe {
+                folder,
+                path: x.clone(),
+            },
+        )
+        .unwrap();
+        let next = sim.clock.plus_nanos(1);
+        sim.run_until(next).unwrap();
+        assert_eq!(sim.stats.observes, 1);
+        let record = sim
+            .engine(id)
+            .and_then(|e| e.folder(folder))
+            .and_then(|f| f.index().live(&x))
+            .map(|r| r.entry.hash);
+        assert_eq!(record, Some(file(6, false).hash()));
+        sim.act(id, Action::Observe { folder, path: x }).unwrap();
+        sim.crash(id, NANOS).unwrap();
+        assert!(
+            sim.nodes[&id].observe.is_empty(),
+            "the request died with the process"
+        );
     }
 
     /// §7.5 step 2, draft 54, in seed 4013's shape. The source's watcher
