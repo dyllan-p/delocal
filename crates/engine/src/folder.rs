@@ -1203,9 +1203,13 @@ impl FolderState {
     /// was resolved against, which an ordinary local change dominates (so
     /// the result is the same) but `revert` discards (so it would not be).
     /// Members that announced the old content still hold it, so they stay
-    /// sources if the re-derived want has the same content.
+    /// sources if the re-derived want has the same content. Those that
+    /// refused it stay refused (§7.5 step 3), but only in a want this
+    /// re-derivation makes: a want already at the path is revert's restoring
+    /// want, which asks every member afresh (§8.3 step 4).
     fn rederive(&mut self, now: Timestamp, old: Want) {
         let path = old.path().clone();
+        let replaces = self.wants.get(&path).is_none();
         let classified = batch::classify(&self.index, &old.received);
         if classified.fallback {
             self.winner_fallbacks += 1;
@@ -1224,6 +1228,10 @@ impl FolderState {
             );
             for src in old.sources {
                 self.wants.note_announced(&path, &old.entry.hash, src);
+            }
+            if replaces {
+                self.wants
+                    .keep_refusals(&path, &old.entry.hash, old.refused);
             }
         }
     }
@@ -2020,6 +2028,7 @@ impl FolderState {
                         source: own,
                         seq_high: 0,
                         sources: BTreeSet::new(),
+                        refused: BTreeMap::new(),
                         excluded: BTreeMap::new(),
                         strikes: BTreeMap::new(),
                         mismatches: 0,
@@ -2052,6 +2061,7 @@ impl FolderState {
                     source: own,
                     seq_high: 0,
                     sources: others.clone(),
+                    refused: BTreeMap::new(),
                     excluded: BTreeMap::new(),
                     strikes: BTreeMap::new(),
                     mismatches: 0,
@@ -5737,6 +5747,70 @@ mod tests {
         );
     }
 
+    /// A edits f00 and B wants A's content, which A then refuses (§7.5
+    /// step 3); B edits f00 too, and A's edit wins, so B wants `M` with
+    /// A's content, re-derived from the entry it received.
+    fn refused_then_edited() -> FolderState {
+        let (mut a, mut b) = a_and_b(2, Rules::default());
+        a.scanned(t(20.0), p("f00"), file(7, 70));
+        let batch = a.form_batches(t(22.0), bid(7)).remove(0);
+        assert_eq!(b.receive(t(22.0), &batch).decision, Decision::Accepted);
+        let version = batch.entries[0].version.clone();
+        let (steps, _) = b.dispatch(t(23.0), &lan(&[1]));
+        assert!(matches!(&steps[..], [HostStep::Fetch { from, .. }] if *from == node(1)));
+        b.fetched(t(24.0), &p("f00"), &version, FetchReport::NotAvailable);
+        assert!(b.dispatch(t(24.0), &lan(&[1])).0.is_empty());
+        assert!(!b.in_flight(&p("f00")), "without source, so observable");
+        b.scanned(t(25.0), p("f00"), file(5, 5));
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(want.conflict.is_some(), "a conflict's M");
+        assert_eq!(want.entry.hash, hash(7), "with A's content");
+        b
+    }
+
+    /// §7.5 step 3: a want re-derived for the same content keeps the
+    /// refusals of the one it replaces. Re-deriving announces nothing.
+    #[test]
+    fn a_rederived_want_keeps_its_refusals() {
+        let mut b = refused_then_edited();
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(want.sources.contains(&node(1)));
+        assert_eq!(want.refused.get(&node(1)), Some(&t(24.0 + 3600.0)));
+        assert!(
+            b.dispatch(t(26.0), &lan(&[1])).0.is_empty(),
+            "A is not asked"
+        );
+    }
+
+    /// §8.3 step 4: revert's restoring want asks every member afresh, so the
+    /// stale want it re-derives at the path lends it no refusals.
+    #[test]
+    fn a_restoring_want_inherits_no_refusals() {
+        let mut b = refused_then_edited();
+        assert!(
+            b.rules_changed(Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            })
+            .is_empty()
+        );
+        b.scanned(t(26.0), p("f01"), file(6, 6));
+        assert!(matches!(b.tick(t(30.0), bid(5)), Ticked::Paused { .. }));
+        // Back to the defaults, so A's version, re-admitted, is not held.
+        b.rules_changed(Rules::default());
+        b.revert(t(31.0)).unwrap();
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(want.restoring);
+        assert_eq!(want.entry.hash, hash(7), "A's version, re-derived");
+        assert!(want.refused.is_empty(), "{:?}", want.refused);
+        let (steps, _) = b.dispatch(t(32.0), &lan(&[1]));
+        assert!(
+            steps.iter().any(|s| matches!(s, HostStep::Fetch { path, from, .. } if *path == p("f00") && *from == node(1))),
+            "{steps:?}"
+        );
+    }
+
     #[test]
     fn a_restoring_want_ignores_absent_but_a_new_file_cancels_it() {
         let (_, mut b) = a_and_b(
@@ -7117,7 +7191,7 @@ mod tests {
                     prop_assert!(!w.in_flight(), "nothing left in flight when the host has answered everything");
                     match w.state {
                         WantState::NoSource => prop_assert!(
-                            a_tier.is_none() || !w.sources.contains(&node(1)) || w.excluded.contains_key(&node(1)),
+                            a_tier.is_none() || !w.sources.contains(&node(1)) || w.excluded.contains_key(&node(1)) || w.refused.contains_key(&node(1)),
                             "no source only when the announcer moved on or served bad content"
                         ),
                         WantState::Deferred { need } => {
