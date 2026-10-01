@@ -1271,6 +1271,7 @@ mod tests {
                 folder: f,
                 path: path(&format!("f{n:02}")),
                 state: ScanState::Observed(file(n)),
+                at: pair.now(),
             });
         }
         let sent = pair.tick_a();
@@ -1323,6 +1324,7 @@ mod tests {
             folder: f,
             path: path("mine"),
             state: ScanState::Observed(file(9)),
+            at: pair.now(),
         });
         pair.tick_b();
 
@@ -1333,6 +1335,7 @@ mod tests {
                 folder: f,
                 path,
                 state: ScanState::Absent,
+                at: pair.now(),
             });
         }
         let sent = pair.tick_a();
@@ -1367,12 +1370,14 @@ mod tests {
                 folder: f,
                 path,
                 state: ScanState::Absent,
+                at: pair.now(),
             });
         }
         pair.b(Event::Scanned {
             folder: f,
             path: path("new"),
             state: ScanState::Observed(file(10)),
+            at: pair.now(),
         });
         pair.tick_b();
         assert!(pair.store.parts(f).unwrap().unwrap().rest.paused.is_some());

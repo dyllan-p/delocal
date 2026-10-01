@@ -220,8 +220,9 @@ pub enum Abort {
     List(io::Error),
 }
 
-/// A report for one path, or nothing (the path is absent).
-type Found = Option<(RelPath, ScanState)>;
+/// A report for one path with the time it was taken (the `stat`, §7.3,
+/// draft 56), or nothing (the path is absent).
+type Found = Option<(RelPath, ScanState, Timestamp)>;
 
 impl Scan<'_> {
     /// Scan the folder, handing each event to `emit` as it is ready. The
@@ -257,8 +258,9 @@ impl Scan<'_> {
                     skipped: &mut report.skipped,
                     unstable: &mut report.unstable,
                 };
+                let at = self.clock.now();
                 for path in top_level(&names, self.records) {
-                    out.take(Some(Some((path, ScanState::Skipped { reason }))));
+                    out.take(Some(Some((path, ScanState::Skipped { reason }, at))));
                 }
                 return check_marker(&*delocal);
             }
@@ -369,7 +371,7 @@ impl Out<'_, '_> {
     /// Report what one item found. `None` is a job that panicked, whose
     /// path goes unreported: see the end of [`Scan::walk`].
     fn take(&mut self, found: Option<Found>) {
-        let Some(Some((path, state))) = found else {
+        let Some(Some((path, state, at))) = found else {
             return;
         };
         if let ScanState::Skipped { reason } = state {
@@ -382,6 +384,7 @@ impl Out<'_, '_> {
             folder: self.folder,
             path,
             state,
+            at,
         });
     }
 }
@@ -416,6 +419,9 @@ struct Job {
     stat: Stat,
     /// What it saw, all but the hash.
     seen: Observed,
+    /// When it stated it: the observation's time, however long the hash
+    /// takes (§7.3, draft 56).
+    at: Timestamp,
 }
 
 fn hash_job(job: Job) -> Found {
@@ -425,7 +431,7 @@ fn hash_job(job: Job) -> Found {
         Hashed::Vanished => return None,
         Hashed::Failed(e) => skipped(&e),
     };
-    Some((job.path, state))
+    Some((job.path, state, job.at))
 }
 
 impl Walker<'_, '_> {
@@ -578,6 +584,7 @@ impl Walker<'_, '_> {
                 path,
                 stat,
                 seen,
+                at: self.clock.now(),
             };
             self.pipe.submit(job, &mut |found| self.out.take(found));
         }
@@ -624,8 +631,9 @@ impl Walker<'_, '_> {
 
     /// A report that needs no hashing, in its place.
     fn ready(&mut self, path: RelPath, state: ScanState) {
+        let at = self.clock.now();
         self.pipe
-            .ready(Some((path, state)), &mut |found| self.out.take(found));
+            .ready(Some((path, state, at)), &mut |found| self.out.take(found));
     }
 }
 
