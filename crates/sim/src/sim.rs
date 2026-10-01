@@ -17,7 +17,7 @@
 //! action) and processes it in a fixed order, so a run is a pure function
 //! of the seed, the knobs and the steps.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use delocal_engine::batch::BatchRole;
@@ -61,6 +61,9 @@ const FAIL_STREAM: u64 = 4;
 /// The PRNG stream that spells file names in upper case, for the
 /// case-insensitive node (§7.6).
 const CASE_STREAM: u64 = 5;
+/// The PRNG stream a full scan's delay between its read and its reports
+/// is drawn from (§14.1, draft 58).
+const SCAN_STREAM: u64 = 6;
 /// How often a host whose folder's inbound is paused checks for free
 /// space (§7.5).
 const SPACE_CHECK_NANOS: i64 = 30 * NANOS;
@@ -128,6 +131,16 @@ pub struct Stats {
     pub case_collisions: u64,
     /// Temp files a failed rename took with it.
     pub temps_lost: u64,
+    /// Full scans whose reports arrived after their read (draft 58).
+    pub scans_delayed: u64,
+    /// Observations the engine dropped as stale: taken before their path's
+    /// last commit report (§7.3).
+    pub stale_dropped: u64,
+    /// Observations taken before another of the same path that the engine
+    /// was already fed, and of those, the ones the engine wrote the index
+    /// for: a delayed scan's report that arrived after the watcher's.
+    pub out_of_order: u64,
+    pub out_of_order_acted: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -347,6 +360,15 @@ struct Node {
     /// When each path's last commit that changed it was reported, by the
     /// time the engine was given: the stale-observation check's reference.
     written: BTreeMap<RelPath, Timestamp>,
+    /// When the engine was last fed an observation of each path, by the
+    /// time it was taken: what an observation arriving out of order is
+    /// counted against.
+    last_fed: BTreeMap<RelPath, Timestamp>,
+    /// A full scan that has read the disk and opened its bracket, and whose
+    /// reports are still on their way (draft 58's scan delay). In the
+    /// process's memory, so a crash loses it.
+    #[serde(skip)]
+    pending_scan: Option<PendingScan>,
     /// The filesystem ignores case (§7.6): two names that differ only by
     /// case are one file.
     case_insensitive: bool,
@@ -479,6 +501,27 @@ struct Walk {
     beneath: BTreeSet<RelPath>,
 }
 
+/// A full scan whose reports arrive after its read (draft 58): each report
+/// with when it is delivered, in the walk's order, and the end of the
+/// bracket after the last.
+struct PendingScan {
+    reports: VecDeque<(Timestamp, RelPath, ScanState)>,
+    end_at: Timestamp,
+    /// When the scan read the disk, the time every report carries.
+    read_at: Timestamp,
+    /// The scan stops before its remaining reports, without its deletion
+    /// pass (`ScanAborted`).
+    aborted: bool,
+    check: SkipCheck,
+}
+
+impl PendingScan {
+    /// When the next report, or the end of the bracket, is due.
+    fn next_at(&self) -> Timestamp {
+        self.reports.front().map_or(self.end_at, |(t, _, _)| *t)
+    }
+}
+
 /// What the skip checker holds one node's index writes against (§7.3).
 struct SkipCheck {
     node: NodeId,
@@ -582,6 +625,34 @@ fn observation(event: &Event) -> Option<(&RelPath, &ScanState)> {
             outcome: ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. },
             ..
         } => Some((path, found)),
+        _ => None,
+    }
+}
+
+/// True if `actions`, the response of `id`'s engine to an observation of
+/// `path`, act on it: a new local version there, its own counter above
+/// `own_before`, or a removed record. Anything else at the path in the same
+/// response, such as a wanted version adopted because its content is
+/// already in place, comes from the engine's dispatch after every event,
+/// not from the observation.
+fn acts_on(actions: &[Action], id: NodeId, path: &RelPath, own_before: u64) -> bool {
+    actions.iter().any(|a| match a {
+        Action::IndexChanged { record, .. } => {
+            record.entry.path == *path
+                && record.entry.modified_by == id
+                && record.entry.version.counter(id) > own_before
+        }
+        Action::IndexRemoved { path: p, .. } => p == path,
+        _ => false,
+    })
+}
+
+/// When the observation an event carries was taken, by its node's clock.
+fn observed_at(event: &Event) -> Option<Timestamp> {
+    match event {
+        Event::Scanned { at, .. } | Event::Applied { at, .. } | Event::Trashed { at, .. } => {
+            Some(*at)
+        }
         _ => None,
     }
 }
@@ -718,6 +789,8 @@ pub struct Sim {
     fail_rng: ChaCha8Rng,
     /// Draws for upper-case spellings, on `CASE_STREAM`.
     case_rng: ChaCha8Rng,
+    /// Draws for the scan delay, on `SCAN_STREAM`.
+    scan_rng: ChaCha8Rng,
     /// While a node is fed an event: which node, what kind of event, and
     /// its index's `seq` as the event began, for the disk-full checker.
     feeding: Option<Feeding>,
@@ -770,6 +843,8 @@ pub struct Sim {
     /// False in the final phase, in which no fetch or commit fails and no
     /// disk fills.
     failures_on: bool,
+    /// False in the final phase, whose scans take no time.
+    scan_delays_on: bool,
     steps: Vec<Step>,
     steps_applied: usize,
     stats: Stats,
@@ -830,6 +905,8 @@ impl Sim {
                 observe: BTreeSet::new(),
                 last_stamp: Timestamp::default(),
                 written: BTreeMap::new(),
+                last_fed: BTreeMap::new(),
+                pending_scan: None,
                 case_insensitive: i == 0 && knobs.case_variants > 0.0,
                 paused_inbound: false,
                 sent: BTreeMap::new(),
@@ -863,6 +940,8 @@ impl Sim {
         fail_rng.set_stream(FAIL_STREAM);
         let mut case_rng = ChaCha8Rng::seed_from_u64(seed);
         case_rng.set_stream(CASE_STREAM);
+        let mut scan_rng = ChaCha8Rng::seed_from_u64(seed);
+        scan_rng.set_stream(SCAN_STREAM);
         let watch = knobs.check_i9.then(i9::Watch::default);
         let mut sim = Self {
             seed,
@@ -873,6 +952,7 @@ impl Sim {
             skip_rng,
             fail_rng,
             case_rng,
+            scan_rng,
             feeding: None,
             checking: None,
             committing: BTreeMap::new(),
@@ -896,6 +976,7 @@ impl Sim {
             corruption_on: true,
             skips_on: true,
             failures_on: true,
+            scan_delays_on: true,
             steps: Vec::new(),
             steps_applied: 0,
             stats: Stats::default(),
@@ -1019,6 +1100,9 @@ impl Sim {
         for node in self.nodes.values_mut() {
             node.ignored.clear();
         }
+        // The final scans take no time; one still on its way is delivered
+        // when its node scans next.
+        self.scan_delays_on = false;
         let ids = self.order.clone();
         for id in &ids {
             if self.nodes.get(id).is_some_and(|n| n.restart_at.is_some()) {
@@ -1076,6 +1160,7 @@ impl Sim {
             n.online
                 && n.restart_at.is_none()
                 && n.observe.is_empty()
+                && n.pending_scan.is_none()
                 && n.group.as_ref().is_none_or(|g| g.effects.is_empty())
                 && !f.disk_full()
                 && f.window().is_none()
@@ -1201,6 +1286,7 @@ impl Sim {
                 if !n.observe.is_empty() {
                     consider(Some(self.clock));
                 }
+                consider(n.pending_scan.as_ref().map(PendingScan::next_at));
             }
         }
         consider(self.messages.iter().map(|m| m.deliver_at).min());
@@ -1289,6 +1375,15 @@ impl Sim {
                 },
             );
         }
+        // 4d. a delayed scan's next report, or the end of its bracket
+        if let Some(id) = self
+            .nodes
+            .values()
+            .find(|n| n.alive() && n.pending_scan.as_ref().is_some_and(|p| p.next_at() <= now))
+            .map(|n| n.id)
+        {
+            return self.deliver_scan(id);
+        }
         // 5. scans
         if let Some(id) = self
             .nodes
@@ -1344,6 +1439,40 @@ impl Sim {
                 .map(|written| (path.clone(), *at, *written)),
             _ => None,
         };
+        // This node's own counter at the observed path as the event begins:
+        // what an observation acted on raises (see `acts_on`).
+        let own_before = match &event {
+            Event::Scanned { path, .. } => self
+                .engine(id)
+                .and_then(|e| e.folder(self.folder))
+                .and_then(|f| f.index().get(path))
+                .map_or(0, |r| r.entry.version.counter(id)),
+            _ => 0,
+        };
+        // Counted for the scan delay (draft 58): an observation the engine
+        // drops as stale, and one taken before another of its path that the
+        // engine was already fed.
+        let scanned = match &event {
+            Event::Scanned {
+                path, state, at, ..
+            } if !matches!(state, ScanState::Skipped { .. }) => Some((path.clone(), *at)),
+            _ => None,
+        };
+        if let Some((path, at)) = &scanned
+            && self
+                .engine(id)
+                .and_then(|e| e.folder(self.folder))
+                .is_some_and(|f| f.is_stale(path, *at))
+        {
+            self.stats.stale_dropped += 1;
+        }
+        // I9 measures what the engine knew of a path from when the disk was
+        // read, on the run's clock: the observation's own time, less the
+        // node's skew.
+        let observed_at = observed_at(&event).map(|at| {
+            let skew = self.nodes.get(&id).map_or(0, |n| n.skew_ns);
+            at.plus_nanos(-skew)
+        });
         let folder = self.folder;
         let may_adopt = matches!(event, Event::Applied { .. } | Event::Scanned { .. });
         let (actions, seq) = {
@@ -1359,12 +1488,20 @@ impl Sim {
         if let Ok(bytes) = postcard::to_stdvec(&actions) {
             self.log.update(&bytes);
         }
+        if let Some((path, at)) = scanned
+            && let Some(n) = self.nodes.get_mut(&id)
+        {
+            let last = n.last_fed.entry(path.clone()).or_insert(at);
+            if at < *last {
+                self.stats.out_of_order += 1;
+                if acts_on(&actions, id, &path, own_before) {
+                    self.stats.out_of_order_acted += 1;
+                }
+            }
+            *last = (*last).max(at);
+        }
         if let Some((path, at, written)) = stale
-            && actions.iter().any(|a| match a {
-                Action::IndexChanged { record, .. } => record.entry.path == path,
-                Action::IndexRemoved { path: p, .. } => *p == path,
-                _ => false,
-            })
+            && acts_on(&actions, id, &path, own_before)
         {
             return Err(self.fail(
                 "stale observation",
@@ -1383,8 +1520,8 @@ impl Sim {
         if let (Some(watch), Some((cause, observed))) = (self.i9.as_mut(), cause) {
             let node = self.nodes.get(&id);
             let group_open = node.is_some_and(|n| n.group.is_some());
-            if let Some(path) = observed {
-                watch.observed(id, &path, self.clock, group_open);
+            if let (Some(path), Some(at)) = (observed, observed_at) {
+                watch.observed(id, &path, at, group_open);
             }
             watch.note(id, &actions, seq, &cause, group_open, |p| {
                 node.and_then(|n| content_at(n, p))
@@ -2407,6 +2544,12 @@ impl Sim {
                 n.wake_at = n.wake_at.map(|t| t.max(clock));
                 n.space_check_at = n.space_check_at.map(|t| t.max(clock));
                 n.next_scan_at = n.next_scan_at.max(clock);
+                if let Some(pending) = &mut n.pending_scan {
+                    for (t, _, _) in &mut pending.reports {
+                        *t = (*t).max(clock);
+                    }
+                    pending.end_at = pending.end_at.max(clock);
+                }
             }
             for op in &mut self.ops {
                 if let Op::Commit {
@@ -2485,6 +2628,7 @@ impl Sim {
             n.temp.clear();
             n.wake_at = None;
             n.observe.clear();
+            n.pending_scan = None;
             // The host's own memory of a full disk died with it; at the
             // restart it learns the folder's state from its tables.
             n.space_check_at = None;
@@ -3303,6 +3447,15 @@ impl Sim {
     /// skip checker watches every report of `Skipped` and, if there was
     /// one, the end of the bracket.
     fn full_scan(&mut self, id: NodeId, may_abort: bool) -> Result<(), Failure> {
+        // A scan still on its way ends first: a node scans again before one
+        // ends only in the final phase, which does not wait for it.
+        while self
+            .nodes
+            .get(&id)
+            .is_some_and(|n| n.pending_scan.is_some())
+        {
+            self.deliver_scan(id)?;
+        }
         let Some(node) = self.nodes.get_mut(&id) else {
             return Ok(());
         };
@@ -3339,11 +3492,14 @@ impl Sim {
         } else {
             None
         };
-        let walk = self.skip_some(id, entries);
+        let mut walk = self.skip_some(id, entries);
         let mut check = SkipCheck::new(id);
-        check.beneath = walk.beneath;
+        check.beneath = std::mem::take(&mut walk.beneath);
         let folder = self.folder;
         self.feed(id, Event::ScanStarted { folder })?;
+        if let Some(delay) = self.scan_delay() {
+            return self.delay_scan(id, walk, abort_at, read_at, delay, check);
+        }
         for (i, (path, state)) in walk.reports.into_iter().enumerate() {
             if abort_at == Some(i) {
                 return self.bracket_end(id, Event::ScanAborted { folder }, &mut check);
@@ -3359,6 +3515,96 @@ impl Sim {
             self.report(id, path, state, read_at, &mut check)?;
         }
         self.bracket_end(id, Event::ScanFinished { folder }, &mut check)
+    }
+
+    /// How long a full scan's reports take to arrive after its read, drawn
+    /// on `SCAN_STREAM` (draft 58), or `None` for a scan that takes no
+    /// time: no draw is made with the knob at `0..0` or in the final phase.
+    fn scan_delay(&mut self) -> Option<i64> {
+        let (lo, hi) = self.knobs.scan_delay_ms;
+        if !self.scan_delays_on || hi == 0 {
+            return None;
+        }
+        let ms = self.scan_rng.random_range(lo.min(hi)..=hi);
+        Some(i64::try_from(ms).map_or(i64::MAX, |ms| ms.saturating_mul(1_000_000)))
+    }
+
+    /// Hold the rest of `id`'s full scan for `delay`: its bracket is open
+    /// and its disk read at `read_at`, and its reports, in the walk's order,
+    /// arrive spread evenly over the delay, the bracket's end with the last
+    /// (draft 58). The node's next scan comes after this one has ended.
+    fn delay_scan(
+        &mut self,
+        id: NodeId,
+        walk: Walk,
+        abort_at: Option<usize>,
+        read_at: Timestamp,
+        delay: i64,
+        check: SkipCheck,
+    ) -> Result<(), Failure> {
+        let mut states = Vec::new();
+        let mut aborted = false;
+        for (i, (path, state)) in walk.reports.into_iter().enumerate() {
+            if abort_at == Some(i) {
+                aborted = true;
+                break;
+            }
+            if let Some(state) = state {
+                states.push((path, state));
+            }
+        }
+        if !aborted {
+            for path in walk.unreached {
+                let state = ScanState::Skipped {
+                    reason: SkipReason::Ignored,
+                };
+                states.push((path, state));
+            }
+        }
+        let clock = self.clock;
+        let parts = i64::try_from(states.len()).unwrap_or(i64::MAX - 1) + 1;
+        let reports: VecDeque<(Timestamp, RelPath, ScanState)> = states
+            .into_iter()
+            .zip(1..)
+            .map(|((path, state), k)| (clock.plus_nanos(delay / parts * k), path, state))
+            .collect();
+        let end_at = clock.plus_nanos(delay);
+        self.stats.scans_delayed += 1;
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.next_scan_at = n.next_scan_at.max(end_at.plus_nanos(1));
+            n.pending_scan = Some(PendingScan {
+                reports,
+                end_at,
+                aborted,
+                read_at,
+                check,
+            });
+        }
+        Ok(())
+    }
+
+    /// The next report of `id`'s delayed scan, or once every report is in,
+    /// the end of its bracket (draft 58).
+    fn deliver_scan(&mut self, id: NodeId) -> Result<(), Failure> {
+        let Some(mut pending) = self.nodes.get_mut(&id).and_then(|n| n.pending_scan.take()) else {
+            return Ok(());
+        };
+        let folder = self.folder;
+        if let Some((_, path, state)) = pending.reports.pop_front() {
+            let fed = self.report(id, path, state, pending.read_at, &mut pending.check);
+            if let Some(n) = self.nodes.get_mut(&id)
+                && n.engine.is_some()
+            {
+                n.pending_scan = Some(pending);
+            }
+            return fed;
+        }
+        let end = if pending.aborted {
+            Event::ScanAborted { folder }
+        } else {
+            Event::ScanFinished { folder }
+        };
+        self.bracket_end(id, end, &mut pending.check)
     }
 
     /// One report of a full scan. A `Skipped` one joins the bracket's skips
@@ -5346,6 +5592,58 @@ mod tests {
             .and_then(|e| e.folder(folder))
             .is_some_and(|f| f.index().live(&x).is_some());
         assert!(live, "the stale read is dropped");
+    }
+
+    /// §14.1, draft 58: with the scan delay on, a full scan reads the disk
+    /// and opens its bracket at once, and its reports arrive spread over the
+    /// delay, each carrying the time of the read; the bracket ends with the
+    /// delay. Here A's scan takes 5 s and reports only x, which arrives
+    /// halfway: nothing is recorded before, x is recorded as read after, and
+    /// the bracket stays open until 5 s.
+    #[test]
+    fn a_delayed_scan_delivers_its_reports_after_its_read() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                scan_delay_ms: (5_000, 5_000),
+                ..Knobs::default()
+            },
+        );
+        let a = sim.order[0];
+        let x = rel("x");
+        sim.nodes
+            .get_mut(&a)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        for n in sim.nodes.values_mut() {
+            n.next_scan_at = Timestamp::from_unix_nanos(i64::MAX);
+        }
+        let read = sim.clock;
+        let read_at = sim.now_for(a);
+        sim.full_scan(a, false).unwrap();
+        let folder = sim.folder;
+        let recorded = |sim: &Sim| {
+            sim.engine(a)
+                .and_then(|e| e.folder(folder))
+                .is_some_and(|f| f.index().live(&x).is_some())
+        };
+        assert!(!recorded(&sim), "nothing is reported at the read");
+        sim.run_until(read.plus_nanos(2 * NANOS)).unwrap();
+        assert!(!recorded(&sim), "the report is still on its way");
+        sim.run_until(read.plus_nanos(3 * NANOS)).unwrap();
+        assert!(recorded(&sim));
+        let fed = sim.nodes[&a].last_fed[&x];
+        assert!(
+            read_at <= fed && fed < read_at.plus_nanos(NANOS),
+            "x is recorded as read, {fed:?}"
+        );
+        assert!(sim.nodes[&a].pending_scan.is_some(), "the bracket is open");
+        sim.run_until(read.plus_nanos(6 * NANOS)).unwrap();
+        assert!(sim.nodes[&a].pending_scan.is_none(), "the bracket ended");
+        assert_eq!(sim.stats.scans_delayed, 1);
     }
 
     /// §8.3 step 2, draft 57: the host performs a revert's move to the trash

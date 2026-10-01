@@ -4,7 +4,8 @@
 //! delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P]
 //!             [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P]
 //!             [--group-commit-lag E] [--displace-subtrees true|false] [--skip P]
-//!             [--io-failure P] [--disk-fill P] [--case-variants P] [--nodes N]
+//!             [--io-failure P] [--disk-fill P] [--case-variants P]
+//!             [--scan-delay-ms LO..HI] [--nodes N]
 //!             [--check-i9 true|false] [--keep-going] [--jobs J] [--digests]
 //! ```
 //!
@@ -125,11 +126,21 @@ fn parse_args() -> Result<Args, String> {
                     hi.parse().map_err(|e| format!("--delay-ms: {e}"))?,
                 );
             }
+            "--scan-delay-ms" => {
+                let v = value()?;
+                let (lo, hi) = v
+                    .split_once("..")
+                    .ok_or_else(|| "--scan-delay-ms wants LO..HI".to_owned())?;
+                args.knobs.scan_delay_ms = (
+                    lo.parse().map_err(|e| format!("--scan-delay-ms: {e}"))?,
+                    hi.parse().map_err(|e| format!("--scan-delay-ms: {e}"))?,
+                );
+            }
             "--keep-going" => args.keep_going = true,
             "--jobs" => args.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             "--digests" => args.digests = true,
             "--help" | "-h" => {
-                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--displace-subtrees true|false] [--skip P] [--io-failure P] [--disk-fill P] [--case-variants P] [--nodes N] [--check-i9 true|false] [--keep-going] [--jobs J] [--digests]".to_owned());
+                return Err("usage: delocal-sim --seeds N [--start S] [--steps K] [--corruption P] [--drop-watcher P] [--delay-ms LO..HI] [--crash-after-rename P] [--crash-between-renames P] [--group-commit-lag E] [--displace-subtrees true|false] [--skip P] [--io-failure P] [--disk-fill P] [--case-variants P] [--scan-delay-ms LO..HI] [--nodes N] [--check-i9 true|false] [--keep-going] [--jobs J] [--digests]".to_owned());
             }
             other => return Err(format!("unknown flag {other}")),
         }
@@ -306,6 +317,10 @@ fn main() -> ExitCode {
                 totals.upper_spellings += outcome.stats.upper_spellings;
                 totals.case_collisions += outcome.stats.case_collisions;
                 totals.temps_lost += outcome.stats.temps_lost;
+                totals.scans_delayed += outcome.stats.scans_delayed;
+                totals.stale_dropped += outcome.stats.stale_dropped;
+                totals.out_of_order += outcome.stats.out_of_order;
+                totals.out_of_order_acted += outcome.stats.out_of_order_acted;
                 if args.digests {
                     println!("seed {seed} digest {}", hex(&outcome.fingerprint));
                 }

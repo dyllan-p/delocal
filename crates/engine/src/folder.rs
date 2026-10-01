@@ -1105,6 +1105,15 @@ impl FolderState {
         self.take_observation(now, at, path, state, Observer::Scan)
     }
 
+    /// True if an observation of `path` taken at `at` is stale: older than
+    /// the path's last commit report (§7.3, draft 56), so the engine drops
+    /// it. A skip is not an observation and is never dropped as one.
+    pub fn is_stale(&self, path: &RelPath, at: Timestamp) -> bool {
+        self.reported
+            .get(path)
+            .is_some_and(|reported| at < *reported)
+    }
+
     /// [`Self::scanned`], for an observation made by `observer` at `at`: a
     /// scan or the watcher, or the guard of a commit whose report carries
     /// it. A live path implies its ancestors (§7.3): an observation of
@@ -1188,11 +1197,7 @@ impl FolderState {
         // has replaced. It is dropped, though the bracket has counted the
         // path as seen above, so nothing is tombstoned for having been read
         // at the wrong moment.
-        if self
-            .reported
-            .get(&path)
-            .is_some_and(|reported| at < *reported)
-        {
+        if self.is_stale(&path, at) {
             return Scanned::default();
         }
         let marked = self.marked(&path);

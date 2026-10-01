@@ -65,6 +65,16 @@ pub struct Knobs {
     /// from a live record. In the final phase a user on a case-sensitive
     /// node resolves every such pair, as §7.6 says the user does.
     pub case_variants: f64,
+    /// The delay range in milliseconds, inclusive, between a full scan's
+    /// read of the disk and the delivery of its last report (§14.1, draft
+    /// 58). The scan opens its bracket and reads every path at once; its
+    /// reports then arrive spread evenly over the drawn delay, and its
+    /// bracket ends with the last, while everything else goes on: commits
+    /// land, users edit, the watcher reports. So an observation can arrive
+    /// after a commit changed its path, and the stale rule (§7.3) acts.
+    /// `0..0` delivers every scan at once, as a scan that took no time.
+    /// The final phase's scans take no time.
+    pub scan_delay_ms: (u64, u64),
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
     /// Check I9, what revert discards stays discarded (§14.1), and fail a
@@ -89,6 +99,7 @@ impl Default for Knobs {
             io_failure: 0.01,
             disk_fill: 0.002,
             case_variants: 0.02,
+            scan_delay_ms: (0, 0),
             nodes: None,
             check_i9: false,
         }
@@ -99,7 +110,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {} --check-i9 {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {} --scan-delay-ms {}..{} --check-i9 {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -112,6 +123,8 @@ impl fmt::Display for Knobs {
             self.io_failure,
             self.disk_fill,
             self.case_variants,
+            self.scan_delay_ms.0,
+            self.scan_delay_ms.1,
             self.check_i9
         )?;
         if let Some(n) = self.nodes {
