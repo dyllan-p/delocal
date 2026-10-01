@@ -1,0 +1,39 @@
+Removes draft 54's serve-mismatch observation from the simulated host
+(be31269): a source that finds a candidate out of step with its record
+while serving tells its engine nothing, as before. A chmod its watcher
+missed is refused but never observed, and if its user undoes it before a
+scan, nothing is ever announced and the peer it refused is never told to
+ask again (DESIGN.md §7.5 step 2). Seed 4013 (--nodes 2 --steps 200)
+showed it on main from 841fe16 on; since drafts 52 and 53's failed-report
+rules its history no longer reaches it, and no seed does in 44,300 run
+with this patch (0 to 1,999 and the 76,000, 86,000 and 96,000 slices at
+the defaults, and 0 to 19,999 in two-node and in three-node worlds at 200
+steps), so the fix's unit test stands in for a pinned seed.
+
+test: delocal-sim sim::tests::a_source_that_refuses_a_fetch_observes_its_path
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 6a6cb97..1cc658c 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -2542,20 +2542,6 @@ impl Sim {
+                         file.map(|file| file.content.clone())
+                     })
+                 });
+-                for at in stale {
+-                    let Some(state) = self.nodes.get(&from).map(|src| found(src, &at)) else {
+-                        continue;
+-                    };
+-                    self.stats.serve_observations += 1;
+-                    self.feed(
+-                        from,
+-                        Event::Scanned {
+-                            folder: self.folder,
+-                            path: at,
+-                            state,
+-                        },
+-                    )?;
+-                }
+                 let report = match served {
+                     None => {
+                         self.stats.not_available += 1;

@@ -1,0 +1,29 @@
+Restores §7.5 step 3 as it was before draft 54 (9c0f69e): a source that
+answers `NotAvailable` is removed from the want instead of being refused
+for an hour, so only its own announcement of the wanted content makes it
+a source again, and a want whose every source refused and none announces
+stays without a source for good (DESIGN.md §7.5 step 3). No seed fails
+with this patch in 44,300 (0 to 1,999 and the 76,000, 86,000 and 96,000
+slices at the defaults, and 0 to 19,999 in two-node and in three-node
+worlds at 200 steps): with the serve-mismatch observation in place, a
+source that can serve again says so. The rule's unit tests stand in for a
+pinned seed.
+
+test: delocal-engine want::tests::a_refusing_source_is_asked_again_when_its_hour_is_up
+test: delocal-engine want::tests::announcing_the_wanted_content_ends_only_that_sources_refusal
+test: delocal-engine want::tests::a_want_whose_every_source_refuses_asks_each_at_most_once_an_hour
+test: delocal-engine folder::tests::a_rederived_want_keeps_its_refusals
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+index c507172..391c6ac 100644
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -678,7 +678,7 @@ impl WantList {
+                 want.state = WantState::Wanted;
+             }
+             FetchReport::NotAvailable => {
+-                want.refused.insert(from, now.plus_nanos(REFUSAL_NANOS));
++                want.sources.remove(&from);
+                 want.answered.insert(from);
+                 want.state = WantState::Wanted;
+             }
