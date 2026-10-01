@@ -13,7 +13,7 @@ test: delocal-engine want::tests::an_exclusion_expires_on_a_backoff_that_doubles
 test: delocal-engine want::tests::an_exclusion_is_released_when_the_wanted_content_is_announced
 
 diff --git a/crates/engine/src/engine.rs b/crates/engine/src/engine.rs
-index 027f086..28cc7d3 100644
+index 00a02bd..e51ee12 100644
 --- a/crates/engine/src/engine.rs
 +++ b/crates/engine/src/engine.rs
 @@ -449,9 +449,6 @@ impl Engine {
@@ -27,18 +27,18 @@ index 027f086..28cc7d3 100644
                  for (id, folder) in &self.folders {
                      if folder.is_member(peer) {
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
-index ed54a7b..f51dc1b 100644
+index c507172..ea71d4b 100644
 --- a/crates/engine/src/want.rs
 +++ b/crates/engine/src/want.rs
-@@ -499,7 +499,6 @@ impl WantList {
-         if want.sources.insert(by) {
+@@ -513,7 +513,6 @@ impl WantList {
+         if added || unrefused {
              self.note(path);
          }
 -        self.release(path, None);
      }
  
-     /// A member connected (§7.5): every want it was excluded from after a
-@@ -824,19 +823,6 @@ impl WantList {
+     /// A want re-derived at `path` keeps the refusals of the one it
+@@ -860,19 +859,6 @@ impl WantList {
      /// becomes overdue but keeps its path, and a local retry whose backoff
      /// has run out is wanted again (§7.5).
      pub fn expire(&mut self, now: Timestamp) -> Expired {
@@ -55,19 +55,15 @@ index ed54a7b..f51dc1b 100644
 -        for (path, node) in released {
 -            self.release(&path, Some(node));
 -        }
-         let mut expired = Expired::default();
-         for (path, want) in &self.wants {
-             match want.state {
-@@ -905,11 +891,7 @@ impl WantList {
-             | WantState::LocalRetry { until: deadline } => Some(deadline),
-             _ => None,
-         });
--        let expiries = self
--            .wants
--            .values()
--            .flat_map(|w| w.excluded.values().copied());
--        deadlines.chain(expiries).min()
-+        deadlines.min()
+         let mut unrefused = Vec::new();
+         for (path, want) in &mut self.wants {
+             let before = want.refused.len();
+@@ -955,7 +941,7 @@ impl WantList {
+         let expiries = self
+             .wants
+             .values()
+-            .flat_map(|w| w.excluded.values().chain(w.refused.values()).copied());
++            .flat_map(|w| w.refused.values().copied());
+         deadlines.chain(expiries).min()
      }
  
-     /// The want the ordering gate holds `want` on, if it is deferred or

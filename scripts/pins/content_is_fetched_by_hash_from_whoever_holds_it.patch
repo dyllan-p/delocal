@@ -13,9 +13,10 @@ test: delocal-sim regressions::content_is_fetched_by_hash_from_whoever_holds_it
 test: delocal-sim sim::tests::a_source_serves_the_wanted_content_under_any_version_or_path
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 6a6cb97..953594f 100644
 --- a/crates/sim/src/sim.rs
 +++ b/crates/sim/src/sim.rs
-@@ -2001,16 +2001,17 @@
+@@ -2516,21 +2516,19 @@ impl Sim {
                  if !self.connected(node, from) {
                      return Ok(());
                  }
@@ -24,11 +25,17 @@ diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 -                // on disk still matches the record by the scan's fast-path
 -                // test (size, mtime and exec bit for a file, kind and target
 -                // for a symlink), failing that from any live file with that
--                // hash, failing that not at all.
+-                // hash, failing that not at all. Every path it looked at and
+-                // found out of step with its record it has observed, and it
+-                // tells its engine so, as a scan would (draft 54), before it
+-                // answers: the change is announced, and a refused peer is
+-                // told what to ask for next.
 +                // The source serves the requested version from `path` if its
 +                // live record there is exactly that version and what is on
 +                // disk still matches the record by the scan's fast-path test,
-+                // failing that not at all.
++                // failing that not at all. A path it found out of step with
++                // its record it reports to its engine, as a scan would.
+                 let mut stale = Vec::new();
                  let served = self.nodes.get(&from).and_then(|src| {
                      let engine = src.engine.as_ref()?;
                      let index = engine.folder(self.folder)?.index();
@@ -38,5 +45,5 @@ diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
 +                        .is_some_and(|r| r.entry.version == version);
 +                    exact.then_some(&path).into_iter().find_map(|at| {
                          let record = index.live(at)?;
-                         let file = src.fs.get(at)?;
-                         record
+                         let file = src
+                             .fs
