@@ -13,12 +13,12 @@ unit test stands in for a pinned seed.
 test: delocal-engine folder::tests::a_reset_whose_retry_finds_its_own_work_has_landed
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index 18842d5..7764be4 100644
+index 69baf27..04c29a3 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2415,21 +2415,6 @@ impl FolderState {
-         if self.wants.get(path).is_none_or(|w| w.version() != version) {
-             return Vec::new();
+@@ -2555,21 +2555,6 @@ impl FolderState {
+         if looked {
+             self.unobserved.remove(path);
          }
 -        // A failed report whose observation is exactly what the commit
 -        // would have left says the commit landed and a crash took its report
@@ -38,7 +38,7 @@ index 18842d5..7764be4 100644
          let found = match outcome {
              ApplyOutcome::Ok => None,
              ApplyOutcome::ChangedUnderneath { found } => Some(found),
-@@ -2532,29 +2517,6 @@ impl FolderState {
+@@ -2672,29 +2657,6 @@ impl FolderState {
              .collect()
      }
  

@@ -699,9 +699,8 @@ mod tests {
     /// lose to the same winner under the same copy name, and a copy of
     /// either is the copy of a losing version. Here b holds the copy of e's
     /// first version, which e's second replaced in the version table. The
-    /// pins `two_losers_under_one_reissued_vector_both_count` and
-    /// `two_symlink_losers_under_one_reissued_vector_both_count` guard this
-    /// only while their seeds reach it.
+    /// pin `two_symlink_losers_under_one_reissued_vector_both_count` guards
+    /// this only while its seed reaches it.
     #[test]
     fn two_losers_under_one_vector_are_both_losing_versions() {
         let mut sim = world();
