@@ -285,6 +285,7 @@ fn main() -> ExitCode {
                 totals.crashes += outcome.stats.crashes;
                 totals.fetches += outcome.stats.fetches;
                 totals.not_available += outcome.stats.not_available;
+                totals.serve_observations += outcome.stats.serve_observations;
                 totals.mismatches += outcome.stats.mismatches;
                 totals.changed_underneath += outcome.stats.changed_underneath;
                 totals.stalled += outcome.stats.stalled;
