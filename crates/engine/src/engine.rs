@@ -158,6 +158,18 @@ pub enum Event {
         version: Version,
         outcome: ApplyOutcome,
     },
+    /// The host finished a revert's move to the trash, `MoveToTrash`, at
+    /// `at` (§8.3 step 2, draft 57): `Ok` once the path is in the trash or
+    /// was already gone, `ChangedUnderneath` if its guard found something
+    /// other than the file revert trashed, `Failed` on a local failure. A
+    /// failed report carries what the guard found, as every commit's does.
+    Trashed {
+        folder: FolderId,
+        path: RelPath,
+        version: Version,
+        at: Timestamp,
+        outcome: ApplyOutcome,
+    },
 
     /// User commands (§8.2, §8.3). PR 5. `approve` runs at once; `deny`
     /// and `revert` run at once on a settled folder and are queued
@@ -232,8 +244,17 @@ pub enum Action {
         mtime_ns: i64,
         exec: bool,
     },
-    /// Move a local file aside with nothing to rename in: revert only (§8.3).
-    MoveToTrash { folder: FolderId, path: RelPath },
+    /// A revert's move to the trash (§8.3 step 2, draft 57), a commit like
+    /// any other: check `expected` against the path (an absent path is
+    /// already where the move would leave it), move what is there to the
+    /// trash, and report with [`Event::Trashed`] under `version`, the
+    /// trashed record's.
+    MoveToTrash {
+        folder: FolderId,
+        path: RelPath,
+        version: Version,
+        expected: Observed,
+    },
     /// Observe `path` and report it with [`Event::Scanned`], the same
     /// observation a scan would report (§8.3): a waiting `revert` needs a
     /// fresh observation of a path whose latest one was ignored while a
@@ -503,6 +524,20 @@ impl Engine {
                 }
                 None => out.push(unknown_folder(folder)),
             },
+            Event::Trashed {
+                folder,
+                path,
+                version,
+                at,
+                outcome,
+            } => match self.folders.get_mut(&folder) {
+                Some(f) => {
+                    for record in f.trashed(now, &path, &version, at, outcome) {
+                        out.push(Action::IndexChanged { folder, record });
+                    }
+                }
+                None => out.push(unknown_folder(folder)),
+            },
             Event::Fetched {
                 folder,
                 path,
@@ -748,6 +783,16 @@ impl Engine {
                         mtime_ns,
                         exec,
                     },
+                    HostStep::Trash {
+                        path,
+                        version,
+                        expected,
+                    } => Action::MoveToTrash {
+                        folder: folder_id,
+                        path,
+                        version,
+                        expected,
+                    },
                 });
             }
             for record in adopted {
@@ -992,12 +1037,6 @@ fn decide(
                             folder,
                             path: write.path,
                         },
-                    });
-                }
-                for path in &reverted.trash {
-                    out.push(Action::MoveToTrash {
-                        folder,
-                        path: path.clone(),
                     });
                 }
                 out.push(Action::StatusChanged {
@@ -2364,15 +2403,18 @@ mod tests {
             .into_iter()
             .filter(|a| !matches!(a, Action::IndexChanged { .. } | Action::IndexRemoved { .. }))
             .collect();
-        assert_eq!(
-            out[0],
-            Action::MoveToTrash {
-                folder: folder(),
-                path: p("junk")
-            }
+        // The move to the trash is a commit of its own (§8.3 step 2, draft
+        // 57), dispatched with the want-list after the revert itself.
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::MoveToTrash { path, expected, .. }
+                    if path == &p("junk") && expected.hash == hash(6)
+            )),
+            "{out:?}"
         );
         assert_eq!(
-            out[1],
+            out[0],
             Action::StatusChanged {
                 folder: folder(),
                 status: FolderStatus::Reverted {
@@ -2679,9 +2721,28 @@ mod tests {
             out.iter()
                 .any(|a| matches!(a, Action::IndexRemoved { path, .. } if path == &p("n")))
         );
+        let moved = out
+            .iter()
+            .find_map(|a| match a {
+                Action::MoveToTrash { path, version, .. } if path == &p("n") => {
+                    Some(version.clone())
+                }
+                _ => None,
+            })
+            .expect("n is moved to the trash");
         assert!(
-            out.iter()
-                .any(|a| matches!(a, Action::MoveToTrash { path, .. } if path == &p("n")))
+            fetch_of(&tagged(out), hash(9)).is_none(),
+            "nothing at n moves on before the move's report (§8.3 step 2)"
+        );
+        let out = b.handle(
+            t(37.0),
+            Event::Trashed {
+                folder: folder(),
+                path: p("n"),
+                version: moved,
+                at: t(37.0),
+                outcome: ApplyOutcome::Ok,
+            },
         );
         let (wanted, from) = fetch_of(&tagged(out), hash(9)).expect("v3's content is fetched");
         assert_eq!((wanted, from), (v3.clone(), node(1)));

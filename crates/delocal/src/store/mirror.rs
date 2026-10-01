@@ -246,6 +246,7 @@ fn want() -> BoxedStrategy<Want> {
                 ApplyMode::Direct,
                 ApplyMode::MetadataOnly,
                 ApplyMode::IndexOnly,
+                ApplyMode::Trash,
             ]),
             option::of((path(), entry()).prop_map(|(path, loser)| ConflictCopy { path, loser })),
             batch_id(),

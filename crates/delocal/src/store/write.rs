@@ -920,7 +920,7 @@ mod tests {
             Action::Remove {
                 folder: f,
                 path: path("a"),
-                expected: Some(observed),
+                expected: Some(observed.clone()),
                 displace: Displace::Trash,
             },
             Action::SetMeta {
@@ -933,6 +933,8 @@ mod tests {
             Action::MoveToTrash {
                 folder: f,
                 path: path("a"),
+                version: Version::empty(),
+                expected: observed,
             },
             Action::Observe {
                 folder: f,

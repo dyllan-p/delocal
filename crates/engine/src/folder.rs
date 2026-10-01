@@ -48,11 +48,13 @@
 //! children. `ScanAborted` drops the bracket and announces nothing.
 //!
 //! **Revert** (§8.3). Every pending path gets back the record peers last
-//! saw. The current file goes to trash and the restored live entry is
-//! wanted again under the restoring mark, unless the file already holds
-//! the restored content (its pending change was a touch, a chmod or a
-//! deny's bump): then it stays, and a reset sets its mtime and exec bit
-//! back to the record where they differ.
+//! saw. The current file goes to trash by a commit of its own, a want in
+//! `ApplyMode::Trash` that holds the path until the host reports the move
+//! (draft 57), and the restored live entry is wanted again under the
+//! restoring mark once it has, unless the file already holds the restored
+//! content (its pending change was a touch, a chmod or a deny's bump): then
+//! it stays, and a reset sets its mtime and exec bit back to the record
+//! where they differ.
 //!
 //! **Settled decisions** (§8.3). `deny` and `revert` write or discard this
 //! machine's own local state, so they run only on a settled folder. A `deny`
@@ -588,7 +590,8 @@ pub struct RevertOutcome {
     /// back (`restored`) or removed. The persistence hooks come from here;
     /// §11 says every write the engine makes is reported.
     pub reverted: Vec<Reverted>,
-    /// Paths whose current file the host moves to trash.
+    /// Paths whose current file goes to the trash, each by a commit of its
+    /// own (§8.3 step 2): a want in [`ApplyMode::Trash`].
     pub trash: Vec<RelPath>,
     /// Restored live entries wanted again.
     pub refetch: usize,
@@ -635,6 +638,14 @@ pub enum HostStep {
         expected: Option<Observed>,
         mtime_ns: i64,
         exec: bool,
+    },
+    /// A revert's move to the trash (§8.3 step 2, draft 57), after the same
+    /// guard: `expected` is the file revert decided to trash. Reported with
+    /// `Trashed` under `version`, the trashed record's.
+    Trash {
+        path: RelPath,
+        version: Version,
+        expected: Observed,
     },
 }
 
@@ -1100,11 +1111,29 @@ impl FolderState {
         // or a local change, and the occupant rules below come first (§8.3,
         // §7.5's revert exception). An ignored observation leaves the path
         // unobserved, which a `revert` waits on (§8.3).
-        if self.wants.in_flight(&path) && !marked {
+        // A revert's move to the trash in flight holds the path even when it
+        // is marked: the file is not in the trash yet, and the move's report
+        // says what its guard found (§8.3 step 2).
+        let moving = self
+            .wants
+            .get(&path)
+            .is_some_and(|w| w.is_trash() && w.in_flight());
+        if self.wants.in_flight(&path) && (!marked || moving) {
             self.unobserved.insert(path);
             return Scanned::default();
         }
         self.unobserved.remove(&path);
+        // A move to the trash that failed backs off observably, the file it
+        // is to move still in place: exactly that file is the disk as revert
+        // left it, nothing new, as for a reset that failed (§8.3 step 2).
+        if let ScanState::Observed(observed) = &state
+            && self
+                .wants
+                .get(&path)
+                .is_some_and(|w| w.is_trash() && w.entry.unchanged_by_stat(observed))
+        {
+            return Scanned::default();
+        }
         // A reset that failed backs off observably while the restored record
         // still leads the disk (§8.3 step 2): the file exactly as the reset
         // expects to find it is the disk as revert left it, nothing new.
@@ -1301,6 +1330,13 @@ impl FolderState {
     /// re-derivation makes: a want already at the path is revert's restoring
     /// want, which asks every member afresh (§8.3 step 4).
     fn rederive(&mut self, now: Timestamp, old: Want) {
+        // A revert's move to the trash received nothing: its entry is the
+        // version revert discarded. Once the index has moved on at its path
+        // the move is over, given up for whatever replaced the file, whose
+        // guard would refuse it anyway (§8.3 step 2).
+        if old.is_trash() {
+            return;
+        }
         let path = old.path().clone();
         let replaces = self.wants.get(&path).is_none();
         let classified = batch::classify(&self.index, &old.received);
@@ -1441,7 +1477,13 @@ impl FolderState {
     /// index has caught up with it. Observations and commits re-evaluate
     /// `ChangedUnderneath` entries only: a `Frozen` entry waits for the
     /// folder to unpause (§8.1), however often its path is scanned meanwhile.
+    /// Nothing at a path moves on before a revert's move to the trash there
+    /// is reported (§8.3 step 2): its entries, the mark's carrier among them,
+    /// wait for the report.
     fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: DeferredReason) {
+        if self.wants.get(path).is_some_and(Want::is_trash) {
+            return;
+        }
         let take = self.deferred.take_where(path, |d| d.reason == reason);
         if take.is_empty() {
             return;
@@ -2176,8 +2218,30 @@ impl FolderState {
                 }
                 continue;
             }
-            if current.is_some() {
+            // The move to the trash is a commit like any other (§8.3 step 2,
+            // draft 57): a want of its own, holding the path until its
+            // report. A refetch waits for it as the mark's carrier, wanted
+            // again once the move is reported.
+            if let Some(current) = current {
                 trash.push(reverted.path.clone());
+                self.wants
+                    .insert_reverted(Want::trash(current.clone(), paused.batch, own));
+                if let Some(restored) = restored {
+                    refetch += 1;
+                    self.deferred.push(
+                        reverted.path.clone(),
+                        Deferred {
+                            entry: restored.clone(),
+                            batch: paused.batch,
+                            source: own,
+                            seq_high: 0,
+                            reason: DeferredReason::ChangedUnderneath,
+                            restoring: Some(restored.clone()),
+                            trashed: Some(current.observed()),
+                        },
+                    );
+                }
+                continue;
             }
             if let Some(restored) = restored {
                 let mode = if restored.kind == Kind::Dir {
@@ -2202,7 +2266,7 @@ impl FolderState {
                     local_retries: 0,
                     fetched: false,
                     restoring: true,
-                    trashed: current.map(Entry::observed),
+                    trashed: None,
                     answered: BTreeSet::new(),
                     reset: None,
                     state: WantState::Wanted,
@@ -2490,6 +2554,11 @@ impl FolderState {
                         None => self.expected(&path),
                     };
                     host.push(match want.mode {
+                        ApplyMode::Trash => HostStep::Trash {
+                            path,
+                            version: want.entry.version.clone(),
+                            expected: want.entry.observed(),
+                        },
                         ApplyMode::MetadataOnly => HostStep::SetMeta {
                             path,
                             expected,
@@ -2692,6 +2761,63 @@ impl FolderState {
             .into_iter()
             .chain(scanned.landed)
             .collect()
+    }
+
+    /// The host reported a revert's move to the trash (§8.3 step 2, draft
+    /// 57), made at `at`. Only the move the want at `path` waits for counts;
+    /// any other report is stale and changes nothing. Moved, the want ends
+    /// and nothing is adopted, since the index holds what revert restored;
+    /// the mark's carrier is wanted again and anything else deferred at the
+    /// path is classified again. The guard finding something else means the
+    /// user changed the path after the revert: the move is given up and what
+    /// it found is taken as an observation, a local change like any other. A
+    /// local failure backs off and tries again, as any commit's does (§7.5).
+    /// Returns every record written.
+    pub fn trashed(
+        &mut self,
+        now: Timestamp,
+        path: &RelPath,
+        version: &Version,
+        at: Timestamp,
+        outcome: ApplyOutcome,
+    ) -> Vec<IndexRecord> {
+        let _ = at;
+        if !self
+            .wants
+            .get(path)
+            .is_some_and(|w| w.is_trash() && w.version() == version)
+        {
+            return Vec::new();
+        }
+        let looked = match &outcome {
+            ApplyOutcome::Ok => true,
+            ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. } => {
+                !matches!(found, ScanState::Skipped { .. })
+            }
+        };
+        if looked {
+            self.unobserved.remove(path);
+        }
+        match outcome {
+            ApplyOutcome::Ok => {
+                self.wants.remove(path);
+                self.rewant_carriers(path);
+                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+                Vec::new()
+            }
+            ApplyOutcome::ChangedUnderneath { found } => {
+                self.wants.remove(path);
+                let records = self.observe_found(now, path, &found);
+                self.reconsider(now, path, DeferredReason::ChangedUnderneath);
+                records
+            }
+            ApplyOutcome::Failed { error, found } => {
+                let with_seq = self.collision_seq(&error);
+                self.wants.failed(now, path, version, &error, with_seq);
+                self.failed(now, path, error);
+                self.observe_found(now, path, &found)
+            }
+        }
     }
 
     /// True if `found` is exactly what the commit of the want at `path`
@@ -3613,6 +3739,9 @@ mod tests {
                         let version = f.wants().get(path).unwrap().version().clone();
                         out.extend(f.applied(now, path, &version, ApplyOutcome::Ok));
                     }
+                    HostStep::Trash { path, version, .. } => {
+                        out.extend(f.trashed(now, path, version, now, ApplyOutcome::Ok));
+                    }
                 }
             }
             if steps.is_empty() && f.wants().iter().all(|w| !w.in_flight()) {
@@ -3751,6 +3880,27 @@ mod tests {
 
     /// A (node 1) with `n` announced files, and B (node 2, `rules`) holding
     /// the same files after committing A's batch.
+    /// `revert`, and then the host moves every file it trashed and reports
+    /// each move (§8.3 step 2, draft 57), so the refetches can begin.
+    fn revert_moved(b: &mut FolderState, now: Timestamp) -> RevertOutcome {
+        let out = b.revert(now).unwrap();
+        trash_moved(b, now);
+        out
+    }
+
+    /// The host reports every move to the trash the want-list holds as made.
+    fn trash_moved(b: &mut FolderState, now: Timestamp) {
+        let moves: Vec<(RelPath, Version)> = b
+            .wants()
+            .iter()
+            .filter(|w| w.is_trash())
+            .map(|w| (w.path().clone(), w.version().clone()))
+            .collect();
+        for (path, version) in moves {
+            b.trashed(now, &path, &version, now, ApplyOutcome::Ok);
+        }
+    }
+
     fn a_and_b(n: usize, rules: Rules) -> (FolderState, FolderState) {
         let paths: Vec<RelPath> = (0..n).map(|i| p(&format!("f{i:02}"))).collect();
         a_and_b_at(&paths, rules)
@@ -4673,7 +4823,7 @@ mod tests {
             b.tick(t(12.0), bid(5)),
             Ticked::Paused { first: true, .. }
         ));
-        let out = b.revert(t(13.0)).unwrap();
+        let out = revert_moved(&mut b, t(13.0));
         assert_eq!(out.batch, bid(5));
         assert_eq!(
             out.trash,
@@ -4767,7 +4917,7 @@ mod tests {
             b.scanned(t(10.0), p(&format!("f{i:02}")), file(5, 5));
         }
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        let out = b.revert(t(13.0)).unwrap();
+        let out = revert_moved(&mut b, t(13.0));
         assert_eq!(out.trash.len(), 8, "the edited files go to trash");
         let f00 = b.wants().get(&p("f00")).unwrap().clone();
         assert!(f00.restoring);
@@ -4825,7 +4975,7 @@ mod tests {
         assert_eq!(b.queued().len(), 1, "queued once");
         assert_eq!(b.next_queued(), None, "still paused");
 
-        b.revert(t(16.0)).unwrap();
+        revert_moved(&mut b, t(16.0));
         assert_eq!(
             b.next_queued(),
             Some(Next::Waiting(FolderStatus::Waiting {
@@ -4917,7 +5067,7 @@ mod tests {
         assert_eq!(b.next_queued(), None);
         b.applied(t(17.0), &p("f09"), &v, ApplyOutcome::Ok);
         assert_eq!(b.next_queued(), Some(Next::Run(revert)));
-        assert_eq!(b.revert(t(17.0)).unwrap().reverted.len(), 4);
+        assert_eq!(revert_moved(&mut b, t(17.0)).reverted.len(), 4);
     }
 
     /// Seed 96183's shape (§8.3, draft 55): B deletes f09 and three more,
@@ -4978,7 +5128,7 @@ mod tests {
         assert!(b.observe_requests().is_empty(), "asked once");
         assert!(b.scanned(t(19.0), p("f09"), file(9, 9)).change.is_some());
         assert_eq!(b.next_queued(), Some(Next::Run(revert)));
-        let out = b.revert(t(20.0)).unwrap();
+        let out = revert_moved(&mut b, t(20.0));
         assert!(out.trash.contains(&p("f09")), "{:?}", out.trash);
     }
 
@@ -5007,7 +5157,7 @@ mod tests {
         );
         assert_eq!(b.next_queued(), Some(Next::Run(revert)));
         assert!(b.observe_requests().is_empty());
-        let out = b.revert(t(20.0)).unwrap();
+        let out = revert_moved(&mut b, t(20.0));
         assert!(out.trash.contains(&p("f09")), "{:?}", out.trash);
     }
 
@@ -5070,7 +5220,7 @@ mod tests {
         b.scan_finished(t(13.0)).unwrap();
         assert!(!b.startup_scan_pending());
         assert_eq!(b.next_queued(), Some(Next::Run(revert)));
-        let out = b.revert(t(14.0)).unwrap();
+        let out = revert_moved(&mut b, t(14.0));
         let copy = p("f04.conflict-20231114-221300-alpha");
         assert!(out.trash.contains(&copy), "trashed with the rest");
         assert_eq!(b.index().get(&copy), None, "peers never saw it");
@@ -5127,7 +5277,7 @@ mod tests {
             b.scanned(t(14.0), p(&format!("f{i:02}")), ScanState::Absent);
         }
         assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
-        let out = b.revert(t(17.0)).unwrap();
+        let out = revert_moved(&mut b, t(17.0));
         assert_eq!(out.returned, vec![(bid(3), 4)]);
         // Back as it was, its versions arriving again after anything held
         // meanwhile.
@@ -5168,7 +5318,7 @@ mod tests {
             b.scanned(t(17.0), p(&format!("f{i:02}")), ScanState::Absent);
         }
         assert!(matches!(b.tick(t(20.0), bid(5)), Ticked::Paused { .. }));
-        let out = b.revert(t(21.0)).unwrap();
+        let out = revert_moved(&mut b, t(21.0));
         assert!(out.returned.is_empty());
         assert!(b.quarantine().is_empty());
         assert!(!b.index().get(&p("f00")).unwrap().entry.deleted);
@@ -5213,7 +5363,7 @@ mod tests {
             "the checkout back leaves only touches pending"
         );
 
-        let out = b.revert(t(14.0)).unwrap();
+        let out = revert_moved(&mut b, t(14.0));
         assert!(out.trash.is_empty(), "no file moves to trash");
         assert_eq!((out.refetch, out.kept), (0, 8));
         let records: Vec<IndexRecord> = b.index().records().cloned().collect();
@@ -5276,7 +5426,7 @@ mod tests {
         }
         assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
 
-        let out = b.revert(t(17.0)).unwrap();
+        let out = revert_moved(&mut b, t(17.0));
         assert_eq!(out.returned, vec![(bid(3), 4)]);
         assert!(out.trash.is_empty(), "f06 to f09 are gone; f00 to f03 stay");
         assert_eq!(
@@ -5337,7 +5487,7 @@ mod tests {
             b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
         }
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        let out = b.revert(t(13.0)).unwrap();
+        let out = revert_moved(&mut b, t(13.0));
         assert!(out.trash.is_empty());
         assert_eq!((out.refetch, out.kept), (4, 1));
         let v = b.wants().get(&p("f09")).unwrap().version().clone();
@@ -5360,7 +5510,8 @@ mod tests {
                 HostStep::Fetch { path, .. }
                 | HostStep::Write { path, .. }
                 | HostStep::Remove { path, .. }
-                | HostStep::SetMeta { path, .. } => path == &p("f09"),
+                | HostStep::SetMeta { path, .. }
+                | HostStep::Trash { path, .. } => path == &p("f09"),
             })
             .collect();
         assert_eq!(
@@ -5602,7 +5753,7 @@ mod tests {
         let deny = UserDecision::Deny { batch: bid(3) };
         assert!(matches!(b.request(deny), Requested::Queued(_)));
 
-        b.revert(t(16.0)).unwrap();
+        revert_moved(&mut b, t(16.0));
         assert_eq!(
             b.next_queued(),
             Some(Next::Waiting(FolderStatus::Waiting {
@@ -5630,7 +5781,7 @@ mod tests {
             b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
         }
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        b.revert(t(13.0)).unwrap();
+        revert_moved(&mut b, t(13.0));
         let restored = b.index().get(&p("f09")).unwrap().clone();
         let v = b.wants().get(&p("f09")).unwrap().version().clone();
         b.dispatch(t(13.0), &lan(&[1, 3]));
@@ -5664,7 +5815,7 @@ mod tests {
         assert_eq!(b.next_queued(), None);
         b.scan_finished(t(16.0)).unwrap();
         assert_eq!(b.next_queued(), Some(Next::Run(revert)));
-        b.revert(t(16.0)).unwrap();
+        revert_moved(&mut b, t(16.0));
         commit_all(&mut b, t(17.0));
         b.scan_started();
         let deny = UserDecision::Deny { batch: bid(3) };
@@ -5900,6 +6051,7 @@ mod tests {
                 HostStep::Write { .. } => "write",
                 HostStep::Remove { .. } => "remove",
                 HostStep::SetMeta { .. } => "setmeta",
+                HostStep::Trash { .. } => "trash",
             })
             .collect();
         assert_eq!(
@@ -6071,7 +6223,7 @@ mod tests {
         assert!(matches!(b.tick(t(30.0), bid(5)), Ticked::Paused { .. }));
         // Back to the defaults, so A's version, re-admitted, is not held.
         b.rules_changed(Rules::default());
-        b.revert(t(31.0)).unwrap();
+        revert_moved(&mut b, t(31.0));
         let want = b.wants().get(&p("f00")).unwrap();
         assert!(want.restoring);
         assert_eq!(want.entry.hash, hash(7), "A's version, re-derived");
@@ -6096,7 +6248,7 @@ mod tests {
         b.scanned(t(10.0), p("f00"), ScanState::Absent);
         b.scanned(t(10.0), p("f01"), ScanState::Absent);
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        b.revert(t(13.0)).unwrap();
+        revert_moved(&mut b, t(13.0));
         // Nobody connected: without source, observable, but Absent is the trash move.
         assert!(b.dispatch(t(13.0), &BTreeMap::new()).0.is_empty());
         assert_eq!(b.wants().get(&p("f00")).unwrap().state, WantState::NoSource);
@@ -6139,7 +6291,7 @@ mod tests {
         );
         b.scanned(t(10.0), path.clone(), file(5, 5));
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        b.revert(t(13.0)).unwrap();
+        revert_moved(&mut b, t(13.0));
         let restored = b.index().get(&path).unwrap().clone();
         let v = restored.entry.version.clone();
         b.dispatch(t(13.0), &lan(&[1]));
@@ -6215,7 +6367,7 @@ mod tests {
         b.scanned(t(10.0), p("f00"), link(5));
         b.scanned(t(10.0), p("f01"), file(6, 6));
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        b.revert(t(13.0)).unwrap();
+        revert_moved(&mut b, t(13.0));
         b.rules_changed(Rules::default());
         assert!(b.wants().restoring(&p("f00")));
         assert_eq!(
@@ -6281,6 +6433,200 @@ mod tests {
         assert_eq!(b.index().get(&p("f00")), Some(&restored));
     }
 
+    /// B edits f00 twice and f01 once and pauses; the revert moves both
+    /// edited files to the trash, each by a commit of its own (§8.3 step 2,
+    /// draft 57), and the refetch of each restored record waits as the
+    /// mark's carrier. Returns A, B, the revert's outcome and f00's move's
+    /// version.
+    fn reverting() -> (FolderState, FolderState, RevertOutcome, Version) {
+        let (a, mut b) = a_and_b(
+            2,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(9.0), p("f00"), file(4, 4));
+        b.scanned(t(10.0), p("f00"), file(5, 5));
+        b.scanned(t(10.0), p("f01"), file(6, 6));
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(13.0)).unwrap();
+        b.rules_changed(Rules::default());
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        (a, b, out, v)
+    }
+
+    /// Draft 57: the move holds its path until its report, so nothing else
+    /// at the path starts and even an observation at the marked path is
+    /// ignored meanwhile; once the move is reported, the refetch begins.
+    #[test]
+    fn a_reverts_move_to_the_trash_holds_its_path_until_its_report() {
+        let (_, mut b, out, v) = reverting();
+        assert_eq!(out.trash, [p("f00"), p("f01")]);
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(want.is_trash() && want.entry.hash == hash(5));
+        assert!(
+            b.deferred()
+                .any(|d| d.entry.path == p("f00") && d.restoring.is_some()),
+            "the refetch waits as the mark's carrier"
+        );
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        let ScanState::Observed(edited) = file(5, 5) else {
+            unreachable!()
+        };
+        assert!(
+            steps.iter().any(|s| matches!(s, HostStep::Trash { path, expected, .. } if *path == p("f00") && *expected == edited)),
+            "{steps:?}"
+        );
+        assert!(
+            !steps.iter().any(|s| matches!(s, HostStep::Fetch { .. })),
+            "no refetch before the moves are reported"
+        );
+        let restored = b.index().get(&p("f00")).unwrap().clone();
+        assert_eq!(b.scanned(t(14.0), p("f00"), file(8, 8)), Scanned::default());
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(
+            b.trashed(t(15.0), &p("f00"), &v, t(15.0), ApplyOutcome::Ok)
+                .is_empty()
+        );
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(
+            want.restoring && !want.is_trash(),
+            "the refetch is wanted again"
+        );
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1]));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Fetch { path, .. } if *path == p("f00"))),
+            "{steps:?}"
+        );
+    }
+
+    /// Draft 57: a move whose guard finds another file is given up, and what
+    /// it found is the user's change since the revert, taken as a local
+    /// change; the mark goes with it.
+    #[test]
+    fn a_move_that_finds_another_file_leaves_it_as_a_local_change() {
+        let (_, mut b, _, v) = reverting();
+        b.dispatch(t(13.0), &lan(&[1]));
+        let ScanState::Observed(other) = file(8, 8) else {
+            unreachable!()
+        };
+        let found = ScanState::Observed(other);
+        let written = b.trashed(
+            t(15.0),
+            &p("f00"),
+            &v,
+            t(15.0),
+            ApplyOutcome::ChangedUnderneath { found },
+        );
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(b.index().get(&p("f00")).unwrap().entry.hash, hash(8));
+        assert!(b.wants().get(&p("f00")).is_none_or(|w| !w.is_trash()));
+        assert!(
+            !b.deferred()
+                .any(|d| d.restoring.is_some() && d.entry.path == p("f00"))
+        );
+    }
+
+    /// Draft 57: a move that fails locally backs off like any commit, and
+    /// meanwhile the file it is to move is the disk as revert left it,
+    /// nothing new, as for a reset that failed; then it is tried again.
+    #[test]
+    fn a_failed_move_backs_off_and_its_file_is_nothing_new() {
+        let (_, mut b, _, v) = reverting();
+        b.dispatch(t(13.0), &lan(&[1]));
+        let restored = b.index().get(&p("f00")).unwrap().clone();
+        b.trashed(
+            t(15.0),
+            &p("f00"),
+            &v,
+            t(15.0),
+            ApplyOutcome::Failed {
+                error: LocalError::Io,
+                found: file(5, 5),
+            },
+        );
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert!(want.is_trash());
+        assert!(matches!(want.state, WantState::LocalRetry { .. }));
+        // Seed 584: the failure's report, like any, re-examines what waits at
+        // the path, and the mark's carrier was taken as caught up and lost.
+        // It waits for the move.
+        let carrier = |b: &FolderState| {
+            b.deferred()
+                .any(|d| d.entry.path == p("f00") && d.restoring.is_some())
+        };
+        assert!(carrier(&b), "the refetch still waits for the move");
+        assert_eq!(b.scanned(t(16.0), p("f00"), file(5, 5)), Scanned::default());
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(carrier(&b));
+        b.expire(t(80.0));
+        let (steps, _) = b.dispatch(t(80.0), &lan(&[1]));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Trash { path, .. } if *path == p("f00"))),
+            "tried again: {steps:?}"
+        );
+        b.trashed(t(81.0), &p("f00"), &v, t(81.0), ApplyOutcome::Ok);
+        assert!(b.wants().restoring(&p("f00")), "then the refetch");
+    }
+
+    /// Draft 57: nothing at the path moves on before the move's report. A
+    /// peer's newer version arriving while the move waits to be dispatched
+    /// waits too, and is wanted once the move is reported.
+    #[test]
+    fn a_version_arriving_before_the_move_is_reported_waits_for_it() {
+        let (mut a, mut b, _, v) = reverting();
+        a.scanned(t(20.0), p("f00"), file(7, 70));
+        let batch = a.form_batches(t(22.0), bid(7)).remove(0);
+        assert_eq!(b.receive(t(22.0), &batch).decision, Decision::Accepted);
+        assert!(
+            b.wants().get(&p("f00")).unwrap().is_trash(),
+            "still the move"
+        );
+        assert!(
+            b.deferred()
+                .any(|d| d.entry.path == p("f00") && d.entry.hash == hash(7))
+        );
+        b.dispatch(t(23.0), &lan(&[1]));
+        b.trashed(t(24.0), &p("f00"), &v, t(24.0), ApplyOutcome::Ok);
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert_eq!(want.entry.hash, hash(7), "A's version, wanted now");
+        assert!(want.restoring, "with the mark");
+    }
+
+    /// Seed 192's shape: while a move waits (here backing off), the user
+    /// writes another file at the path. The move is over, given up for the
+    /// new file; it is never re-derived as if its entry, the version revert
+    /// discarded, had been received, which left a want for it without
+    /// source and every later version deferred behind it.
+    #[test]
+    fn a_waiting_move_gives_way_to_a_local_change() {
+        let (_, mut b, _, v) = reverting();
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.trashed(
+            t(15.0),
+            &p("f00"),
+            &v,
+            t(15.0),
+            ApplyOutcome::Failed {
+                error: LocalError::Io,
+                found: file(5, 5),
+            },
+        );
+        assert!(b.scanned(t(16.0), p("f00"), file(8, 8)).change.is_some());
+        assert!(
+            b.wants().get(&p("f00")).is_none(),
+            "{:?}",
+            b.wants().get(&p("f00"))
+        );
+        assert_eq!(b.index().get(&p("f00")).unwrap().entry.hash, hash(8));
+    }
+
     /// A and B hold two files A made; B's user edits both, B pauses and
     /// reverts, so both paths carry the restoring mark with the restored
     /// records wanted back. The rules go back to the defaults so the
@@ -6297,7 +6643,7 @@ mod tests {
         b.scanned(t(10.0), p("f00"), file(5, 5));
         b.scanned(t(10.0), p("f01"), file(6, 6));
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        b.revert(t(13.0)).unwrap();
+        revert_moved(&mut b, t(13.0));
         b.rules_changed(Rules::default());
         assert_eq!(b.wants().len(), 2);
         assert!(b.wants().iter().all(|w| w.restoring));
@@ -6536,7 +6882,7 @@ mod tests {
         );
         b.scanned(t(10.0), p("f00"), file(5, 5));
         assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
-        b.revert(t(13.0)).unwrap();
+        revert_moved(&mut b, t(13.0));
         let v = b.wants().get(&p("f00")).unwrap().version().clone();
         assert_eq!(b.wants().get(&p("f00")).unwrap().state, WantState::Wanted);
         assert!(b.in_flight(&p("f00")));
@@ -7246,6 +7592,9 @@ mod tests {
                         let version = f.wants().get(path).unwrap().version().clone();
                         f.applied(now, path, &version, ApplyOutcome::Ok);
                     }
+                    HostStep::Trash { path, version, .. } => {
+                        f.trashed(now, path, version, now, ApplyOutcome::Ok);
+                    }
                 }
             }
             all.extend(steps);
@@ -7484,7 +7833,7 @@ mod tests {
                 })
             };
             let pending: Vec<RelPath> = b.index().pending_paths().cloned().collect();
-            let out = b.revert(t(13.0)).unwrap();
+            let out = revert_moved(&mut b, t(13.0));
             let trashed: BTreeSet<RelPath> =
                 current.keys().filter(|p| !holds_announced(p)).cloned().collect();
             prop_assert_eq!(out.trash.iter().cloned().collect::<BTreeSet<_>>(), trashed);

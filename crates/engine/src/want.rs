@@ -263,14 +263,48 @@ impl Want {
         self.mode == ApplyMode::Fetch && !self.fetched
     }
 
-    /// True if this want removes the entry.
+    /// True if this want removes the entry: a tombstone's, or a revert's
+    /// move to the trash, which the ordering gate treats alike (children
+    /// first).
     pub fn is_delete(&self) -> bool {
-        self.entry.deleted
+        self.entry.deleted || self.mode == ApplyMode::Trash
     }
 
     /// True if this want creates or replaces a directory.
     pub fn is_dir_create(&self) -> bool {
-        !self.entry.deleted && self.entry.kind == Kind::Dir
+        !self.is_delete() && self.entry.kind == Kind::Dir
+    }
+
+    /// True if this want is a revert's move to the trash (§8.3 step 2).
+    pub fn is_trash(&self) -> bool {
+        self.mode == ApplyMode::Trash
+    }
+
+    /// A revert's move to the trash of the file `current` describes (§8.3
+    /// step 2, draft 57): a commit of its own, whose guard expects exactly
+    /// that file, and which adopts nothing.
+    pub fn trash(current: Entry, batch: BatchId, own: NodeId) -> Self {
+        Self {
+            received: current.clone(),
+            entry: current,
+            mode: ApplyMode::Trash,
+            conflict: None,
+            batch,
+            source: own,
+            seq_high: 0,
+            sources: BTreeSet::new(),
+            refused: BTreeMap::new(),
+            excluded: BTreeMap::new(),
+            strikes: BTreeMap::new(),
+            mismatches: 0,
+            local_retries: 0,
+            fetched: false,
+            restoring: false,
+            trashed: None,
+            answered: BTreeSet::new(),
+            reset: None,
+            state: WantState::Wanted,
+        }
     }
 
     fn from_item(
