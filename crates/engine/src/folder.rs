@@ -40,7 +40,8 @@
 //! too. A local change at an observable wanted path re-classifies the want.
 //!
 //! **Scan bracket.** Between `ScanStarted` and `ScanFinished` every path the
-//! host reports is marked seen; at `ScanFinished` every live record not seen
+//! host reports is marked seen, and so is every path a commit report
+//! arrives for (draft 58); at `ScanFinished` every live record not seen
 //! becomes a tombstone dated then (§7.3). A path reported `Skipped` is seen
 //! and nothing more: the host could not inspect it, so its record stands
 //! and nothing is announced for it. A skip also covers every tracked path
@@ -488,8 +489,9 @@ pub struct Scanned {
     pub landed: Option<IndexRecord>,
 }
 
-/// An open scan bracket (§7.3): every path the host has reported since
-/// `ScanStarted`, and which of them it reported `Skipped`.
+/// An open scan bracket (§7.3): every path seen since `ScanStarted`, by an
+/// observation or a commit report, and which of them the host reported
+/// `Skipped`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Bracket {
     seen: BTreeSet<RelPath>,
@@ -505,8 +507,16 @@ impl Bracket {
         }
     }
 
-    /// True if the bracket's end may not take `path` for absent: the host
-    /// reported it, or reported a path above it `Skipped`. A directory
+    /// A commit report of `path` arrived (draft 58): the host has just been
+    /// there, so whatever the walk found, or did not reach, is no evidence
+    /// that the path is gone.
+    fn committed(&mut self, path: &RelPath) {
+        self.seen.insert(path.clone());
+    }
+
+    /// True if the bracket's end may not take `path` for absent: something
+    /// was seen of it, an observation or a commit report, or the host
+    /// reported a path above it `Skipped`. A directory
     /// that cannot be listed is reported once and covers every tracked
     /// path beneath it, since the host cannot see the children to report
     /// them one by one (§7.3). The engine does not know what the host found
@@ -1700,8 +1710,9 @@ impl FolderState {
         self.scan = Some(Bracket::default());
     }
 
-    /// A full scan ended: every live record it did not report is gone
-    /// (§7.3), except records beneath a path it reported `Skipped`, paths
+    /// A full scan ended: every live record nothing has been seen of since
+    /// it opened, no observation and no commit report, is gone (§7.3, draft
+    /// 58), except records beneath a path it reported `Skipped`, paths
     /// in flight and paths carrying the restoring mark, whatever state the
     /// want that carries it is in, or whether a deferred entry carries it
     /// instead (§8.3). Returns the tombstones, or `Err` if no bracket was
@@ -2779,6 +2790,12 @@ impl FolderState {
         at: Timestamp,
         outcome: ApplyOutcome,
     ) -> Vec<IndexRecord> {
+        // Whatever becomes of the report below, the host has just been at
+        // the path, and a scan open meanwhile may not take it for absent: a
+        // commit can land after the walk passed its directory (draft 58).
+        if let Some(bracket) = &mut self.scan {
+            bracket.committed(path);
+        }
         // The report of a commit a rule released early: discarded, and the
         // path is free for a new commit (§7.5). No other commit of the path
         // started meanwhile, so the report can be no one else's.
@@ -2941,6 +2958,10 @@ impl FolderState {
         at: Timestamp,
         outcome: ApplyOutcome,
     ) -> Vec<IndexRecord> {
+        // As for any commit's report (draft 58).
+        if let Some(bracket) = &mut self.scan {
+            bracket.committed(path);
+        }
         if !self
             .wants
             .get(path)
@@ -6756,6 +6777,41 @@ mod tests {
         let stale = b.observed_at(t(22.0), t(14.5), p("f00"), file(9, 9));
         assert_eq!(stale, Scanned::default());
         assert_eq!(b.index().get(&p("f00")).unwrap().entry.hash, hash(8));
+    }
+
+    /// §7.3 (draft 58): a bracket's deletion pass tombstones only a path
+    /// nothing has been seen of since it opened. A's new file n lands on B
+    /// while B's scan is open, after the walk passed where n would be: the
+    /// scan never reports it, but its commit report says it is there, so
+    /// it stays. f01, which nothing reported, is tombstoned as before.
+    #[test]
+    fn a_commit_that_lands_during_a_scan_is_not_taken_for_absent() {
+        let (mut a, mut b) = a_and_b(2, Rules::default());
+        a.scanned(t(10.0), p("n"), file(7, 7));
+        let batch = a.form_batches(t(12.0), bid(2)).remove(0);
+        b.receive(t(12.0), &batch);
+        b.scan_started();
+        b.scanned(t(13.0), p("f00"), ScanState::Unchanged);
+        let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
+        let Some(HostStep::Fetch { version, .. }) = steps.first() else {
+            panic!("{steps:?}")
+        };
+        let v = version.clone();
+        b.fetched(t(14.0), &p("n"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(
+            matches!(steps.first(), Some(HostStep::Write { .. })),
+            "{steps:?}"
+        );
+        assert_eq!(
+            b.applied_at(t(15.0), &p("n"), &v, t(15.0), ApplyOutcome::Ok)
+                .len(),
+            1
+        );
+        let gone = b.scan_finished(t(16.0)).unwrap();
+        let gone: Vec<&RelPath> = gone.iter().map(|c| &c.record.entry.path).collect();
+        assert_eq!(gone, [&p("f01")]);
+        assert!(b.index().live(&p("n")).is_some());
     }
 
     /// §7.3, §8.3 step 2 (drafts 56 and 57), seed 57's shape: B adds f09,
