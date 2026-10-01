@@ -706,6 +706,12 @@ pub struct FolderState {
     /// `Observe`, until an observation of them arrives. Not persisted
     /// either: the request dies with the process.
     observing: BTreeSet<RelPath>,
+    /// The time of each path's last commit report (§7.3, draft 56): an
+    /// `Applied` when the engine handled it, a revert's `Trashed` when the
+    /// move ran. An observation taken before it describes a state the
+    /// commit has since replaced. Not persisted: after a restart every
+    /// observation is taken afresh.
+    reported: BTreeMap<RelPath, Timestamp>,
     /// True while a full disk pauses the folder's inbound (§7.5 "local
     /// failures"): from the first `DiskFull` reported by a fetch or commit
     /// a want waited for, until the host reports space recovered. Nothing
@@ -756,6 +762,7 @@ impl FolderState {
             startup_scan: false,
             unobserved: BTreeSet::new(),
             observing: BTreeSet::new(),
+            reported: BTreeMap::new(),
             disk_full: false,
             statuses: Vec::new(),
         }
@@ -795,6 +802,7 @@ impl FolderState {
             startup_scan: false,
             unobserved: BTreeSet::new(),
             observing: BTreeSet::new(),
+            reported: BTreeMap::new(),
             disk_full: rest.disk_full,
             statuses: Vec::new(),
         }
@@ -852,6 +860,7 @@ impl FolderState {
             startup_scan,
             unobserved,
             observing,
+            reported,
             disk_full,
             statuses,
         } = self;
@@ -877,6 +886,7 @@ impl FolderState {
             .or_else(|| differs("startup_scan", *startup_scan == other.startup_scan))
             .or_else(|| differs("unobserved", *unobserved == other.unobserved))
             .or_else(|| differs("observing", *observing == other.observing))
+            .or_else(|| differs("reported", *reported == other.reported))
             .or_else(|| differs("disk_full", *disk_full == other.disk_full))
             .or_else(|| differs("statuses", *statuses == other.statuses))
     }
@@ -1060,14 +1070,28 @@ impl FolderState {
     /// the index as it is and is the landing of a refetch whose report was
     /// lost (§13); anything else is a local change like any other.
     pub fn scanned(&mut self, now: Timestamp, path: RelPath, state: ScanState) -> Scanned {
-        self.take_observation(now, path, state, Observer::Scan)
+        self.take_observation(now, now, path, state, Observer::Scan)
     }
 
-    /// [`Self::scanned`], for an observation made by `observer`: a scan or
-    /// the watcher, or the guard of a commit whose report carries it.
+    /// [`Self::scanned`], for an observation the host took at `at` (§7.3,
+    /// draft 56).
+    pub fn observed_at(
+        &mut self,
+        now: Timestamp,
+        at: Timestamp,
+        path: RelPath,
+        state: ScanState,
+    ) -> Scanned {
+        self.take_observation(now, at, path, state, Observer::Scan)
+    }
+
+    /// [`Self::scanned`], for an observation made by `observer` at `at`: a
+    /// scan or the watcher, or the guard of a commit whose report carries
+    /// it.
     fn take_observation(
         &mut self,
         now: Timestamp,
+        at: Timestamp,
         path: RelPath,
         state: ScanState,
         observer: Observer,
@@ -1083,6 +1107,18 @@ impl FolderState {
         // Whatever becomes of it below, this is the observation an
         // `Observe` asked for, if one did.
         self.observing.remove(&path);
+        // An observation is a fact about a moment (§7.3, draft 56): one taken
+        // before the path's last commit report describes a state the commit
+        // has replaced. It is dropped, though the bracket has counted the
+        // path as seen above, so nothing is tombstoned for having been read
+        // at the wrong moment.
+        if self
+            .reported
+            .get(&path)
+            .is_some_and(|reported| at < *reported)
+        {
+            return Scanned::default();
+        }
         let marked = self.marked(&path);
         if state == ScanState::Absent && marked {
             self.unobserved.remove(&path);
@@ -2497,6 +2533,7 @@ impl FolderState {
         self.startup_scan = true;
         self.unobserved.clear();
         self.observing.clear();
+        self.reported.clear();
     }
 
     /// Decide the next host steps for the want-list (§7.5) and adopt every
@@ -2628,11 +2665,13 @@ impl FolderState {
         // path is free for a new commit (§7.5). No other commit of the path
         // started meanwhile, so the report can be no one else's.
         if self.wants.released_reported(path, version) {
+            self.reported.insert(path.clone(), now);
             return Vec::new();
         }
         if self.wants.get(path).is_none_or(|w| w.version() != version) {
             return Vec::new();
         }
+        self.reported.insert(path.clone(), now);
         // The report says what the commit left at the path or found there:
         // a fresh observation, for a `revert` waiting on one (§8.3), unless
         // the host could not look. If the observation it carries is ignored
@@ -2670,7 +2709,7 @@ impl FolderState {
                 let with_seq = self.collision_seq(&error);
                 self.wants.failed(now, path, version, &error, with_seq);
                 self.failed(now, path, error);
-                return self.observe_found(now, path, &found);
+                return self.observe_found(now, now, path, &found);
             }
         };
         let Some(want) = self.wants.remove(path) else {
@@ -2685,7 +2724,7 @@ impl FolderState {
             // the path are then classified against it; if the file changed
             // underneath, they wait for the next observation instead.
             if let Some(found) = found {
-                return self.observe_found(now, path, &found);
+                return self.observe_found(now, now, path, &found);
             }
             let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
             self.reconsider(now, path, DeferredReason::ChangedUnderneath);
@@ -2693,7 +2732,7 @@ impl FolderState {
         }
         if let Some(found) = found {
             self.defer_changed_underneath(want);
-            return self.observe_found(now, path, &found);
+            return self.observe_found(now, now, path, &found);
         }
         let Some(record) = self.adopt(now, want.entry.clone()) else {
             // The record moved on under the commit (release-build fallback
@@ -2725,7 +2764,9 @@ impl FolderState {
     /// engine takes that as an observation before anything else (§7.5 step
     /// 6): the path is never left unknown, and an observation set aside
     /// while the commit was in flight is replaced by this fresher one. The
-    /// records it writes, in order.
+    /// guard looked at `at`, the report's own time (draft 56), so the
+    /// observation is never older than the report. The records it writes,
+    /// in order.
     ///
     /// An observation that says nothing the index does not (the path as
     /// its record says, or nothing seen) is no news, and the entries at the
@@ -2737,6 +2778,7 @@ impl FolderState {
     fn observe_found(
         &mut self,
         now: Timestamp,
+        at: Timestamp,
         path: &RelPath,
         found: &ScanState,
     ) -> Vec<IndexRecord> {
@@ -2754,7 +2796,7 @@ impl FolderState {
         if !news {
             return Vec::new();
         }
-        let scanned = self.take_observation(now, path.clone(), found.clone(), Observer::Guard);
+        let scanned = self.take_observation(now, at, path.clone(), found.clone(), Observer::Guard);
         scanned
             .change
             .map(|c| c.record)
@@ -2781,7 +2823,6 @@ impl FolderState {
         at: Timestamp,
         outcome: ApplyOutcome,
     ) -> Vec<IndexRecord> {
-        let _ = at;
         if !self
             .wants
             .get(path)
@@ -2789,6 +2830,7 @@ impl FolderState {
         {
             return Vec::new();
         }
+        self.reported.insert(path.clone(), at);
         let looked = match &outcome {
             ApplyOutcome::Ok => true,
             ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. } => {
@@ -2807,7 +2849,7 @@ impl FolderState {
             }
             ApplyOutcome::ChangedUnderneath { found } => {
                 self.wants.remove(path);
-                let records = self.observe_found(now, path, &found);
+                let records = self.observe_found(now, at, path, &found);
                 self.reconsider(now, path, DeferredReason::ChangedUnderneath);
                 records
             }
@@ -2815,7 +2857,7 @@ impl FolderState {
                 let with_seq = self.collision_seq(&error);
                 self.wants.failed(now, path, version, &error, with_seq);
                 self.failed(now, path, error);
-                self.observe_found(now, path, &found)
+                self.observe_found(now, at, path, &found)
             }
         }
     }
@@ -6433,6 +6475,68 @@ mod tests {
         assert_eq!(b.index().get(&p("f00")), Some(&restored));
     }
 
+    /// §7.3, draft 56: an observation is a fact about a moment. B's commit
+    /// of f00 was reported at 4 s; a scan that read f00 at 3.5 s, before the
+    /// commit replaced it, and reports it only now describes a state that
+    /// no longer exists. It is dropped, but counts as seen for the bracket,
+    /// so the bracket's end does not take f00 for absent either. Read after
+    /// the report, the same observation is a local change.
+    #[test]
+    fn an_observation_taken_before_the_last_commit_report_is_stale() {
+        let (_, mut b) = a_and_b(2, Rules::default());
+        let record = b.index().get(&p("f00")).unwrap().clone();
+        assert_eq!(
+            b.observed_at(t(5.0), t(3.5), p("f00"), ScanState::Absent),
+            Scanned::default()
+        );
+        assert_eq!(b.index().get(&p("f00")), Some(&record));
+        b.scan_started();
+        b.observed_at(t(6.0), t(3.5), p("f00"), ScanState::Absent);
+        b.scanned(t(6.0), p("f01"), ScanState::Unchanged);
+        assert!(
+            b.scan_finished(t(6.0)).unwrap().is_empty(),
+            "f00 counts as seen"
+        );
+        assert_eq!(b.index().get(&p("f00")), Some(&record));
+        let change = b
+            .observed_at(t(7.0), t(4.5), p("f00"), ScanState::Absent)
+            .change;
+        assert!(
+            change.is_some_and(|c| c.record.entry.deleted),
+            "read after the report"
+        );
+    }
+
+    /// §7.3, §8.3 step 2 (drafts 56 and 57), seed 57's shape: B adds f09,
+    /// which peers never saw, and edits f00; the revert removes f09's record
+    /// and moves the file to the trash, leaving no mark there. The move ran
+    /// at 15 s; a scan that read f09 at 14 s and reports it after the move's
+    /// report is stale, and does not announce the discarded add again.
+    #[test]
+    fn a_read_from_before_the_move_to_the_trash_is_stale() {
+        let (_, mut b) = a_and_b(
+            1,
+            Rules {
+                hold_count: 1,
+                hold_pct: 0,
+                ..Rules::default()
+            },
+        );
+        b.scanned(t(10.0), p("f09"), file(9, 9));
+        b.scanned(t(10.0), p("f00"), file(5, 5));
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        b.revert(t(13.0)).unwrap();
+        assert_eq!(b.index().get(&p("f09")), None, "peers never saw it");
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.trashed(t(15.5), &p("f09"), &v, t(15.0), ApplyOutcome::Ok);
+        assert_eq!(
+            b.observed_at(t(16.0), t(14.0), p("f09"), file(9, 9)),
+            Scanned::default()
+        );
+        assert_eq!(b.index().get(&p("f09")), None, "not added again");
+    }
+
     /// B edits f00 twice and f01 once and pauses; the revert moves both
     /// edited files to the trash, each by a commit of its own (§8.3 step 2,
     /// draft 57), and the refetch of each restored record waits as the
@@ -6529,6 +6633,24 @@ mod tests {
             !b.deferred()
                 .any(|d| d.restoring.is_some() && d.entry.path == p("f00"))
         );
+    }
+
+    /// Draft 56: what a move's guard found is taken at the time the move
+    /// ran, the report's own time, so it is never older than the report,
+    /// however far ahead of the engine's clock the host stamped it.
+    #[test]
+    fn a_moves_own_observation_is_taken_when_the_move_ran() {
+        let (_, mut b, _, v) = reverting();
+        b.dispatch(t(13.0), &lan(&[1]));
+        let written = b.trashed(
+            t(15.0),
+            &p("f00"),
+            &v,
+            t(16.0),
+            ApplyOutcome::ChangedUnderneath { found: file(8, 8) },
+        );
+        assert_eq!(written.len(), 1, "{written:?}");
+        assert_eq!(b.index().get(&p("f00")).unwrap().entry.hash, hash(8));
     }
 
     /// Draft 57: a move that fails locally backs off like any commit, and
