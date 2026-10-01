@@ -412,6 +412,7 @@ fn queued() -> BoxedStrategy<Queued> {
         path().prop_map(|path| WaitReason::Restoring { path }),
         path().prop_map(|path| WaitReason::Committing { path }),
         Just(WaitReason::StartupScan),
+        path().prop_map(|path| WaitReason::Unobserved { path }),
         Just(WaitReason::ScanOpen),
     ];
     (decision, reason)
