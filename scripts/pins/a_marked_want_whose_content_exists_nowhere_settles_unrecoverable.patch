@@ -9,10 +9,10 @@ test: delocal-sim regressions::a_marked_want_whose_content_exists_nowhere_settle
 test: delocal-engine folder::tests::a_want_at_a_marked_path_asks_every_member_and_settles_when_all_refuse
 
 diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
-index a48d211..b5da8cb 100644
+index e9282c7..e0c5903 100644
 --- a/crates/engine/src/want.rs
 +++ b/crates/engine/src/want.rs
-@@ -371,9 +371,8 @@ impl WantList {
+@@ -483,9 +483,8 @@ impl WantList {
          if let Some(existing) = self.wants.get_mut(&path) {
              if incoming == *existing.version() {
                  existing.sources.insert(source);
@@ -23,10 +23,10 @@ index a48d211..b5da8cb 100644
                  }
                  self.note(&path);
                  return None;
-@@ -385,9 +384,6 @@ impl WantList {
-         }
+@@ -501,9 +500,6 @@ impl WantList {
          let mut want = Want::from_item(item, received, batch, source, seq_high);
          want.restoring = restoring;
+         want.trashed = trashed;
 -        if let Some(others) = marked {
 -            want.sources.extend(others.iter().copied());
 -        }
