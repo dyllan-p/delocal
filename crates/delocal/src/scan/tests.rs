@@ -177,6 +177,7 @@ fn reports(events: &[Event]) -> Vec<(RelPath, ScanState)> {
                 folder,
                 path,
                 state,
+                ..
             } if *folder == id() => out.push((path.clone(), state.clone())),
             other => panic!("not a report of this folder: {other:?}"),
         }
@@ -307,7 +308,9 @@ fn a_tree_scans_to_what_is_on_disk_then_to_nothing_new() {
     disk.file("big", &big, OLD, false);
     disk.symlink("docs/link", "../run.sh");
 
-    let (events, report) = scan(&disk.folder(), &BTreeMap::new());
+    // One clock for both scans: the reports carry the time they were taken.
+    let now = settled_now();
+    let (events, report) = scan_at(&disk.folder(), &BTreeMap::new(), now, 4);
     assert!(finished(&events));
     assert!(report.aborted.is_none());
     assert!(report.skipped.is_empty() && report.disk_names.is_empty());
@@ -328,7 +331,7 @@ fn a_tree_scans_to_what_is_on_disk_then_to_nothing_new() {
         ]
     );
     // Whichever threads hash, the events are the same.
-    let one_thread = scan_at(&disk.folder(), &BTreeMap::new(), settled_now(), 1);
+    let one_thread = scan_at(&disk.folder(), &BTreeMap::new(), now, 1);
     assert_eq!(one_thread.0, events);
 
     // The engine records it all; scanned again against those records,

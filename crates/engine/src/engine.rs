@@ -78,11 +78,15 @@ pub enum Event {
 
     /// The scanner or watcher reports one path (§7.3). Inside a bracket it
     /// also marks the path seen. A path the host could not inspect is
-    /// reported `Skipped`: seen, and nothing more.
+    /// reported `Skipped`: seen, and nothing more. `at` is when the host
+    /// took the observation (the `stat` or the read), not when it delivers
+    /// it: one older than the path's last commit report is stale (draft
+    /// 56).
     Scanned {
         folder: FolderId,
         path: RelPath,
         state: ScanState,
+        at: Timestamp,
     },
     /// A full scan begins.
     ScanStarted {
@@ -424,10 +428,11 @@ impl Engine {
                 folder,
                 path,
                 state,
+                at,
             } => match self.folders.get_mut(&folder) {
                 Some(f) => {
                     let before = f.winner_fallbacks();
-                    let scanned = f.scanned(now, path, state);
+                    let scanned = f.observed_at(now, at, path, state);
                     if let Some(change) = scanned.change {
                         out.push(Action::IndexChanged {
                             folder,
@@ -1251,6 +1256,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(1.0),
             },
         );
         assert_eq!(
@@ -1291,6 +1297,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(10.0),
             },
         ));
         assert!(matches!(out[0], Action::IndexChanged { .. }));
@@ -1304,6 +1311,7 @@ mod tests {
                 folder: folder(),
                 path: p("other.txt"),
                 state: file(2, 5),
+                at: t(11.0),
             },
         ));
         assert_eq!(out[1], Action::WakeAt(t(13.0)));
@@ -1375,6 +1383,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = a.handle(
@@ -1441,6 +1450,7 @@ mod tests {
                 folder: folder(),
                 path: p("dir/note.md"),
                 state: file(4, 77),
+                at: t(1.0),
             },
         );
         let out = a.handle(
@@ -1542,6 +1552,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = b.handle(
@@ -1585,6 +1596,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(5, 100),
+                at: t(10.0),
             },
         );
         assert!(matches!(out_a[0], Action::IndexChanged { .. }));
@@ -1594,6 +1606,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(6, 200),
+                at: t(10.0),
             },
         );
         let out_a = engines.get_mut(&node(1)).unwrap().handle(
@@ -1753,6 +1766,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i}")),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -1772,6 +1786,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -1961,6 +1976,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -1998,6 +2014,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2161,6 +2178,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -2222,6 +2240,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2250,6 +2269,7 @@ mod tests {
                 folder: folder(),
                 path: p("f09"),
                 state: file(2, 2),
+                at: t(13.0),
             },
         );
         let out = b.handle(
@@ -2345,6 +2365,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2354,6 +2375,7 @@ mod tests {
                 folder: folder(),
                 path: p("junk"),
                 state: file(6, 6),
+                at: t(10.0),
             },
         );
         let out = b.handle(t(11.0), Event::Revert { folder: folder() });
@@ -2467,6 +2489,7 @@ mod tests {
                     folder: folder(),
                     path: path.clone(),
                     state,
+                    at: t(10.0),
                 },
             );
         }
@@ -2522,6 +2545,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -2599,6 +2623,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(8, 70),
+                at: t(22.0),
             },
         );
         let out = a.handle(
@@ -2628,6 +2653,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(26.0),
                 },
             );
         }
@@ -2652,6 +2678,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(30.0),
             },
         );
         for i in 3..10 {
@@ -2661,6 +2688,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Unchanged,
+                    at: t(30.0),
                 },
             );
         }
@@ -2688,6 +2716,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(9, 80),
+                at: t(32.0),
             },
         );
         let out = a.handle(
@@ -2793,6 +2822,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2898,6 +2928,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(10.0),
                 },
             );
         }
@@ -2925,6 +2956,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i:02}")),
                     state: ScanState::Absent,
+                    at: t(13.0),
                 },
             );
         }
@@ -2988,6 +3020,7 @@ mod tests {
                     folder: folder(),
                     path: p(&format!("f{i}")),
                     state: file(1, 1),
+                    at: t(1.0),
                 },
             );
         }
@@ -3090,6 +3123,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3190,6 +3224,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3271,6 +3306,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3343,6 +3379,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3387,6 +3424,7 @@ mod tests {
                 folder: folder(),
                 path: p("n"),
                 state: file(7, 7),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3442,6 +3480,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(10.0),
             },
         );
         let snapshot = a.folder(folder()).unwrap().clone();
@@ -3486,6 +3525,7 @@ mod tests {
                 folder: folder(),
                 path: p("doc.txt"),
                 state: file(1, 5),
+                at: t(10.0),
             },
         );
         let out = a.handle(
@@ -3511,6 +3551,7 @@ mod tests {
                 folder: folder(),
                 path: p("a"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         e.handle(
@@ -3519,6 +3560,7 @@ mod tests {
                 folder: folder(),
                 path: p("b"),
                 state: file(2, 1),
+                at: t(1.0),
             },
         );
         e.handle(
@@ -3536,6 +3578,7 @@ mod tests {
                 folder: folder(),
                 path: p("a"),
                 state: ScanState::Unchanged,
+                at: t(5.0),
             },
         );
         let out = e.handle(t(5.5), Event::ScanAborted { folder: folder() });
@@ -3550,6 +3593,7 @@ mod tests {
                 folder: folder(),
                 path: p("a"),
                 state: ScanState::Unchanged,
+                at: t(6.0),
             },
         );
         let out = core(&e.handle(t(7.0), Event::ScanFinished { folder: folder() }));
@@ -3574,6 +3618,7 @@ mod tests {
                 folder: folder(),
                 path: p("ghost"),
                 state: ScanState::Unchanged,
+                at: t(8.0),
             },
         );
         assert_eq!(
@@ -3595,6 +3640,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = e.handle(
@@ -3640,6 +3686,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         other.handle(
@@ -3690,6 +3737,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let mut batch = other
@@ -3748,6 +3796,7 @@ mod tests {
                 folder: f2,
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         e.handle(
@@ -3756,6 +3805,7 @@ mod tests {
                 folder: folder(),
                 path: p("y"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let out = e.handle(
@@ -3810,6 +3860,7 @@ mod tests {
                         folder: folder(),
                         path: p("b"),
                         state: file(1, 1),
+                        at: t(1.0),
                     },
                 ),
                 (
@@ -3818,6 +3869,7 @@ mod tests {
                         folder: folder(),
                         path: p("a"),
                         state: file(2, 1),
+                        at: t(1.5),
                     },
                 ),
                 (
@@ -3826,6 +3878,7 @@ mod tests {
                         folder: folder(),
                         path: p("b"),
                         state: ScanState::Absent,
+                        at: t(2.0),
                     },
                 ),
                 (
@@ -3866,6 +3919,7 @@ mod tests {
                 folder: folder(),
                 path: p("x"),
                 state: file(1, 1),
+                at: t(1.0),
             },
         );
         let bytes = postcard::to_stdvec(&e).unwrap();
@@ -3920,7 +3974,7 @@ mod tests {
             let mut engines = two_with_ten_files();
             let b = engines.get_mut(&node(2)).unwrap();
             for i in 0..8 {
-                b.handle(t(10.0), Event::Scanned { folder: folder(), path: p(&format!("f{i:02}")), state: ScanState::Absent });
+                b.handle(t(10.0), Event::Scanned { folder: folder(), path: p(&format!("f{i:02}")), state: ScanState::Absent, at: t(10.0) });
             }
             let out = b.handle(t(12.0), Event::Tick { fresh_batch_id: fresh(3) });
             prop_assert!(sends(&out).is_empty());
@@ -3929,7 +3983,7 @@ mod tests {
                 now = now.plus_nanos(1_500_000_000);
                 let path = p(&format!("f{:02}", i));
                 let state = if gone { ScanState::Absent } else { file(h + 1, k as i64 + 20) };
-                let out = b.handle(now, Event::Scanned { folder: folder(), path, state });
+                let out = b.handle(now, Event::Scanned { folder: folder(), path, state, at: now });
                 prop_assert!(sends(&out).is_empty());
                 if tick {
                     let out = b.handle(now.plus_nanos(12_000_000_000), Event::Tick { fresh_batch_id: fresh(100 + k as u8) });
@@ -3958,7 +4012,7 @@ mod tests {
                 if connect_c {
                     b.handle(t(0.0), Event::PeerConnected { peer: node(3), tier: Tier::Relay });
                 }
-                a.handle(t(1.0), Event::Scanned { folder: folder(), path: p("n"), state: file(seed, 1) });
+                a.handle(t(1.0), Event::Scanned { folder: folder(), path: p("n"), state: file(seed, 1), at: t(1.0) });
                 let out = a.handle(t(3.0), Event::Tick { fresh_batch_id: fresh(1) });
                 let mut engines = BTreeMap::from([(node(1), a), (node(2), b)]);
                 let mut all = deliver(t(3.0), node(1), out, &mut engines);

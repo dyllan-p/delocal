@@ -341,6 +341,12 @@ struct Node {
     /// report. In the process's memory, so a crash loses them.
     #[serde(skip)]
     observe: BTreeSet<RelPath>,
+    /// The host's monotonic clock (§7.3, draft 56): the last time it
+    /// stamped, so that no two of its stamps are the same.
+    last_stamp: Timestamp,
+    /// When each path's last commit that changed it was reported, by the
+    /// time the engine was given: the stale-observation check's reference.
+    written: BTreeMap<RelPath, Timestamp>,
     /// The filesystem ignores case (§7.6): two names that differ only by
     /// case are one file.
     case_insensitive: bool,
@@ -822,6 +828,8 @@ impl Sim {
                 full_until: None,
                 space_check_at: None,
                 observe: BTreeSet::new(),
+                last_stamp: Timestamp::default(),
+                written: BTreeMap::new(),
                 case_insensitive: i == 0 && knobs.case_variants > 0.0,
                 paused_inbound: false,
                 sent: BTreeMap::new(),
@@ -934,6 +942,19 @@ impl Sim {
                 .map(|n| n.host.clone())
                 .unwrap_or_else(HostName::empty),
         }
+    }
+
+    /// A stamp from the host's monotonic clock on `id` (§7.3, draft 56): the
+    /// node's time, but never a value it has stamped before, so that a read
+    /// and a commit at the same instant are ordered as they ran.
+    fn stamp(&mut self, id: NodeId) -> Timestamp {
+        let now = self.now_for(id);
+        let Some(n) = self.nodes.get_mut(&id) else {
+            return now;
+        };
+        let at = now.max(n.last_stamp.plus_nanos(1));
+        n.last_stamp = at;
+        at
     }
 
     fn now_for(&self, id: NodeId) -> Timestamp {
@@ -1257,12 +1278,14 @@ impl Sim {
             let state = found(node, &path);
             self.stats.observes += 1;
             let folder = self.folder;
+            let at = self.stamp(id);
             return self.feed(
                 id,
                 Event::Scanned {
                     folder,
                     path,
                     state,
+                    at,
                 },
             );
         }
@@ -1309,6 +1332,18 @@ impl Sim {
             Event::Scanned { path, .. } => Some((id, path.clone())),
             _ => None,
         };
+        // The stale-observation check (§7.3, draft 56): an observation taken
+        // before the last commit at its path was reported describes a state
+        // that no longer exists.
+        let stale = match &event {
+            Event::Scanned { path, at, .. } => self
+                .nodes
+                .get(&id)
+                .and_then(|n| n.written.get(path))
+                .filter(|written| *at < **written)
+                .map(|written| (path.clone(), *at, *written)),
+            _ => None,
+        };
         let folder = self.folder;
         let may_adopt = matches!(event, Event::Applied { .. } | Event::Scanned { .. });
         let (actions, seq) = {
@@ -1323,6 +1358,21 @@ impl Sim {
         };
         if let Ok(bytes) = postcard::to_stdvec(&actions) {
             self.log.update(&bytes);
+        }
+        if let Some((path, at, written)) = stale
+            && actions.iter().any(|a| match a {
+                Action::IndexChanged { record, .. } => record.entry.path == path,
+                Action::IndexRemoved { path: p, .. } => *p == path,
+                _ => false,
+            })
+        {
+            return Err(self.fail(
+                "stale observation",
+                format!(
+                    "{} acted on an observation of {path} taken at {at:?}, before the commit there reported at {written:?}",
+                    Self::short(id)
+                ),
+            ));
         }
         // Opened before any action is carried out: an event's effects wait
         // for its writes even when the engine lists the effect first.
@@ -2592,12 +2642,14 @@ impl Sim {
                         continue;
                     };
                     self.stats.serve_observations += 1;
+                    let stamp = self.stamp(from);
                     self.feed(
                         from,
                         Event::Scanned {
                             folder: self.folder,
                             path: at,
                             state,
+                            at: stamp,
                         },
                     )?;
                 }
@@ -2824,12 +2876,24 @@ impl Sim {
                     && outcome == ApplyOutcome::Ok
                     && !matches!(*action, Action::MoveToTrash { .. }))
                 .then(|| (path.clone(), (*action).clone()));
+                // The time the engine takes the commit to have happened at: a
+                // move's own stamp, an apply's report as it is handled.
+                let at = if matches!(*action, Action::MoveToTrash { .. }) {
+                    self.stamp(node)
+                } else {
+                    self.now_for(node)
+                };
+                if outcome == ApplyOutcome::Ok
+                    && let Some(n) = self.nodes.get_mut(&node)
+                {
+                    n.written.insert(path.clone(), at);
+                }
                 let report = if matches!(*action, Action::MoveToTrash { .. }) {
                     Event::Trashed {
                         folder: self.folder,
                         path,
                         version,
-                        at: self.now_for(node),
+                        at,
                         outcome,
                     }
                 } else {
@@ -3212,6 +3276,7 @@ impl Sim {
             let event = Event::Scanned {
                 folder: self.folder,
                 path,
+                at: self.stamp(id),
                 state: ScanState::Skipped {
                     reason: SkipReason::Ignored,
                 },
@@ -3223,12 +3288,14 @@ impl Sim {
             .get(&id)
             .and_then(|n| n.fs.get(&path))
             .map_or(ScanState::Absent, |f| ScanState::Observed(f.observed()));
+        let at = self.stamp(id);
         self.feed(
             id,
             Event::Scanned {
                 folder: self.folder,
                 path,
                 state,
+                at,
             },
         )
     }
@@ -3247,6 +3314,12 @@ impl Sim {
         if !node.alive() {
             return Ok(());
         }
+        // Every report of the scan describes the disk as read now, whenever
+        // it is delivered (§7.3, draft 56).
+        let read_at = self.stamp(id);
+        let Some(node) = self.nodes.get(&id) else {
+            return Ok(());
+        };
         let entries: Vec<(RelPath, ScanState)> = node
             .fs
             .iter()
@@ -3278,14 +3351,14 @@ impl Sim {
                 return self.bracket_end(id, Event::ScanAborted { folder }, &mut check);
             }
             if let Some(state) = state {
-                self.report(id, path, state, &mut check)?;
+                self.report(id, path, state, read_at, &mut check)?;
             }
         }
         for path in walk.unreached {
             let state = ScanState::Skipped {
                 reason: SkipReason::Ignored,
             };
-            self.report(id, path, state, &mut check)?;
+            self.report(id, path, state, read_at, &mut check)?;
         }
         self.bracket_end(id, Event::ScanFinished { folder }, &mut check)
     }
@@ -3297,6 +3370,7 @@ impl Sim {
         id: NodeId,
         path: RelPath,
         state: ScanState,
+        at: Timestamp,
         check: &mut SkipCheck,
     ) -> Result<(), Failure> {
         let skipped = matches!(state, ScanState::Skipped { .. });
@@ -3308,6 +3382,7 @@ impl Sim {
             folder,
             path,
             state,
+            at,
         };
         if skipped {
             self.checked(id, event, check)
@@ -4387,12 +4462,14 @@ impl Sim {
             n.fs.insert(path.clone(), file);
         }
         let folder = self.folder;
+        let at = self.stamp(id);
         self.feed(
             id,
             Event::Scanned {
                 folder,
                 path,
                 state,
+                at,
             },
         )
     }
@@ -4468,6 +4545,7 @@ mod tests {
             folder: sim.folder,
             path: f.clone(),
             state: ScanState::Absent,
+            at: sim.clock,
         };
         sim.feed(id, event).unwrap();
         assert_eq!(sim.i9.as_ref().unwrap().last_observed(id, &f), None);
@@ -5216,6 +5294,60 @@ mod tests {
         assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
         sim.full_scan(id, false).unwrap();
         assert!(!live(&sim), "observed gone once the rule went");
+    }
+
+    /// §7.3, draft 56: an observation the host took before the last commit
+    /// at its path was reported, and delivers after, describes a state that
+    /// no longer exists. The engine drops it; with the rule off, the stale-
+    /// observation check fails the run as soon as the engine acts on it. Here
+    /// B's commit of A's file is followed by a read of x from just before it,
+    /// which says x is absent.
+    #[test]
+    fn an_observation_older_than_the_last_commit_is_not_acted_on() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                ..Knobs::default()
+            },
+        );
+        let (a, b) = (sim.order[0], sim.order[1]);
+        let x = rel("x");
+        sim.nodes
+            .get_mut(&a)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        sim.full_scan(a, false).unwrap();
+        sim.full_scan(b, false).unwrap();
+        for n in sim.nodes.values_mut() {
+            n.next_scan_at = Timestamp::from_unix_nanos(i64::MAX);
+        }
+        for _ in 0..600 {
+            if sim.nodes[&b].written.contains_key(&x) {
+                break;
+            }
+            let next = sim.clock.plus_nanos(NANOS / 10);
+            sim.run_until(next).unwrap();
+        }
+        let written = sim.nodes[&b].written[&x];
+        let folder = sim.folder;
+        sim.feed(
+            b,
+            Event::Scanned {
+                folder,
+                path: x.clone(),
+                state: ScanState::Absent,
+                at: written.plus_nanos(-1),
+            },
+        )
+        .unwrap();
+        let live = sim
+            .engine(b)
+            .and_then(|e| e.folder(folder))
+            .is_some_and(|f| f.index().live(&x).is_some());
+        assert!(live, "the stale read is dropped");
     }
 
     /// §8.3 step 2, draft 57: the host performs a revert's move to the trash
