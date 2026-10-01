@@ -88,6 +88,9 @@ pub struct Stats {
     pub crashes: u64,
     pub fetches: u64,
     pub not_available: u64,
+    /// Paths a source found out of step with its record while serving,
+    /// and reported to its engine as observations (§7.5 step 2).
+    pub serve_observations: u64,
     pub mismatches: u64,
     pub changed_underneath: u64,
     pub stalled: u64,
@@ -2518,19 +2521,41 @@ impl Sim {
                 // on disk still matches the record by the scan's fast-path
                 // test (size, mtime and exec bit for a file, kind and target
                 // for a symlink), failing that from any live file with that
-                // hash, failing that not at all.
+                // hash, failing that not at all. Every path it looked at and
+                // found out of step with its record it has observed, and it
+                // tells its engine so, as a scan would (draft 54), before it
+                // answers: the change is announced, and a refused peer is
+                // told what to ask for next.
+                let mut stale = Vec::new();
                 let served = self.nodes.get(&from).and_then(|src| {
                     let engine = src.engine.as_ref()?;
                     let index = engine.folder(self.folder)?.index();
                     index.locate(&path, &hash).find_map(|at| {
                         let record = index.live(at)?;
-                        let file = src.fs.get(at)?;
-                        record
-                            .entry
-                            .unchanged_by_stat(&file.observed())
-                            .then(|| file.content.clone())
+                        let file = src
+                            .fs
+                            .get(at)
+                            .filter(|file| record.entry.unchanged_by_stat(&file.observed()));
+                        if file.is_none() {
+                            stale.push(at.clone());
+                        }
+                        file.map(|file| file.content.clone())
                     })
                 });
+                for at in stale {
+                    let Some(state) = self.nodes.get(&from).map(|src| found(src, &at)) else {
+                        continue;
+                    };
+                    self.stats.serve_observations += 1;
+                    self.feed(
+                        from,
+                        Event::Scanned {
+                            folder: self.folder,
+                            path: at,
+                            state,
+                        },
+                    )?;
+                }
                 let report = match served {
                     None => {
                         self.stats.not_available += 1;
@@ -5119,6 +5144,115 @@ mod tests {
         assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
         sim.full_scan(id, false).unwrap();
         assert!(!live(&sim), "observed gone once the rule went");
+    }
+
+    /// §7.5 step 2, draft 54, in seed 4013's shape. The source's watcher
+    /// misses a chmod, so its disk is out of step with its record when the
+    /// asker's fetch arrives, and the chmod is undone before any scan sees
+    /// it. Refusing, the source has observed the chmod and tells its engine,
+    /// which announces it; the asker wants the chmodded version and asks
+    /// again, the source's second refusal observes the undo the same way,
+    /// and the third request is served, all within a minute. Before draft 54
+    /// the refusal said nothing, the disk went back to matching the record
+    /// with nobody the wiser, and the refused asker never asked again. No
+    /// seed reaches this any more, 4013 included, so this test is what
+    /// pins.sh checks the fix against.
+    #[test]
+    fn a_source_that_refuses_a_fetch_observes_its_path() {
+        // Every group durable at once, so effects need no later events.
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                ..Knobs::default()
+            },
+        );
+        let (asker, source) = (sim.order[0], sim.order[1]);
+        let x = rel("x");
+        sim.nodes
+            .get_mut(&source)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(6, false));
+        sim.full_scan(source, false).unwrap();
+        sim.full_scan(asker, false).unwrap();
+        // No more scans: only the refusals can see the chmod and its undo.
+        for n in sim.nodes.values_mut() {
+            n.next_scan_at = Timestamp::from_unix_nanos(i64::MAX);
+        }
+        let fetching = |sim: &Sim| {
+            sim.ops
+                .iter()
+                .position(|op| matches!(op, Op::Fetch { node, .. } if *node == asker))
+        };
+        for _ in 0..600 {
+            if fetching(&sim).is_some() {
+                break;
+            }
+            let next = sim.clock.plus_nanos(NANOS / 10);
+            sim.run_until(next).unwrap();
+        }
+        let pos = fetching(&sim).expect("the asker fetches x within a minute");
+        sim.nodes
+            .get_mut(&source)
+            .unwrap()
+            .fs
+            .get_mut(&x)
+            .unwrap()
+            .exec = true;
+        if let Op::Fetch {
+            done_at,
+            next_progress,
+            ..
+        } = &mut sim.ops[pos]
+        {
+            (*done_at, *next_progress) = (sim.clock, sim.clock);
+        }
+        let before = sim.stats.clone();
+        sim.progress_op(pos).unwrap();
+        assert_eq!(
+            (sim.stats.not_available, sim.stats.serve_observations),
+            (before.not_available + 1, before.serve_observations + 1)
+        );
+        let record = |sim: &Sim, id| {
+            sim.engine(id)
+                .and_then(|e| e.folder(sim.folder))
+                .and_then(|f| f.index().live(&x))
+                .map(|r| r.entry.clone())
+        };
+        assert!(
+            record(&sim, source).is_some_and(|e| e.exec),
+            "the refusal observed the chmod"
+        );
+        // The undo, which no scan sees either.
+        sim.nodes
+            .get_mut(&source)
+            .unwrap()
+            .fs
+            .get_mut(&x)
+            .unwrap()
+            .exec = false;
+        let end = sim.clock.plus_nanos(60 * NANOS);
+        sim.run_until(end).unwrap();
+        assert!(
+            sim.stats.serve_observations >= before.serve_observations + 2,
+            "the second refusal observed the undo"
+        );
+        let on_disk = |id| {
+            sim.nodes[&id]
+                .fs
+                .get(&x)
+                .map(|f| (f.content.clone(), f.exec))
+        };
+        assert_eq!(on_disk(asker), on_disk(source), "the asker converged");
+        assert_eq!(record(&sim, asker), record(&sim, source));
+        assert!(record(&sim, source).is_some_and(|e| !e.exec));
+        assert!(
+            sim.engine(asker)
+                .and_then(|e| e.folder(sim.folder))
+                .is_some_and(|f| f.wants().is_empty())
+        );
     }
 
     /// §7.5 step 2 (draft 46): a source serves its file only if what is on
