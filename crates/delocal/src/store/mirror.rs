@@ -261,6 +261,7 @@ fn want() -> BoxedStrategy<Want> {
             any::<u32>(),
             any::<bool>(),
             any::<bool>(),
+            option::of(observed()),
             btree_set(node(), 0..3),
             option::of(observed()),
             want_state(),
@@ -278,6 +279,7 @@ fn want() -> BoxedStrategy<Want> {
                     local_retries,
                     fetched,
                     restoring,
+                    trashed,
                     answered,
                     reset,
                     state,
@@ -298,6 +300,7 @@ fn want() -> BoxedStrategy<Want> {
                 local_retries,
                 fetched,
                 restoring,
+                trashed,
                 answered,
                 reset,
                 state,
@@ -377,15 +380,17 @@ fn deferred() -> BoxedStrategy<Vec<Deferred>> {
             DeferredReason::Frozen,
         ]),
         option::of(entry()),
+        option::of(observed()),
     )
         .prop_map(
-            |(entry, batch, source, seq_high, reason, restoring)| Deferred {
+            |(entry, batch, source, seq_high, reason, restoring, trashed)| Deferred {
                 entry,
                 batch,
                 source,
                 seq_high,
                 reason,
                 restoring,
+                trashed,
             },
         );
     vec(one, 1..3).boxed()
