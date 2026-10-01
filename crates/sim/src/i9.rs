@@ -153,7 +153,8 @@ pub(crate) struct Watch {
     /// the mark each replaced: a crash before the group is durable takes
     /// the revert with it, so its marks go too.
     undurable_marks: BTreeMap<NodeId, Vec<(RelPath, Option<Mark>)>>,
-    /// When each node's engine was last fed an observation of each path.
+    /// When the latest observation of each path that each node's engine
+    /// was fed was taken.
     last_observed: BTreeMap<(NodeId, RelPath), Timestamp>,
     /// Observations fed while their node's group of writes is open (§11),
     /// with the time each replaced and whether the path was in `moved`: a
@@ -175,16 +176,23 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
-    /// When `id`'s engine was last fed an observation of `path`.
+    /// When the latest observation of `path` that `id`'s engine was fed was
+    /// taken.
     #[cfg(test)]
     pub(crate) fn last_observed(&self, id: NodeId, path: &RelPath) -> Option<Timestamp> {
         self.last_observed.get(&(id, path.clone())).copied()
     }
 
-    /// `id`'s engine was fed an observation of `path` at `at`. `group_open`
-    /// says whether the node's writes wait in an open group (§11).
+    /// `id`'s engine was fed an observation of `path` taken at `at`.
+    /// `group_open` says whether the node's writes wait in an open group
+    /// (§11). One taken before another the engine was already fed, a
+    /// delayed scan's report (draft 58), does not take back what the later
+    /// one showed it.
     pub(crate) fn observed(&mut self, id: NodeId, path: &RelPath, at: Timestamp, group_open: bool) {
-        let replaced = self.last_observed.insert((id, path.clone()), at);
+        let key = (id, path.clone());
+        let replaced = self.last_observed.get(&key).copied();
+        self.last_observed
+            .insert(key, replaced.map_or(at, |last| last.max(at)));
         let moved = self.moved.remove(&(id, path.clone()));
         if group_open {
             self.undurable_observed
