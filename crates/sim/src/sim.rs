@@ -570,6 +570,11 @@ fn observation(event: &Event) -> Option<(&RelPath, &ScanState)> {
             path,
             outcome: ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. },
             ..
+        }
+        | Event::Trashed {
+            path,
+            outcome: ApplyOutcome::ChangedUnderneath { found } | ApplyOutcome::Failed { found, .. },
+            ..
         } => Some((path, found)),
         _ => None,
     }
@@ -655,16 +660,14 @@ enum Held {
         size: u64,
         from: NodeId,
     },
-    /// `Write`, `Remove` or `SetMeta`, with the version of the want it
-    /// commits as the engine asked for it, and its number.
+    /// `Write`, `Remove`, `SetMeta` or a revert's `MoveToTrash`, with the
+    /// version of the want it commits as the engine asked for it, and its
+    /// number.
     Commit {
         path: RelPath,
         version: Version,
         action: Box<Action>,
         commit: u64,
-    },
-    MoveToTrash {
-        path: RelPath,
     },
 }
 
@@ -1763,10 +1766,15 @@ impl Sim {
             )?,
             Action::Write {
                 ref path,
-                ref entry,
+                entry: Entry { ref version, .. },
+                ..
+            }
+            | Action::MoveToTrash {
+                ref path,
+                ref version,
                 ..
             } => {
-                let (path, version) = (path.clone(), entry.version.clone());
+                let (path, version) = (path.clone(), version.clone());
                 let commit = self.commit_started(id, &path, &version, &action)?;
                 self.hold(
                     id,
@@ -1801,7 +1809,6 @@ impl Sim {
                     },
                 )?;
             }
-            Action::MoveToTrash { path, .. } => self.hold(id, Held::MoveToTrash { path })?,
             // Reading the disk depends on nothing unwritten, so it is not
             // held for the group (§11).
             Action::Observe { path, .. } => {
@@ -2213,11 +2220,6 @@ impl Sim {
                     done_at,
                     suspended: false,
                 });
-            }
-            Held::MoveToTrash { path } => {
-                if let Some(n) = self.nodes.get_mut(&id) {
-                    move_to_trash(n, &path);
-                }
             }
         }
         Ok(())
@@ -2818,17 +2820,27 @@ impl Sim {
                 self.copy_recorded = copy_to
                     .filter(|_| outcome == ApplyOutcome::Ok)
                     .map(|to| (node, to));
-                let landing = (self.i9.is_some() && outcome == ApplyOutcome::Ok)
-                    .then(|| (path.clone(), (*action).clone()));
-                let fed = self.feed(
-                    node,
+                let landing = (self.i9.is_some()
+                    && outcome == ApplyOutcome::Ok
+                    && !matches!(*action, Action::MoveToTrash { .. }))
+                .then(|| (path.clone(), (*action).clone()));
+                let report = if matches!(*action, Action::MoveToTrash { .. }) {
+                    Event::Trashed {
+                        folder: self.folder,
+                        path,
+                        version,
+                        at: self.now_for(node),
+                        outcome,
+                    }
+                } else {
                     Event::Applied {
                         folder: self.folder,
                         path,
                         version,
                         outcome,
-                    },
-                );
+                    }
+                };
+                let fed = self.feed(node, report);
                 self.copy_recorded = None;
                 fed?;
                 // I9: a crash before the report's group is durable loses the
@@ -3021,6 +3033,22 @@ impl Sim {
             self.stats.case_collisions += 1;
             let error = LocalError::CaseCollision { with };
             return (failed(node, error), Vec::new());
+        }
+        // A revert's move to the trash (§8.3 step 2, draft 57): an absent
+        // path is already where the move would leave it; anything but the
+        // file revert decided to trash fails the guard.
+        if let Action::MoveToTrash { expected, .. } = action {
+            if !node.fs.contains_key(path) {
+                return (Committed::Report(ApplyOutcome::Ok), Vec::new());
+            }
+            if !expected_matches(node.fs.get(path), Some(expected)) {
+                return (changed(node), Vec::new());
+            }
+            if let Some(error) = fail {
+                return (failed(node, error), Vec::new());
+            }
+            move_to_trash(node, path);
+            return (Committed::Report(ApplyOutcome::Ok), Vec::new());
         }
         // §7.5 step 6: the same guard before every commit, SetMeta included.
         let expected = match action {
@@ -4010,6 +4038,7 @@ fn event_name(event: &Event) -> String {
         Event::Fetched { path, outcome, .. } => format!("Fetched {path} {outcome:?}"),
         Event::FetchProgress { path, .. } => format!("FetchProgress {path}"),
         Event::Applied { path, outcome, .. } => format!("Applied {path} {outcome:?}"),
+        Event::Trashed { path, outcome, .. } => format!("Trashed {path} {outcome:?}"),
         other => {
             let name = format!("{other:?}");
             name.split([' ', '{', '(']).next().unwrap_or("").to_owned()
@@ -5187,6 +5216,54 @@ mod tests {
         assert!(sim.nodes[&id].ignored.is_empty(), "the rule has gone");
         sim.full_scan(id, false).unwrap();
         assert!(!live(&sim), "observed gone once the rule went");
+    }
+
+    /// §8.3 step 2, draft 57: the host performs a revert's move to the trash
+    /// as a commit, behind the same guard. Exactly the file revert decided
+    /// to trash goes to the trash; anything else fails the guard and is
+    /// reported as found; an absent path is already where the move would
+    /// leave it.
+    #[test]
+    fn the_host_moves_to_the_trash_behind_the_guard() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let folder = sim.folder;
+        let x = rel("x");
+        let edited = file(6, false);
+        let mv = |expected: &File| Action::MoveToTrash {
+            folder,
+            path: rel("x"),
+            version: Version::empty(),
+            expected: expected.observed(),
+        };
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(x.clone(), file(7, false));
+        let (other, _) = sim.commit(id, &x, &Version::empty(), &mv(&edited), None);
+        assert!(
+            matches!(&other, Committed::Report(ApplyOutcome::ChangedUnderneath { found: ScanState::Observed(o) }) if o.hash == file(7, false).hash()),
+            "another file is not the one revert trashed"
+        );
+        assert!(sim.nodes[&id].fs.contains_key(&x), "left where it was");
+        sim.nodes
+            .get_mut(&id)
+            .unwrap()
+            .fs
+            .insert(x.clone(), edited.clone());
+        let (moved, _) = sim.commit(id, &x, &Version::empty(), &mv(&edited), None);
+        assert!(matches!(moved, Committed::Report(ApplyOutcome::Ok)));
+        assert!(!sim.nodes[&id].fs.contains_key(&x));
+        assert!(
+            sim.nodes[&id].trash.contains(&edited.hash()),
+            "in the trash"
+        );
+        let (absent, _) = sim.commit(id, &x, &Version::empty(), &mv(&edited), None);
+        assert!(
+            matches!(absent, Committed::Report(ApplyOutcome::Ok)),
+            "already gone"
+        );
     }
 
     /// §8.3, draft 55: the host answers `Observe` with the observation a

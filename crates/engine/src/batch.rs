@@ -194,6 +194,11 @@ pub enum ApplyMode {
     /// Same content and nothing to set on disk (a directory, a symlink or a
     /// tombstone, none of which carry an mtime, §7.1): adopt the version only.
     IndexOnly,
+    /// A revert's move to the trash (§8.3 step 2, draft 57): the file the
+    /// entry describes goes to the trash, and nothing is adopted, since the
+    /// index already holds the record revert restored. A commit like any
+    /// other, holding its path until its report.
+    Trash,
 }
 
 /// One candidate in an apply set: an entry that dominates the local record.

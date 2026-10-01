@@ -207,10 +207,18 @@ impl Watch {
         };
         let reverted = status(|s| matches!(s, FolderStatus::Reverted { .. }));
         let denied = status(|s| matches!(s, FolderStatus::Denied { .. }));
+        // What the revert moves to the trash: each by a commit of its own
+        // (§8.3 step 2, draft 57), a want the revert makes, whose move may
+        // wait for those beneath it.
         let trash: Vec<&RelPath> = actions
             .iter()
             .filter_map(|a| match a {
                 Action::MoveToTrash { path, .. } => Some(path),
+                Action::WantChanged {
+                    path,
+                    want: Some(want),
+                    ..
+                } if want.is_trash() => Some(path),
                 _ => None,
             })
             .collect();
@@ -533,6 +541,14 @@ mod tests {
         Action::MoveToTrash {
             folder: FOLDER,
             path: rel(path),
+            version: Version::empty(),
+            expected: delocal_engine::Observed {
+                kind: Kind::File,
+                size: 0,
+                mtime_ns: 0,
+                exec: false,
+                hash: ContentHash::EMPTY,
+            },
         }
     }
 
