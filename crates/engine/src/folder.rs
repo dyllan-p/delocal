@@ -476,6 +476,11 @@ impl Window {
 /// What handling one scan report produced.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Scanned {
+    /// Live directory records written for the ancestors the observation
+    /// implies (§7.3): every directory above an observed path is present,
+    /// and one the index did not hold as a live directory is recorded so,
+    /// a local change, top down and before `change`.
+    pub ancestors: Vec<IndexRecord>,
     pub change: Option<LocalChange>,
     pub status: Option<FolderStatus>,
     /// The restored record, adopted with a new `seq`, when the report
@@ -595,6 +600,11 @@ pub struct RevertOutcome {
     pub trash: Vec<RelPath>,
     /// Restored live entries wanted again.
     pub refetch: usize,
+    /// Live directory records revert wrote of its own (§8.3 step 2): for a
+    /// directory it would have trashed while a live record beneath it is
+    /// restored or kept, which stays on disk instead. Local changes,
+    /// announced like any other.
+    pub written: Vec<IndexRecord>,
     /// Paths whose file already held the restored content and stays; a
     /// reset sets each one's mtime and exec bit back where they differ.
     pub kept: usize,
@@ -1087,8 +1097,64 @@ impl FolderState {
 
     /// [`Self::scanned`], for an observation made by `observer` at `at`: a
     /// scan or the watcher, or the guard of a commit whose report carries
-    /// it.
+    /// it. A live path implies its ancestors (§7.3): an observation of
+    /// anything present at `path` is also one of every directory above it
+    /// as present, so each one the index does not hold as a live directory,
+    /// missing or tombstoned, is observed as one first, top down, by the
+    /// same rules.
     fn take_observation(
+        &mut self,
+        now: Timestamp,
+        at: Timestamp,
+        path: RelPath,
+        state: ScanState,
+        observer: Observer,
+    ) -> Scanned {
+        let mut ancestors = Vec::new();
+        let present = matches!(state, ScanState::Observed(_) | ScanState::Unchanged);
+        // Inside a bracket every directory above a present path is seen, so
+        // its end cannot take one for absent beneath a live child.
+        if present && let Some(bracket) = &mut self.scan {
+            let mut up = path.parent();
+            while let Some(dir) = up {
+                up = dir.parent();
+                bracket.seen.insert(dir);
+            }
+        }
+        if present {
+            let mut chain = Vec::new();
+            let mut up = path.parent();
+            while let Some(dir) = up {
+                up = dir.parent();
+                chain.push(dir);
+            }
+            for dir in chain.into_iter().rev() {
+                if self
+                    .index
+                    .live(&dir)
+                    .is_some_and(|r| r.entry.kind == Kind::Dir)
+                {
+                    continue;
+                }
+                let observed = ScanState::Observed(Observed {
+                    kind: Kind::Dir,
+                    size: 0,
+                    mtime_ns: 0,
+                    exec: false,
+                    hash: crate::entry::ContentHash::EMPTY,
+                });
+                let implied = self.take_one(now, at, dir, observed, observer);
+                ancestors.extend(implied.change.map(|c| c.record));
+                ancestors.extend(implied.landed);
+            }
+        }
+        let mut scanned = self.take_one(now, at, path, state, observer);
+        scanned.ancestors = ancestors;
+        scanned
+    }
+
+    /// One observation, once its ancestors are taken care of.
+    fn take_one(
         &mut self,
         now: Timestamp,
         at: Timestamp,
@@ -1184,6 +1250,7 @@ impl FolderState {
         }
         if state == ScanState::Unchanged && self.index.live(&path).is_none() {
             return Scanned {
+                ancestors: Vec::new(),
                 change: None,
                 status: Some(FolderStatus::UnchangedUnknownPath { path }),
                 landed: None,
@@ -1204,6 +1271,7 @@ impl FolderState {
             {
                 self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
                 return Scanned {
+                    ancestors: Vec::new(),
                     change: None,
                     status: None,
                     landed: Some(landed),
@@ -1229,6 +1297,7 @@ impl FolderState {
         }
         self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
         Scanned {
+            ancestors: Vec::new(),
             change,
             status: None,
             landed: None,
@@ -2201,6 +2270,7 @@ impl FolderState {
         let mut trash = Vec::new();
         let mut refetch = 0;
         let mut kept = 0;
+        let mut written = Vec::new();
         let reverted = self.index.revert_pending();
         // The pending set held every unannounced deny's bumps, so each of
         // those denies is undone with the rest: its held item returns.
@@ -2252,6 +2322,36 @@ impl FolderState {
                         state: WantState::Wanted,
                     });
                 }
+                continue;
+            }
+            // A revert never trashes a directory while a live record beneath
+            // it is restored or kept (§8.3 step 2): the announced records
+            // contradict each other, a live child under a directory's
+            // tombstone, say. The directory stays on disk and gets a live
+            // directory record of its own, a local change, since a directory
+            // is the one thing that can be made without content and losing
+            // the child would be worse.
+            if let Some(current) = current
+                && current.kind == Kind::Dir
+                && restored.is_none_or(|r| r.kind != Kind::Dir)
+                && self
+                    .index
+                    .live_records()
+                    .any(|r| reverted.path.is_ancestor_of(&r.entry.path))
+            {
+                let dir = Observed {
+                    kind: Kind::Dir,
+                    size: 0,
+                    mtime_ns: 0,
+                    exec: false,
+                    hash: crate::entry::ContentHash::EMPTY,
+                };
+                written.extend(
+                    self.index
+                        .observe(reverted.path.clone(), dir)
+                        .map(|c| c.record),
+                );
+                kept += 1;
                 continue;
             }
             // The move to the trash is a commit like any other (§8.3 step 2,
@@ -2310,6 +2410,9 @@ impl FolderState {
             }
         }
         self.window = None;
+        if !written.is_empty() {
+            self.touched(now);
+        }
         for old in stale {
             self.rederive(now, old);
         }
@@ -2319,6 +2422,7 @@ impl FolderState {
             reverted,
             trash,
             refetch,
+            written,
             kept,
             returned,
         })
@@ -2798,9 +2902,9 @@ impl FolderState {
         }
         let scanned = self.take_observation(now, at, path.clone(), found.clone(), Observer::Guard);
         scanned
-            .change
-            .map(|c| c.record)
+            .ancestors
             .into_iter()
+            .chain(scanned.change.map(|c| c.record))
             .chain(scanned.landed)
             .collect()
     }
@@ -3049,6 +3153,95 @@ mod tests {
         assert_eq!(f.due(), None);
     }
 
+    /// §7.3 (draft 52): a live path implies its ancestors. Observing d/e/f
+    /// records d and d/e as live directories, top down, as local changes
+    /// announced with it. A tombstoned ancestor is brought back the same
+    /// way when a child under it is observed (seed 640: the watcher missed
+    /// the directory's re-creation). Inside a bracket the child's
+    /// observation counts its ancestors as seen.
+    #[test]
+    fn a_live_path_implies_its_ancestors() {
+        let mut f = folder();
+        let scanned = f.scanned(t(1.0), p("d/e/f"), file(1, 1));
+        let implied: Vec<&RelPath> = scanned.ancestors.iter().map(|r| &r.entry.path).collect();
+        assert_eq!(implied, [&p("d"), &p("d/e")]);
+        assert!(["d", "d/e"].iter().all(|d| {
+            f.index()
+                .live(&p(d))
+                .is_some_and(|r| r.entry.kind == Kind::Dir)
+        }));
+        let sent = f.form_batches(t(3.0), batch_id()).remove(0);
+        let paths: Vec<&RelPath> = sent.entries.iter().map(|e| &e.path).collect();
+        assert_eq!(paths, [&p("d"), &p("d/e"), &p("d/e/f")]);
+
+        assert!(
+            f.scanned(t(4.0), p("d"), ScanState::Absent)
+                .change
+                .is_some()
+        );
+        assert!(f.index().get(&p("d")).unwrap().entry.deleted);
+        let scanned = f.scanned(t(5.0), p("d/e/f"), file(2, 5));
+        assert_eq!(scanned.ancestors.len(), 1, "d again, not d/e");
+        assert!(
+            f.index().live(&p("d")).is_some(),
+            "the tombstoned ancestor is live again"
+        );
+
+        f.form_batches(t(7.0), batch_id());
+        f.scan_started();
+        f.scanned(t(8.0), p("d/e/f"), ScanState::Unchanged);
+        assert!(
+            f.scan_finished(t(8.0)).unwrap().is_empty(),
+            "d and d/e seen"
+        );
+    }
+
+    /// §8.3 step 2 (draft 52), seed 640's shape: the announced records
+    /// contradict each other, d/f live under d's tombstone, and the user's d
+    /// is pending again. A revert would trash d, and d/f with it, though
+    /// d/f's record is kept. It never trashes a directory holding a live
+    /// record: d stays on disk and gets a live directory record of its own,
+    /// announced as a local change.
+    #[test]
+    fn a_revert_never_trashes_a_directory_holding_a_live_record() {
+        let paths: Vec<RelPath> = std::iter::once(p("d/f"))
+            .chain((0..9).map(|i| p(&format!("f{i:02}"))))
+            .collect();
+        let (_, mut b) = a_and_b_at(&paths, tight());
+        // d goes, its child does not: the watcher reported d alone.
+        assert!(
+            b.scanned(t(10.0), p("d"), ScanState::Absent)
+                .change
+                .is_some()
+        );
+        b.form_batches(t(12.0), bid(4));
+        assert!(b.index().get(&p("d")).unwrap().entry.deleted);
+        assert!(b.index().live(&p("d/f")).is_some());
+        // d/f observed again makes d live again, a pending local change;
+        // four deletions pause the folder.
+        b.scanned(t(13.0), p("d/f"), file(1, 1));
+        assert!(b.index().live(&p("d")).is_some());
+        for i in 0..4 {
+            b.scanned(t(13.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(17.0)).unwrap();
+        assert!(!out.trash.contains(&p("d")), "{:?}", out.trash);
+        assert!(b.wants().get(&p("d")).is_none(), "no move to the trash");
+        let written: Vec<&RelPath> = out.written.iter().map(|r| &r.entry.path).collect();
+        assert_eq!(written, [&p("d")]);
+        let d = b.index().live(&p("d")).unwrap();
+        assert_eq!(d.entry.kind, Kind::Dir);
+        assert!(b.index().live(&p("d/f")).is_some());
+        let sent = b.form_batches(t(20.0), bid(6));
+        assert!(
+            sent.iter()
+                .flat_map(|batch| &batch.entries)
+                .any(|e| e.path == p("d") && !e.deleted),
+            "announced as a local change"
+        );
+    }
+
     #[test]
     fn scan_bracket_tombstones_what_it_did_not_see() {
         let mut f = folder();
@@ -3266,7 +3459,7 @@ mod tests {
         f.scanned(t(10.0), p("a"), ScanState::Unchanged);
         let changes = f.scan_finished(t(11.0)).unwrap();
         let gone: Vec<&RelPath> = changes.iter().map(|c| &c.record.entry.path).collect();
-        assert_eq!(gone, [&p("b"), &p("d/x")]);
+        assert_eq!(gone, [&p("b"), &p("d"), &p("d/x")], "d is implied by d/x");
     }
 
     #[test]
@@ -4476,8 +4669,16 @@ mod tests {
         let batch = a.form_batches(t(12.0), bid(6)).remove(0);
         assert_eq!(b.receive(t(12.0), &batch).decision, Decision::Accepted);
         let v = b.wants().get(&p("d/z")).unwrap().version().clone();
+        // A's batch carries `d` too, which d/z implies (§7.3): it is made
+        // first, the ordering gate holding d/z until it is.
+        let dv = b.wants().get(&p("d")).unwrap().version().clone();
         let (steps, _) = b.dispatch(t(13.0), &lan(&[1]));
-        assert!(matches!(&steps[0], HostStep::Fetch { .. }));
+        assert!(
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Fetch { path, .. } if *path == p("d/z")))
+        );
+        b.applied(t(13.2), &p("d"), &dv, ApplyOutcome::Ok);
         b.fetched(t(13.5), &p("d/z"), &v, FetchReport::Ok);
         let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
         assert!(matches!(&steps[0], HostStep::Write { .. }));
@@ -4497,6 +4698,7 @@ mod tests {
         assert!(b.wants().is_empty());
 
         b.scan_started();
+        b.scanned(t(18.0), p("d"), ScanState::Unchanged);
         for i in 0..10 {
             b.scanned(t(18.0), p(&format!("f{i:02}")), ScanState::Unchanged);
         }
@@ -6910,6 +7112,7 @@ mod tests {
         assert_eq!(b.deferred().count(), 1);
 
         b.scan_started();
+        b.scanned(t(21.0), p("d"), ScanState::Unchanged);
         assert!(b.scan_finished(t(21.0)).unwrap().is_empty());
         assert_eq!(b.deferred().count(), 0);
         let want = b.wants().get(&p("d/f00")).unwrap();

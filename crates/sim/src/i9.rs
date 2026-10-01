@@ -275,7 +275,16 @@ impl Watch {
                     if landed {
                         m.lost = None;
                     }
-                    if unrecoverable || bumped || landed {
+                    // A revert writes a directory it would have trashed a
+                    // live record of its own when a live record beneath it
+                    // is restored or kept (§8.3 step 2): the live directory
+                    // record of I9's row. Nothing else in a revert writes a
+                    // live directory record of this machine's.
+                    let kept_dir = reverted
+                        && record.entry.kind == Kind::Dir
+                        && !record.entry.deleted
+                        && record.entry.modified_by == id;
+                    if unrecoverable || bumped || landed || kept_dir {
                         m.let_through.insert(own);
                     }
                     m.made.entry(own).or_insert_with(|| (cause.clone(), made));
@@ -598,6 +607,38 @@ mod tests {
         let mut watch = reverted_watch("f", "f");
         watch.edited_elsewhere(A, &rel("f"), at(12));
         assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
+    }
+
+    /// I9's row lets through the live directory record a revert writes for
+    /// a directory it keeps because a live record beneath it is restored
+    /// (§8.3 step 2): here d's tombstone is restored and, in the same
+    /// event, d gets a live directory record of A's own.
+    #[test]
+    fn a_reverts_own_live_directory_record_is_let_through() {
+        let mut watch = Watch::default();
+        watch.observed(A, &rel("d"), at(10));
+        let restored = entry(
+            "d",
+            &[(A, 1), (B, 1)],
+            ContentHash::EMPTY,
+            ContentHash::EMPTY,
+        );
+        let dir = Entry {
+            kind: Kind::Dir,
+            deleted: false,
+            ..entry(
+                "d",
+                &[(A, 2), (B, 1)],
+                ContentHash::EMPTY,
+                ContentHash::EMPTY,
+            )
+        };
+        let actions = [changed(&restored, 3), changed(&dir, 6), reverted()];
+        let cause = Cause::Other("Revert".to_owned());
+        watch.note(A, &actions, 5, &cause, false, |_| {
+            Some((Kind::Dir, ContentHash::EMPTY, false))
+        });
+        assert_eq!(watch.revives(A, &dir, None).map(|(class, _)| class), None);
     }
 
     /// Class 1: a scan reports the file the revert moved to the trash, as a
