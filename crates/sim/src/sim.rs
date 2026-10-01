@@ -2876,13 +2876,10 @@ impl Sim {
                     && outcome == ApplyOutcome::Ok
                     && !matches!(*action, Action::MoveToTrash { .. }))
                 .then(|| (path.clone(), (*action).clone()));
-                // The time the engine takes the commit to have happened at: a
-                // move's own stamp, an apply's report as it is handled.
-                let at = if matches!(*action, Action::MoveToTrash { .. }) {
-                    self.stamp(node)
-                } else {
-                    self.now_for(node)
-                };
+                // Every report carries the time its operation ran (draft
+                // 58), from the node's clock that never repeats a value, so
+                // a read and a commit at one instant are ordered as they ran.
+                let at = self.stamp(node);
                 if outcome == ApplyOutcome::Ok
                     && let Some(n) = self.nodes.get_mut(&node)
                 {
@@ -2901,6 +2898,7 @@ impl Sim {
                         folder: self.folder,
                         path,
                         version,
+                        at,
                         outcome,
                     }
                 };
