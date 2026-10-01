@@ -32,6 +32,12 @@ pub const EXCLUSION_NANOS: i64 = 60 * NANOS_PER_SECOND;
 /// ...up to this long.
 pub const EXCLUSION_CAP_NANOS: i64 = 60 * 60 * NANOS_PER_SECOND;
 
+/// A source that answered `NotAvailable` is not asked again for that want
+/// for this long, unless it announces the wanted content first (§7.5 step
+/// 3): a safety net for an announcement that never comes, at the cost of
+/// one request per stuck want per hour.
+pub const REFUSAL_NANOS: i64 = 60 * 60 * NANOS_PER_SECOND;
+
 /// A point in time as nanoseconds since the Unix epoch, supplied by the host.
 ///
 /// The same representation as `mtime_ns` on entries, so the two compare

@@ -78,6 +78,7 @@ pub fn want(p: &str) -> Want {
         source: node(2),
         seq_high: 41,
         sources: [node(2), node(3)].into_iter().collect(),
+        refused: [(node(2), at(98))].into_iter().collect(),
         excluded: [(node(3), at(99))].into_iter().collect(),
         strikes: [(node(3), 2)].into_iter().collect(),
         mismatches: 1,

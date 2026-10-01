@@ -255,6 +255,7 @@ fn want() -> BoxedStrategy<Want> {
         (
             btree_set(node(), 0..3),
             btree_map(node(), at(), 0..3),
+            btree_map(node(), at(), 0..3),
             btree_map(node(), any::<u32>(), 0..3),
             any::<u8>(),
             any::<u32>(),
@@ -270,6 +271,7 @@ fn want() -> BoxedStrategy<Want> {
                 (entry, received, mode, conflict, batch, source, seq_high),
                 (
                     sources,
+                    refused,
                     excluded,
                     strikes,
                     mismatches,
@@ -289,6 +291,7 @@ fn want() -> BoxedStrategy<Want> {
                 source,
                 seq_high,
                 sources,
+                refused,
                 excluded,
                 strikes,
                 mismatches,

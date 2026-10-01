@@ -1996,9 +1996,8 @@ mod tests {
             }
             let f = x.folder(folder()).unwrap();
             assert!(
-                f.wants()
-                    .iter()
-                    .all(|w| w.state == WantState::NoSource && w.sources.is_empty()),
+                f.wants().iter().all(|w| w.state == WantState::NoSource
+                    && w.sources.iter().all(|s| w.refused.contains_key(s))),
                 "without source after E refused"
             );
         }
