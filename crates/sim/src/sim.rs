@@ -1381,11 +1381,11 @@ impl Sim {
         }
         self.note_pause(id);
         if let (Some(watch), Some((cause, observed))) = (self.i9.as_mut(), cause) {
-            if let Some(path) = observed {
-                watch.observed(id, &path, self.clock);
-            }
             let node = self.nodes.get(&id);
             let group_open = node.is_some_and(|n| n.group.is_some());
+            if let Some(path) = observed {
+                watch.observed(id, &path, self.clock, group_open);
+            }
             watch.note(id, &actions, seq, &cause, group_open, |p| {
                 node.and_then(|n| content_at(n, p))
             });

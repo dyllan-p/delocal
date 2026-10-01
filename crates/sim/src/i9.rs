@@ -155,6 +155,11 @@ pub(crate) struct Watch {
     undurable_marks: BTreeMap<NodeId, Vec<(RelPath, Option<Mark>)>>,
     /// When each node's engine was last fed an observation of each path.
     last_observed: BTreeMap<(NodeId, RelPath), Timestamp>,
+    /// Observations fed while their node's group of writes is open (§11),
+    /// with the time each replaced and whether the path was in `moved`: a
+    /// crash before the group is durable takes what the engine learned from
+    /// them, so the engine never saw them.
+    undurable_observed: BTreeMap<NodeId, Vec<(RelPath, Option<Timestamp>, bool)>>,
     /// Paths whose file a displacement of a directory above them took away
     /// (§7.6), until the engine next observes them.
     moved: BTreeSet<(NodeId, RelPath)>,
@@ -176,10 +181,17 @@ impl Watch {
         self.last_observed.get(&(id, path.clone())).copied()
     }
 
-    /// `id`'s engine was fed an observation of `path` at `at`.
-    pub(crate) fn observed(&mut self, id: NodeId, path: &RelPath, at: Timestamp) {
-        self.last_observed.insert((id, path.clone()), at);
-        self.moved.remove(&(id, path.clone()));
+    /// `id`'s engine was fed an observation of `path` at `at`. `group_open`
+    /// says whether the node's writes wait in an open group (§11).
+    pub(crate) fn observed(&mut self, id: NodeId, path: &RelPath, at: Timestamp, group_open: bool) {
+        let replaced = self.last_observed.insert((id, path.clone()), at);
+        let moved = self.moved.remove(&(id, path.clone()));
+        if group_open {
+            self.undurable_observed
+                .entry(id)
+                .or_default()
+                .push((path.clone(), replaced, moved));
+        }
     }
 
     /// The actions of one event on `id`, which `cause` describes. A revert
@@ -338,11 +350,23 @@ impl Watch {
     pub(crate) fn durable(&mut self, id: NodeId) {
         self.undurable_landings.remove(&id);
         self.undurable_marks.remove(&id);
+        self.undurable_observed.remove(&id);
     }
 
     /// `id` crashed with a group of writes open (§11): a revert the group
-    /// held never happened, and the landings it recorded are lost.
+    /// held never happened, the landings it recorded are lost, and the
+    /// engine never saw the observations it took in.
     pub(crate) fn crashed(&mut self, id: NodeId, disk: impl Fn(&RelPath) -> Content) {
+        let observed = self.undurable_observed.remove(&id).unwrap_or_default();
+        for (path, replaced, moved) in observed.into_iter().rev() {
+            match replaced {
+                Some(at) => self.last_observed.insert((id, path.clone()), at),
+                None => self.last_observed.remove(&(id, path.clone())),
+            };
+            if moved {
+                self.moved.insert((id, path));
+            }
+        }
         let marks = self.undurable_marks.remove(&id).unwrap_or_default();
         for (path, replaced) in marks.into_iter().rev() {
             match replaced {
@@ -572,7 +596,14 @@ mod tests {
     /// directory above it) unless that is empty.
     fn reverted_watch(path: &str, trashed: &str) -> Watch {
         let mut watch = Watch::default();
-        watch.observed(A, &rel(path), at(10));
+        watch.observed(A, &rel(path), at(10), false);
+        revert(&mut watch, path, trashed);
+        watch
+    }
+
+    /// A reverts `path` to {A: 1, B: 1} holding Y, as in [`reverted_watch`],
+    /// on `watch` as it stands.
+    fn revert(watch: &mut Watch, path: &str, trashed: &str) {
         let restored = entry(path, &[(A, 1), (B, 1)], Y, ContentHash::EMPTY);
         let mut actions = vec![changed(&restored, 3), reverted()];
         if !trashed.is_empty() {
@@ -580,7 +611,6 @@ mod tests {
         }
         let cause = Cause::Other("Revert".to_owned());
         watch.note(A, &actions, 5, &cause, false, x_on_disk);
-        watch
     }
 
     /// A's new version {A: 2, B: 1} at `path`, holding `hash`, made by
@@ -616,7 +646,7 @@ mod tests {
     #[test]
     fn a_reverts_own_live_directory_record_is_let_through() {
         let mut watch = Watch::default();
-        watch.observed(A, &rel("d"), at(10));
+        watch.observed(A, &rel("d"), at(10), false);
         let restored = entry(
             "d",
             &[(A, 1), (B, 1)],
@@ -678,6 +708,32 @@ mod tests {
         );
         watch.crashed(A, x_on_disk);
         assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
+    }
+
+    /// §11: a crash before the group of writes an observation was fed into
+    /// is durable takes what the engine learned from it, so the engine last
+    /// saw the path at the observation before. The user's edit between the
+    /// two is one the revert could not know of.
+    #[test]
+    fn an_observation_a_crash_took_is_not_the_last_sight() {
+        let mut watch = Watch::default();
+        watch.observed(A, &rel("f"), at(10), false);
+        watch.observed(A, &rel("f"), at(20), true);
+        watch.crashed(A, x_on_disk);
+        revert(&mut watch, "f", "f");
+        assert_eq!(
+            made(&mut watch, "f", X, Cause::Observed, Some(at(15))),
+            None
+        );
+        // Once its group is durable, the observation stays.
+        let mut watch = Watch::default();
+        watch.observed(A, &rel("f"), at(10), false);
+        watch.observed(A, &rel("f"), at(20), true);
+        watch.durable(A);
+        watch.crashed(A, x_on_disk);
+        revert(&mut watch, "f", "f");
+        let class = made(&mut watch, "f", X, Cause::Observed, Some(at(15)));
+        assert_eq!(class, Some(Class::SawTrashedFile));
     }
 
     /// §13: a landing whose report a crash took comes back as a local
