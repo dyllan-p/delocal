@@ -4797,11 +4797,14 @@ mod tests {
 
     /// A world of two nodes, for tests that need a `Node` or the `Sim`'s
     /// bookkeeping and none of its history.
+    /// Two nodes, whose scans take no time: the tests that call
+    /// `full_scan` by hand look at what it did as soon as it returns.
     fn world() -> Sim {
         Sim::new(
             0,
             Knobs {
                 nodes: Some(2),
+                scan_delay_ms: (0, 0),
                 ..Knobs::default()
             },
         )
@@ -5553,6 +5556,7 @@ mod tests {
             Knobs {
                 nodes: Some(2),
                 group_commit_lag: 0,
+                scan_delay_ms: (0, 0),
                 ..Knobs::default()
             },
         );
@@ -5753,6 +5757,7 @@ mod tests {
             Knobs {
                 nodes: Some(2),
                 group_commit_lag: 0,
+                scan_delay_ms: (0, 0),
                 ..Knobs::default()
             },
         );
