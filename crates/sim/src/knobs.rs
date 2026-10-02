@@ -73,7 +73,8 @@ pub struct Knobs {
     /// land, users edit, the watcher reports. So an observation can arrive
     /// after a commit changed its path, and the stale rule (§7.3) acts.
     /// `0..0` delivers every scan at once, as a scan that took no time.
-    /// The final phase's scans take no time.
+    /// The final phase's scans take no time. Up to 10 s by default, the
+    /// time a large folder's hashing takes.
     pub scan_delay_ms: (u64, u64),
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
@@ -99,7 +100,7 @@ impl Default for Knobs {
             io_failure: 0.01,
             disk_fill: 0.002,
             case_variants: 0.02,
-            scan_delay_ms: (0, 0),
+            scan_delay_ms: (0, 10_000),
             nodes: None,
             check_i9: false,
         }
