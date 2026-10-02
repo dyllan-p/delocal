@@ -2934,7 +2934,7 @@ impl Sim {
                     // target: empty before, full after.
                     for (from, to, was) in &moves {
                         if !was && n.is_some_and(|n| n.fs.contains_key(to)) {
-                            watch.displaced(node, from, to, from != &path);
+                            watch.displaced(node, from, to, from != &path, self.clock);
                         }
                     }
                 }
