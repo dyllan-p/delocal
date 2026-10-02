@@ -732,6 +732,10 @@ pub struct FolderState {
     /// commit has since replaced. Not persisted: after a restart every
     /// observation is taken afresh.
     reported: BTreeMap<RelPath, Timestamp>,
+    /// The time of the latest observation of each path the engine has taken
+    /// (§7.3, draft 59): one taken before it, a scan's read overtaken by the
+    /// watcher's report, is stale too. Not persisted, as `reported`.
+    last_observed: BTreeMap<RelPath, Timestamp>,
     /// True while a full disk pauses the folder's inbound (§7.5 "local
     /// failures"): from the first `DiskFull` reported by a fetch or commit
     /// a want waited for, until the host reports space recovered. Nothing
@@ -783,6 +787,7 @@ impl FolderState {
             unobserved: BTreeSet::new(),
             observing: BTreeSet::new(),
             reported: BTreeMap::new(),
+            last_observed: BTreeMap::new(),
             disk_full: false,
             statuses: Vec::new(),
         }
@@ -823,6 +828,7 @@ impl FolderState {
             unobserved: BTreeSet::new(),
             observing: BTreeSet::new(),
             reported: BTreeMap::new(),
+            last_observed: BTreeMap::new(),
             disk_full: rest.disk_full,
             statuses: Vec::new(),
         }
@@ -881,6 +887,7 @@ impl FolderState {
             unobserved,
             observing,
             reported,
+            last_observed,
             disk_full,
             statuses,
         } = self;
@@ -907,6 +914,7 @@ impl FolderState {
             .or_else(|| differs("unobserved", *unobserved == other.unobserved))
             .or_else(|| differs("observing", *observing == other.observing))
             .or_else(|| differs("reported", *reported == other.reported))
+            .or_else(|| differs("last_observed", *last_observed == other.last_observed))
             .or_else(|| differs("disk_full", *disk_full == other.disk_full))
             .or_else(|| differs("statuses", *statuses == other.statuses))
     }
@@ -1106,12 +1114,12 @@ impl FolderState {
     }
 
     /// True if an observation of `path` taken at `at` is stale: older than
-    /// the path's last commit report (§7.3, draft 56), so the engine drops
-    /// it. A skip is not an observation and is never dropped as one.
+    /// the path's last commit report (§7.3, draft 56) or than the latest
+    /// observation of it the engine has taken (draft 59), so the engine
+    /// drops it. A skip is not an observation and is never dropped as one.
     pub fn is_stale(&self, path: &RelPath, at: Timestamp) -> bool {
-        self.reported
-            .get(path)
-            .is_some_and(|reported| at < *reported)
+        let before = |time: Option<&Timestamp>| time.is_some_and(|t| at < *t);
+        before(self.reported.get(path)) || before(self.last_observed.get(path))
     }
 
     /// [`Self::scanned`], for an observation made by `observer` at `at`: a
@@ -1192,14 +1200,17 @@ impl FolderState {
         // Whatever becomes of it below, this is the observation an
         // `Observe` asked for, if one did.
         self.observing.remove(&path);
-        // An observation is a fact about a moment (§7.3, draft 56): one taken
-        // before the path's last commit report describes a state the commit
-        // has replaced. It is dropped, though the bracket has counted the
-        // path as seen above, so nothing is tombstoned for having been read
-        // at the wrong moment.
+        // An observation is a fact about a moment (§7.3, drafts 56 and 59):
+        // one taken before the path's last commit report, or before the
+        // latest observation of it taken, describes a state since replaced.
+        // It is dropped, though the bracket has counted the path as seen
+        // above, so nothing is tombstoned for having been read at the wrong
+        // moment.
         if self.is_stale(&path, at) {
             return Scanned::default();
         }
+        let latest = self.last_observed.entry(path.clone()).or_insert(at);
+        *latest = (*latest).max(at);
         let marked = self.marked(&path);
         if state == ScanState::Absent && marked {
             self.unobserved.remove(&path);
@@ -2654,6 +2665,7 @@ impl FolderState {
         self.unobserved.clear();
         self.observing.clear();
         self.reported.clear();
+        self.last_observed.clear();
     }
 
     /// Decide the next host steps for the want-list (§7.5) and adopt every
@@ -6747,6 +6759,28 @@ mod tests {
             change.is_some_and(|c| c.record.entry.deleted),
             "read after the report"
         );
+    }
+
+    /// §7.3 (draft 59), seed 1's shape at a 2 s scan delay: a scan reads f00
+    /// at 5 s, the user deletes it, and the watcher's report of that, taken
+    /// at 6 s, arrives first. The scan's read then arrives describing a file
+    /// that no longer exists: stale, whether it says the file is there or
+    /// unchanged, so the deletion stands, and the bracket counts f00 as
+    /// seen. A read taken after the watcher's is a fresh observation.
+    #[test]
+    fn a_later_observation_outdates_an_earlier_one() {
+        let (_, mut b) = a_and_b(1, Rules::default());
+        let gone = b.observed_at(t(6.5), t(6.0), p("f00"), ScanState::Absent);
+        assert!(gone.change.is_some_and(|c| c.record.entry.deleted));
+        b.scan_started();
+        let read = b.observed_at(t(7.0), t(5.0), p("f00"), file(1, 1));
+        assert_eq!(read, Scanned::default());
+        let read = b.observed_at(t(7.0), t(5.0), p("f00"), ScanState::Unchanged);
+        assert_eq!(read, Scanned::default(), "neither a host bug");
+        assert!(b.scan_finished(t(7.5)).unwrap().is_empty());
+        assert!(b.index().live(&p("f00")).is_none(), "the deletion stands");
+        let back = b.observed_at(t(8.5), t(8.0), p("f00"), file(2, 2));
+        assert!(back.change.is_some_and(|c| !c.record.entry.deleted));
     }
 
     /// §7.3 (draft 58): a commit report carries the time its operation ran,
