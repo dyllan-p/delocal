@@ -150,6 +150,11 @@ struct Mark {
     lost: Option<Content>,
 }
 
+/// An observation fed while its node's group of writes is open: its path,
+/// the time it replaced in `Watch::last_observed`, and the path's entry it
+/// cleared from `Watch::moved`.
+type Undurable = (RelPath, Option<Timestamp>, Option<Timestamp>);
+
 /// The bookkeeping I9 needs, across every node of a run.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watch {
@@ -162,13 +167,14 @@ pub(crate) struct Watch {
     /// was fed was taken.
     last_observed: BTreeMap<(NodeId, RelPath), Timestamp>,
     /// Observations fed while their node's group of writes is open (§11),
-    /// with the time each replaced and whether the path was in `moved`: a
+    /// with the time each replaced and the path's entry in `moved`: a
     /// crash before the group is durable takes what the engine learned from
     /// them, so the engine never saw them.
-    undurable_observed: BTreeMap<NodeId, Vec<(RelPath, Option<Timestamp>, bool)>>,
+    undurable_observed: BTreeMap<NodeId, Vec<Undurable>>,
     /// Paths whose file a displacement of a directory above them took away
-    /// (§7.6), until the engine next observes them.
-    moved: BTreeSet<(NodeId, RelPath)>,
+    /// (§7.6), with when, until the engine is fed an observation of them
+    /// taken since.
+    moved: BTreeMap<(NodeId, RelPath), Timestamp>,
     /// When the user last edited a file somewhere else that has since come
     /// back to a path: a conflict copy the journal's undo moved back at a
     /// restart (§7.5), edited while the node was down.
@@ -198,7 +204,12 @@ impl Watch {
         let replaced = self.last_observed.get(&key).copied();
         self.last_observed
             .insert(key, replaced.map_or(at, |last| last.max(at)));
-        let moved = self.moved.remove(&(id, path.clone()));
+        // Only an observation taken since the move: a delayed scan's read
+        // from before it saw the file still there (draft 58).
+        let moved = match self.moved.get(&(id, path.clone())) {
+            Some(when) if at >= *when => self.moved.remove(&(id, path.clone())),
+            _ => None,
+        };
         if group_open {
             self.undurable_observed
                 .entry(id)
@@ -260,7 +271,7 @@ impl Watch {
                 Trashed::No
             },
             current: restored,
-            moved_with_directory: watch.moved.contains(&(id, path.clone())),
+            moved_with_directory: watch.moved.contains_key(&(id, path.clone())),
             copied_here: false,
             made: BTreeMap::new(),
             let_through: BTreeSet::new(),
@@ -388,8 +399,8 @@ impl Watch {
                 Some(at) => self.last_observed.insert((id, path.clone()), at),
                 None => self.last_observed.remove(&(id, path.clone())),
             };
-            if moved {
-                self.moved.insert((id, path));
+            if let Some(when) = moved {
+                self.moved.insert((id, path), when);
             }
         }
         let marks = self.undurable_marks.remove(&id).unwrap_or_default();
@@ -454,10 +465,18 @@ impl Watch {
     }
 
     /// A commit on `id` displaced what was at `from` to `to`, as a conflict
-    /// copy (§7.6); `beneath` if it went along with a directory above it.
-    pub(crate) fn displaced(&mut self, id: NodeId, from: &RelPath, to: &RelPath, beneath: bool) {
+    /// copy (§7.6), at `at`; `beneath` if it went along with a directory
+    /// above it.
+    pub(crate) fn displaced(
+        &mut self,
+        id: NodeId,
+        from: &RelPath,
+        to: &RelPath,
+        beneath: bool,
+        at: Timestamp,
+    ) {
         if beneath {
-            self.moved.insert((id, from.clone()));
+            self.moved.insert((id, from.clone()), at);
             if let Some(m) = self.marks.get_mut(&(id, from.clone())) {
                 m.moved_with_directory = true;
             }
@@ -819,7 +838,7 @@ mod tests {
         let class = made(&mut watch, "d/f", empty, Cause::ScanFinished, None);
         assert_eq!(class, Some(Class::Other("found empty".to_owned())));
         let mut watch = Watch::default();
-        watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true);
+        watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true, at(1));
         let restored = entry("d/f", &[(A, 1), (B, 1)], Y, ContentHash::EMPTY);
         let cause = Cause::Other("Revert".to_owned());
         watch.note(
@@ -838,6 +857,28 @@ mod tests {
             None,
         );
         assert_eq!(class, None);
+    }
+
+    /// A directory displaced at 20 s took d/f along (§7.6). An observation
+    /// of d/f taken before that, a delayed scan's read, does not say the
+    /// engine has seen the path since: the next scan's finding it empty is
+    /// still the displacement's consequence, let through. One taken after
+    /// it does.
+    #[test]
+    fn only_an_observation_since_a_move_says_the_path_was_seen_since() {
+        let restored = entry("d/f", &[(A, 1), (B, 1)], Y, ContentHash::EMPTY);
+        let cause = Cause::Other("Revert".to_owned());
+        let actions = [changed(&restored, 3), reverted()];
+        let class = |observed: i64| {
+            let mut watch = Watch::default();
+            watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true, at(20));
+            watch.observed(A, &rel("d/f"), at(observed), false);
+            watch.note(A, &actions, 5, &cause, false, |_| None);
+            let empty = ContentHash::EMPTY;
+            made(&mut watch, "d/f", empty, Cause::ScanFinished, None)
+        };
+        assert_eq!(class(15), None, "read before the move");
+        assert_eq!(class(25), Some(Class::Other("found empty".to_owned())));
     }
 
     /// Class 5, let through by I9's row: a commit of another path displaces
@@ -871,7 +912,7 @@ mod tests {
             false,
             x_on_disk,
         );
-        watch.displaced(A, &rel("f"), &rel("f.conflict"), false);
+        watch.displaced(A, &rel("f"), &rel("f.conflict"), false, at(11));
         let applied = Cause::Applied { path: rel("f") };
         let class = made(&mut watch, "f.conflict", Y, applied, None);
         assert_eq!(class, None);
