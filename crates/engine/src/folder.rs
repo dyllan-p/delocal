@@ -2927,6 +2927,13 @@ impl FolderState {
         let mut written = vec![record];
         if let Some(copy) = want.conflict {
             let copy_path = copy.path.clone();
+            // The commit wrote the copy too, so its report is the copy
+            // path's as much as the path's (draft 58): an open bracket has
+            // seen it, and an observation from before the commit is stale.
+            if let Some(bracket) = &mut self.scan {
+                bracket.committed(&copy_path);
+            }
+            self.reported.insert(copy_path.clone(), at);
             let change = self.index.record_conflict_copy(copy.path, &copy.loser);
             self.touched(now);
             written.push(change.record);
@@ -6812,6 +6819,45 @@ mod tests {
         assert!(b.index().live(&p("f00")).is_none(), "the deletion stands");
         let back = b.observed_at(t(8.5), t(8.0), p("f00"), file(2, 2));
         assert!(back.change.is_some_and(|c| !c.record.entry.deleted));
+    }
+
+    /// §7.3, §7.6 (draft 58): a commit that displaces the losing file to a
+    /// conflict copy writes the copy too, so its report is the copy path's
+    /// as well. B's own edit of f00 loses to A's newer one while B's scan is
+    /// open; the scan walked past before the commit made the copy. Its
+    /// bracket has seen the copy all the same, and a read of the copy path
+    /// from before the commit, which found nothing, arriving after the
+    /// bracket, is stale.
+    #[test]
+    fn a_commit_report_covers_its_conflict_copy() {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        b.scanned(t(10.0), p("f00"), file(5, 50));
+        let loser = b.index().get(&p("f00")).unwrap().entry.clone();
+        let copy_path = crate::conflict::conflict_copy_name(&loser).unwrap();
+        a.scanned(t(11.0), p("f00"), file(6, 60));
+        let batch = a.form_batches(t(13.0), bid(6)).remove(0);
+        assert_eq!(b.receive(t(13.0), &batch).decision, Decision::Accepted);
+        b.scan_started();
+        b.scanned(t(14.0), p("f00"), ScanState::Unchanged);
+        let v = b.wants().get(&p("f00")).unwrap().version().clone();
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(
+            matches!(steps.first(), Some(HostStep::Fetch { .. })),
+            "{steps:?}"
+        );
+        b.fetched(t(14.0), &p("f00"), &v, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(14.0), &lan(&[1]));
+        assert!(
+            matches!(steps.first(), Some(HostStep::Write { .. })),
+            "{steps:?}"
+        );
+        let written = b.applied_at(t(16.0), &p("f00"), &v, t(15.0), ApplyOutcome::Ok);
+        assert_eq!(written.len(), 2, "the path and its copy");
+        assert!(b.scan_finished(t(16.5)).unwrap().is_empty());
+        assert!(b.index().live(&copy_path).is_some(), "the bracket saw it");
+        let before = b.observed_at(t(17.0), t(14.5), copy_path.clone(), ScanState::Absent);
+        assert_eq!(before, Scanned::default(), "read before the commit");
+        assert!(b.index().live(&copy_path).is_some());
     }
 
     /// §7.3 (draft 58): a commit report carries the time its operation ran,
