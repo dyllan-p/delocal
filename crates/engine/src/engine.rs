@@ -656,6 +656,18 @@ impl Engine {
         self.observe(&mut out);
         self.schedule(&mut out);
         self.persist(&mut out);
+        // When each record was last written (§7.3, draft 59): every write
+        // the engine makes is reported (§11), so the actions say which.
+        for action in &out {
+            let (folder, path) = match action {
+                Action::IndexChanged { folder, record } => (folder, &record.entry.path),
+                Action::IndexRemoved { folder, path } => (folder, path),
+                _ => continue,
+            };
+            if let Some(f) = self.folders.get_mut(folder) {
+                f.wrote(path, now);
+            }
+        }
         out
     }
 
@@ -1753,6 +1765,94 @@ mod tests {
                 members: members.iter().map(|i| node(*i)).collect(),
             },
         );
+    }
+
+    /// §7.3 (draft 59): `Unchanged` is relative to the record the host
+    /// compared against. As in the test below, but with A the only other
+    /// member: B's restoring want for f0 ends in a tombstone at 14 s, once A
+    /// answers that it cannot serve the content (§8.3 step 4). A scan's
+    /// `Unchanged` taken at 13.5 s was compared against the record that
+    /// tombstone replaced, so it is seen and nothing more. One taken after
+    /// the tombstone, at a path with no live record, is still a host bug.
+    #[test]
+    fn an_unchanged_taken_before_its_record_was_rewritten_is_only_seen() {
+        let mut a = engine(1, "alpha");
+        let mut b = engine(2, "bravo");
+        for e in [&mut a, &mut b] {
+            join_with(e, tight(), &[1, 2]);
+        }
+        connect(&mut a, &mut b);
+        let scanned = |path: &str, state: ScanState, at: Timestamp| Event::Scanned {
+            folder: folder(),
+            path: p(path),
+            state,
+            at,
+        };
+        for i in 0..3 {
+            b.handle(t(1.0), scanned(&format!("f{i}"), file(1, 1), t(1.0)));
+        }
+        let out = b.handle(
+            t(3.0),
+            Event::Tick {
+                fresh_batch_id: fresh(1),
+            },
+        );
+        let mut engines = BTreeMap::from([(node(1), a), (node(2), b)]);
+        deliver(t(3.0), node(2), out, &mut engines);
+        let b = engines.get_mut(&node(2)).unwrap();
+        for i in 0..3 {
+            b.handle(
+                t(10.0),
+                scanned(&format!("f{i}"), ScanState::Absent, t(10.0)),
+            );
+        }
+        b.handle(
+            t(12.0),
+            Event::Tick {
+                fresh_batch_id: fresh(2),
+            },
+        );
+        let out = b.handle(t(13.0), Event::Revert { folder: folder() });
+        let version = out
+            .iter()
+            .find_map(|a| match a {
+                Action::Fetch { path, version, .. } if *path == p("f0") => Some(version.clone()),
+                _ => None,
+            })
+            .expect("the restoring want asks A");
+        let out = b.handle(
+            t(14.0),
+            Event::Fetched {
+                folder: folder(),
+                path: p("f0"),
+                hash: hash(1),
+                version,
+                outcome: FetchReport::NotAvailable,
+            },
+        );
+        assert!(
+            out.iter().any(|a| matches!(
+                a,
+                Action::IndexChanged { record, .. }
+                    if record.entry.path == p("f0") && record.entry.deleted
+            )),
+            "{out:?}"
+        );
+        let host_bug = |out: &[Action]| {
+            out.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::StatusChanged {
+                        status: FolderStatus::UnchangedUnknownPath { .. },
+                        ..
+                    }
+                )
+            })
+        };
+        let out = b.handle(t(15.0), scanned("f0", ScanState::Unchanged, t(13.5)));
+        assert!(!host_bug(&out), "compared against the record replaced");
+        let out = b.handle(t(16.0), scanned("f0", ScanState::Unchanged, t(15.5)));
+        assert!(host_bug(&out), "taken after the tombstone");
     }
 
     /// A and B connected, both with tight rules, both holding ten files A made.
