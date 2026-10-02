@@ -48,9 +48,10 @@ pub(crate) enum Cause {
 }
 
 /// Why a new local version at a reverted path fails I9, judged by the
-/// first new local version the node made there since the revert: the rest
-/// usually follow from it. The five named classes are the ones the first
-/// sweeps were traced into; anything else is [`Class::Other`], named by the
+/// first new local version the node made there since the revert that is
+/// not let through: the rest usually follow from it. The five named
+/// classes are the ones the first sweeps were traced into, two of which
+/// I9's row lets through; anything else is [`Class::Other`], named by the
 /// event that made that first version, until it is traced into a class.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Class {
@@ -65,7 +66,10 @@ pub(crate) enum Class {
     TrashedWithDirectory,
     /// A commit displaced a directory above the path to a conflict copy, and
     /// the path's file with it (§7.6, a non-empty loser), before the revert
-    /// or after it. The next scan found the path empty.
+    /// or after it. The next scan found the path empty. I9's row lets a
+    /// version of this class through as it is made: landing a received
+    /// version and its consequences. It is a failure only where the class
+    /// names a version made before the displacement it would follow from.
     MovedWithDirectory,
     /// A scan reported the file that was at the path when the revert ran,
     /// which the revert left there because the engine did not know of it:
@@ -77,7 +81,8 @@ pub(crate) enum Class {
     /// records the copy as this machine's change, or the next scan finds a
     /// child that went along as an add (§7.6). A conflict copy's name
     /// repeats for the same loser, and a removed path's counters start
-    /// again.
+    /// again. Let through as it is made, as [`Class::MovedWithDirectory`]
+    /// is.
     ConflictCopy,
     /// Anything else, by the event that made the first new local version.
     Other(String),
@@ -304,7 +309,19 @@ impl Watch {
                         && record.entry.kind == Kind::Dir
                         && !record.entry.deleted
                         && record.entry.modified_by == id;
-                    if unrecoverable || bumped || landed || kept_dir {
+                    // Landing a received version and its consequences, by
+                    // I9's row: a directory a commit displaced to a conflict
+                    // copy took the path's file along (§7.6), and the next
+                    // scan found the path empty; or a commit displaced a
+                    // losing file to a conflict copy at the path, or beneath
+                    // it, under the copy's deterministic name. The classes
+                    // say which, as the version is made: `classify` tries the
+                    // failures first, so a trashed file seen again is one.
+                    let consequence = matches!(
+                        classify(m, path, cause, &made),
+                        Class::MovedWithDirectory | Class::ConflictCopy
+                    );
+                    if unrecoverable || bumped || landed || kept_dir || consequence {
                         m.let_through.insert(own);
                     }
                     m.made.entry(own).or_insert_with(|| (cause.clone(), made));
@@ -781,10 +798,20 @@ mod tests {
         assert_eq!(class, Some(Class::TrashedWithDirectory));
     }
 
-    /// Class 3: a directory displaced to a conflict copy before the revert
-    /// took the file along, and the engine had not seen the path since.
+    /// Class 3, let through by I9's row: a directory displaced to a conflict
+    /// copy before the revert took the file along, and the engine had not
+    /// seen the path since, so the next scan found it empty. Without the
+    /// displacement, the same version is a failure.
     #[test]
-    fn a_file_a_directory_took_to_a_conflict_copy_before_the_revert_is_class_3() {
+    fn a_file_a_directory_took_to_a_conflict_copy_is_let_through() {
+        let mut watch = Watch::default();
+        let restored = entry("d/f", &[(A, 1), (B, 1)], Y, ContentHash::EMPTY);
+        let cause = Cause::Other("Revert".to_owned());
+        let actions = [changed(&restored, 3), reverted()];
+        watch.note(A, &actions, 5, &cause, false, |_| None);
+        let empty = ContentHash::EMPTY;
+        let class = made(&mut watch, "d/f", empty, Cause::ScanFinished, None);
+        assert_eq!(class, Some(Class::Other("found empty".to_owned())));
         let mut watch = Watch::default();
         watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true);
         let restored = entry("d/f", &[(A, 1), (B, 1)], Y, ContentHash::EMPTY);
@@ -804,13 +831,26 @@ mod tests {
             Cause::ScanFinished,
             None,
         );
-        assert_eq!(class, Some(Class::MovedWithDirectory));
+        assert_eq!(class, None);
     }
 
-    /// Class 5: a commit of another path displaces its losing file to a
-    /// conflict copy at a path the revert removed, and records the copy.
+    /// Class 5, let through by I9's row: a commit of another path displaces
+    /// its losing file to a conflict copy at a path the revert removed, and
+    /// records the copy. Without the displacement, the same version is a
+    /// failure.
     #[test]
-    fn a_conflict_copy_recorded_at_a_removed_path_is_class_5() {
+    fn a_conflict_copy_recorded_at_a_removed_path_is_let_through() {
+        let removed = Action::IndexRemoved {
+            folder: FOLDER,
+            path: rel("f.conflict"),
+        };
+        let cause = Cause::Other("Revert".to_owned());
+        let mut watch = Watch::default();
+        let actions = [removed, reverted(), trash("f.conflict")];
+        watch.note(A, &actions, 5, &cause, false, x_on_disk);
+        let applied = Cause::Applied { path: rel("f") };
+        let class = made(&mut watch, "f.conflict", Y, applied, None);
+        assert_eq!(class, Some(Class::Other("applied".to_owned())));
         let mut watch = Watch::default();
         let removed = Action::IndexRemoved {
             folder: FOLDER,
@@ -828,6 +868,6 @@ mod tests {
         watch.displaced(A, &rel("f"), &rel("f.conflict"), false);
         let applied = Cause::Applied { path: rel("f") };
         let class = made(&mut watch, "f.conflict", Y, applied, None);
-        assert_eq!(class, Some(Class::ConflictCopy));
+        assert_eq!(class, None);
     }
 }
