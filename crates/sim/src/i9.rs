@@ -437,6 +437,12 @@ impl Watch {
         }
     }
 
+    /// When `id`'s user last edited `path` by way of a copy elsewhere.
+    #[cfg(test)]
+    pub(crate) fn edited_elsewhere_at(&self, id: NodeId, path: &RelPath) -> Option<Timestamp> {
+        self.edited_elsewhere.get(&(id, path.clone())).copied()
+    }
+
     /// The file now at `path` on `id` came back from somewhere its user
     /// edited it, last at `at`: for I9 that is an edit of `path`.
     pub(crate) fn edited_elsewhere(&mut self, id: NodeId, path: &RelPath, at: Timestamp) {
