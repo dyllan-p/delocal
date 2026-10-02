@@ -1454,6 +1454,12 @@ impl FolderState {
     /// the record they would be found caught up and dropped, while the
     /// disk still holds nothing.
     fn rewant_carriers(&mut self, path: &RelPath) {
+        // Nothing at the path moves on before its move to the trash is
+        // reported (§8.3 step 2), whose report wants the carriers again; one
+        // backing off is not in flight, but holds the path all the same.
+        if self.wants.get(path).is_some_and(Want::is_trash) {
+            return;
+        }
         let carriers = self.deferred.take_where(path, |d| d.restoring.is_some());
         for d in carriers {
             let Some(entry) = d.restoring else {
@@ -7116,6 +7122,44 @@ mod tests {
                 .any(|s| matches!(s, HostStep::Trash { path, .. } if *path == p("f00"))),
             "tried again: {steps:?}"
         );
+        b.trashed(t(81.0), &p("f00"), &v, t(81.0), ApplyOutcome::Ok);
+        assert!(b.wants().restoring(&p("f00")), "then the refetch");
+    }
+
+    /// §8.3 step 2: a move to the trash backing off holds its path, and a
+    /// bracket's end that did not see the path wants nothing again there:
+    /// the mark's carrier waits for the move, mark and all, and the path is
+    /// not tombstoned. Seed 200908: after a crash took the move's report,
+    /// the move came back to a full disk; the bracket's end wanted the
+    /// carrier again, the want-list refused it beside the move, and it went
+    /// back to the deferred set without its mark.
+    #[test]
+    fn a_bracket_end_waits_for_a_move_backing_off() {
+        let (_, mut b, _, v) = reverting();
+        b.dispatch(t(13.0), &lan(&[1]));
+        b.trashed(
+            t(15.0),
+            &p("f00"),
+            &v,
+            t(15.0),
+            ApplyOutcome::Failed {
+                error: LocalError::Io,
+                found: file(5, 5),
+            },
+        );
+        let restored = b.index().get(&p("f00")).unwrap().clone();
+        b.scan_started();
+        b.scanned(t(16.0), p("f01"), ScanState::Unchanged);
+        assert!(b.scan_finished(t(17.0)).unwrap().is_empty());
+        assert_eq!(b.index().get(&p("f00")), Some(&restored));
+        assert!(b.wants().get(&p("f00")).is_some_and(Want::is_trash));
+        assert!(
+            b.deferred()
+                .any(|d| d.entry.path == p("f00") && d.restoring.is_some()),
+            "the carrier keeps its mark"
+        );
+        b.expire(t(80.0));
+        b.dispatch(t(80.0), &lan(&[1]));
         b.trashed(t(81.0), &p("f00"), &v, t(81.0), ApplyOutcome::Ok);
         assert!(b.wants().restoring(&p("f00")), "then the refetch");
     }
