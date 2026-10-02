@@ -543,11 +543,14 @@ fn classify(mark: &Mark, path: &RelPath, cause: &Cause, made: &Content) -> Class
     match cause {
         Cause::Observed if found && mark.trashed != Trashed::No => Class::SawTrashedFile,
         Cause::Observed if found => Class::KeptUnknownFile,
-        Cause::Absent | Cause::ScanFinished if mark.trashed == Trashed::WithDirectory => {
-            Class::TrashedWithDirectory
-        }
+        // A displacement of a directory above the path took a file that was
+        // there to take, before the revert or after something landed there
+        // since: it, not the revert's trash, is why the path is empty.
         Cause::Absent | Cause::ScanFinished if mark.moved_with_directory => {
             Class::MovedWithDirectory
+        }
+        Cause::Absent | Cause::ScanFinished if mark.trashed == Trashed::WithDirectory => {
+            Class::TrashedWithDirectory
         }
         Cause::Applied { path: at } if at != path && mark.copied_here => Class::ConflictCopy,
         Cause::Observed if mark.copied_here => Class::ConflictCopy,
@@ -879,6 +882,19 @@ mod tests {
         };
         assert_eq!(class(15), None, "read before the move");
         assert_eq!(class(25), Some(Class::Other("found empty".to_owned())));
+    }
+
+    /// A revert trashed d with d/f in it, a received d/f landed there later,
+    /// and a commit then displaced d to a conflict copy, d/f along (§7.6):
+    /// the next scan's finding d/f empty is the displacement's consequence,
+    /// let through, however the revert left the path.
+    #[test]
+    fn a_move_with_a_directory_after_a_trash_with_one_is_let_through() {
+        let mut watch = reverted_watch("d/f", "d");
+        watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true, at(30));
+        let empty = ContentHash::EMPTY;
+        let class = made(&mut watch, "d/f", empty, Cause::ScanFinished, None);
+        assert_eq!(class, None);
     }
 
     /// Class 5, let through by I9's row: a commit of another path displaces
