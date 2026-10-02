@@ -736,6 +736,13 @@ pub struct FolderState {
     /// (§7.3, draft 59): one taken before it, a scan's read overtaken by the
     /// watcher's report, is stale too. Not persisted, as `reported`.
     last_observed: BTreeMap<RelPath, Timestamp>,
+    /// When the engine last wrote each path's record (§7.3, draft 59), as
+    /// the engine tells it from the writes it reports (see
+    /// [`Self::wrote`]). `Unchanged` means the file is as the record the
+    /// host compared against described, so one taken before this was
+    /// compared against a record since replaced. Not persisted, as
+    /// `reported`.
+    record_written: BTreeMap<RelPath, Timestamp>,
     /// True while a full disk pauses the folder's inbound (§7.5 "local
     /// failures"): from the first `DiskFull` reported by a fetch or commit
     /// a want waited for, until the host reports space recovered. Nothing
@@ -788,6 +795,7 @@ impl FolderState {
             observing: BTreeSet::new(),
             reported: BTreeMap::new(),
             last_observed: BTreeMap::new(),
+            record_written: BTreeMap::new(),
             disk_full: false,
             statuses: Vec::new(),
         }
@@ -829,6 +837,7 @@ impl FolderState {
             observing: BTreeSet::new(),
             reported: BTreeMap::new(),
             last_observed: BTreeMap::new(),
+            record_written: BTreeMap::new(),
             disk_full: rest.disk_full,
             statuses: Vec::new(),
         }
@@ -888,6 +897,7 @@ impl FolderState {
             observing,
             reported,
             last_observed,
+            record_written,
             disk_full,
             statuses,
         } = self;
@@ -915,6 +925,7 @@ impl FolderState {
             .or_else(|| differs("observing", *observing == other.observing))
             .or_else(|| differs("reported", *reported == other.reported))
             .or_else(|| differs("last_observed", *last_observed == other.last_observed))
+            .or_else(|| differs("record_written", *record_written == other.record_written))
             .or_else(|| differs("disk_full", *disk_full == other.disk_full))
             .or_else(|| differs("statuses", *statuses == other.statuses))
     }
@@ -1122,6 +1133,13 @@ impl FolderState {
         before(self.reported.get(path)) || before(self.last_observed.get(path))
     }
 
+    /// The engine wrote `path`'s record at `now` (§7.3, draft 59). The
+    /// engine calls it for every index write it reports, which §11 says is
+    /// every write it makes.
+    pub(crate) fn wrote(&mut self, path: &RelPath, now: Timestamp) {
+        self.record_written.insert(path.clone(), now);
+    }
+
     /// [`Self::scanned`], for an observation made by `observer` at `at`: a
     /// scan or the watcher, or the guard of a commit whose report carries
     /// it. A live path implies its ancestors (§7.3): an observation of
@@ -1207,6 +1225,18 @@ impl FolderState {
         // above, so nothing is tombstoned for having been read at the wrong
         // moment.
         if self.is_stale(&path, at) {
+            return Scanned::default();
+        }
+        // `Unchanged` is relative to a record (draft 59): one taken before
+        // the engine last wrote this path's record was compared against a
+        // record since replaced, the engine's own tombstone for content
+        // nobody can serve, say. It is seen, as above, and nothing more.
+        if state == ScanState::Unchanged
+            && self
+                .record_written
+                .get(&path)
+                .is_some_and(|written| at < *written)
+        {
             return Scanned::default();
         }
         let latest = self.last_observed.entry(path.clone()).or_insert(at);
@@ -2666,6 +2696,7 @@ impl FolderState {
         self.observing.clear();
         self.reported.clear();
         self.last_observed.clear();
+        self.record_written.clear();
     }
 
     /// Decide the next host steps for the want-list (§7.5) and adopt every
