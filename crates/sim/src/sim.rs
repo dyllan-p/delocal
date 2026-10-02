@@ -481,6 +481,8 @@ struct UserDue {
 struct JournalRow {
     path: RelPath,
     to: Displace,
+    /// When the displacement happened.
+    at: Timestamp,
     /// Everything the displacement moved, at the path it had.
     moved: Vec<(RelPath, File)>,
     /// Where in the node's trash the moved files start, for `Displace::Trash`.
@@ -2683,6 +2685,20 @@ impl Sim {
         let rows = std::mem::take(&mut node.journal);
         self.stats.displacements_undone += rows.len() as u64;
         for row in rows.into_iter().rev() {
+            // I9: a user's edit or deletion of a conflict copy the row made,
+            // while the node was down, is a change of the path its file was
+            // moved from, whether or not the undo finds anything to move
+            // back (§7.5).
+            if let (Some(watch), Displace::ConflictCopy(target)) = (self.i9.as_mut(), &row.to) {
+                for (from, _) in &row.moved {
+                    let edited = rebase(from, &row.path, target)
+                        .and_then(|copy| node.local_edit_at.get(&copy))
+                        .filter(|edited| **edited >= row.at);
+                    if let Some(edited) = edited {
+                        watch.edited_elsewhere(id, from, *edited);
+                    }
+                }
+            }
             for (at, back) in undo(node, row, clock) {
                 // I9: a user's edit of the copy while the node was down is
                 // an edit of the file now back at its path.
@@ -4575,6 +4591,7 @@ fn displace_journalled(
     node.journal.push(JournalRow {
         path: path.clone(),
         to: to.clone(),
+        at: now,
         moved,
         trash_at,
     });
@@ -4894,6 +4911,38 @@ mod tests {
             [(adopted.hash(), copy.clone(), displaced)]
         );
         crate::invariants::i2_node(&sim, id).unwrap_or_else(|f| panic!("{f}"));
+    }
+
+    /// I9: the user of a node down with a journalled displacement open
+    /// deleted the conflict copy it made. At the restart the undo finds
+    /// nothing to bring back, and the deletion is the user's change of the
+    /// path the file was moved from (§7.5), as an edit of a copy the undo
+    /// brings back is.
+    #[test]
+    fn a_user_change_of_a_journalled_copy_is_one_of_its_path_for_i9() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                scan_delay_ms: (0, 0),
+                check_i9: true,
+                ..Knobs::default()
+            },
+        );
+        let id = sim.order[0];
+        let (at, copy) = (rel("d1/f2"), rel("d1/f2.conflict-20231114-221320-n1"));
+        let to = Displace::ConflictCopy(copy.clone());
+        let displaced = sim.clock;
+        let deleted = displaced.plus_nanos(NANOS);
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.fs.insert(at.clone(), file(4, false));
+        assert!(displace_journalled(node, &at, &to, false, displaced));
+        node.fs.remove(&copy);
+        node.local_edit_at.insert(copy, deleted);
+        sim.crash(id, NANOS).unwrap();
+        sim.restart(id).unwrap();
+        let watch = sim.i9.as_ref().unwrap();
+        assert_eq!(watch.edited_elsewhere_at(id, &at), Some(deleted));
     }
 
     /// An adoption joins `synced` once its write is durable (§11), which
