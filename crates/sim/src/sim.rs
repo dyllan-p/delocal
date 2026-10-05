@@ -1525,9 +1525,27 @@ impl Sim {
             if let (Some(path), Some(at)) = (observed, observed_at) {
                 watch.observed(id, &path, at, group_open);
             }
-            watch.note(id, &actions, seq, &cause, group_open, |p| {
-                node.and_then(|n| content_at(n, p))
-            });
+            let folder = node
+                .and_then(|n| n.engine.as_ref())
+                .and_then(|e| e.folder(self.folder));
+            watch.note(
+                id,
+                &actions,
+                seq,
+                &cause,
+                group_open,
+                |p| node.and_then(|n| content_at(n, p)),
+                |p| {
+                    folder.is_some_and(|f| {
+                        f.index()
+                            .live_records()
+                            .any(|r| p.is_ancestor_of(&r.entry.path))
+                            || f.wants()
+                                .iter()
+                                .any(|w| !w.is_delete() && p.is_ancestor_of(w.path()))
+                    })
+                },
+            );
         }
         let outer = std::mem::replace(&mut self.observing, observing);
         let outer_feeding = self.feeding.replace(Feeding {
