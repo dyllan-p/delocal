@@ -344,11 +344,15 @@ impl Want {
     }
 
     /// True if a commit for this want is in flight (§8.3's settled folder):
-    /// the host is committing it, or it is a reset, which is a commit from
-    /// the moment `revert` orders it, since the disk is about to change
-    /// under the restored record.
+    /// the host is committing it, or it is a reset or a move to the trash,
+    /// each a commit from the moment `revert` orders it until its report, a
+    /// backoff after a failure included (draft 60), since the disk is about
+    /// to change under the restored record. A newer version at the path
+    /// waits for it rather than replacing it.
     pub fn committing(&self) -> bool {
-        matches!(self.state, WantState::Committing { .. }) || self.reset.is_some()
+        matches!(self.state, WantState::Committing { .. })
+            || self.reset.is_some()
+            || self.is_trash()
     }
 }
 

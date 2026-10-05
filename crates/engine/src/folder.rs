@@ -5378,6 +5378,65 @@ mod tests {
         assert_eq!(b.next_queued(), Some(Next::Run(deny)));
     }
 
+    /// §8.3 step 2 (draft 60): a move to the trash counts as in flight for
+    /// queued decisions from the revert's order until its report, a backoff
+    /// after a failure included, as a reset does. A deleted f09 and B took
+    /// the tombstone; B's user made f09 again, and B's revert puts the
+    /// tombstone back and orders the file to the trash, which leaves no
+    /// mark. A `deny` of A's held batch, which makes f09 again too, waits
+    /// for the move, through a failure, and runs once it is reported.
+    /// Seeds 86301 and 296512: the deny ran at once, its bump re-derived
+    /// f09's want, and the move was dropped, so the file the revert
+    /// discarded stayed, unknown, for a scan to announce.
+    #[test]
+    fn a_deny_waits_for_a_reverts_move_to_the_trash() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(5.0), p("f09"), ScanState::Absent);
+        let gone = a.form_batches(t(6.0), bid(2)).remove(0);
+        assert_eq!(b.receive(t(6.0), &gone).decision, Decision::Accepted);
+        commit_all(&mut b, t(7.0));
+        b.scanned(t(10.0), p("f09"), file(8, 8));
+        for i in 0..3 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        a.scanned(t(13.0), p("f09"), file(9, 9));
+        for i in 3..6 {
+            a.scanned(t(13.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let held = a.form_batches(t(14.0), bid(4)).remove(0);
+        assert!(matches!(
+            b.receive(t(14.0), &held).decision,
+            Decision::Held { .. }
+        ));
+        let revert = UserDecision::Revert {
+            batch: b.paused().unwrap().batch,
+        };
+        assert_eq!(b.request(revert), Requested::Run);
+        b.revert(t(15.0)).unwrap();
+        assert!(b.index().get(&p("f09")).unwrap().entry.deleted);
+        assert!(!b.marked(&p("f09")), "a tombstone put back leaves no mark");
+        let v = b.wants().get(&p("f09")).unwrap().version().clone();
+        assert!(b.wants().get(&p("f09")).is_some_and(Want::is_trash));
+        let deny = UserDecision::Deny { batch: bid(4) };
+        let waiting = Requested::Queued(FolderStatus::Waiting {
+            decision: deny,
+            reason: WaitReason::Committing { path: p("f09") },
+        });
+        assert_eq!(b.request(deny), waiting, "ordered, not yet sent");
+        b.dispatch(t(15.0), &lan(&[1]));
+        let failed = ApplyOutcome::Failed {
+            error: LocalError::Io,
+            found: file(8, 8),
+        };
+        b.trashed(t(16.0), &p("f09"), &v, t(16.0), failed);
+        assert_eq!(b.next_queued(), None, "backing off");
+        b.expire(t(80.0));
+        b.dispatch(t(80.0), &lan(&[1]));
+        b.trashed(t(81.0), &p("f09"), &v, t(81.0), ApplyOutcome::Ok);
+        assert_eq!(b.next_queued(), Some(Next::Run(deny)));
+    }
+
     /// §8.3: `revert` waits while any commit in the folder is in flight:
     /// the disk is about to change under the records it would restore.
     #[test]
