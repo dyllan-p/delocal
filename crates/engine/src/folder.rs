@@ -2721,9 +2721,9 @@ impl FolderState {
             self.wants.pause_inbound();
             return (Vec::new(), Vec::new());
         }
+        let mut adopted = self.keep_directories(now);
         let steps = self.wants.dispatch(now, &self.rules, peers);
         let mut host = Vec::new();
-        let mut adopted = Vec::new();
         for step in steps {
             match step {
                 WantStep::Fetch {
@@ -2801,6 +2801,57 @@ impl FolderState {
             }
         }
         (host, adopted)
+    }
+
+    /// A revert never trashes a directory with anything live beneath it
+    /// (§8.3 step 2), and the rule is judged whenever the directory's move
+    /// would be dispatched, retries included (draft 60): a record that
+    /// landed beneath it, or a want for a live entry there that appeared
+    /// after the revert (a frozen entry it admitted, a carrier's refetch, a
+    /// later arrival), drops the move. The directory gets a live directory
+    /// record of its own, as at the revert, and whatever waited at the path
+    /// for the move is classified again. A move in flight is the host's;
+    /// what lands beneath it meanwhile waits for its report (see
+    /// `want::gates`). Returns the records written.
+    fn keep_directories(&mut self, now: Timestamp) -> Vec<IndexRecord> {
+        let live_beneath = |dir: &RelPath| {
+            self.index
+                .live_records()
+                .any(|r| dir.is_ancestor_of(&r.entry.path))
+                || self
+                    .wants
+                    .iter()
+                    .any(|w| !w.is_delete() && dir.is_ancestor_of(w.path()))
+        };
+        let kept: Vec<RelPath> = self
+            .wants
+            .iter()
+            .filter(|w| {
+                w.is_trash()
+                    && w.entry.kind == Kind::Dir
+                    && !matches!(w.state, WantState::Committing { .. })
+            })
+            .map(Want::path)
+            .filter(|dir| live_beneath(dir))
+            .cloned()
+            .collect();
+        let mut written = Vec::new();
+        for path in kept {
+            self.wants.remove(&path);
+            let dir = Observed {
+                kind: Kind::Dir,
+                size: 0,
+                mtime_ns: 0,
+                exec: false,
+                hash: crate::entry::ContentHash::EMPTY,
+            };
+            written.extend(self.index.observe(path.clone(), dir).map(|c| c.record));
+            self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
+        }
+        if !written.is_empty() {
+            self.touched(now);
+        }
+        written
     }
 
     /// Want-list changes since the last call, for `WantChanged` actions.
@@ -5435,6 +5486,87 @@ mod tests {
         b.dispatch(t(80.0), &lan(&[1]));
         b.trashed(t(81.0), &p("f09"), &v, t(81.0), ApplyOutcome::Ok);
         assert_eq!(b.next_queued(), Some(Next::Run(deny)));
+    }
+
+    /// B's user made d/x, never announced, and deleted three more files, so
+    /// the folder paused under tight rules (the shape of seeds 76296 and
+    /// 287512). Returns A and B, paused, with A's d/y on its way to B.
+    fn a_directory_to_revert() -> (FolderState, FolderState, Batch) {
+        let (mut a, mut b) = a_and_b(10, tight());
+        b.scanned(t(10.0), p("d/x"), file(8, 8));
+        for i in 0..3 {
+            b.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(12.0), bid(5)), Ticked::Paused { .. }));
+        a.scanned(t(13.0), p("d/y"), file(9, 9));
+        let batch = a.form_batches(t(14.0), bid(4)).remove(0);
+        (a, b, batch)
+    }
+
+    /// §8.3 step 2 (draft 60), seeds 76296 and 287512: the revert removes
+    /// d's and d/x's records, which no peer saw, and orders both to the
+    /// trash. A's d/y, which arrived while the folder was paused, is
+    /// admitted by the same revert: a want for a live entry beneath d.
+    /// Judged as d's move would be dispatched, the rule drops the move and
+    /// gives d a live directory record of B's own, and d/y lands in it.
+    #[test]
+    fn a_directorys_move_yields_at_dispatch_to_a_want_beneath_it() {
+        let (_, mut b, batch) = a_directory_to_revert();
+        b.receive(t(14.0), &batch);
+        b.revert(t(15.0)).unwrap();
+        assert!(
+            b.wants().get(&p("d")).is_some_and(Want::is_trash),
+            "ordered"
+        );
+        assert!(b.wants().get(&p("d/y")).is_some(), "admitted beneath it");
+        let (steps, written) = b.dispatch(t(15.0), &lan(&[1]));
+        let moves_d = |steps: &[HostStep]| {
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Trash { path, .. } if *path == p("d")))
+        };
+        assert!(!moves_d(&steps));
+        assert!(b.wants().get(&p("d")).is_none_or(|w| !w.is_trash()));
+        let d = b.index().live(&p("d")).unwrap();
+        assert!(d.entry.kind == Kind::Dir && d.entry.modified_by == b.index().own());
+        assert!(written.iter().any(|r| r.entry.path == p("d")));
+        commit_all(&mut b, t(16.0));
+        assert!(b.index().live(&p("d/y")).is_some(), "landed in it");
+    }
+
+    /// §8.3 step 2 (draft 60): nothing lands in a directory on its way to
+    /// the trash. B's revert orders d/x and then d to the trash, and A's d/y
+    /// arrives once d's move is in flight. It is fetched, but its commit
+    /// waits for d's move to be reported.
+    #[test]
+    fn a_create_beneath_a_directory_on_its_way_to_the_trash_waits_for_it() {
+        let (_, mut b, batch) = a_directory_to_revert();
+        b.revert(t(15.0)).unwrap();
+        let trash = |steps: &[HostStep], at: &str| {
+            steps.iter().find_map(|s| match s {
+                HostStep::Trash { path, version, .. } if *path == p(at) => Some(version.clone()),
+                _ => None,
+            })
+        };
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1]));
+        let vx = trash(&steps, "d/x").unwrap();
+        b.trashed(t(16.0), &p("d/x"), &vx, t(16.0), ApplyOutcome::Ok);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1]));
+        let vd = trash(&steps, "d").expect("nothing live beneath d yet");
+        b.receive(t(17.0), &batch);
+        let vy = b.wants().get(&p("d/y")).unwrap().version().clone();
+        b.dispatch(t(17.0), &lan(&[1]));
+        b.fetched(t(18.0), &p("d/y"), &vy, FetchReport::Ok);
+        let (steps, _) = b.dispatch(t(18.0), &lan(&[1]));
+        let writes_y = |steps: &[HostStep]| {
+            steps
+                .iter()
+                .any(|s| matches!(s, HostStep::Write { path, .. } if *path == p("d/y")))
+        };
+        assert!(!writes_y(&steps), "waits for d's move: {steps:?}");
+        b.trashed(t(19.0), &p("d"), &vd, t(19.0), ApplyOutcome::Ok);
+        commit_all(&mut b, t(20.0));
+        assert!(b.index().live(&p("d/y")).is_some(), "then lands");
     }
 
     /// §8.3: `revert` waits while any commit in the folder is in flight:
