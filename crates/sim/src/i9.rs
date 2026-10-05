@@ -226,7 +226,12 @@ impl Watch {
     /// a marked path that raises the node's own counter is a new local
     /// version, and what made it is noted. One the engine makes for a reason
     /// §8.3 or §13 gives, or a deny's bump, is let through. `group_open` says
-    /// whether the event's writes wait in an open group (§11).
+    /// whether the event's writes wait in an open group (§11), and
+    /// `live_beneath` whether, once the event is over, the node holds a live
+    /// record or wants a live entry beneath a path.
+    // Each argument is a different reading of one event, taken by the host
+    // where it has them; a struct to carry them would be built at one call.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn note(
         &mut self,
         id: NodeId,
@@ -235,6 +240,7 @@ impl Watch {
         cause: &Cause,
         group_open: bool,
         disk: impl Fn(&RelPath) -> Content,
+        live_beneath: impl Fn(&RelPath) -> bool,
     ) {
         let status = |want: fn(&FolderStatus) -> bool| {
             actions
@@ -311,12 +317,14 @@ impl Watch {
                     if landed {
                         m.lost = None;
                     }
-                    // A revert writes a directory it would have trashed a
-                    // live record of its own when a live record beneath it
-                    // is restored or kept (§8.3 step 2): the live directory
-                    // record of I9's row. Nothing else in a revert writes a
-                    // live directory record of this machine's.
-                    let kept_dir = reverted
+                    // The live directory record of I9's row: a directory a
+                    // revert would have trashed is kept, with a live record
+                    // of this machine's, while anything live is beneath it
+                    // (§8.3 step 2): at the revert, at the move's dispatch
+                    // (draft 60), or as an observation beneath it implies it
+                    // (§7.3). Whatever made the record, the engine's state
+                    // after the event says whether something live is there.
+                    let kept_dir = live_beneath(path)
                         && record.entry.kind == Kind::Dir
                         && !record.entry.deleted
                         && record.entry.modified_by == id;
@@ -663,7 +671,7 @@ mod tests {
             actions.push(trash(trashed));
         }
         let cause = Cause::Other("Revert".to_owned());
-        watch.note(A, &actions, 5, &cause, false, x_on_disk);
+        watch.note(A, &actions, 5, &cause, false, x_on_disk, |_| false);
     }
 
     /// A's new version {A: 2, B: 1} at `path`, holding `hash`, made by
@@ -677,7 +685,9 @@ mod tests {
         edited: Option<Timestamp>,
     ) -> Option<Class> {
         let new = entry(path, &[(A, 2), (B, 1)], hash, Y);
-        watch.note(A, &[changed(&new, 7)], 6, &cause, false, x_on_disk);
+        watch.note(A, &[changed(&new, 7)], 6, &cause, false, x_on_disk, |_| {
+            false
+        });
         watch.revives(A, &new, edited).map(|(class, _)| class)
     }
 
@@ -718,10 +728,45 @@ mod tests {
         };
         let actions = [changed(&restored, 3), changed(&dir, 6), reverted()];
         let cause = Cause::Other("Revert".to_owned());
-        watch.note(A, &actions, 5, &cause, false, |_| {
-            Some((Kind::Dir, ContentHash::EMPTY, false))
-        });
+        watch.note(
+            A,
+            &actions,
+            5,
+            &cause,
+            false,
+            |_| Some((Kind::Dir, ContentHash::EMPTY, false)),
+            |p| *p == rel("d"),
+        );
         assert_eq!(watch.revives(A, &dir, None).map(|(class, _)| class), None);
+    }
+
+    /// The same live directory record, written later: when the rule is
+    /// judged again as the directory's move would be dispatched (draft 60),
+    /// or when an observation beneath the directory implies it (§7.3), in
+    /// whatever event that is. It is let through while something live is
+    /// beneath the directory once the event is over; with nothing there it
+    /// is a new local version like any other.
+    #[test]
+    fn a_directory_kept_for_something_live_beneath_it_is_let_through() {
+        let dir = Entry {
+            kind: Kind::Dir,
+            deleted: false,
+            ..entry(
+                "d",
+                &[(A, 2), (B, 1)],
+                ContentHash::EMPTY,
+                ContentHash::EMPTY,
+            )
+        };
+        let cause = Cause::Other("Tick".to_owned());
+        let class = |beneath: bool| {
+            let mut watch = reverted_watch("d", "d");
+            let actions = [changed(&dir, 7)];
+            watch.note(A, &actions, 6, &cause, false, x_on_disk, |_| beneath);
+            watch.revives(A, &dir, None).map(|(class, _)| class)
+        };
+        assert_eq!(class(true), None);
+        assert_eq!(class(false), Some(Class::Other("Tick".to_owned())));
     }
 
     /// Class 1: a scan reports the file the revert moved to the trash, as a
@@ -758,6 +803,7 @@ mod tests {
             &cause,
             true,
             x_on_disk,
+            |_| false,
         );
         watch.crashed(A, x_on_disk);
         assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
@@ -815,7 +861,15 @@ mod tests {
     fn a_later_reverts_trash_move_of_a_directory_takes_a_marked_file() {
         let mut watch = reverted_watch("d/f", "");
         let cause = Cause::Other("Revert".to_owned());
-        watch.note(A, &[reverted(), trash("d")], 6, &cause, false, x_on_disk);
+        watch.note(
+            A,
+            &[reverted(), trash("d")],
+            6,
+            &cause,
+            false,
+            x_on_disk,
+            |_| false,
+        );
         let class = made(
             &mut watch,
             "d/f",
@@ -836,7 +890,7 @@ mod tests {
         let restored = entry("d/f", &[(A, 1), (B, 1)], Y, ContentHash::EMPTY);
         let cause = Cause::Other("Revert".to_owned());
         let actions = [changed(&restored, 3), reverted()];
-        watch.note(A, &actions, 5, &cause, false, |_| None);
+        watch.note(A, &actions, 5, &cause, false, |_| None, |_| false);
         let empty = ContentHash::EMPTY;
         let class = made(&mut watch, "d/f", empty, Cause::ScanFinished, None);
         assert_eq!(class, Some(Class::Other("found empty".to_owned())));
@@ -851,6 +905,7 @@ mod tests {
             &cause,
             false,
             |_| None,
+            |_| false,
         );
         let class = made(
             &mut watch,
@@ -876,7 +931,7 @@ mod tests {
             let mut watch = Watch::default();
             watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true, at(20));
             watch.observed(A, &rel("d/f"), at(observed), false);
-            watch.note(A, &actions, 5, &cause, false, |_| None);
+            watch.note(A, &actions, 5, &cause, false, |_| None, |_| false);
             let empty = ContentHash::EMPTY;
             made(&mut watch, "d/f", empty, Cause::ScanFinished, None)
         };
@@ -910,7 +965,7 @@ mod tests {
         let cause = Cause::Other("Revert".to_owned());
         let mut watch = Watch::default();
         let actions = [removed, reverted(), trash("f.conflict")];
-        watch.note(A, &actions, 5, &cause, false, x_on_disk);
+        watch.note(A, &actions, 5, &cause, false, x_on_disk, |_| false);
         let applied = Cause::Applied { path: rel("f") };
         let class = made(&mut watch, "f.conflict", Y, applied, None);
         assert_eq!(class, Some(Class::Other("applied".to_owned())));
@@ -927,6 +982,7 @@ mod tests {
             &cause,
             false,
             x_on_disk,
+            |_| false,
         );
         watch.displaced(A, &rel("f"), &rel("f.conflict"), false, at(11));
         let applied = Cause::Applied { path: rel("f") };
