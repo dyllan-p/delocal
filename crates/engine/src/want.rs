@@ -1073,8 +1073,8 @@ impl WantList {
     }
 
     /// True if committing `path` must wait (§7.5 ordering): a create with an
-    /// ancestor directory still to be created, or a directory delete with a
-    /// descendant still to be deleted.
+    /// ancestor directory still to be created or on its way to the trash
+    /// (§8.3), or a directory delete with a descendant still to be deleted.
     fn gated(&self, want: &Want) -> bool {
         self.wants.values().any(|other| gates(want, other))
     }
@@ -1306,7 +1306,11 @@ fn gates(want: &Want, other: &Want) -> bool {
             && other.is_delete()
             && want.path().is_ancestor_of(other.path())
     } else {
-        other.is_dir_create() && other.path().is_ancestor_of(want.path())
+        // A create waits for its parents' creates, and for a revert's move
+        // of a directory above it to the trash until the move is reported
+        // or dropped (§8.3 step 2, draft 60), so that nothing lands in a
+        // directory on its way to the trash.
+        other.path().is_ancestor_of(want.path()) && (other.is_dir_create() || other.is_trash())
     }
 }
 
