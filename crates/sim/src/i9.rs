@@ -184,6 +184,10 @@ pub(crate) struct Watch {
     /// takes the record the report wrote, so the landing is lost as if the
     /// report never came.
     undurable_landings: BTreeMap<NodeId, Vec<(RelPath, Action)>>,
+    /// Lost landings an event found while its node's group was open: a
+    /// crash before the group is durable takes the record that event wrote,
+    /// so the landing is still there for the restart's scan to find.
+    undurable_found: BTreeMap<NodeId, Vec<(RelPath, Content)>>,
 }
 
 impl Watch {
@@ -316,6 +320,12 @@ impl Watch {
                     let landed = scanned && m.lost == Some(made);
                     if landed {
                         m.lost = None;
+                        if group_open {
+                            self.undurable_found
+                                .entry(id)
+                                .or_default()
+                                .push((path.clone(), made));
+                        }
                     }
                     // The live directory record of I9's row: a directory a
                     // revert would have trashed is kept, with a live record
@@ -395,6 +405,7 @@ impl Watch {
         self.undurable_landings.remove(&id);
         self.undurable_marks.remove(&id);
         self.undurable_observed.remove(&id);
+        self.undurable_found.remove(&id);
     }
 
     /// `id` crashed with a group of writes open (§11): a revert the group
@@ -417,6 +428,11 @@ impl Watch {
                 Some(mark) => self.marks.insert((id, path), mark),
                 None => self.marks.remove(&(id, path)),
             };
+        }
+        for (path, found) in self.undurable_found.remove(&id).unwrap_or_default() {
+            if let Some(m) = self.marks.get_mut(&(id, path)) {
+                m.lost = Some(found);
+            }
         }
         for (path, action) in self.undurable_landings.remove(&id).unwrap_or_default() {
             self.lost(id, &path, &action, &disk);
@@ -852,6 +868,39 @@ mod tests {
         let tick = Cause::Other("Tick".to_owned());
         assert!(made(&mut watch.clone(), "f", X, tick, None).is_some());
         assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
+    }
+
+    /// §11, §13, seed 96083: a scan, or a commit report carrying what the
+    /// host found, takes up a lost landing, but a crash before its group of
+    /// writes is durable takes the record it wrote. The restart's scan
+    /// then finds the same landing, under a counter of its own, and it is
+    /// let through again.
+    #[test]
+    fn a_lost_landing_a_crash_took_back_is_found_again() {
+        let lost = Action::Remove {
+            folder: FOLDER,
+            path: rel("f"),
+            expected: None,
+            displace: Displace::Trash,
+        };
+        let mut watch = reverted_watch("f", "");
+        watch.lost(A, &rel("f"), &lost, x_on_disk);
+        let first = entry("f", &[(A, 2), (B, 1)], X, Y);
+        let actions = [changed(&first, 7)];
+        let observed = Cause::Observed;
+        watch.note(A, &actions, 6, &observed, true, x_on_disk, |_| false);
+        watch.crashed(A, x_on_disk);
+        let again = entry("f", &[(A, 3), (B, 1)], X, Y);
+        watch.note(
+            A,
+            &[changed(&again, 7)],
+            6,
+            &observed,
+            false,
+            x_on_disk,
+            |_| false,
+        );
+        assert_eq!(watch.revives(A, &again, None).map(|(class, _)| class), None);
     }
 
     /// Class 2: a later revert's trash move of a directory takes a file an
