@@ -3284,6 +3284,13 @@ impl Sim {
             if !expected_matches(node.fs.get(path), Some(expected)) {
                 return (changed(node), Vec::new());
             }
+            // A directory goes to the trash only when empty, as any
+            // directory delete (§7.5, draft 61). Its children's own moves
+            // ran first, so anything still inside is something the revert
+            // did not know of, and it stays.
+            if has_children(node, path) {
+                return (changed(node), Vec::new());
+            }
             if let Some(error) = fail {
                 return (failed(node, error), Vec::new());
             }
@@ -5763,6 +5770,40 @@ mod tests {
             matches!(absent, Committed::Report(ApplyOutcome::Ok)),
             "already gone"
         );
+    }
+
+    /// §8.3 step 2, draft 61: the host moves a directory to the trash only
+    /// when it is empty. Seed 277383's shape: the user put d/u into d after
+    /// the revert ordered d to the trash, so the guard refuses the move and
+    /// reports the directory as found, and d and d/u stay where they are.
+    #[test]
+    fn the_host_moves_only_an_empty_directory_to_the_trash() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let folder = sim.folder;
+        let d = rel("d");
+        let mv = Action::MoveToTrash {
+            folder,
+            path: d.clone(),
+            version: Version::empty(),
+            expected: dir().observed(),
+        };
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.fs.insert(d.clone(), dir());
+        node.fs.insert(rel("d/u"), file(6, false));
+        let (refused, _) = sim.commit(id, &d, &Version::empty(), &mv, None);
+        assert!(
+            matches!(&refused, Committed::Report(ApplyOutcome::ChangedUnderneath { found: ScanState::Observed(o) }) if o.kind == Kind::Dir),
+            "the directory, found not empty"
+        );
+        assert!(
+            sim.nodes[&id].fs.contains_key(&rel("d/u")),
+            "the user's file stays"
+        );
+        sim.nodes.get_mut(&id).unwrap().fs.remove(&rel("d/u"));
+        let (moved, _) = sim.commit(id, &d, &Version::empty(), &mv, None);
+        assert!(matches!(moved, Committed::Report(ApplyOutcome::Ok)));
+        assert!(!sim.nodes[&id].fs.contains_key(&d), "empty, it goes");
     }
 
     /// §8.3, draft 55: the host answers `Observe` with the observation a
