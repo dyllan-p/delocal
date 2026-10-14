@@ -1,0 +1,30 @@
+Removes the two checks of c94ad78 that let a revert's move to the trash
+through: `admit` and `receive` again skip an arriving version that the
+path's want outranks, a move to the trash's included, whose version is
+the one the revert discarded. A version approved or received while the
+move holds its path is then dropped without a trace. DESIGN.md §7.5,
+§8.3 step 2.
+
+test: delocal-sim regressions::an_approved_version_waits_for_a_move_to_the_trash
+test: delocal-engine folder::tests::an_approved_version_waits_for_a_move_to_the_trash_at_its_path
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index 4302fce..cff5f40 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1552,7 +1552,6 @@ impl FolderState {
+             // the move and is classified against the restored record (§7.5,
+             // §8.3 step 2).
+             if let Some(want) = self.wants.get(c.item.path())
+-                && !want.is_trash()
+                 && (entry.version == *want.version() || want.version().dominates(&entry.version))
+             {
+                 self.wants
+@@ -2017,7 +2016,6 @@ impl FolderState {
+             // older) only adds a source, and must not be held or quarantined
+             // while its fetch is under way (§7.5).
+             if let Some(want) = self.wants.get(item.path())
+-                && !want.is_trash()
+                 && (item.incoming().version == *want.version()
+                     || want.version().dominates(&item.incoming().version))
+             {

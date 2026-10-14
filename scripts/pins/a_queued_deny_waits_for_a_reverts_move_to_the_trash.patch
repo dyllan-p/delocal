@@ -1,0 +1,24 @@
+Removes draft 60's rule that a revert's move to the trash counts as a
+commit in flight for queued decisions from the revert's order until its
+report, a backoff after a failure included: `Want::committing` again
+counts a reset but not a move. A queued `deny` then runs while the move
+at a path of its held item is still to be sent or backing off, its bump
+re-derives the path's want, which drops the move, and the file the revert
+discarded stays on disk unknown for a scan to announce. DESIGN.md §8.3
+step 2.
+
+test: delocal-sim regressions::a_queued_deny_waits_for_a_reverts_move_to_the_trash
+test: delocal-engine folder::tests::a_deny_waits_for_a_reverts_move_to_the_trash
+
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+index a2662d1..55b6cb6 100644
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -352,7 +352,6 @@ impl Want {
+     pub fn committing(&self) -> bool {
+         matches!(self.state, WantState::Committing { .. })
+             || self.reset.is_some()
+-            || self.is_trash()
+     }
+ }
+ 

@@ -1,0 +1,22 @@
+Removes draft 61's guard from the simulated host's move to the trash: a
+directory is moved whatever is inside it, so a file the user created in
+it after the revert's order goes to the trash with it. DESIGN.md §8.3
+step 2, §7.5 "Deletes".
+
+test: delocal-sim regressions::a_revert_moves_only_an_empty_directory_to_the_trash
+test: delocal-sim sim::tests::the_host_moves_only_an_empty_directory_to_the_trash
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index ddaa102..fcf1c1a 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -3288,9 +3288,6 @@ impl Sim {
+             // directory delete (§7.5, draft 61). Its children's own moves
+             // ran first, so anything still inside is something the revert
+             // did not know of, and it stays.
+-            if has_children(node, path) {
+-                return (changed(node), Vec::new());
+-            }
+             if let Some(error) = fail {
+                 return (failed(node, error), Vec::new());
+             }
