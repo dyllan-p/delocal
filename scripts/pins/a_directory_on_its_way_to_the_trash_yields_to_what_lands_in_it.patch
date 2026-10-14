@@ -1,0 +1,41 @@
+Removes both halves of draft 60's directory rule (§8.3 step 2). The
+keep-the-directory rule is judged only when the revert runs, not again
+as the directory's move would be dispatched (`keep_directories`), and a
+create beneath a directory whose move to the trash is pending no longer
+waits for it (`want::gates`). A want for a live entry that appears
+beneath the directory after the revert then lands in it, and the move
+takes it to the trash.
+
+Since draft 61 the host moves only an empty directory, which refuses the
+same move, so no seed of the slices or of 0 to 9,999 fails with this
+patch, and the rule's unit tests stand in for one.
+
+test: delocal-engine folder::tests::a_directorys_move_yields_at_dispatch_to_a_want_beneath_it
+test: delocal-engine folder::tests::a_create_beneath_a_directory_on_its_way_to_the_trash_waits_for_it
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index 48bed7e..7ae54b7 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -2721,7 +2721,7 @@ impl FolderState {
+             self.wants.pause_inbound();
+             return (Vec::new(), Vec::new());
+         }
+-        let mut adopted = self.keep_directories(now);
++        let mut adopted: Vec<IndexRecord> = Vec::new();
+         let steps = self.wants.dispatch(now, &self.rules, peers);
+         let mut host = Vec::new();
+         for step in steps {
+diff --git a/crates/engine/src/want.rs b/crates/engine/src/want.rs
+index a2662d1..f2d1a57 100644
+--- a/crates/engine/src/want.rs
++++ b/crates/engine/src/want.rs
+@@ -1310,7 +1310,7 @@ fn gates(want: &Want, other: &Want) -> bool {
+         // of a directory above it to the trash until the move is reported
+         // or dropped (§8.3 step 2, draft 60), so that nothing lands in a
+         // directory on its way to the trash.
+-        other.path().is_ancestor_of(want.path()) && (other.is_dir_create() || other.is_trash())
++        other.path().is_ancestor_of(want.path()) && other.is_dir_create()
+     }
+ }
+ 
