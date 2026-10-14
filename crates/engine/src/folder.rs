@@ -5569,6 +5569,57 @@ mod tests {
         assert!(b.index().live(&p("d/y")).is_some(), "then lands");
     }
 
+    /// §8.3 step 2 (draft 61), seed 277383's shape: d's move to the trash
+    /// is under way when the user puts d/u into d. The host moves only an
+    /// empty directory, so it refuses with what it found, the directory.
+    /// The move is given up, d is kept as a local change with a live record
+    /// of B's own, and the user's d/u stays recorded: nothing beneath a
+    /// tombstone, nothing for a bracket to take for absent.
+    #[test]
+    fn a_directory_the_user_put_a_file_into_is_kept_off_the_trash() {
+        let (_, mut b, _) = a_directory_to_revert();
+        b.revert(t(15.0)).unwrap();
+        let trash = |steps: &[HostStep], at: &str| {
+            steps.iter().find_map(|s| match s {
+                HostStep::Trash { path, version, .. } if *path == p(at) => Some(version.clone()),
+                _ => None,
+            })
+        };
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1]));
+        let vx = trash(&steps, "d/x").unwrap();
+        b.trashed(t(16.0), &p("d/x"), &vx, t(16.0), ApplyOutcome::Ok);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1]));
+        let vd = trash(&steps, "d").expect("nothing live beneath d yet");
+        b.scanned(t(17.0), p("d/u"), file(6, 6));
+        assert!(b.index().live(&p("d/u")).is_some());
+        let found = ScanState::Observed(Observed {
+            kind: Kind::Dir,
+            size: 0,
+            mtime_ns: 0,
+            exec: false,
+            hash: crate::entry::ContentHash::EMPTY,
+        });
+        let changed = ApplyOutcome::ChangedUnderneath { found };
+        b.trashed(t(18.0), &p("d"), &vd, t(18.0), changed);
+        assert!(b.wants().get(&p("d")).is_none(), "the move is given up");
+        let d = b.index().live(&p("d")).unwrap();
+        assert!(d.entry.kind == Kind::Dir && d.entry.modified_by == b.index().own());
+        assert!(b.index().live(&p("d/u")).is_some(), "the user's file stays");
+        b.scan_started();
+        for path in ["d", "d/u"] {
+            b.scanned(t(19.0), p(path), ScanState::Unchanged);
+        }
+        for i in 0..10 {
+            b.scanned(t(19.0), p(&format!("f{i:02}")), ScanState::Unchanged);
+        }
+        let gone = b.scan_finished(t(20.0)).unwrap();
+        assert!(
+            gone.iter()
+                .all(|c| !c.record.entry.path.as_str().starts_with('d')),
+            "{gone:?}"
+        );
+    }
+
     /// §8.3: `revert` waits while any commit in the folder is in flight:
     /// the disk is about to change under the records it would restore.
     #[test]
