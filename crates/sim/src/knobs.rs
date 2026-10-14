@@ -79,10 +79,10 @@ pub struct Knobs {
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
     /// Check I9, what revert discards stays discarded (§14.1), and fail a
-    /// run that breaks it with the failure's class (see `i9.rs`). Off by
-    /// default, and in the required CI jobs, while the engine still breaks
-    /// it for reasons older than the invariant. It changes nothing a run
-    /// does, only what it checks.
+    /// run that breaks it with the failure's class (see `i9.rs`). On by
+    /// default, so the required CI jobs, the sweep and the pinned seeds,
+    /// check it as they check every other invariant. It changes nothing a
+    /// run does, only what it checks.
     pub check_i9: bool,
 }
 
@@ -102,7 +102,7 @@ impl Default for Knobs {
             case_variants: 0.02,
             scan_delay_ms: (0, 10_000),
             nodes: None,
-            check_i9: false,
+            check_i9: true,
         }
     }
 }

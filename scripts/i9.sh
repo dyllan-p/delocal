@@ -3,11 +3,10 @@
 #
 #   scripts/i9.sh [--start S] [--seeds N] [--jobs J]
 #
-# I9, what revert discards stays discarded, is checked only with
-# `--check-i9 true`, which the required CI jobs leave off while the engine
-# still breaks it for reasons older than the invariant. A failure is named
-# by its class (crates/sim/src/i9.rs), and this script says how many seeds
-# of each slice fail with each class.
+# I9, what revert discards stays discarded, is checked by default, in the
+# required CI jobs too. A failure is named by its class
+# (crates/sim/src/i9.rs), and this script says how many seeds of each
+# slice fail with each class.
 #
 # The slices are laid out as the nightly lays out its 100,000 seeds: the
 # default knobs from S, `--corruption 0.05` from S + 76,000, `--skip 0.02`

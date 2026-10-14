@@ -194,7 +194,7 @@ jobs:
   # The random sweep was advisory (continue-on-error) until it first passed
   # clean at 1,000 seeds, and is required from that PR on. `--keep-going`
   # runs every seed in a shard and lists the failures by invariant before
-  # it exits.
+  # it exits. Both check I9 (§14.1), which the simulator does by default.
   simulate-pinned:
     name: simulate (pinned seeds)
     runs-on: ubuntu-24.04
