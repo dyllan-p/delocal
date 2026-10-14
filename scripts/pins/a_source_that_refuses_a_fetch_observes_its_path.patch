@@ -13,10 +13,10 @@ steps), so the fix's unit test stands in for a pinned seed.
 test: delocal-sim sim::tests::a_source_that_refuses_a_fetch_observes_its_path
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
-index 6a6cb97..1cc658c 100644
+index ea687f2..ced30d6 100644
 --- a/crates/sim/src/sim.rs
 +++ b/crates/sim/src/sim.rs
-@@ -2542,20 +2542,6 @@ impl Sim {
+@@ -2797,22 +2797,6 @@ impl Sim {
                          file.map(|file| file.content.clone())
                      })
                  });
@@ -25,12 +25,14 @@ index 6a6cb97..1cc658c 100644
 -                        continue;
 -                    };
 -                    self.stats.serve_observations += 1;
+-                    let stamp = self.stamp(from);
 -                    self.feed(
 -                        from,
 -                        Event::Scanned {
 -                            folder: self.folder,
 -                            path: at,
 -                            state,
+-                            at: stamp,
 -                        },
 -                    )?;
 -                }

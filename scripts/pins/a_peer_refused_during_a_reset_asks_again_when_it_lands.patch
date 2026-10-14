@@ -12,12 +12,12 @@ seed is gone and the rule's unit tests below stand in for it.
 test: delocal-engine folder::tests::a_resets_landing_is_announced_under_a_new_seq
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index 18842d5..5ea01f9 100644
+index 395fb77..4fa865d 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2456,9 +2456,8 @@ impl FolderState {
+@@ -2966,9 +2966,8 @@ impl FolderState {
              if let Some(found) = found {
-                 return self.observe_found(now, path, &found);
+                 return self.observe_found(now, at, path, &found);
              }
 -            let written: Vec<IndexRecord> = self.adopt(now, want.entry).into_iter().collect();
              self.reconsider(now, path, DeferredReason::ChangedUnderneath);
