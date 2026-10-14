@@ -9,10 +9,10 @@ test: delocal-sim regressions::a_revert_reports_every_index_write
 test: delocal-engine engine::tests::a_revert_reports_every_index_write_it_makes
 
 diff --git a/crates/engine/src/engine.rs b/crates/engine/src/engine.rs
-index 01954b3..2427b82 100644
+index 983f77f..0cb1e52 100644
 --- a/crates/engine/src/engine.rs
 +++ b/crates/engine/src/engine.rs
-@@ -950,15 +950,6 @@ fn decide(
+@@ -1052,15 +1052,6 @@ fn decide(
          },
          UserDecision::Revert { .. } => match f.revert(now) {
              Some(reverted) => {
@@ -25,6 +25,6 @@ index 01954b3..2427b82 100644
 -                        },
 -                    });
 -                }
-                 for path in &reverted.trash {
-                     out.push(Action::MoveToTrash {
-                         folder,
+                 for record in reverted.written {
+                     out.push(Action::IndexChanged { folder, record });
+                 }

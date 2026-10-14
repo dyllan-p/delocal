@@ -10,10 +10,10 @@ test: delocal-sim regressions::a_want_at_a_reverted_path_is_rederived_from_the_r
 test: delocal-engine engine::tests::revert_rederives_a_conflict_want_and_the_newer_version_is_fetched
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..7960dc3 100644
+index 395fb77..f966912 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -1842,13 +1842,6 @@ impl FolderState {
+@@ -2338,13 +2338,6 @@ impl FolderState {
          // The pending set held every unannounced deny's bumps, so each of
          // those denies is undone with the rest: its held item returns.
          let returned = self.quarantine.return_denied();
@@ -27,10 +27,10 @@ index e843412..7960dc3 100644
          for reverted in &reverted {
              let current = reverted.current.as_ref().filter(|e| !e.deleted);
              let restored = reverted
-@@ -1919,9 +1912,6 @@ impl FolderState {
-             }
+@@ -2476,9 +2469,6 @@ impl FolderState {
+         if !written.is_empty() {
+             self.touched(now);
          }
-         self.window = None;
 -        for old in stale {
 -            self.rederive(now, old);
 -        }
