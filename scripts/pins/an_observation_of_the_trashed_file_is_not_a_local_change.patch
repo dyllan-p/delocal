@@ -5,7 +5,10 @@ ran and reports it after then clears the mark and announces, as a local
 change, the very version the revert discarded (I9, "saw trashed file";
 DESIGN.md §8.3).
 
-test: delocal-sim regressions::an_observation_of_the_trashed_file_is_not_a_local_change
+Since PR E's scan delay, on by default, and drafts 58 to 61 moved its
+history, no seed of 0 to 9,999 fails with this patch as I9 saw trashed file (two nodes, 200 steps), so the
+pinned seed is gone and the unit tests below stand in for it.
+
 test: delocal-engine folder::tests::an_observation_of_the_file_revert_trashed_reports_nothing
 test: delocal-engine folder::tests::the_mark_remembers_the_trashed_file_wherever_it_goes
 

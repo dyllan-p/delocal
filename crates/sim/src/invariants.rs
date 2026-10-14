@@ -698,9 +698,10 @@ mod tests {
     /// issue the same vector again with other content. Both versions can
     /// lose to the same winner under the same copy name, and a copy of
     /// either is the copy of a losing version. Here b holds the copy of e's
-    /// first version, which e's second replaced in the version table. The
-    /// pin `two_symlink_losers_under_one_reissued_vector_both_count` guards
-    /// this only while its seed reaches it.
+    /// first version, which e's second replaced in the version table. No
+    /// seed reaches this since PR E moved the histories, so this test is
+    /// what the pin `two_symlink_losers_under_one_reissued_vector_both_count`
+    /// names.
     #[test]
     fn two_losers_under_one_vector_are_both_losing_versions() {
         let mut sim = world();

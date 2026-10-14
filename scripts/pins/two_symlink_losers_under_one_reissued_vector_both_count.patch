@@ -3,7 +3,10 @@ alone again, as before cf000f2. Of two losers that share a vector re-issued
 across a revert with other content, only the first then counts, and the
 second's conflict copy matches no losing version (DESIGN.md §14.1 I4).
 
-test: delocal-sim regressions::two_symlink_losers_under_one_reissued_vector_both_count
+Since PR E's scan delay, on by default, and drafts 58 to 61 moved its
+history, no seed of 0 to 9,999 fails with this patch as I4 bounded conflicts, so the
+pinned seed is gone and the unit tests below stand in for it.
+
 test: delocal-sim invariants::tests::two_losers_under_one_vector_are_both_losing_versions
 
 diff --git a/crates/sim/src/invariants.rs b/crates/sim/src/invariants.rs
