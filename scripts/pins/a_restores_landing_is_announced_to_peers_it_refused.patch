@@ -15,10 +15,10 @@ test: delocal-engine folder::tests::an_occupant_matching_the_restored_record_is_
 test: delocal-engine folder::tests::an_occupant_matching_a_later_carrier_is_its_landing
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..79d076c 100644
+index 395fb77..7cc91c4 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -910,26 +910,9 @@ impl FolderState {
+@@ -1312,27 +1312,9 @@ impl FolderState {
                  landed: None,
              };
          }
@@ -38,6 +38,7 @@ index e843412..79d076c 100644
 -            {
 -                self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
 -                return Scanned {
+-                    ancestors: Vec::new(),
 -                    change: None,
 -                    status: None,
 -                    landed: Some(landed),

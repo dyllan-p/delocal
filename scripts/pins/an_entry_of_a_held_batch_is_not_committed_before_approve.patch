@@ -16,10 +16,10 @@ test: delocal-engine folder::tests::a_frozen_entry_of_a_held_batch_is_wanted_onl
 test: delocal-engine folder::tests::frozen_entries_wait_for_unpause_through_scans_and_commits
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..5c1f44b 100644
+index 395fb77..f7f7005 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -1116,11 +1116,6 @@ impl FolderState {
+@@ -1559,11 +1559,6 @@ impl FolderState {
                  *joined.entry(held).or_insert(0) += 1;
                  continue;
              }
@@ -31,10 +31,10 @@ index e843412..5c1f44b 100644
              groups
                  .entry((c.batch, c.source, c.seq_high))
                  .or_default()
-@@ -1202,7 +1197,9 @@ impl FolderState {
-     /// `ChangedUnderneath` entries only: a `Frozen` entry waits for the
-     /// folder to unpause (§8.1), however often its path is scanned meanwhile.
-     fn reconsider(&mut self, now: Timestamp, path: &RelPath, reason: DeferredReason) {
+@@ -1651,7 +1646,9 @@ impl FolderState {
+         if self.wants.get(path).is_some_and(Want::is_trash) {
+             return;
+         }
 -        let take = self.deferred.take_where(path, |d| d.reason == reason);
 +        let take = self.deferred.take_where(path, |d| {
 +            d.reason == reason || d.reason == DeferredReason::Frozen

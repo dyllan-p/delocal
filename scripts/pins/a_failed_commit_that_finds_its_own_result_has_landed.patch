@@ -13,10 +13,10 @@ unit test stands in for a pinned seed.
 test: delocal-engine folder::tests::a_reset_whose_retry_finds_its_own_work_has_landed
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index 69baf27..04c29a3 100644
+index 395fb77..6a4626a 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -2555,21 +2555,6 @@ impl FolderState {
+@@ -2925,21 +2925,6 @@ impl FolderState {
          if looked {
              self.unobserved.remove(path);
          }
@@ -38,8 +38,8 @@ index 69baf27..04c29a3 100644
          let found = match outcome {
              ApplyOutcome::Ok => None,
              ApplyOutcome::ChangedUnderneath { found } => Some(found),
-@@ -2672,29 +2657,6 @@ impl FolderState {
-             .collect()
+@@ -3113,29 +3098,6 @@ impl FolderState {
+         }
      }
  
 -    /// True if `found` is exactly what the commit of the want at `path`
