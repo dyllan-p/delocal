@@ -1543,7 +1543,7 @@ impl Sim {
                             || f.wants()
                                 .iter()
                                 .any(|w| !w.is_delete() && p.is_ancestor_of(w.path()))
-                    })
+                    }) || node.is_some_and(|n| n.fs.keys().any(|q| p.is_ancestor_of(q)))
                 },
             );
         }
