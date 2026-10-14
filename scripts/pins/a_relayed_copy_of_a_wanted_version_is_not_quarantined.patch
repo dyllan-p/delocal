@@ -11,10 +11,10 @@ rule's unit test.
 test: delocal-engine folder::tests::a_version_already_wanted_is_not_rebraked_when_relayed
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index e843412..e0b9eb2 100644
+index 4302fce..0b3ced1 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -1541,24 +1541,13 @@ impl FolderState {
+@@ -2005,25 +2005,13 @@ impl FolderState {
  
          let mut joined = 0;
          let mut frozen = 0;
@@ -31,6 +31,7 @@ index e843412..e0b9eb2 100644
 -            // older) only adds a source, and must not be held or quarantined
 -            // while its fetch is under way (§7.5).
 -            if let Some(want) = self.wants.get(item.path())
+-                && !want.is_trash()
 -                && (item.incoming().version == *want.version()
 -                    || want.version().dominates(&item.incoming().version))
 -            {
