@@ -7,7 +7,10 @@ restarted node's full scan at once, so either wait alone still holds a queued
 revert until that scan finishes. The deny's open-bracket wait is left as it
 is, since this pin's decision is a revert. DESIGN.md §8.3.
 
-test: delocal-sim regressions::a_queued_revert_waits_for_the_startup_scan_to_finish
+Since PR E's scan delay, on by default, and drafts 58 to 61 moved its
+history, no seed of 0 to 9,999 fails with this patch as a host bug, so the
+pinned seed is gone and the unit tests below stand in for it.
+
 test: delocal-engine folder::tests::a_revert_after_a_restart_waits_for_the_startup_scan
 test: delocal-engine folder::tests::decisions_wait_while_a_scan_bracket_is_open
 
