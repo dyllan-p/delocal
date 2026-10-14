@@ -3,12 +3,11 @@
 //! only when its user has changed the path since; landing a received
 //! version there is announced as usual.
 //!
-//! The check is off unless `--check-i9 true` turns it on, and the required
-//! CI jobs leave it off: the engine still fails it, for reasons older than
-//! the invariant, and those are being classified before any is fixed. A
-//! failure is named by its [`Class`], so a sweep with `--keep-going` counts
-//! the classes, `scripts/i9.sh` prints the counts per slice, and the
-//! shrinker keeps a failing step list to the class it was found with.
+//! The check is on by default, and so in the required CI jobs, the sweep
+//! and the pinned seeds; `--check-i9 false` turns it off. A failure is
+//! named by its [`Class`], so a sweep with `--keep-going` counts the
+//! classes, `scripts/i9.sh` prints the counts per slice, and the shrinker
+//! keeps a failing step list to the class it was found with.
 //!
 //! [`Watch`] is the bookkeeping. The host in `sim.rs` feeds it at the points
 //! its methods name and asks it about every entry a node sends. It only
