@@ -1547,7 +1547,12 @@ impl FolderState {
         let mut joined: BTreeMap<BatchId, usize> = BTreeMap::new();
         for c in candidates {
             let entry = c.item.incoming();
+            // A revert's move to the trash carries the version it throws
+            // away, which outranks nothing: what arrives meanwhile waits for
+            // the move and is classified against the restored record (§7.5,
+            // §8.3 step 2).
             if let Some(want) = self.wants.get(c.item.path())
+                && !want.is_trash()
                 && (entry.version == *want.version() || want.version().dominates(&entry.version))
             {
                 self.wants
@@ -2012,6 +2017,7 @@ impl FolderState {
             // older) only adds a source, and must not be held or quarantined
             // while its fetch is under way (§7.5).
             if let Some(want) = self.wants.get(item.path())
+                && !want.is_trash()
                 && (item.incoming().version == *want.version()
                     || want.version().dominates(&item.incoming().version))
             {
@@ -5618,6 +5624,65 @@ mod tests {
                 .all(|c| !c.record.entry.path.as_str().starts_with('d')),
             "{gone:?}"
         );
+    }
+
+    /// §7.5, §8.3 step 2, seed 231's shape: a version arriving while a
+    /// revert's move to the trash is at its path waits for the move, and is
+    /// classified against the restored record, not against the version the
+    /// move throws away. B denies A's held batch, its bump at f00 ranking
+    /// above A's version there, and edits f00 on top; B's folder pauses and
+    /// B reverts, which returns the held batch and orders the edit to the
+    /// trash. Approved before the move is reported, A's f00 used to be
+    /// dropped as outranked by the discarded edit, and B never fetched it.
+    #[test]
+    fn an_approved_version_waits_for_a_move_to_the_trash_at_its_path() {
+        let (mut a, mut b) = a_and_b(10, tight());
+        a.scanned(t(10.0), p("f00"), file(7, 7));
+        for i in 1..4 {
+            a.scanned(t(10.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        let held = a.form_batches(t(12.0), bid(3)).remove(0);
+        let theirs = held
+            .entries
+            .iter()
+            .find(|e| e.path == p("f00"))
+            .unwrap()
+            .version
+            .clone();
+        assert!(matches!(
+            b.receive(t(12.0), &held).decision,
+            Decision::Held { .. }
+        ));
+        assert_eq!(
+            b.request(UserDecision::Deny { batch: bid(3) }),
+            Requested::Run
+        );
+        b.deny(t(13.0), bid(3)).unwrap();
+        b.scanned(t(14.0), p("f00"), file(8, 8));
+        for i in 6..9 {
+            b.scanned(t(14.0), p(&format!("f{i:02}")), ScanState::Absent);
+        }
+        assert!(matches!(b.tick(t(16.0), bid(5)), Ticked::Paused { .. }));
+        let out = b.revert(t(17.0)).unwrap();
+        assert_eq!(out.returned, vec![(bid(3), 4)]);
+        let moving = b.wants().get(&p("f00")).unwrap().clone();
+        assert!(moving.is_trash() && moving.version().dominates(&theirs));
+        b.approve(t(18.0), bid(3));
+        assert!(
+            b.deferred()
+                .any(|d| d.entry.path == p("f00") && d.entry.version == theirs),
+            "A's version waits for the move"
+        );
+        b.dispatch(t(18.0), &lan(&[1]));
+        b.trashed(
+            t(19.0),
+            &p("f00"),
+            moving.version(),
+            t(19.0),
+            ApplyOutcome::Ok,
+        );
+        let want = b.wants().get(&p("f00")).unwrap();
+        assert_eq!(want.version(), &theirs, "then wanted");
     }
 
     /// §8.3: `revert` waits while any commit in the folder is in flight:
