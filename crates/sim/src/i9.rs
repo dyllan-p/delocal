@@ -231,8 +231,9 @@ impl Watch {
     /// version, and what made it is noted. One the engine makes for a reason
     /// §8.3 or §13 gives, or a deny's bump, is let through. `group_open` says
     /// whether the event's writes wait in an open group (§11), and
-    /// `live_beneath` whether, once the event is over, the node holds a live
-    /// record or wants a live entry beneath a path.
+    /// `live_beneath` whether, once the event is over, something is beneath
+    /// a path: a live record or a wanted live entry of the node's, or
+    /// anything on its disk.
     // Each argument is a different reading of one event, taken by the host
     // where it has them; a struct to carry them would be built at one call.
     #[allow(clippy::too_many_arguments)]
@@ -329,11 +330,12 @@ impl Watch {
                     }
                     // The live directory record of I9's row: a directory a
                     // revert would have trashed is kept, with a live record
-                    // of this machine's, while anything live is beneath it
-                    // (§8.3 step 2): at the revert, at the move's dispatch
-                    // (draft 60), or as an observation beneath it implies it
-                    // (§7.3). Whatever made the record, the engine's state
-                    // after the event says whether something live is there.
+                    // of this machine's, while anything is beneath it (§8.3
+                    // step 2): at the revert, at the move's dispatch (draft
+                    // 60), when the host refuses to move a directory that is
+                    // not empty (draft 61), or as an observation beneath it
+                    // implies it (§7.3). Whatever made the record, the state
+                    // after the event says whether something is there.
                     let kept_dir = live_beneath(path)
                         && record.entry.kind == Kind::Dir
                         && !record.entry.deleted
