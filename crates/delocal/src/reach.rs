@@ -40,10 +40,6 @@ use crate::names::{self, IndexName, Name};
 use crate::scan::EXEC_BIT;
 use crate::scan::hash::hash_target;
 
-/// `.delocal/tmp/`, where transfers land (§11) and the probe makes its
-/// files.
-pub const TMP_DIR: &str = ".delocal/tmp";
-
 /// The names on disk that are not their index path's bytes (§7.3): the
 /// last component of each path, as its directory lists it. The host keeps
 /// them in `disk_names` (§11).
@@ -113,7 +109,7 @@ impl Sensitivity {
     /// removed again, and one left by a crash is an unclaimed temp file,
     /// which the next start removes (§7.5).
     pub fn probe(fs: &dyn Fs) -> io::Result<Self> {
-        let tmp = Path::new(TMP_DIR);
+        let tmp = Path::new(crate::tmp::DIR);
         let id = unique();
         let lower = tmp.join(format!("probe-{id}-case"));
         let upper = tmp.join(format!("PROBE-{}-CASE", id.to_uppercase()));

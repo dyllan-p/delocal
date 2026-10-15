@@ -17,7 +17,7 @@ fn p(s: &str) -> RelPath {
 /// A folder with `.delocal/tmp/`, and one operation on it.
 fn folder() -> (tempfile::TempDir, Box<dyn Fs>) {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join(TMP_DIR)).unwrap();
+    std::fs::create_dir_all(tmp.path().join(crate::tmp::DIR)).unwrap();
     let fs = RealFolder::new(tmp.path()).open().unwrap();
     (tmp, fs)
 }
@@ -89,7 +89,7 @@ fn a_collision_is_a_live_record_spelt_otherwise_at_the_path_or_above() {
 fn the_probe_agrees_with_what_std_sees() {
     let (tmp, fs) = folder();
     let found = Sensitivity::probe(&*fs).unwrap();
-    let dir = tmp.path().join(TMP_DIR);
+    let dir = tmp.path().join(crate::tmp::DIR);
     // The probe leaves nothing behind.
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
 
