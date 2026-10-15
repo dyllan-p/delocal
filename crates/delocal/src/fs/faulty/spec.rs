@@ -81,6 +81,7 @@ pub enum Op {
     OpenRead,
     CreateNew,
     OpenAppend,
+    SyncFile,
     SyncDir,
     Rename,
     RenameNoreplace,

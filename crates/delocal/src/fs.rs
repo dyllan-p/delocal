@@ -43,6 +43,7 @@
 //! | [`create_new`](Fs::create_new) | §7.5 step 3 a new temp file in `.delocal/tmp/`; §8.4 restore's copy |
 //! | [`open_append`](Fs::open_append) | §7.5 steps 2 and 3 resuming a temp file; §13 crash during a transfer |
 //! | [`WriteFile::sync`] | §7.5 the data is durable before the rename (step 8) |
+//! | [`sync_file`](Fs::sync_file) | §7.5 a temp file's data and metadata are durable before the rename in (step 8); a `SetMeta`'s new mtime and exec bit before its report |
 //! | [`sync_dir`](Fs::sync_dir) | §7.5 step 9 the parent directory is durable before the report, and after the displacement of step 7 |
 //! | [`rename_noreplace`](Fs::rename_noreplace) | §7.5 every commit rename: the displacement of step 7 (to the trash, a trash name's `~N`, or §7.6's conflict path), the rename in of step 8 (a symlink's temp included), deletes to the trash, the journal's undo |
 //! | [`rename`](Fs::rename) | §7.5 the fallback for a filesystem that cannot refuse to replace, after a fresh check |
@@ -72,9 +73,9 @@
 //! never follow a symlink at the last component either, and `read_dir`,
 //! `sync_dir` and `available_space` refuse one there with `NotADirectory`.
 //!
-//! **Opening a file.** `open_read`, `open_append` and `set_mode` open the
-//! last component without following a symlink and without waiting on a
-//! FIFO, then check what the descriptor is. Anything but a file (or, for
+//! **Opening a file.** `open_read`, `open_append`, `sync_file` and
+//! `set_mode` open the last component without following a symlink and
+//! without waiting on a FIFO, then check what the descriptor is. Anything but a file (or, for
 //! `set_mode`, a directory) is refused with [`NotAFile`], which says what
 //! was there: a file swapped for a symlink or a FIFO between a caller's
 //! `lstat` and the open is observed as what it has become.
@@ -153,6 +154,12 @@ pub trait Fs: Send + Sync {
     /// over, it does not create one. Anything else there is refused with
     /// [`NotAFile`], neither followed nor waited on.
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn WriteFile>>;
+
+    /// Make the file at `path` durable, its data and its metadata (`fsync`),
+    /// through a descriptor opened for reading. Anything else there, a
+    /// symlink included, is refused with [`NotAFile`], neither followed nor
+    /// waited on.
+    fn sync_file(&self, path: &Path) -> io::Result<()>;
 
     /// Make the entries of the directory at `path` durable: creations,
     /// removals and renames in it survive a power loss once this returns. A

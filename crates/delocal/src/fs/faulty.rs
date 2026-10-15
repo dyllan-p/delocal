@@ -284,6 +284,11 @@ impl Fs for FaultyFs {
         }))
     }
 
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        self.check(Op::SyncFile, &[path])?;
+        self.inner.sync_file(path)
+    }
+
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.check(Op::SyncDir, &[path])?;
         self.inner.sync_dir(path)
