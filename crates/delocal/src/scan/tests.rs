@@ -11,9 +11,8 @@ use super::*;
 use crate::fs::RealFolder;
 
 mod reference;
-mod spy;
 
-use spy::Spy;
+use crate::fs::spy::Spy;
 
 const SECOND: i64 = 1_000_000_000;
 const DAY: i64 = 86_400 * SECOND;

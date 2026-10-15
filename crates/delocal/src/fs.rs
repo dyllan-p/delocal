@@ -99,6 +99,8 @@ mod conformance;
 #[cfg(feature = "faults")]
 pub mod faulty;
 pub mod real;
+#[cfg(test)]
+pub(crate) mod spy;
 
 #[cfg(feature = "faults")]
 pub use faulty::{FaultyFolder, FaultyFs};

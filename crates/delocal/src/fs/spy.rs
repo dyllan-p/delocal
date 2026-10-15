@@ -1,13 +1,14 @@
 //! [`Spy`], a folder for tests that logs every call made through it, by
 //! whole path, and can meddle with a file while it is read (DESIGN.md
-//! §7.3: the walk's opens, and the re-stat after hashing).
+//! §7.3: the walk's opens, and the re-stat after hashing). The scan's tests
+//! and the commit path's use it.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::fs::{Dir, Folder, Fs, ReadFile, RealFolder, Stat, WriteFile};
+use super::{Dir, Folder, Fs, ReadFile, RealFolder, Stat, WriteFile};
 
 /// A change to make to a file the first time it is read.
 type Meddle = Box<dyn FnOnce() + Send>;
