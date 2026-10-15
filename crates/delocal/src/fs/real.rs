@@ -383,6 +383,13 @@ impl Fs for RealFs {
         ))
     }
 
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        // `fsync` needs no write access: a descriptor opened for reading
+        // makes the file's data and metadata durable just the same, on
+        // Linux and macOS (`F_FULLFSYNC` there, as `WriteFile::sync`).
+        self.open_file(path, OFlags::RDONLY)?.sync_all()
+    }
+
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         // Through `File` for its `F_FULLFSYNC` on macOS, as `WriteFile::sync`.
         File::from(self.dir_fd(path)?).sync_all()

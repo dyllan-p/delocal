@@ -123,6 +123,11 @@ impl Fs for SpyFs {
         self.inner.open_append(path)
     }
 
+    fn sync_file(&self, path: &Path) -> io::Result<()> {
+        self.state.log("fs.sync_file", path);
+        self.inner.sync_file(path)
+    }
+
     fn sync_dir(&self, path: &Path) -> io::Result<()> {
         self.state.log("fs.sync_dir", path);
         self.inner.sync_dir(path)
