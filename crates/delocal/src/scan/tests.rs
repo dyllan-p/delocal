@@ -557,6 +557,85 @@ fn ignored_paths_are_left_alone_and_tracked_ones_are_frozen() {
     );
 }
 
+/// §7.3, draft 48: the walk never crosses onto another device. A mount
+/// point is an ignored path, never reported or tracked; what is tracked
+/// beneath one is frozen until the mount goes, so a disk that unmounts
+/// never reads as its subtree deleted.
+#[test]
+fn a_mount_point_is_never_crossed_and_what_it_covers_is_frozen() {
+    let disk = Disk::new();
+    disk.dir("data/sub");
+    disk.file("data/a", b"a", OLD, false);
+    disk.file("data/sub/b", b"b", OLD, false);
+    disk.file("other", b"o", OLD, false);
+    disk.dir("media");
+    disk.file("media/photo", b"p", OLD, false);
+
+    // Tracked before anything is mounted, except `media`, which is a mount
+    // point from the start: neither it nor anything in it is reported.
+    let mut engine = engine();
+    let spy = Spy::new(disk.root());
+    spy.mount("media");
+    let (events, _) = scan(&spy, &BTreeMap::new());
+    let paths: Vec<RelPath> = reports(&events).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        paths,
+        [
+            p("data"),
+            p("data/a"),
+            p("data/sub"),
+            p("data/sub/b"),
+            p("other")
+        ]
+    );
+    assert!(
+        spy.calls("dir.open_dir")
+            .iter()
+            .all(|d| !d.starts_with("media"))
+    );
+    feed(&mut engine, events);
+
+    // Something is mounted over `data`: everything tracked there is
+    // skipped after the walk, nothing beneath it is walked, and nothing is
+    // tombstoned.
+    let spy = Spy::new(disk.root());
+    spy.mount("media");
+    spy.mount("data");
+    let (events, _) = scan(&spy, &index(&engine));
+    assert_eq!(
+        reports(&events),
+        [
+            (p("other"), ScanState::Unchanged),
+            (p("data"), skip(SkipReason::Ignored)),
+            (p("data/a"), skip(SkipReason::Ignored)),
+            (p("data/sub"), skip(SkipReason::Ignored)),
+            (p("data/sub/b"), skip(SkipReason::Ignored)),
+        ]
+    );
+    assert!(
+        spy.calls("dir.open_dir")
+            .iter()
+            .all(|d| !d.starts_with("data"))
+    );
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+
+    // The mounted disk holds none of it: still frozen.
+    std::fs::remove_dir_all(disk.at("data")).unwrap();
+    disk.dir("data");
+    let (events, _) = scan(&spy, &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+    assert!(live(&engine).contains_key(&p("data/sub/b")));
+
+    // Once it is unmounted, the next bracket sees the paths as they are.
+    let spy = Spy::new(disk.root());
+    spy.mount("media");
+    let (events, _) = scan(&spy, &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert_eq!(tombstoned, [p("data/a"), p("data/sub"), p("data/sub/b")]);
+}
+
 /// Damage done to a tracked tree before a scan, which must abort before
 /// observing anything: the root guard's cases.
 fn guarded(damage: impl FnOnce(&Disk), why: fn(&Abort) -> bool) {
@@ -1001,12 +1080,14 @@ fn the_walk_opens_each_directory_once() {
     assert_eq!(opened, dirs, "each directory opened exactly once");
     assert_eq!(spy.calls("open_root"), [PathBuf::new()]);
     // Nothing reached by a whole path: the root is held as it is, and
-    // everything else is reached from the directory it is in.
+    // stated once for its device (§7.3, mount points), and everything else
+    // is reached from the directory it is in.
     assert_eq!(spy.calls("fs.open_dir"), [PathBuf::new()]);
+    assert_eq!(spy.calls("fs.lstat"), [PathBuf::new()]);
     let by_path: Vec<_> = spy
         .all()
         .into_iter()
-        .filter(|(op, _)| op.starts_with("fs.") && *op != "fs.open_dir")
+        .filter(|(op, _)| op.starts_with("fs.") && !["fs.open_dir", "fs.lstat"].contains(op))
         .collect();
     assert!(by_path.is_empty(), "{by_path:?}");
     // And each directory listed once.

@@ -24,6 +24,9 @@ pub struct Spy {
 #[derive(Default)]
 struct State {
     calls: Mutex<Vec<(&'static str, PathBuf)>>,
+    /// Directories that read as the root of another device, with
+    /// everything beneath them: mount points (§7.3).
+    mounts: Mutex<Vec<PathBuf>>,
     /// A file, and what to do to it after its first read returns.
     meddle: Mutex<Option<(PathBuf, Meddle)>>,
     meddled: Mutex<bool>,
@@ -32,6 +35,22 @@ struct State {
 impl State {
     fn log(&self, op: &'static str, path: &Path) {
         self.calls.lock().unwrap().push((op, path.to_path_buf()));
+    }
+
+    /// `stat` of `path`, on another device if it is at or beneath a mount
+    /// point.
+    fn mounted(&self, path: &Path, stat: io::Result<Stat>) -> io::Result<Stat> {
+        let mut stat = stat?;
+        if self
+            .mounts
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|m| path.starts_with(m))
+        {
+            stat.dev = stat.dev.wrapping_add(1);
+        }
+        Ok(stat)
     }
 }
 
@@ -67,6 +86,13 @@ impl Spy {
     pub fn meddled(&self) -> bool {
         *self.state.meddled.lock().unwrap()
     }
+
+    /// Make the directory at `path` read as a mount point: it and
+    /// everything beneath it are stated on another device than the root.
+    /// Nothing else about it changes.
+    pub fn mount(&self, path: &str) {
+        self.state.mounts.lock().unwrap().push(path.into());
+    }
 }
 
 impl Folder for Spy {
@@ -101,7 +127,7 @@ impl Fs for SpyFs {
 
     fn lstat(&self, path: &Path) -> io::Result<Stat> {
         self.state.log("fs.lstat", path);
-        self.inner.lstat(path)
+        self.state.mounted(path, self.inner.lstat(path))
     }
 
     fn read_link(&self, path: &Path) -> io::Result<PathBuf> {
@@ -193,8 +219,9 @@ impl Dir for SpyDir {
     }
 
     fn lstat(&self, name: &OsStr) -> io::Result<Stat> {
-        self.state.log("dir.lstat", &self.path.join(name));
-        self.inner.lstat(name)
+        let path = self.path.join(name);
+        self.state.log("dir.lstat", &path);
+        self.state.mounted(&path, self.inner.lstat(name))
     }
 
     fn read_link(&self, name: &OsStr) -> io::Result<PathBuf> {

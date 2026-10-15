@@ -50,6 +50,15 @@
 //! `Skipped { Ignored }`, whether or not it is on disk: the record stays,
 //! frozen, and a rule that hides a file never reads as its deletion (§7.3).
 //!
+//! **Mount points** (§7.3, draft 48). The walk never crosses onto another
+//! device. A directory whose device is not the root's is a mount point:
+//! treated as an ignored path, it is neither reported nor walked into, and
+//! never tracked. Every tracked path at or beneath one (something was
+//! mounted over a tracked directory) is reported `Skipped { Ignored }` with
+//! the paths the rules ignore, until the mount goes: a disk mounted inside
+//! the folder that later unmounts must not read as its whole subtree
+//! deleted, for the same reason as the root guard.
+//!
 //! **An unreadable `.delocalignore`** (an I/O error, permission denied, or
 //! something other than a file at that name) makes the root `Skipped` with
 //! that reason, covering the whole folder (§7.3): with the rules unknown the
@@ -245,6 +254,9 @@ impl Scan<'_> {
     fn walk(&self, report: &mut ScanReport, emit: &mut dyn FnMut(Event)) -> Result<(), Abort> {
         let fs = self.folder.open().map_err(Abort::Root)?;
         let root: Arc<dyn Dir> = Arc::from(fs.open_dir(Path::new("")).map_err(Abort::Root)?);
+        // The device the walk stays on (§7.3, mount points): the root's,
+        // stated through the descriptor the operation holds.
+        let device = fs.lstat(Path::new("")).map_err(Abort::Root)?.dev;
         let delocal = marker(&*root)?;
         let names = root.read_dir().map_err(Abort::List)?;
         let rules = match IgnoreRules::read(&*root) {
@@ -272,6 +284,8 @@ impl Scan<'_> {
                 records: self.records,
                 clock: self.clock,
                 rules: &rules,
+                device,
+                mounts: Vec::new(),
                 disk_names: &mut report.disk_names,
                 unobservable: &mut report.unobservable,
                 pipe: Ordered::start(scope, self.hashers, &hash_job),
@@ -353,6 +367,11 @@ struct Walker<'a, 'e> {
     records: &'a dyn Records,
     clock: &'a dyn Clock,
     rules: &'a IgnoreRules,
+    /// The root's device, which the walk never leaves.
+    device: u64,
+    /// The mount points the walk met: directories on another device, at
+    /// their index paths.
+    mounts: Vec<RelPath>,
     disk_names: &'a mut Vec<DiskName>,
     unobservable: &'a mut Vec<(PathBuf, Unobservable)>,
     pipe: Ordered<Job, Found>,
@@ -501,6 +520,12 @@ impl Walker<'_, '_> {
         if self.rules.ignores_entry(&path, kind == Kind::Dir) {
             return None;
         }
+        // A mount point is an ignored path: not reported, not walked into,
+        // and what is tracked beneath it is skipped after the walk.
+        if kind == Kind::Dir && stat.dev != self.device {
+            self.mounts.push(path);
+            return None;
+        }
         self.keep_name(&path, disk, differs);
         match kind {
             Kind::Dir => return self.directory(&*dir, disk, path),
@@ -590,12 +615,17 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// Every tracked path the rules ignore, reported `Skipped`, on disk or
-    /// not: frozen until the rule goes (§7.3).
+    /// Every tracked path the rules ignore, on disk or not, and every one
+    /// at or beneath a mount point, reported `Skipped`: frozen until the
+    /// rule or the mount goes (§7.3).
     fn ignored_records(&mut self) {
         let records = self.records;
         for entry in records.live_entries() {
-            if self.rules.ignores(&entry.path, entry.kind == Kind::Dir) {
+            let mounted = self
+                .mounts
+                .iter()
+                .any(|m| *m == entry.path || m.is_ancestor_of(&entry.path));
+            if mounted || self.rules.ignores(&entry.path, entry.kind == Kind::Dir) {
                 let reason = SkipReason::Ignored;
                 self.ready(entry.path.clone(), ScanState::Skipped { reason });
             }
