@@ -69,7 +69,7 @@ struct Disk {
 impl Disk {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(RESERVED_DIR)).unwrap();
+        std::fs::create_dir_all(tmp.path().join(crate::reach::TMP_DIR)).unwrap();
         std::fs::write(tmp.path().join(RESERVED_DIR).join(MARKER), "{}").unwrap();
         Self { tmp }
     }
@@ -1099,6 +1099,104 @@ fn the_walk_opens_each_directory_once() {
         .collect();
     walked.sort();
     assert_eq!(listed, walked);
+}
+
+/// One path observed as the scan sees it, with the clock at `now`.
+fn observe_at(folder: &dyn Folder, records: &dyn Records, path: &str, now: i64) -> ScanState {
+    let fs = folder.open().unwrap();
+    let clock = move || at(now);
+    let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let observer = Observer {
+        fs: &*fs,
+        records,
+        names: &names,
+        clock: &clock,
+        sensitivity: Sensitivity::probe(&*fs).unwrap(),
+    };
+    let (state, taken) = observer.observe(&p(path));
+    assert_eq!(taken, at(now));
+    state
+}
+
+fn observe(folder: &dyn Folder, records: &dyn Records, path: &str) -> ScanState {
+    observe_at(folder, records, path, settled_now())
+}
+
+/// §7.3, §7.5 step 6: one path observed alone is reported as the scan
+/// reports it, for every path a scan reports, against the records it was
+/// compared with.
+#[test]
+fn one_path_observed_alone_is_what_the_scan_reports() {
+    let disk = Disk::new();
+    disk.dir("d/e");
+    disk.file("d/e/f", b"deep", OLD, false);
+    disk.file("x", b"x", OLD, true);
+    disk.file("y", b"y", OLD, false);
+    disk.symlink("s", "x");
+    disk.file("skip.log", b"l", OLD, false);
+    disk.file(ignore_rules::IGNORE_FILE, b"*.log\n", OLD, false);
+    let mut engine = engine();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    feed(&mut engine, events);
+    // Changes after the records were taken: a touch, a retarget, a new file.
+    disk.touch("y", OLD + SECOND);
+    std::fs::remove_file(disk.at("s")).unwrap();
+    disk.symlink("s", "y");
+    disk.file("d/new", b"n", OLD, false);
+    let records = index(&engine);
+    let (events, _) = scan(&disk.folder(), &records);
+    let reported = reports(&events);
+    assert!(reported.len() > 6);
+    for (path, state) in reported {
+        assert_eq!(
+            observe(&disk.folder(), &records, path.as_str()),
+            state,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn one_path_observed_alone_follows_the_scans_rules() {
+    let disk = Disk::new();
+    disk.file("file", b"x", OLD, false);
+    disk.dir("mnt/in");
+    disk.file("mnt/in/f", b"f", OLD, false);
+    let none: BTreeMap<RelPath, Entry> = BTreeMap::new();
+    let folder = disk.folder();
+
+    // Nothing there, beneath a file, or something that is not an entry.
+    assert_eq!(observe(&folder, &none, "missing"), ScanState::Absent);
+    assert_eq!(observe(&folder, &none, "missing/deeper"), ScanState::Absent);
+    assert_eq!(observe(&folder, &none, "file/x"), ScanState::Absent);
+    let _socket = std::os::unix::net::UnixListener::bind(disk.at("sock")).unwrap();
+    assert_eq!(observe(&folder, &none, "sock"), ScanState::Absent);
+
+    // A file that has not settled is not hashed (§7.3).
+    disk.file("fresh", b"new", OLD, false);
+    assert_eq!(
+        observe_at(&folder, &none, "fresh", wall()),
+        skip(SkipReason::Unstable)
+    );
+
+    // A mount point and what is beneath it are ignored paths (draft 48).
+    let spy = Spy::new(disk.root());
+    spy.mount("mnt");
+    assert_eq!(observe(&spy, &none, "mnt"), skip(SkipReason::Ignored));
+    assert_eq!(observe(&spy, &none, "mnt/in/f"), skip(SkipReason::Ignored));
+    assert_eq!(
+        observe(&spy, &none, "mnt/in/gone"),
+        skip(SkipReason::Ignored)
+    );
+
+    // So is what a rule ignores, there or not; and with the rules
+    // unreadable nothing can be told.
+    disk.file(ignore_rules::IGNORE_FILE, b"file\nghost\n", OLD, false);
+    assert_eq!(observe(&folder, &none, "file"), skip(SkipReason::Ignored));
+    assert_eq!(observe(&folder, &none, "ghost"), skip(SkipReason::Ignored));
+    std::fs::remove_file(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+    disk.dir(ignore_rules::IGNORE_FILE);
+    assert_eq!(observe(&folder, &none, "file"), skip(SkipReason::Io));
 }
 
 #[cfg(feature = "faults")]
