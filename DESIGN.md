@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 62 · 15 October 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 61: a create beneath a pending move waits until the move is reported, not merely dispatched; what a commit's guard finds implies ancestors like any observation, and a commit report covers its conflict copy (§7.3, §8.3).
+> Draft 63 · 15 October 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 62: trash day directories are named in UTC (§8.4).
+>
+> Changes from draft 61: a create beneath a pending move waits until the move is reported, not merely dispatched; what a commit's guard finds implies ancestors like any observation, and a commit report covers its conflict copy (§7.3, §8.3).
 >
 > Changes from draft 60: a revert moves a directory to the trash only when it is empty, as any directory delete; what the user put inside meanwhile stays (§8.3).
 >
@@ -551,7 +553,7 @@ A `deny` can still run on an unpaused folder whose window then pauses on other l
 
 ### 8.4 Trash
 
-Location: `<folder>/.delocal/trash/YYYY-MM-DD/<relative path>`, the day in local time: the trash is one machine's, browsed by its user, and pruning uses the recorded `trashed_at`, not the name. Name collisions within a day get a `~1`, `~2` suffix before the extension, split as §7.6 splits conflict names, so `report.xlsx` becomes `report~1.xlsx`; a name that would exceed 255 bytes is cut as §7.6 cuts conflict names, stem first, keeping the `~N`. Living inside the folder means every move is a same-filesystem rename: instant, no copy, no extra disk pressure until pruning.
+Location: `<folder>/.delocal/trash/YYYY-MM-DD/<relative path>`, the day in UTC: pruning uses the recorded `trashed_at`, not the name, and the directory name only has to be stable and sortable. Local time would need a time-zone database for a folder name, and would make names depend on DST and on which zone the machine was in that day. Name collisions within a day get a `~1`, `~2` suffix before the extension, split as §7.6 splits conflict names, so `report.xlsx` becomes `report~1.xlsx`; a name that would exceed 255 bytes is cut as §7.6 cuts conflict names, stem first, keeping the `~N`. Living inside the folder means every move is a same-filesystem rename: instant, no copy, no extra disk pressure until pruning.
 
 What goes in: every file delocal is about to overwrite or delete because of a **remote** change, plus files moved aside by `revert`. Nothing else — delocal never sees a local edit until it has already happened, and it is not a backup.
 
