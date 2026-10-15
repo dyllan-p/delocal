@@ -13,6 +13,7 @@
 //!   guard (§7.3)
 //! - [`store`]: the SQLite database, the persisted parts and the host's
 //!   tables (§11, §8.5)
+//! - [`tmp`]: `.delocal/tmp/`, its names and what goes at start (§7.5)
 
 // Tests may unwrap and expect (CLAUDE.md conventions); production code may not.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
@@ -22,3 +23,4 @@ pub mod names;
 pub mod reach;
 pub mod scan;
 pub mod store;
+pub mod tmp;

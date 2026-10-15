@@ -69,7 +69,7 @@ struct Disk {
 impl Disk {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(crate::reach::TMP_DIR)).unwrap();
+        std::fs::create_dir_all(tmp.path().join(crate::tmp::DIR)).unwrap();
         std::fs::write(tmp.path().join(RESERVED_DIR).join(MARKER), "{}").unwrap();
         Self { tmp }
     }
