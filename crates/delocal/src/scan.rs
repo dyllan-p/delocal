@@ -80,6 +80,15 @@
 //! as a mass deletion. An aborted scan closes the bracket with
 //! `ScanAborted`, which announces no deletions (§7.3).
 //!
+//! **One path at a time.** [`Observer::observe`] observes a single path as
+//! the scan would report it, by the same rules: ignored and mounted paths
+//! skipped, the fast path against the record, a file hashed only once
+//! settled. It is what a failed commit's report carries (§7.5 step 6) and
+//! what the host answers the engine's `Observe` with (§8.3). It reaches the
+//! path from the root through its names on disk ([`crate::reach`]) rather
+//! than walking to it, so on a filesystem that folds names it confirms the
+//! name through the parent's listing.
+//!
 //! **What the host keeps** of a scan is its [`ScanReport`]: the names on
 //! disk, the unobservable names, the skips by reason, and the rules left out
 //! of `.delocalignore`, all for `status` and the store; and the unstable
@@ -99,8 +108,9 @@ use delocal_engine::{
     Timestamp,
 };
 
-use crate::fs::{Dir, FileKind, Folder, NotAFile, Stat};
+use crate::fs::{Dir, FileKind, Folder, Fs, NotAFile, Stat};
 use crate::names::{self, IndexName, Name, Unobservable};
+use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
 use crate::store::DiskName;
 
 pub mod hash;
@@ -664,6 +674,123 @@ impl Walker<'_, '_> {
         let at = self.clock.now();
         self.pipe
             .ready(Some((path, state, at)), &mut |found| self.out.take(found));
+    }
+}
+
+/// Observes one path as a scan would report it (see the module docs), in
+/// one operation's `fs`.
+pub struct Observer<'a> {
+    pub fs: &'a dyn Fs,
+    /// The folder's index records, as the host last wrote them.
+    pub records: &'a dyn Records,
+    /// Its names on disk that are not their index paths' (§7.3).
+    pub names: &'a dyn DiskNames,
+    pub clock: &'a dyn Clock,
+    /// How its filesystem compares names.
+    pub sensitivity: Sensitivity,
+}
+
+impl Observer<'_> {
+    /// What a scan would report for `path` now, and when the host took the
+    /// observation (§7.3, draft 56). `Absent` stands for what a scan would
+    /// leave unreported: nothing there, a FIFO or the like, or a name on
+    /// disk that is another path's.
+    pub fn observe(&self, path: &RelPath) -> (ScanState, Timestamp) {
+        let state = self.state(path);
+        (state, self.clock.now())
+    }
+
+    fn state(&self, path: &RelPath) -> ScanState {
+        let fs = self.fs;
+        // The rules decide first, as for a scan: with them unknown nothing
+        // can be told, and an ignored path is skipped whatever is there.
+        let rules = match fs
+            .open_dir(Path::new(""))
+            .and_then(|root| IgnoreRules::read(&*root))
+        {
+            Ok(rules) => rules,
+            Err(e) => {
+                return ScanState::Skipped {
+                    reason: ignore_file_reason(&e),
+                };
+            }
+        };
+        let ignored = |is_dir: bool| -> Option<ScanState> {
+            rules.ignores(path, is_dir).then_some(ScanState::Skipped {
+                reason: SkipReason::Ignored,
+            })
+        };
+        let tracked_dir = self
+            .records
+            .live(path)
+            .is_some_and(|record| record.kind == Kind::Dir);
+        let absent = || ignored(tracked_dir).unwrap_or(ScanState::Absent);
+        let device = match fs.lstat(Path::new("")) {
+            Ok(stat) => stat.dev,
+            Err(e) => return skipped(&e),
+        };
+        let disk = reach::disk_path(path, self.names);
+        match reach::walk(fs, path, &disk, device) {
+            Ok(Walk::Reached) => {}
+            Ok(Walk::Missing { .. } | Walk::NotADirectory { .. }) => return absent(),
+            // Beneath a mount point: an ignored path (§7.3).
+            Ok(Walk::Crossed { .. }) => {
+                return ScanState::Skipped {
+                    reason: SkipReason::Ignored,
+                };
+            }
+            Err(e) => return skipped(&e),
+        }
+        let parent = disk.parent().unwrap_or(Path::new(""));
+        let name = disk.file_name().unwrap_or_default();
+        let (name, stat, seen) = match reach::look(fs, parent, path, name, self.sensitivity) {
+            Ok(Look::Present {
+                name,
+                stat,
+                seen: Some(seen),
+            }) => (name, stat, seen),
+            Ok(Look::Present { seen: None, .. } | Look::Absent | Look::Taken { .. }) => {
+                return absent();
+            }
+            Ok(Look::Coinciding) => {
+                return ScanState::Skipped {
+                    reason: SkipReason::CoincidingNames,
+                };
+            }
+            Err(e) => return skipped(&e),
+        };
+        if let Some(skip) = ignored(seen.kind == Kind::Dir) {
+            return skip;
+        }
+        if seen.kind == Kind::Dir && stat.dev != device {
+            return ScanState::Skipped {
+                reason: SkipReason::Ignored,
+            };
+        }
+        if self
+            .records
+            .live(path)
+            .is_some_and(|record| record.unchanged_by_stat(&seen))
+        {
+            return ScanState::Unchanged;
+        }
+        if seen.kind != Kind::File {
+            return ScanState::Observed(seen);
+        }
+        if !settled(stat.ctime_ns, self.clock.now()) {
+            return unstable();
+        }
+        let dir = match fs.open_dir(parent) {
+            Ok(dir) => dir,
+            Err(e) if gone(&e) => return absent(),
+            Err(e) => return skipped(&e),
+        };
+        match hash_file(&*dir, &name, &stat) {
+            Hashed::Stable(hash) => ScanState::Observed(Observed { hash, ..seen }),
+            Hashed::Unstable => unstable(),
+            Hashed::Vanished => absent(),
+            Hashed::Failed(e) => skipped(&e),
+        }
     }
 }
 
