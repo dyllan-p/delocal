@@ -6,6 +6,9 @@
 //!
 //! - [`fs`]: the filesystem layer, every operation on a folder (§14.2)
 //! - [`names`]: names on disk and the index paths they map to (§7.1, §7.3)
+//! - [`reach`]: an index path on disk: its names, the walk to it that never
+//!   crosses a mount point, and what a filesystem that folds names answers
+//!   (§7.3, §7.5)
 //! - [`scan`]: the full scan, its fast path, hashing, ignore rules and root
 //!   guard (§7.3)
 //! - [`store`]: the SQLite database, the persisted parts and the host's
@@ -16,5 +19,6 @@
 
 pub mod fs;
 pub mod names;
+pub mod reach;
 pub mod scan;
 pub mod store;
