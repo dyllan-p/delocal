@@ -290,3 +290,34 @@ fn a_user_rewriting_the_target_through_10000_commits_loses_nothing() {
     // nothing, and the trash holds exactly what was written.
     assert_eq!(everywhere.len(), written.len() + ours.len(), "{outcomes:?}");
 }
+
+/// §7.3, the root guard: a folder whose marker goes while a commit runs
+/// (its disk unmounted, say) reports what it found as `Skipped`, never as
+/// what a stat of the now empty mount point would say.
+#[test]
+fn a_marker_gone_during_a_commit_makes_its_report_skipped() {
+    let disk = Disk::new();
+    let spy = Spy::new(disk.root());
+    let temp = disk.temp(b"received");
+    let (marker, target) = (disk.at(RESERVED_DIR).join(MARKER), disk.at("f"));
+    spy.before("fs.rename_noreplace", temp.clone(), move || {
+        std::fs::remove_file(marker).unwrap();
+        std::fs::write(target, "the user's").unwrap();
+    });
+    let done = disk.commit_with(
+        &spy,
+        &write(
+            "f",
+            entry("f", Kind::File, b"received", OLD, false),
+            None,
+            Displace::Trash,
+        ),
+        Some(&temp),
+    );
+    assert_eq!(
+        outcome(&done),
+        &changed(ScanState::Skipped {
+            reason: SkipReason::Io
+        })
+    );
+}
