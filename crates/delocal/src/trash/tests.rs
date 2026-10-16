@@ -264,7 +264,8 @@ fn a_directory_moves_whole_and_counts_everything_in_it() {
     std::fs::write(root.join("d/a"), "12345").unwrap();
     std::fs::write(root.join("d/sub/b"), "678").unwrap();
     std::os::unix::fs::symlink("ab", root.join("d/s")).unwrap();
-    assert_eq!(size_of(&*fs, Path::new("d")), 5 + 3 + 2);
+    let device = fs.lstat(Path::new("")).unwrap().dev;
+    assert_eq!(size_of(&*fs, Path::new("d"), device), 5 + 3 + 2);
     let original = p("d");
     let what = Moving {
         original: &original,
@@ -447,4 +448,38 @@ fn a_name_trashed_many_times_a_day_keeps_numbering_in_order() {
         };
         assert_eq!(moved.place.row, Path::new(&expected));
     }
+}
+
+/// §7.3, draft 48: a disk mounted in the trash is not the trash's. Pruning
+/// never enters it, sizing does not count it, and reconciling adopts
+/// nothing on it.
+#[test]
+fn nothing_in_the_trash_enters_a_mounted_disk() {
+    let (tmp, _) = folder();
+    let root = tmp.path();
+    let entry = root.join(DIR).join("2026-10-15/x");
+    std::fs::create_dir_all(entry.join("mnt")).unwrap();
+    std::fs::write(entry.join("mnt/precious"), "on another device").unwrap();
+    let spy = crate::fs::spy::Spy::new(root);
+    spy.mount(".delocal/trash/2026-10-15/x/mnt");
+    let fs = spy.open().unwrap();
+    let device = fs.lstat(Path::new("")).unwrap().dev;
+
+    let x = Path::new(DIR).join("2026-10-15/x");
+    assert_eq!(size_of(&*fs, &x, device), 0);
+    assert!(reconcile(&*fs, folder_id(), &[], at(NOON)).is_empty());
+    let rows = [row("2026-10-15/x", NOON, 17)];
+    let pruned = prune(
+        &*fs,
+        folder_id(),
+        &rows,
+        at(NOON + 40 * DAY),
+        Policy::default(),
+    );
+    assert!(pruned.writes.is_empty(), "the row stays");
+    assert_eq!(pruned.failed.len(), 1);
+    assert_eq!(
+        std::fs::read(entry.join("mnt/precious")).unwrap(),
+        b"on another device"
+    );
 }

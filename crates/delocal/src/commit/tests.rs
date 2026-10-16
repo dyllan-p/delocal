@@ -567,6 +567,64 @@ fn a_commit_never_writes_beneath_a_mount_point() {
     assert!(spy.calls("fs.rename_noreplace").is_empty());
 }
 
+/// §7.3, draft 48: a directory with a disk mounted inside is never moved.
+/// A rename takes the mounted disk with it: into the trash, where pruning
+/// would delete what is on it, or to a conflict copy.
+#[test]
+fn a_directory_with_a_disk_mounted_inside_is_never_moved() {
+    let disk = Disk::new();
+    disk.dir("x/mnt");
+    disk.file("x/mnt/precious", b"on another device", OLD, false);
+    let spy = Spy::new(disk.root());
+    spy.mount("x/mnt");
+    let temp = disk.temp(b"a file now");
+    let incoming = entry("x", Kind::File, b"a file now", OLD, false);
+    let copy = Displace::ConflictCopy(p("x.conflict"));
+    for (action, temp) in [
+        (
+            write("x", incoming.clone(), Some(dir()), Displace::Trash),
+            Some(temp.as_path()),
+        ),
+        (
+            write("x", incoming.clone(), Some(dir()), copy.clone()),
+            Some(temp.as_path()),
+        ),
+        (remove("x", Some(dir()), copy.clone()), None),
+    ] {
+        let done = disk.commit_with(&spy, &action, temp);
+        assert!(
+            matches!(
+                outcome(&done),
+                ApplyOutcome::Failed {
+                    error: LocalError::Io,
+                    found: ScanState::Observed(Observed {
+                        kind: Kind::Dir,
+                        ..
+                    })
+                }
+            ),
+            "{action:?}: {:?}",
+            outcome(&done)
+        );
+        assert_eq!(disk.read("x/mnt/precious"), b"on another device");
+        assert!(disk.trash().is_empty() && !disk.exists("x.conflict"));
+        assert!(disk.journal.taken().is_empty(), "nothing journalled");
+    }
+    // A delete to the trash removes only an empty directory.
+    let done = disk.commit_with(&spy, &remove("x", Some(dir()), Displace::Trash), None);
+    assert!(matches!(
+        outcome(&done),
+        ApplyOutcome::ChangedUnderneath { .. }
+    ));
+    // Once the disk is unmounted, the write goes ahead.
+    let done = disk.commit(
+        &write("x", incoming, Some(dir()), Displace::Trash),
+        Some(&temp),
+    );
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    assert_eq!(disk.trash(), [b"on another device".to_vec()]);
+}
+
 #[test]
 fn a_folder_without_its_marker_is_not_written_and_reads_as_skipped() {
     let failed = ApplyOutcome::Failed {
