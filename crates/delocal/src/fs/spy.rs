@@ -168,6 +168,12 @@ impl Spy {
             .push((op, path.into(), Box::new(hook)));
     }
 
+    /// Count and log a step that is not a filesystem call (a journal write,
+    /// say) as if it were one, named `op`, so that hooks can be set on it.
+    pub fn mark(&self, op: &'static str) {
+        self.state.call(op, &[]);
+    }
+
     /// Run `hook` once, just before the call with index `index`, counting
     /// every call from 0.
     pub fn at_call(&self, index: usize, hook: impl FnOnce() + Send + 'static) {

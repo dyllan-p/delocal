@@ -145,13 +145,25 @@ impl Disk {
         action: &Action,
         temp: Option<&Path>,
     ) -> Committed {
+        self.commit_through(folder, &self.journal, action, temp)
+    }
+
+    /// A commit through `folder`, making its journal rows durable in
+    /// `journal`.
+    pub fn commit_through(
+        &self,
+        folder: &dyn Folder,
+        journal: &dyn Journal,
+        action: &Action,
+        temp: Option<&Path>,
+    ) -> Committed {
         let clock = settled_now;
         Commit {
             id: folder_id(),
             folder,
             records: &self.records,
             names: &self.names,
-            journal: &self.journal,
+            journal,
             clock: &clock,
             disk: &self.state,
         }
@@ -557,16 +569,40 @@ fn a_commit_never_writes_beneath_a_mount_point() {
 
 #[test]
 fn a_folder_without_its_marker_is_not_written_and_reads_as_skipped() {
-    let disk = Disk::new();
-    let old = disk.file("f", b"old", OLD, false);
-    std::fs::remove_dir_all(disk.at(RESERVED_DIR)).unwrap();
-    let temp = PathBuf::from(tmp::DIR).join("gone");
     let failed = ApplyOutcome::Failed {
         error: LocalError::Io,
         found: ScanState::Skipped {
             reason: SkipReason::Io,
         },
     };
+    // The marker gone, `.delocal/` still there: nothing is written, and
+    // what is at the path is not reported, since it may be an empty mount
+    // point's (§7.3, the root guard).
+    let disk = Disk::new();
+    let old = disk.file("f", b"old", OLD, false);
+    std::fs::remove_file(disk.at(RESERVED_DIR).join(MARKER)).unwrap();
+    let temp = disk.temp(b"new");
+    let done = disk.commit(
+        &write(
+            "f",
+            entry("f", Kind::File, b"new", OLD, false),
+            Some(old.clone()),
+            Displace::Trash,
+        ),
+        Some(&temp),
+    );
+    assert_eq!(outcome(&done), &failed);
+    let done = disk.commit(&remove("f", Some(old.clone()), Displace::Trash), None);
+    assert_eq!(outcome(&done), &failed);
+    let done = disk.commit(&move_to_trash("f", old.clone()), None);
+    assert!(matches!(done.event, Event::Trashed { outcome, .. } if outcome == failed));
+    assert_eq!(disk.read("f"), b"old");
+    assert!(disk.exists(temp.to_str().unwrap()));
+    assert!(disk.trash().is_empty());
+
+    // `.delocal/` gone altogether: nothing makes it again.
+    std::fs::remove_dir_all(disk.at(RESERVED_DIR)).unwrap();
+    let temp = PathBuf::from(tmp::DIR).join("gone");
     let done = disk.commit(
         &write(
             "f",
