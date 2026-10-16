@@ -576,6 +576,119 @@ fn both_renames_failing_strand_the_file_until_it_is_put_back() {
     }
 }
 
+/// §7.5, draft 64: a stranded path is skipped by the scan until a resolve
+/// puts the file back.
+#[cfg(feature = "faults")]
+#[test]
+fn a_stranded_path_is_skipped_until_it_is_resolved() {
+    let scenario = Scenario::WriteOverFile;
+    let disk = disk_for(scenario);
+    let temp = Scenario::temp();
+    let path = p(scenario.path());
+    let rules = vec![
+        Rule {
+            op: Op::RenameNoreplace,
+            path: temp.to_str().unwrap().to_owned(),
+            at: Trigger::Call(1),
+            fail: Fault::Eio,
+        },
+        Rule {
+            op: Op::RenameNoreplace,
+            path: scenario.path().to_owned(),
+            at: Trigger::FromCall(3),
+            fail: Fault::Eio,
+        },
+    ];
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules }).unwrap();
+    let (action, _) = scenario.action();
+    disk.commit_with(&faulty, &action, Some(&temp));
+    let skipped = ScanState::Skipped {
+        reason: crate::scan::OPEN_ROW,
+    };
+    assert!(disk.state.is_open(&path));
+    assert_eq!(disk.scanned().get(&path), Some(&skipped));
+    // Still failing: still open.
+    let resolved = disk.resolve(&faulty);
+    assert_eq!(resolved.open, std::slice::from_ref(&path));
+    assert_eq!(disk.scanned().get(&path), Some(&skipped));
+
+    let mut rows = disk.journal.taken();
+    let resolved = disk.resolve(&disk.folder());
+    assert_eq!(resolved.resolved, std::slice::from_ref(&path));
+    assert!(!disk.state.is_open(&path));
+    assert_eq!(
+        std::fs::read(disk.at(scenario.path())).unwrap(),
+        OLD_CONTENT
+    );
+    rows.extend(disk.journal.taken());
+    assert!(open_rows(&rows, &[]).is_empty());
+    rows_match_the_trash(&disk, &[], &rows).unwrap();
+    assert!(matches!(
+        disk.scanned().get(&path),
+        Some(ScanState::Observed(_))
+    ));
+}
+
+/// §7.5, draft 64: a commit that landed while an fsync after it failed
+/// keeps its path skipped until its directories sync; a commit there in
+/// the meantime goes ahead.
+#[cfg(feature = "faults")]
+#[test]
+fn an_unsynced_commit_is_skipped_until_its_directories_sync() {
+    let scenario = Scenario::WriteOverFile;
+    let disk = disk_for(scenario);
+    let temp = Scenario::temp();
+    let path = p(scenario.path());
+    let rule = Rule {
+        op: Op::SyncDir,
+        path: "dir".into(),
+        at: Trigger::FromCall(1),
+        fail: Fault::Eio,
+    };
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] }).unwrap();
+    let (action, _) = scenario.action();
+    let done = disk.commit_with(&faulty, &action, Some(&temp));
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    assert!(disk.state.is_open(&path));
+    let skipped = ScanState::Skipped {
+        reason: crate::scan::OPEN_ROW,
+    };
+    assert_eq!(disk.scanned().get(&path), Some(&skipped));
+    assert_eq!(disk.resolve(&faulty).open, std::slice::from_ref(&path));
+
+    // A metadata-only apply there goes ahead; the row stays open.
+    let landed = Observed {
+        kind: Kind::File,
+        size: NEW_CONTENT.len() as u64,
+        mtime_ns: OLD + SECOND,
+        exec: true,
+        hash: blake3_of(NEW_CONTENT),
+    };
+    let done = disk.commit_with(
+        &faulty,
+        &set_meta(scenario.path(), Some(landed), OLD + 9, true),
+        None,
+    );
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    assert!(disk.state.is_open(&path));
+
+    disk.journal.taken();
+    let resolved = disk.resolve(&disk.folder());
+    assert_eq!(resolved.resolved, std::slice::from_ref(&path));
+    assert_eq!(
+        disk.journal.taken(),
+        [HostWrite::RemoveJournal {
+            folder: folder_id(),
+            path: path.clone()
+        }]
+    );
+    assert!(!disk.state.is_open(&path));
+    assert!(matches!(
+        disk.scanned().get(&path),
+        Some(ScanState::Observed(_))
+    ));
+}
+
 /// While a stranded file cannot be put back, no commit at its path goes
 /// ahead, and each reports `Skipped`.
 #[cfg(feature = "faults")]

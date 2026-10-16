@@ -84,7 +84,7 @@ use delocal_engine::{
 
 use crate::fs::{FileKind, Folder, Fs, NotAFile, ParentNotADirectory, Refusing, rename_refusing};
 use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
-use crate::scan::{Clock, MARKER, Observer, Records};
+use crate::scan::{Clock, MARKER, Observer, OpenRows, Records};
 use crate::store::{HostWrite, JournalRow, TrashRow};
 use crate::tmp;
 use crate::trash::{self, Moving, NotMoved};
@@ -101,21 +101,43 @@ pub use start::{Start, Started};
 pub struct DiskState {
     sensitivity: OnceLock<Sensitivity>,
     narrower: AtomicBool,
-    /// Displacements a failed write could not put back, by path: the next
-    /// commit at the path puts it back first (see [`Commit::run`]).
-    stranded: Mutex<BTreeMap<RelPath, Stranded>>,
+    /// The paths whose journal row is open while the daemon runs, and what
+    /// resolves each (§7.5, draft 64). The scan and every single
+    /// observation report them `Skipped` ([`OpenRows`]).
+    open: Mutex<BTreeMap<RelPath, Open>>,
 }
 
-/// A displaced file that could not be put back, and its journal row still
-/// open.
-#[derive(Clone, Debug)]
-struct Stranded {
-    /// Where it is now.
-    at: PathBuf,
-    /// Where it was found, and goes back to.
-    back: PathBuf,
-    /// Its trash row, if it is in the trash.
-    trash: Option<TrashRow>,
+/// Why a path's journal row is still open, and what resolves it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Open {
+    /// What a commit displaced is not back: a write whose rename in failed
+    /// could not put it back, or the start's undo could not run. Resolved
+    /// by moving it back into the path if that is empty, or by finding the
+    /// path taken.
+    Displaced {
+        /// Where it is now.
+        at: PathBuf,
+        /// Where it goes back to.
+        back: PathBuf,
+        /// Its place in the trash, relative to `.delocal/trash/`, if it is
+        /// there: its row goes when it comes back.
+        trash: Option<PathBuf>,
+    },
+    /// A commit landed, but an fsync after it failed, so its rename is not
+    /// known to be durable. Resolved once these directories are synced.
+    Unsynced { dirs: Vec<PathBuf> },
+}
+
+impl OpenRows for DiskState {
+    fn is_open(&self, path: &RelPath) -> bool {
+        self.opened()
+            .keys()
+            .any(|open| open == path || open.is_ancestor_of(path))
+    }
+
+    fn open_paths(&self) -> Vec<RelPath> {
+        self.opened().keys().cloned().collect()
+    }
 }
 
 impl DiskState {
@@ -148,8 +170,17 @@ impl DiskState {
         Ok(*self.sensitivity.get_or_init(|| probed))
     }
 
-    fn stranded(&self) -> std::sync::MutexGuard<'_, BTreeMap<RelPath, Stranded>> {
-        self.stranded.lock().unwrap_or_else(PoisonError::into_inner)
+    fn opened(&self) -> std::sync::MutexGuard<'_, BTreeMap<RelPath, Open>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Keep `path` open: a journal row the start's undo could not resolve,
+    /// whose displaced file is at `at` (relative to the folder root) and
+    /// goes back to `back`.
+    pub(crate) fn keep_displaced(&self, path: RelPath, at: PathBuf, back: PathBuf) {
+        let trash = at.strip_prefix(trash::DIR).ok().map(Path::to_path_buf);
+        self.opened()
+            .insert(path, Open::Displaced { at, back, trash });
     }
 
     fn renamed(&self, how: Refusing) {
@@ -360,6 +391,15 @@ impl Commit<'_> {
                 (outcome, at, done)
             }
         };
+        // A commit that removed the path's journal row has resolved it,
+        // whatever kept it open before.
+        let removed_row = done
+            .writes
+            .iter()
+            .any(|w| matches!(w, HostWrite::RemoveJournal { path: p, .. } if p == path));
+        if removed_row {
+            self.disk.opened().remove(path);
+        }
         let (folder, path, version) = (self.id, path.clone(), version.clone());
         let event = if trashed {
             Event::Trashed {
@@ -407,6 +447,7 @@ impl Commit<'_> {
             fs: &*fs,
             records: self.records,
             names: self.names,
+            open: self.disk,
             clock: self.clock,
             sensitivity,
         }
@@ -438,7 +479,34 @@ impl Commit<'_> {
             device,
             sensitivity,
         };
-        self.put_stranded_back(fs, path)?;
+        match self.resolve_one(fs, path) {
+            Resolution::NotOpen | Resolution::Resolved => {}
+            // A displaced file that cannot go back yet: the path is empty
+            // only because of this host, and no commit there goes ahead.
+            Resolution::Open {
+                displaced: true,
+                error,
+            } => {
+                return Err(Fail::Blind {
+                    error: local(&error),
+                    reason: SkipReason::Io,
+                }
+                .into());
+            }
+            // A landed commit still not known durable: the path holds what
+            // the engine adopted, and this commit may go ahead.
+            Resolution::Open {
+                displaced: false, ..
+            } => {}
+            // Resolved on disk, but its rows still say otherwise: the
+            // report carries their changes, and this commit stops here.
+            Resolution::Unrecorded { error, writes } => {
+                return Err(Failed {
+                    fail: Fail::Local(local(&error)),
+                    writes,
+                });
+            }
+        }
         match *op {
             Op::Write {
                 entry,
@@ -455,61 +523,99 @@ impl Commit<'_> {
         }
     }
 
-    /// Before anything else at `path`: put back a displaced file an
-    /// earlier write there could not put back, if the path is still empty.
-    /// The rows that change with it are made durable at once, before this
-    /// commit can make rows of its own for the same places (it may displace
-    /// into the very place the file just left). While the file cannot be
-    /// put back, no commit at the path goes ahead, and each reports
-    /// `Skipped`: the path is empty only because of this host.
-    fn put_stranded_back(&self, fs: &dyn Fs, path: &RelPath) -> Result<(), Failed> {
-        let Some(stranded) = self.disk.stranded().get(path).cloned() else {
-            return Ok(());
+    /// Resolve the open journal row at `path`, if there is one (§7.5,
+    /// draft 64): put a displaced file back if the path is still empty, or
+    /// sync the directories of a commit whose fsync failed. The rows that
+    /// change are made durable at once, before a commit can make rows of
+    /// its own for the same places (it may displace into the very place a
+    /// file just left).
+    fn resolve_one(&self, fs: &dyn Fs, path: &RelPath) -> Resolution {
+        let Some(open) = self.disk.opened().get(path).cloned() else {
+            return Resolution::NotOpen;
         };
         let journal_gone = HostWrite::RemoveJournal {
             folder: self.id,
             path: path.clone(),
         };
-        let writes = match rename_refusing(fs, &stranded.at, &stranded.back) {
-            Ok(how) => {
-                self.disk.renamed(how);
-                let mut writes = vec![journal_gone];
-                writes.extend(
-                    stranded
-                        .trash
-                        .as_ref()
-                        .map(|row| remove_trash(self.id, row)),
-                );
-                writes
-            }
-            // The path was taken meanwhile, or the file went: nothing is
-            // left to undo, and the file stays where it is.
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
-                ) =>
-            {
+        let writes = match open {
+            Open::Displaced { at, back, trash } => match rename_refusing(fs, &at, &back) {
+                Ok(how) => {
+                    self.disk.renamed(how);
+                    let back_from_trash = trash.map(|trashed_path| HostWrite::RemoveTrash {
+                        folder: self.id,
+                        trashed_path,
+                    });
+                    let mut writes = vec![journal_gone];
+                    writes.extend(back_from_trash);
+                    writes
+                }
+                // The path was taken meanwhile, or the file went: nothing
+                // is left to undo, and the file stays where it is.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    vec![journal_gone]
+                }
+                Err(e) => {
+                    return Resolution::Open {
+                        displaced: true,
+                        error: e,
+                    };
+                }
+            },
+            Open::Unsynced { dirs } => {
+                if let Some(error) = dirs.iter().find_map(|dir| fs.sync_dir(dir).err()) {
+                    return Resolution::Open {
+                        displaced: false,
+                        error,
+                    };
+                }
                 vec![journal_gone]
             }
-            Err(e) => {
-                return Err(Fail::Blind {
-                    error: local(&e),
-                    reason: SkipReason::Io,
-                }
-                .into());
+        };
+        self.disk.opened().remove(path);
+        match self.journal.durable(writes.clone()) {
+            Ok(()) => Resolution::Resolved,
+            Err(e) => Resolution::Unrecorded { error: e, writes },
+        }
+    }
+
+    /// Resolve every open journal row of the folder that can be resolved
+    /// now (§7.5, draft 64). The host calls this before each scan, so a
+    /// path stays `Skipped` no longer than it must; each commit resolves its
+    /// own path's row first anyway.
+    pub fn resolve(&self) -> Resolved {
+        let mut resolved = Resolved::default();
+        let paths = self.disk.open_paths();
+        if paths.is_empty() {
+            return resolved;
+        }
+        // Nothing is moved in a folder whose marker is gone (§7.3).
+        let fs = match self.folder.open() {
+            Ok(fs) if marker(&*fs).is_ok() => fs,
+            _ => {
+                resolved.open = paths;
+                return resolved;
             }
         };
-        self.disk.stranded().remove(path);
-        match self.journal.durable(writes.clone()) {
-            Ok(()) => Ok(()),
-            // The file is back, but its rows still say otherwise: the
-            // report carries their changes, and this commit stops here.
-            Err(e) => Err(Failed {
-                fail: Fail::Local(local(&e)),
-                writes,
-            }),
+        for path in paths {
+            match self.resolve_one(&*fs, &path) {
+                Resolution::NotOpen | Resolution::Resolved => resolved.resolved.push(path),
+                Resolution::Open { error, .. } => {
+                    resolved.errors.push((path.clone(), error));
+                    resolved.open.push(path);
+                }
+                Resolution::Unrecorded { error, writes } => {
+                    resolved.errors.push((path.clone(), error));
+                    resolved.unrecorded.extend(writes);
+                    resolved.resolved.push(path);
+                }
+            }
         }
+        resolved
     }
 
     /// Step 6's look at the path: the walk to its parent, then the path
@@ -667,6 +773,18 @@ impl Commit<'_> {
         let mut writes = if unsynced.is_empty() {
             journal_rows(&displaced)
         } else {
+            if displaced.is_some() {
+                let mut dirs = vec![at.parent.clone()];
+                dirs.extend(
+                    displaced
+                        .as_ref()
+                        .and_then(|d| d.to.parent())
+                        .map(Path::to_path_buf),
+                );
+                self.disk
+                    .opened()
+                    .insert(at.path.clone(), Open::Unsynced { dirs });
+            }
             Vec::new()
         };
         writes.extend(self.stale_name(at.path));
@@ -840,12 +958,12 @@ impl Commit<'_> {
             }
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Some(vec![journal_gone]),
             Err(_) => {
-                let stranded = Stranded {
+                let stranded = Open::Displaced {
                     at: displaced.to.clone(),
                     back: to.to_path_buf(),
-                    trash: displaced.trash.clone(),
+                    trash: displaced.trash.as_ref().map(|row| row.trashed_path.clone()),
                 };
-                self.disk.stranded().insert(path.clone(), stranded);
+                self.disk.opened().insert(path.clone(), stranded);
                 None
             }
         }
@@ -1034,6 +1152,37 @@ impl Commit<'_> {
             unsynced: Vec::new(),
         }
     }
+}
+
+/// What resolving one path's open journal row came to.
+enum Resolution {
+    /// Its row was not open.
+    NotOpen,
+    /// Resolved, and its rows durable.
+    Resolved,
+    /// Still open: a displaced file that cannot go back yet, or
+    /// directories that still cannot be synced.
+    Open { displaced: bool, error: io::Error },
+    /// Resolved on disk, but its rows could not be made durable: `writes`
+    /// still have to be.
+    Unrecorded {
+        error: io::Error,
+        writes: Vec<HostWrite>,
+    },
+}
+
+/// What [`Commit::resolve`] did.
+#[derive(Debug, Default)]
+pub struct Resolved {
+    /// Paths whose rows were resolved: no longer skipped.
+    pub resolved: Vec<RelPath>,
+    /// Paths still open, still skipped.
+    pub open: Vec<RelPath>,
+    /// Why, for the host to log.
+    pub errors: Vec<(RelPath, io::Error)>,
+    /// Writes resolved on disk that could not be made durable through the
+    /// journal; the host writes them with its next group.
+    pub unrecorded: Vec<HostWrite>,
 }
 
 /// What step 6 found at the path.

@@ -3,7 +3,7 @@
 //! nothing a scan could not see is ever tombstoned) a real engine sits
 //! behind the scanner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules, Version};
 
@@ -117,12 +117,24 @@ fn scan_at(
     now: i64,
     hashers: usize,
 ) -> (Vec<Event>, ScanReport) {
+    scan_open(folder, records, &BTreeSet::new(), now, hashers)
+}
+
+/// [`scan_at`] with paths whose journal row is open.
+fn scan_open(
+    folder: &dyn Folder,
+    records: &dyn Records,
+    open: &dyn OpenRows,
+    now: i64,
+    hashers: usize,
+) -> (Vec<Event>, ScanReport) {
     let clock = move || at(now);
     let mut events = Vec::new();
     let report = Scan {
         id: id(),
         folder,
         records,
+        open,
         clock: &clock,
         hashers: NonZeroUsize::new(hashers).unwrap(),
     }
@@ -822,6 +834,7 @@ fn a_folder_deleted_while_it_is_scanned_is_not_a_mass_deletion() {
         id: id(),
         folder: &folder,
         records: &records,
+        open: &BTreeSet::new(),
         clock: &clock,
         hashers: NonZeroUsize::MIN,
     }
@@ -1106,10 +1119,12 @@ fn observe_at(folder: &dyn Folder, records: &dyn Records, path: &str, now: i64) 
     let fs = folder.open().unwrap();
     let clock = move || at(now);
     let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let open = BTreeSet::new();
     let observer = Observer {
         fs: &*fs,
         records,
         names: &names,
+        open: &open,
         clock: &clock,
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
     };
@@ -1211,10 +1226,12 @@ fn one_path_observed_alone_is_dated_by_its_stat() {
     let clock = || at(ticks.fetch_add(SECOND, std::sync::atomic::Ordering::SeqCst));
     let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
     let none: BTreeMap<RelPath, Entry> = BTreeMap::new();
+    let open = BTreeSet::new();
     let observer = Observer {
         fs: &*fs,
         records: &none,
         names: &names,
+        open: &open,
         clock: &clock,
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
     };
@@ -1225,6 +1242,73 @@ fn one_path_observed_alone_is_dated_by_its_stat() {
     // hash; the observation is the first.
     assert_eq!(taken, at(start));
     assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > start + SECOND);
+}
+
+/// §7.5, draft 64: a path with an open journal row, and everything
+/// beneath it, is reported `Skipped` and never looked at, whether it is on
+/// disk or not, until the row is resolved. Nothing is tombstoned for it.
+#[test]
+fn a_path_with_an_open_journal_row_is_skipped_until_it_is_resolved() {
+    let disk = Disk::new();
+    disk.file("a", b"a", OLD, false);
+    disk.dir("d");
+    disk.file("d/x", b"x", OLD, false);
+    disk.file("b", b"b", OLD, false);
+    let mut engine = engine();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    feed(&mut engine, events);
+
+    // A write displaced `a` and could not put it back; `d` holds a commit
+    // not yet known durable.
+    std::fs::remove_file(disk.at("a")).unwrap();
+    let open: BTreeSet<RelPath> = [p("a"), p("d")].into();
+    let spy = Spy::new(disk.root());
+    let (events, report) = scan_open(&spy, &index(&engine), &open, settled_now(), 4);
+    assert_eq!(
+        reports(&events),
+        [
+            (p("b"), ScanState::Unchanged),
+            (p("d"), skip(SkipReason::Io)),
+            (p("a"), skip(SkipReason::Io)),
+        ]
+    );
+    assert_eq!(report.skipped.get(&SkipReason::Io), Some(&2));
+    assert!(
+        spy.calls("dir.open_dir")
+            .iter()
+            .all(|d| !d.starts_with("d"))
+    );
+    assert!(spy.calls("dir.lstat").iter().all(|d| d != Path::new("d")));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+
+    // Observed alone, the same, beneath an open path too.
+    let fs = disk.folder().open().unwrap();
+    let clock = || at(settled_now());
+    let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let records = index(&engine);
+    let observer = Observer {
+        fs: &*fs,
+        records: &records,
+        names: &names,
+        open: &open,
+        clock: &clock,
+        sensitivity: Sensitivity::probe(&*fs).unwrap(),
+    };
+    assert_eq!(observer.observe(&p("a")).0, skip(SkipReason::Io));
+    assert_eq!(observer.observe(&p("d/x")).0, skip(SkipReason::Io));
+    assert_eq!(observer.observe(&p("b")).0, ScanState::Unchanged);
+
+    // Resolved: `a` is back, and both are seen as they are.
+    disk.file("a", b"a", OLD, false);
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events.clone()));
+    assert!(tombstoned.is_empty());
+    assert!(
+        reports(&events)
+            .iter()
+            .all(|(_, state)| *state == ScanState::Unchanged)
+    );
 }
 
 #[cfg(feature = "faults")]
