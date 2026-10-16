@@ -65,7 +65,8 @@
 //! found as `Skipped`, never `Absent`: a disk that is not mounted must not
 //! read as its files deleted (§7.3, the root guard). An fsync that fails
 //! after the rename does not undo a commit that has landed: the report is
-//! `Ok`, and the error is returned for the host to log.
+//! `Ok`, the error is returned for the host to log, and the journal row
+//! stays open, since the rename is not known to be durable.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -660,7 +661,14 @@ impl Commit<'_> {
             sync(Path::new(tmp::DIR));
         }
         incoming.finish(fs);
-        let mut writes = journal_rows(&displaced);
+        // The journal row goes once the rename is durable (§7.5). If an
+        // fsync failed, that is not known, and the row stays for the next
+        // start, which leaves an occupied path alone.
+        let mut writes = if unsynced.is_empty() {
+            journal_rows(&displaced)
+        } else {
+            Vec::new()
+        };
         writes.extend(self.stale_name(at.path));
         Ok(Done {
             at: now,
