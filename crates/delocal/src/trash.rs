@@ -572,7 +572,7 @@ fn original(row: &Path) -> Option<RelPath> {
 }
 
 /// BLAKE3 of the file at `path`, streamed.
-fn hash_file(fs: &dyn Fs, path: &Path) -> io::Result<ContentHash> {
+pub(crate) fn hash_file(fs: &dyn Fs, path: &Path) -> io::Result<ContentHash> {
     let mut file = fs.open_read(path)?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0; CHUNK];
