@@ -472,15 +472,23 @@ fn a_fault_at_any_step_never_loses_the_displaced_file() {
 }
 
 /// §7.5: the rename in fails, and so does putting the displaced file back.
-/// The journal row stays open, and the start's undo puts it back.
+/// The report carries `Skipped`, never `Absent`: the path is empty only
+/// because of this commit, and must not read as a local deletion. The
+/// journal row stays open. Either the next start's undo puts the file back,
+/// or, while the daemon runs, the next commit at the path does so before
+/// anything else.
 #[cfg(feature = "faults")]
 #[test]
-fn both_renames_failing_leave_the_undo_to_the_next_start() {
-    for scenario in [
-        Scenario::WriteOverFile,
-        Scenario::WriteToConflictCopy,
-        Scenario::WriteOverDirectory,
+fn both_renames_failing_strand_the_file_until_it_is_put_back() {
+    for (scenario, fail, restart) in [
+        (Scenario::WriteOverFile, Fault::Eio, true),
+        (Scenario::WriteOverFile, Fault::Enospc, false),
+        (Scenario::WriteToConflictCopy, Fault::Eio, false),
+        (Scenario::WriteToConflictCopy, Fault::Enospc, true),
+        (Scenario::WriteOverDirectory, Fault::Eio, true),
+        (Scenario::WriteOverDirectory, Fault::Eio, false),
     ] {
+        let what = format!("{scenario:?}, {fail:?}, restart {restart}");
         let disk = disk_for(scenario);
         let temp = Scenario::temp();
         let rules = vec![
@@ -488,53 +496,117 @@ fn both_renames_failing_leave_the_undo_to_the_next_start() {
                 op: Op::RenameNoreplace,
                 path: temp.to_str().unwrap().to_owned(),
                 at: Trigger::Call(1),
-                fail: Fault::Eio,
+                fail,
             },
-            // Putting it back renames to the path: its second rename on it.
+            // Putting it back renames to the path: its third rename on it.
             Rule {
                 op: Op::RenameNoreplace,
                 path: scenario.path().to_owned(),
                 at: Trigger::Call(3),
-                fail: Fault::Eio,
+                fail,
             },
         ];
         let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules }).unwrap();
         let (action, _) = scenario.action();
         let done = disk.commit_with(&faulty, &action, Some(&temp));
-        assert_eq!(faulty.injected().len(), 2, "{scenario:?}");
-        assert!(
-            matches!(
-                outcome(&done),
-                ApplyOutcome::Failed {
-                    error: LocalError::Io,
-                    found: ScanState::Absent
+        assert_eq!(faulty.injected().len(), 2, "{what}");
+        let error = if fail == Fault::Enospc {
+            LocalError::DiskFull
+        } else {
+            LocalError::Io
+        };
+        assert_eq!(
+            outcome(&done),
+            &ApplyOutcome::Failed {
+                error,
+                found: ScanState::Skipped {
+                    reason: SkipReason::Io
                 }
-            ),
-            "{scenario:?}: {:?}",
-            outcome(&done)
+            },
+            "{what}"
         );
-        let durable = disk.journal.taken();
-        let open = open_rows(&durable, &done.writes);
-        assert_eq!(open.len(), 1, "{scenario:?}");
-        assert!(
-            everything(&disk)
-                .iter()
-                .any(|c| c == scenario.precious().unwrap())
-        );
-
-        let undone = undo_rows(&disk, &open);
-        assert_eq!(undone.back, [p(scenario.path())]);
-        let mut rows = durable.clone();
+        let mut rows = disk.journal.taken();
         rows.extend(done.writes);
-        rows.extend(undone.writes);
-        rows_match_the_trash(&disk, &[], &rows).unwrap();
-        let found = folder_tree(&disk);
+        assert_eq!(open_rows(&rows, &[]).len(), 1, "{what}");
         let precious = scenario.precious().unwrap().to_vec();
-        assert!(
-            found.values().any(|seen| seen.content == precious),
-            "{scenario:?}: not back"
-        );
+        assert!(everything(&disk).contains(&precious), "{what}: lost");
+
+        if restart {
+            let undone = undo_rows(&disk, &open_rows(&rows, &[]));
+            assert_eq!(undone.back, [p(scenario.path())], "{what}");
+            rows.extend(undone.writes);
+            let found = folder_tree(&disk);
+            assert!(
+                found.values().any(|seen| seen.content == precious),
+                "{what}: not back"
+            );
+        } else {
+            // The engine retries the want: the file goes back first, and
+            // the commit then runs as it should have.
+            let again = disk.commit(&action, Some(&temp));
+            assert_eq!(outcome(&again), &ApplyOutcome::Ok, "{what}");
+            // The put-back's rows were made durable before the commit's
+            // own, which may reuse the place in the trash it left.
+            rows.extend(disk.journal.taken());
+            rows.extend(again.writes);
+            landed(&disk, scenario)
+                .map_err(|e| format!("{what}: {e}"))
+                .unwrap();
+            assert!(everything(&disk).contains(&precious), "{what}: lost");
+        }
+        assert!(open_rows(&rows, &[]).is_empty(), "{what}: a row left open");
+        rows_match_the_trash(&disk, &[], &rows)
+            .map_err(|e| format!("{what}: {e}"))
+            .unwrap();
     }
+}
+
+/// While a stranded file cannot be put back, no commit at its path goes
+/// ahead, and each reports `Skipped`.
+#[cfg(feature = "faults")]
+#[test]
+fn a_stranded_file_blocks_its_path_until_it_is_put_back() {
+    let scenario = Scenario::WriteOverFile;
+    let disk = disk_for(scenario);
+    let temp = Scenario::temp();
+    let rules = vec![
+        Rule {
+            op: Op::RenameNoreplace,
+            path: temp.to_str().unwrap().to_owned(),
+            at: Trigger::Call(1),
+            fail: Fault::Eio,
+        },
+        // Every rename back to the path fails from the third on.
+        Rule {
+            op: Op::RenameNoreplace,
+            path: scenario.path().to_owned(),
+            at: Trigger::FromCall(3),
+            fail: Fault::Eio,
+        },
+    ];
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules }).unwrap();
+    let (action, _) = scenario.action();
+    let skipped = ApplyOutcome::Failed {
+        error: LocalError::Io,
+        found: ScanState::Skipped {
+            reason: SkipReason::Io,
+        },
+    };
+    assert_eq!(
+        outcome(&disk.commit_with(&faulty, &action, Some(&temp))),
+        &skipped
+    );
+    let again = disk.commit_with(&faulty, &action, Some(&temp));
+    assert_eq!(outcome(&again), &skipped);
+    assert!(again.writes.is_empty(), "the row stays open");
+    // A delete there waits too: nothing at the path is the user's yet.
+    let done = disk.commit_with(
+        &faulty,
+        &remove(scenario.path(), None, Displace::Trash),
+        None,
+    );
+    assert_eq!(outcome(&done), &skipped);
+    assert!(everything(&disk).contains(&OLD_CONTENT.to_vec()));
 }
 
 /// The folder id and a store with the folder in it, for a journal that
