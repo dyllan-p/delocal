@@ -338,6 +338,19 @@ fn pruning_takes_what_is_old_then_the_oldest_past_the_cap() {
     // Within the policy nothing goes.
     let pruned = prune(&*fs, folder_id(), &rows[2..], at(now), policy);
     assert!(pruned.writes.is_empty());
+
+    // Age alone, well under the size: only the old entry goes.
+    let small = [
+        row("2026-10-15/aged", NOON, 1),
+        row("2026-11-11/fresh", NOON + 39 * DAY, 1),
+    ];
+    for r in &small {
+        let at = root.join(DIR).join(&r.trashed_path);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, "x").unwrap();
+    }
+    let pruned = prune(&*fs, folder_id(), &small, at(now), policy);
+    assert_eq!(removed(&pruned.writes), [PathBuf::from("2026-10-15/aged")]);
 }
 
 #[test]

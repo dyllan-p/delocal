@@ -152,20 +152,44 @@ fn disk_for(scenario: Scenario) -> Disk {
     disk
 }
 
-/// Everything outside `.delocal`, path by path: kind and content.
-fn folder_tree(disk: &Disk) -> BTreeMap<PathBuf, (bool, Vec<u8>)> {
-    fn walk(root: &Path, rel: &Path, out: &mut BTreeMap<PathBuf, (bool, Vec<u8>)>) {
+/// What a test sees of an entry: a directory, or a file's content, mode
+/// and mtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Seen {
+    dir: bool,
+    content: Vec<u8>,
+    mode: u32,
+    mtime_ns: i64,
+}
+
+/// Everything outside `.delocal`, path by path, with each file's mode and
+/// mtime: a failure must leave all of it as it found it.
+fn folder_tree(disk: &Disk) -> BTreeMap<PathBuf, Seen> {
+    fn walk(root: &Path, rel: &Path, out: &mut BTreeMap<PathBuf, Seen>) {
         for entry in std::fs::read_dir(root.join(rel)).unwrap() {
             let entry = entry.unwrap();
             let rel = rel.join(entry.file_name());
             if rel == Path::new(RESERVED_DIR) {
                 continue;
             }
-            if entry.file_type().unwrap().is_dir() {
-                out.insert(rel.clone(), (true, Vec::new()));
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            if meta.is_dir() {
+                let seen = Seen {
+                    dir: true,
+                    content: Vec::new(),
+                    mode: 0,
+                    mtime_ns: 0,
+                };
+                out.insert(rel.clone(), seen);
                 walk(root, &rel, out);
             } else {
-                out.insert(rel, (false, std::fs::read(entry.path()).unwrap()));
+                let seen = Seen {
+                    dir: false,
+                    content: std::fs::read(entry.path()).unwrap(),
+                    mode: meta.mode() & 0o7777,
+                    mtime_ns: meta.mtime() * SECOND + meta.mtime_nsec(),
+                };
+                out.insert(rel, seen);
             }
         }
     }
@@ -178,8 +202,8 @@ fn folder_tree(disk: &Disk) -> BTreeMap<PathBuf, (bool, Vec<u8>)> {
 fn everything(disk: &Disk) -> Vec<Vec<u8>> {
     let mut all: Vec<Vec<u8>> = folder_tree(disk)
         .into_values()
-        .filter(|(dir, _)| !dir)
-        .map(|(_, bytes)| bytes)
+        .filter(|seen| !seen.dir)
+        .map(|seen| seen.content)
         .collect();
     all.extend(disk.trash());
     all
@@ -274,12 +298,51 @@ fn landed(disk: &Disk, scenario: Scenario) -> Result<(), String> {
     }
 }
 
-/// The calls a clean run of `scenario` makes, with all their paths.
+/// The step a journal write is, among a commit's calls.
+const JOURNAL: &str = "journal.durable";
+
+/// A journal whose writes are steps of the commit like its filesystem
+/// calls: each is marked on a Spy just before it is made durable, so a hook
+/// (the kill) can land on it, and the `fail_at`th can be made to fail.
+struct StepJournal<'a> {
+    inner: &'a dyn Journal,
+    spy: Option<&'a Spy>,
+    fail_at: Option<usize>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> StepJournal<'a> {
+    fn new(inner: &'a dyn Journal, spy: Option<&'a Spy>, fail_at: Option<usize>) -> Self {
+        Self {
+            inner,
+            spy,
+            fail_at,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Journal for StepJournal<'_> {
+    fn durable(&self, writes: Vec<HostWrite>) -> io::Result<()> {
+        if let Some(spy) = self.spy {
+            spy.mark(JOURNAL);
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_at == Some(n) {
+            return Err(io::Error::other("the journal failed"));
+        }
+        self.inner.durable(writes)
+    }
+}
+
+/// The steps a clean run of `scenario` makes: its filesystem calls with all
+/// their paths, and its journal writes.
 fn steps(scenario: Scenario) -> Vec<(&'static str, Vec<PathBuf>)> {
     let disk = disk_for(scenario);
     let spy = Spy::new(disk.root());
+    let journal = StepJournal::new(&disk.journal, Some(&spy), None);
     let (action, temp) = scenario.action();
-    let done = disk.commit_with(&spy, &action, temp.as_deref());
+    let done = disk.commit_through(&spy, &journal, &action, temp.as_deref());
     assert_eq!(outcome(&done), &ApplyOutcome::Ok, "{scenario:?}");
     spy.steps()
 }
@@ -319,7 +382,7 @@ fn rule_at(steps: &[(&'static str, Vec<PathBuf>)], k: usize, fail: Fault) -> Rul
     let pattern = paths[0].clone();
     let matching = steps[..=k]
         .iter()
-        .filter(|(n, ps)| op(n) == op(name) && ps.contains(&pattern))
+        .filter(|(n, ps)| *n != JOURNAL && op(n) == op(name) && ps.contains(&pattern))
         .count();
     Rule {
         op: op(name),
@@ -341,13 +404,22 @@ fn a_fault_at_any_step_never_loses_the_displaced_file() {
                 tried += 1;
                 let disk = disk_for(scenario);
                 let before = folder_tree(&disk);
-                let rule = rule_at(&steps, k, fail);
                 let what = format!("{scenario:?}, step {k} {:?}, {fail:?}", steps[k]);
-                let faulty =
-                    FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] }).unwrap();
                 let (action, temp) = scenario.action();
-                let done = disk.commit_with(&faulty, &action, temp.as_deref());
-                assert_eq!(faulty.injected().len(), 1, "{what}: the fault did not fire");
+                let done = if steps[k].0 == JOURNAL {
+                    // The journal write fails: the nth of the commit's.
+                    let nth = steps[..k].iter().filter(|(n, _)| *n == JOURNAL).count();
+                    let journal = StepJournal::new(&disk.journal, None, Some(nth));
+                    disk.commit_through(&disk.folder(), &journal, &action, temp.as_deref())
+                } else {
+                    let rule = rule_at(&steps, k, fail);
+                    let faulty =
+                        FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] })
+                            .unwrap();
+                    let done = disk.commit_with(&faulty, &action, temp.as_deref());
+                    assert_eq!(faulty.injected().len(), 1, "{what}: the fault did not fire");
+                    done
+                };
                 let durable = disk.journal.taken();
 
                 if let Some(precious) = scenario.precious() {
@@ -374,7 +446,8 @@ fn a_fault_at_any_step_never_loses_the_displaced_file() {
                         // could not look at all (the root, its marker):
                         // that is `Io`, carrying `Skipped`.
                         let blind = matches!(found, ScanState::Skipped { .. });
-                        let expected = if fail == Fault::Enospc && !blind {
+                        let journal = steps[k].0 == JOURNAL;
+                        let expected = if fail == Fault::Enospc && !blind && !journal {
                             LocalError::DiskFull
                         } else {
                             LocalError::Io
@@ -458,7 +531,7 @@ fn both_renames_failing_leave_the_undo_to_the_next_start() {
         let found = folder_tree(&disk);
         let precious = scenario.precious().unwrap().to_vec();
         assert!(
-            found.values().any(|(_, c)| *c == precious),
+            found.values().any(|seen| seen.content == precious),
             "{scenario:?}: not back"
         );
     }
@@ -515,10 +588,12 @@ fn kill_child() {
     });
     let writer = Store::open(Path::new(&db)).unwrap().writer().unwrap();
     let clock = settled_now;
-    let journal = StoreJournal {
+    let store = StoreJournal {
         writer: &writer,
         clock: &clock,
     };
+    // Its writes are steps too, so the kill can land just before one.
+    let journal = StepJournal::new(&store, Some(&spy), None);
     let fs = RealFolder::new(&root).open().unwrap();
     let state = DiskState::knowing(Sensitivity::probe(&*fs).unwrap());
     drop(fs);
