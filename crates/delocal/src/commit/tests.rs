@@ -1234,6 +1234,12 @@ fn row(path: &str, to: &Path) -> JournalRow {
     }
 }
 
+/// The temp file [`row`] names, as a commit whose rename never happened
+/// leaves it (draft 65).
+fn unrenamed(disk: &Disk) {
+    std::fs::write(disk.at(tmp::DIR).join("t"), "fetched").unwrap();
+}
+
 fn undo_rows(disk: &Disk, rows: &[JournalRow]) -> journal::Undone {
     let fs = disk.folder().open().unwrap();
     undo(&*fs, folder_id(), rows, &disk.names)
@@ -1253,8 +1259,10 @@ fn the_journal_undoes_a_displacement_into_an_empty_path_only() {
     };
     std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
 
-    // The crash came between the two renames: the path is empty, and what
-    // was displaced comes back out of the trash, losing its trash row.
+    // The crash came between the two renames: the path is empty, the temp
+    // file is still there, and what was displaced comes back out of the
+    // trash, losing its trash row.
+    unrenamed(&disk);
     std::fs::write(disk.at(in_trash.to_str().unwrap()), "displaced").unwrap();
     let undone = undo_rows(&disk, &[row("a", &in_trash)]);
     assert_eq!(undone.back, [p("a")]);
@@ -1303,6 +1311,7 @@ fn the_journal_undoes_a_displacement_into_an_empty_path_only() {
 #[test]
 fn an_undo_that_cannot_look_keeps_its_row() {
     let disk = Disk::new();
+    unrenamed(&disk);
     disk.dir("dir");
     let in_trash = Path::new(trash::DIR).join("2026-10-15/f");
     std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
@@ -1343,6 +1352,7 @@ fn an_undo_that_cannot_look_keeps_its_row() {
 #[test]
 fn a_row_the_start_cannot_undo_keeps_its_path_skipped() {
     let disk = Disk::new();
+    unrenamed(&disk);
     disk.dir("dir");
     let in_trash = Path::new(trash::DIR).join("2026-10-15/f");
     std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
@@ -1392,6 +1402,65 @@ fn a_row_the_start_cannot_undo_keeps_its_path_skipped() {
     ));
 }
 
+/// Draft 65: a row whose temp file is gone belongs to a commit that
+/// landed. Its directories are synced and the row dropped; the displaced
+/// file stays where it went, whether the path still holds what landed or
+/// the user has since deleted it, and nothing is put back over either.
+#[test]
+fn the_journal_drops_the_row_of_a_commit_that_landed() {
+    let disk = Disk::new();
+    let in_trash = Path::new(trash::DIR).join("2026-10-15/a");
+    std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
+    std::fs::write(disk.at(in_trash.to_str().unwrap()), "old").unwrap();
+    let journal_row = HostWrite::RemoveJournal {
+        folder: folder_id(),
+        path: p("a"),
+    };
+    for present in [true, false] {
+        if present {
+            std::fs::write(disk.at("a"), "landed").unwrap();
+        } else {
+            std::fs::remove_file(disk.at("a")).unwrap();
+        }
+        let undone = undo_rows(&disk, &[row("a", &in_trash)]);
+        assert_eq!(undone.landed, [p("a")]);
+        assert!(undone.back.is_empty() && undone.left.is_empty());
+        assert_eq!(
+            undone.writes,
+            std::slice::from_ref(&journal_row),
+            "the trash row stays"
+        );
+        assert_eq!(disk.exists("a"), present);
+        assert_eq!(disk.trash(), [b"old".to_vec()]);
+    }
+}
+
+/// Draft 65 at a later resolve: a row the start could not undo, whose temp
+/// file is gone by the time it is resolved, belongs to a commit that
+/// landed, and is dropped rather than put back.
+#[test]
+fn a_resolve_drops_the_row_of_a_commit_that_landed() {
+    let disk = Disk::new();
+    disk.dir("dir");
+    let in_trash = Path::new(trash::DIR).join("2026-10-15/f");
+    std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
+    std::fs::write(disk.at(in_trash.to_str().unwrap()), "old").unwrap();
+    let temp = PathBuf::from(tmp::DIR).join("gone");
+    disk.state
+        .keep_displaced(p("dir/f"), in_trash.clone(), "dir/f".into(), Some(temp));
+    let resolved = disk.resolve(&disk.folder());
+    assert_eq!(resolved.resolved, [p("dir/f")]);
+    assert!(!disk.exists("dir/f"), "nothing put back");
+    assert_eq!(disk.trash(), [b"old".to_vec()]);
+    assert_eq!(
+        disk.journal.taken(),
+        [HostWrite::RemoveJournal {
+            folder: folder_id(),
+            path: p("dir/f")
+        }]
+    );
+}
+
 /// What a test tree holds at `path`: a file's content, a directory, or
 /// nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1422,17 +1491,22 @@ use proptest::prelude::*;
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// §7.5, draft 36: whatever is at the path and at the displacement's
-    /// target when the daemon starts, the undo replaces nothing. What was
-    /// at the path is still there, and what was displaced is at the path
-    /// or still where it was put.
+    /// §7.5, drafts 36 and 65: whatever is at the path and at the
+    /// displacement's target when the daemon starts, and whether the rename
+    /// happened, the undo replaces nothing. What was at the path is still
+    /// there, and what was displaced is at the path or still where it was
+    /// put; after a rename, it is left where it was put.
     #[test]
     fn the_journal_undo_never_replaces_anything(
         at_path in arb_held(),
         displaced in arb_held(),
         to_trash in any::<bool>(),
+        renamed in any::<bool>(),
     ) {
         let disk = Disk::new();
+        if !renamed {
+            unrenamed(&disk);
+        }
         let to = if to_trash {
             Path::new(trash::DIR).join("2026-10-15/x")
         } else {
@@ -1455,7 +1529,12 @@ proptest! {
 
         let undone = undo_rows(&disk, &[row("x", &to)]);
         prop_assert!(undone.failed.is_empty());
-        if at_path != Held::Nothing {
+        if renamed && displaced != Held::Nothing {
+            // The commit landed (draft 65): nothing moves at all.
+            prop_assert_eq!(&undone.landed, &[p("x")]);
+            prop_assert_eq!(held(&disk, "x"), at_path);
+            prop_assert_eq!(held(&disk, to_str), displaced);
+        } else if at_path != Held::Nothing {
             prop_assert_eq!(held(&disk, "x"), at_path);
             prop_assert_eq!(inner_of("x"), inner_at);
             prop_assert_eq!(held(&disk, to_str), displaced);

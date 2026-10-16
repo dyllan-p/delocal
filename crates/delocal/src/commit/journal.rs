@@ -14,12 +14,19 @@
 //! for the fetch to resume (§7.5); the engine's commit did not survive the
 //! restart, so it fetches and commits again.
 //!
+//! It undoes only a commit whose rename never happened (draft 65), told by
+//! whether the row's temp file is still there, since a rename consumes it.
+//! A row whose temp file is gone belongs to a commit that landed, its
+//! report or its sync lost: its directories are synced and the row dropped,
+//! and the displaced file stays where the commit put it, rather than come
+//! back over a newer version or over the user's deletion of it.
+//!
 //! A displacement to the trash makes its trash row durable with the journal
 //! row ([`crate::trash`]), so a file that stays in the trash after an undo
 //! keeps its row, and one that comes back loses it.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use delocal_engine::{FolderId, RelPath};
 
@@ -71,9 +78,43 @@ pub struct Undone {
     /// Paths that were occupied, or could not be reached, so their
     /// displaced file stayed where the commit put it.
     pub left: Vec<RelPath>,
+    /// Paths whose commit had landed (its temp file was gone, draft 65):
+    /// made durable and dropped, the displaced file left where it went.
+    pub landed: Vec<RelPath>,
+    /// Paths whose commit had landed but whose directories could not be
+    /// synced, with them: the row stays, for the host to resolve later.
+    pub unsynced: Vec<(RelPath, Vec<PathBuf>, io::Error)>,
     /// Rows that could not be undone for an error other than the path
     /// being occupied; they stay, and the next start tries again.
     pub failed: Vec<(RelPath, io::Error)>,
+}
+
+/// The directories a landed commit's renames changed: the path's parent
+/// and where its displaced file went.
+pub(crate) fn landed_dirs(disk: &Path, displaced_to: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![disk.parent().unwrap_or(Path::new("")).to_path_buf()];
+    let to = displaced_to.parent().unwrap_or(Path::new("")).to_path_buf();
+    if !dirs.contains(&to) {
+        dirs.push(to);
+    }
+    dirs
+}
+
+/// Make a landed commit's directories durable. One that is gone, or is no
+/// longer a directory, has nothing left to make durable.
+pub(crate) fn sync_landed(fs: &dyn Fs, dirs: &[PathBuf]) -> io::Result<()> {
+    for dir in dirs {
+        match fs.sync_dir(dir) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// Undo every open row of `folder`'s commit journal, `rows`, at daemon
@@ -122,6 +163,32 @@ pub fn undo(fs: &dyn Fs, folder: FolderId, rows: &[JournalRow], names: &dyn Disk
             }
         }
         let disk = reach::disk_path(&row.path, names);
+        // Draft 65: a rename consumes the row's temp file, so a temp file
+        // that is gone means the commit landed, its report or its sync lost.
+        // Only a rename that never happened is undone: a landed one is made
+        // durable and its row dropped, its displaced file left where it
+        // went. A row with no temp file (a directory made in place) cannot
+        // be told this way, and is undone into an empty path as before.
+        if let Some(temp) = &row.temp_file {
+            match fs.lstat(temp) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    let dirs = landed_dirs(&disk, &row.displaced_to);
+                    match sync_landed(fs, &dirs) {
+                        Ok(()) => {
+                            undone.writes.push(gone);
+                            undone.landed.push(row.path.clone());
+                        }
+                        Err(e) => undone.unsynced.push((row.path.clone(), dirs, e)),
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    undone.failed.push((row.path.clone(), e));
+                    continue;
+                }
+            }
+        }
         let moved = match reach::walk(fs, &row.path, &disk, device) {
             Ok(Walk::Reached) => rename_refusing(fs, &row.displaced_to, &disk),
             // The parent went, or is not a directory: there is no empty
