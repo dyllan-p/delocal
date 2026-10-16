@@ -431,10 +431,25 @@ fn a_fault_at_any_step_never_loses_the_displaced_file() {
                 rows_match_the_trash(&disk, &durable, &done.writes)
                     .map_err(|e| format!("{what}: {e}"))
                     .unwrap();
-                assert!(
-                    open_rows(&durable, &done.writes).is_empty(),
-                    "{what}: a journal row left open"
+                // A row stays open only where the rename landed and an
+                // fsync after it failed: it is not known to be durable.
+                let unsure = *outcome(&done) == ApplyOutcome::Ok && !done.unsynced.is_empty();
+                let open = open_rows(&durable, &done.writes);
+                let displaces = matches!(
+                    scenario,
+                    Scenario::WriteOverFile
+                        | Scenario::WriteToConflictCopy
+                        | Scenario::WriteOverDirectory
                 );
+                assert_eq!(!open.is_empty(), unsure && displaces, "{what}: {open:?}");
+                if !open.is_empty() {
+                    // The next start leaves the landed commit alone.
+                    let undone = undo_rows(&disk, &open);
+                    assert_eq!(undone.left, [p(scenario.path())], "{what}");
+                    landed(&disk, scenario)
+                        .map_err(|e| format!("{what}: {e}"))
+                        .unwrap();
+                }
                 match outcome(&done) {
                     // A fault the commit could carry on past (an fsync after
                     // the rename in, the trash row's size): it landed.
