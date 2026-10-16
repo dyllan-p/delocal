@@ -391,3 +391,47 @@ fn reconciling_adopts_orphans_and_drops_rows_whose_entry_is_gone() {
     };
     assert_eq!(writes, expected);
 }
+
+#[test]
+fn the_free_number_is_found_by_galloping() {
+    use std::cell::Cell;
+    let looks = Cell::new(0u32);
+    let below = |k: u32| move |n: u32| -> io::Result<bool> { Ok(n < k) };
+    for k in [0, 1, 2, 3, 7, 8, 9, 1000, 4097] {
+        let taken = below(k);
+        let counted = |n: u32| {
+            looks.set(looks.get() + 1);
+            taken(n)
+        };
+        looks.set(0);
+        assert_eq!(free_number(&counted, 0).unwrap(), k);
+        assert!(
+            looks.get() <= 2 * (32 - k.leading_zeros()) + 2,
+            "{k}: {}",
+            looks.get()
+        );
+    }
+    // From a later number, and with a gap: some free number, at or after.
+    assert_eq!(free_number(&below(10), 4).unwrap(), 10);
+    let gap = |n: u32| -> io::Result<bool> { Ok(n != 5 && n < 20) };
+    let found = free_number(&gap, 0).unwrap();
+    assert!(!gap(found).unwrap());
+}
+
+#[test]
+fn a_name_trashed_many_times_a_day_keeps_numbering_in_order() {
+    let (tmp, fs) = folder();
+    let root = tmp.path();
+    let original = p("log.txt");
+    for i in 0..40u8 {
+        std::fs::write(root.join("victim"), [i]).unwrap();
+        let what = moving(&original, &[i], NOON);
+        let moved = move_in(&*fs, Path::new("victim"), &what, &mut |_| Ok(())).unwrap();
+        let expected = if i == 0 {
+            "2026-10-15/log.txt".to_owned()
+        } else {
+            format!("2026-10-15/log~{i}.txt")
+        };
+        assert_eq!(moved.place.row, Path::new(&expected));
+    }
+}

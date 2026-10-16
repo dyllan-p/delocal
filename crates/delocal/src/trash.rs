@@ -193,22 +193,31 @@ pub fn move_in(
     let day = day(what.at);
     let parent = parents(fs, &day, what.original).map_err(NotMoved::Failed)?;
     let name = what.original.file_name();
-    for n in 0.. {
-        let candidate = numbered(name, what.kind, n);
-        let row = parent.join(&candidate);
-        let place = Place {
+    let place = |n: u32| {
+        let row = parent.join(numbered(name, what.kind, n));
+        Place {
             disk: Path::new(DIR).join(&row),
             row,
-        };
-        match fs.lstat(&place.disk) {
-            Ok(_) => continue,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(NotMoved::Failed(e)),
         }
+    };
+    let taken = |n: u32| match fs.lstat(&place(n).disk) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    };
+    let mut from_n = 0;
+    loop {
+        let n = free_number(&taken, from_n).map_err(NotMoved::Failed)?;
+        let place = place(n);
         before(&place).map_err(NotMoved::Failed)?;
         match rename_refusing(fs, from, &place.disk) {
             Ok(refusing) => return Ok(Moved { place, refusing }),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            // Taken in the window: look on from the next number.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                from_n = n.checked_add(1).ok_or_else(|| {
+                    NotMoved::Failed(io::Error::other("no free name in the trash"))
+                })?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 // The trash's own directories were made just now, so what
                 // is missing is the entry.
@@ -220,9 +229,40 @@ pub fn move_in(
             Err(e) => return Err(NotMoved::Failed(e)),
         }
     }
-    Err(NotMoved::Failed(io::Error::other(
-        "no free name in the trash",
-    )))
+}
+
+/// A number at or after `from` whose name is not `taken`: the lowest, if
+/// the taken numbers from `from` on have no gaps, which they do not unless
+/// something was removed from a day's trash by hand; any free number makes
+/// a valid name. It gallops (1, 2, 4, …) to a free number and then halves
+/// back to the first, so a name trashed thousands of times in a day costs
+/// a few dozen `lstat`s, not thousands.
+fn free_number(taken: &dyn Fn(u32) -> io::Result<bool>, from: u32) -> io::Result<u32> {
+    if !taken(from)? {
+        return Ok(from);
+    }
+    // `low` is taken; find a free `high` above it.
+    let (mut low, mut step) = (from, 1u32);
+    let mut high = loop {
+        let candidate = low
+            .checked_add(step)
+            .ok_or_else(|| io::Error::other("no free name in the trash"))?;
+        if !taken(candidate)? {
+            break candidate;
+        }
+        low = candidate;
+        step = step.saturating_mul(2);
+    };
+    // The first free number in (low, high], as far as halving can tell.
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        if taken(mid)? {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Ok(high)
 }
 
 /// Make the directories an entry from `original` goes into, under the
