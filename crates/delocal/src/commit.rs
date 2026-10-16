@@ -69,7 +69,7 @@
 //! stays open, since the rename is not known to be durable.
 
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -82,8 +82,12 @@ use delocal_engine::{
     Observed, RelPath, ScanState, SkipReason, Timestamp, Version,
 };
 
-use crate::fs::{FileKind, Folder, Fs, NotAFile, ParentNotADirectory, Refusing, rename_refusing};
+use crate::fs::{
+    FileKind, Folder, Fs, NotAFile, ParentNotADirectory, Refusing, Stat, rename_refusing,
+};
+use crate::names::{self, IndexName, Name};
 use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
+use crate::scan::ignore_rules::{IgnoreRules, RuleSource};
 use crate::scan::{Clock, MARKER, Observer, OpenRows, Records};
 use crate::store::{HostWrite, JournalRow, TrashRow};
 use crate::tmp;
@@ -226,6 +230,10 @@ pub struct Committed {
     /// Fsyncs that failed after the commit had landed: it is reported
     /// `Ok`, but whether it survives a power loss is not known.
     pub unsynced: Vec<io::Error>,
+    /// The files a user rule ignores inside a directory this commit was to
+    /// remove, which it therefore did not remove (§7.3, draft 64): `status`
+    /// names them.
+    pub holds_ignored: Vec<RelPath>,
 }
 
 /// The commit an action asks for, in the host's terms.
@@ -255,6 +263,12 @@ enum Fail {
     Changed,
     /// `Failed`.
     Local(LocalError),
+    /// A directory to be removed holds files a user rule ignores (§7.3,
+    /// draft 64): nothing was removed, and these are the files, which
+    /// `status` names. The engine has no want state for this yet, so it is
+    /// reported as `ChangedUnderneath`, as any directory found not empty,
+    /// and the delete waits for the next observation of the directory.
+    HoldsIgnored(Vec<RelPath>),
     /// `Failed`, and what the host found is not to be trusted as an
     /// observation, so the report carries `Skipped` for `reason`: the root
     /// guard failed (§7.3), the path is beneath a mount point (draft 48), or
@@ -373,12 +387,17 @@ impl Commit<'_> {
             _ => return None,
         };
         let trashed = matches!(op, Op::MoveToTrash { .. });
+        let mut holds_ignored = Vec::new();
         let (outcome, at, done) = match self.attempt(path, &op, temp) {
             Ok(done) => (ApplyOutcome::Ok, done.at, done),
             Err(failed) => {
                 let (found, at) = self.found(path, &failed.fail);
                 let outcome = match failed.fail {
                     Fail::Changed => ApplyOutcome::ChangedUnderneath { found },
+                    Fail::HoldsIgnored(files) => {
+                        holds_ignored = files;
+                        ApplyOutcome::ChangedUnderneath { found }
+                    }
                     Fail::Local(error) => ApplyOutcome::Failed { error, found },
                     Fail::Blind { error, .. } => ApplyOutcome::Failed { error, found },
                 };
@@ -423,6 +442,7 @@ impl Commit<'_> {
             writes: done.writes,
             created: done.created,
             unsynced: done.unsynced,
+            holds_ignored,
         })
     }
 
@@ -996,7 +1016,7 @@ impl Commit<'_> {
         let mut writes = Vec::new();
         let to = match (seen.kind, displace) {
             (Kind::Dir, Displace::Trash) => {
-                fs.remove_dir(&disk).map_err(|e| changed_or_local(&e))?;
+                writes.extend(self.remove_dir(at, &disk)?);
                 None
             }
             (_, Displace::ConflictCopy(copy)) => {
@@ -1009,7 +1029,7 @@ impl Commit<'_> {
                 Some(to)
             }
             (Kind::File | Kind::Symlink, Displace::Trash) => {
-                let place = self.trash(at, &disk, &seen, hash)?;
+                let place = self.trash(at, at.path, &disk, seen.kind, hash, seen.size)?;
                 writes.push(HostWrite::PutTrash {
                     folder: self.id,
                     row: place.1,
@@ -1034,21 +1054,23 @@ impl Commit<'_> {
         })
     }
 
-    /// Move the file or symlink at `disk` into the trash, unjournalled:
-    /// one rename leaves the path absent, which is what the commit is for.
-    /// Returns where it went and its row.
+    /// Move what is at `disk`, the index path `original`, into the trash,
+    /// unjournalled: one rename leaves the path absent, which is what the
+    /// commit is for. Returns where it went and its row.
     fn trash(
         &self,
         at: &At<'_>,
+        original: &RelPath,
         disk: &Path,
-        seen: &Observed,
+        kind: Kind,
         hash: ContentHash,
+        size: u64,
     ) -> Result<(PathBuf, TrashRow), Fail> {
         let what = Moving {
-            original: at.path,
-            kind: seen.kind,
+            original,
+            kind,
             hash,
-            size: seen.size,
+            size,
             at: self.clock.now(),
         };
         match trash::move_in(at.fs, disk, &what, &mut |_| Ok(())) {
@@ -1059,6 +1081,98 @@ impl Commit<'_> {
             }
             Err(NotMoved::Gone) => Err(Fail::Changed),
             Err(NotMoved::Failed(e)) => Err(changed_or_local(&e)),
+        }
+    }
+
+    /// Remove the directory at `disk`, the commit's path, which is to be
+    /// removed (§7.5 "Deletes", §8.3, drafts 61 and 64): only when it is
+    /// empty, except that what only the default rules ignore inside (a
+    /// `.DS_Store`, an editor's swap file) goes to the trash first. Anything
+    /// else inside stops it: an entry no rule ignores is `ChangedUnderneath`,
+    /// as before, and a file a user rule ignores is [`Fail::HoldsIgnored`],
+    /// with nothing moved. Returns the trash rows of what went.
+    fn remove_dir(&self, at: &At<'_>, disk: &Path) -> Result<Vec<HostWrite>, Failed> {
+        let fs = at.fs;
+        match fs.remove_dir(disk) {
+            Ok(()) => return Ok(Vec::new()),
+            Err(e) if not_empty(&e) => {}
+            Err(e) => return Err(changed_or_local(&e).into()),
+        }
+        let mut writes = Vec::new();
+        for (name, index, stat) in self.holds(at, disk)? {
+            let child = disk.join(&name);
+            let (kind, hash, size) = match stat.kind {
+                FileKind::File => {
+                    let hash = trash::hash_file(fs, &child).map_err(|e| changed_or_local(&e))?;
+                    (Kind::File, hash, stat.size)
+                }
+                FileKind::Symlink => {
+                    let target = fs.read_link(&child).map_err(|e| changed_or_local(&e))?;
+                    let hash = crate::scan::hash::hash_target(target.as_os_str().as_bytes());
+                    (Kind::Symlink, hash, stat.size)
+                }
+                FileKind::Dir => {
+                    // Never a disk mounted there (draft 48).
+                    if stat.dev != at.device {
+                        return Err(Fail::Local(LocalError::Io).into());
+                    }
+                    refuse_mounts(at, &child)?;
+                    let size = trash::size_of(fs, &child, at.device);
+                    (Kind::Dir, ContentHash::EMPTY, size)
+                }
+                FileKind::Other => return Err(Fail::Changed.into()),
+            };
+            match self.trash(at, &index, &child, kind, hash, size) {
+                Ok((_, row)) => writes.push(HostWrite::PutTrash {
+                    folder: self.id,
+                    row,
+                }),
+                Err(fail) => return Err(Failed { fail, writes }),
+            }
+        }
+        match fs.remove_dir(disk) {
+            Ok(()) => Ok(writes),
+            Err(e) => Err(Failed {
+                fail: changed_or_local(&e),
+                writes,
+            }),
+        }
+    }
+
+    /// What the directory at `disk`, the commit's path, holds, when every
+    /// entry in it is ignored by the default rules: those entries, by name
+    /// on disk, index path and `stat`. A file a user rule ignores is
+    /// [`Fail::HoldsIgnored`], listing every such file; an entry no rule
+    /// ignores, or one with no index path, is `ChangedUnderneath`; rules
+    /// that cannot be read leave nothing to tell by, and are too.
+    fn holds(&self, at: &At<'_>, disk: &Path) -> Result<Vec<(OsString, RelPath, Stat)>, Fail> {
+        let fs = at.fs;
+        let rules = fs
+            .open_dir(Path::new(""))
+            .and_then(|root| IgnoreRules::read(&*root))
+            .map_err(|_| Fail::Changed)?;
+        let listed = fs.read_dir(disk).map_err(|e| changed_or_local(&e))?;
+        let mut defaults = Vec::new();
+        let mut users = Vec::new();
+        for name in listed {
+            let Name::Path(IndexName { path, .. }) = names::name(Some(at.path), &name) else {
+                return Err(Fail::Changed);
+            };
+            let stat = match fs.lstat(&disk.join(&name)) {
+                Ok(stat) => stat,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(changed_or_local(&e)),
+            };
+            match rules.source(&path, stat.kind == FileKind::Dir) {
+                Some(RuleSource::Default) => defaults.push((name, path, stat)),
+                Some(RuleSource::User) => users.push(path),
+                None => return Err(Fail::Changed),
+            }
+        }
+        if users.is_empty() {
+            Ok(defaults)
+        } else {
+            Err(Fail::HoldsIgnored(users))
         }
     }
 
@@ -1119,10 +1233,11 @@ impl Commit<'_> {
         let mut writes = Vec::new();
         let mut dirs = vec![at.parent.clone()];
         if seen.kind == Kind::Dir {
-            // Only an empty directory, which `rmdir` alone guarantees.
-            fs.remove_dir(&disk).map_err(|e| changed_or_local(&e))?;
+            // Only an empty directory, but for what only the defaults
+            // ignore (draft 61, draft 64).
+            writes.extend(self.remove_dir(at, &disk)?);
         } else {
-            let (to, row) = self.trash(at, &disk, &seen, expected.hash)?;
+            let (to, row) = self.trash(at, at.path, &disk, seen.kind, expected.hash, seen.size)?;
             dirs.extend(to.parent().map(Path::to_path_buf));
             writes.push(HostWrite::PutTrash {
                 folder: self.id,
@@ -1433,6 +1548,15 @@ fn changed_or_local(e: &io::Error) -> Fail {
     } else {
         Fail::Local(local(e))
     }
+}
+
+/// Whether `rmdir` refused for a directory not being empty: `ENOTEMPTY`,
+/// or `EEXIST`, which POSIX allows instead.
+fn not_empty(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::AlreadyExists
+    )
 }
 
 /// The removal of a trash row.

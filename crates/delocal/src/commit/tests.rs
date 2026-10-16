@@ -708,6 +708,142 @@ fn trouble_in_the_trash_is_a_local_failure() {
     assert_eq!(disk.read("f"), b"old");
 }
 
+/// The trash rows a commit's report carries, by original path.
+fn trash_rows(writes: &[HostWrite]) -> BTreeMap<RelPath, TrashRow> {
+    writes
+        .iter()
+        .filter_map(|w| match w {
+            HostWrite::PutTrash { row, .. } => Some((row.original_path.clone(), row.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// §7.3, draft 64: a directory to be removed that holds nothing but what
+/// the default rules ignore takes it to the trash first, each with its
+/// row, and is then removed: a delete, and a revert's move alike.
+#[test]
+fn a_directory_holding_only_default_ignored_files_takes_them_to_the_trash() {
+    for revert in [false, true] {
+        let disk = Disk::new();
+        disk.dir("d/.Trashes");
+        disk.file("d/.DS_Store", b"finder", OLD, false);
+        disk.file("d/._photo.jpg", b"resource fork", OLD, false);
+        disk.file(
+            "d/.Trashes/inner",
+            b"in a default-ignored directory",
+            OLD,
+            false,
+        );
+        let done = if revert {
+            disk.commit(&move_to_trash("d", dir()), None)
+        } else {
+            disk.commit(&remove("d", Some(dir()), Displace::Trash), None)
+        };
+        assert_eq!(outcome(&done), &ApplyOutcome::Ok, "revert: {revert}");
+        assert!(!disk.exists("d"));
+        assert_eq!(
+            disk.trash(),
+            [
+                b"finder".to_vec(),
+                b"in a default-ignored directory".to_vec(),
+                b"resource fork".to_vec()
+            ]
+        );
+        let rows = trash_rows(&done.writes);
+        assert_eq!(
+            rows.keys().cloned().collect::<Vec<_>>(),
+            [p("d/.DS_Store"), p("d/.Trashes"), p("d/._photo.jpg")]
+        );
+        assert_eq!(rows[&p("d/.DS_Store")].hash, blake3_of(b"finder"));
+        assert_eq!(rows[&p("d/.Trashes")].hash, ContentHash::EMPTY);
+        assert!(done.holds_ignored.is_empty());
+    }
+}
+
+/// §7.3, draft 64: a directory holding a file a user rule ignores is not
+/// removed, and nothing in it moves; the report names the file for
+/// `status`. Until the engine has a want state for it, the outcome is the
+/// one any directory found not empty gets.
+#[test]
+fn a_directory_holding_a_file_a_user_rule_ignores_is_not_removed() {
+    let disk = Disk::new();
+    disk.file(".delocalignore", b"*.env\n", OLD, false);
+    disk.dir("d/sub");
+    disk.file("d/secret.env", b"KEY=1", OLD, false);
+    disk.file("d/.DS_Store", b"finder", OLD, false);
+    // `d/sub` is an entry no rule ignores: changed underneath, as before,
+    // and no file is named.
+    for done in [
+        disk.commit(&remove("d", Some(dir()), Displace::Trash), None),
+        disk.commit(&move_to_trash("d", dir()), None),
+    ] {
+        assert!(matches!(
+            outcome(&done),
+            ApplyOutcome::ChangedUnderneath { .. }
+        ));
+        assert!(done.holds_ignored.is_empty());
+    }
+    // Without it, only what the rules ignore is left.
+    std::fs::remove_dir(disk.at("d/sub")).unwrap();
+    for done in [
+        disk.commit(&remove("d", Some(dir()), Displace::Trash), None),
+        disk.commit(&move_to_trash("d", dir()), None),
+    ] {
+        assert!(
+            matches!(
+                outcome(&done),
+                ApplyOutcome::ChangedUnderneath {
+                    found: ScanState::Observed(Observed {
+                        kind: Kind::Dir,
+                        ..
+                    })
+                }
+            ),
+            "{:?}",
+            outcome(&done)
+        );
+        assert_eq!(done.holds_ignored, [p("d/secret.env")]);
+        assert!(trash_rows(&done.writes).is_empty());
+    }
+    assert_eq!(disk.read("d/secret.env"), b"KEY=1");
+    assert_eq!(disk.read("d/.DS_Store"), b"finder", "nothing moved");
+    assert!(disk.trash().is_empty());
+
+    // Once the user takes the file away, the delete goes ahead.
+    std::fs::remove_file(disk.at("d/secret.env")).unwrap();
+    let done = disk.commit(&remove("d", Some(dir()), Displace::Trash), None);
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    assert_eq!(disk.trash(), [b"finder".to_vec()]);
+}
+
+/// §7.3: what decides is the rules as they stand. A user's `!` takes a
+/// default back, so that file is an entry like any other; and rules that
+/// cannot be read leave nothing to tell by. Either way nothing moves.
+#[test]
+fn a_directory_with_rules_against_it_keeps_what_it_holds() {
+    let disk = Disk::new();
+    disk.dir("d");
+    disk.file("d/.DS_Store", b"finder", OLD, false);
+    disk.file(".delocalignore", b"!.DS_Store\n", OLD, false);
+    let done = disk.commit(&remove("d", Some(dir()), Displace::Trash), None);
+    assert!(matches!(
+        outcome(&done),
+        ApplyOutcome::ChangedUnderneath { .. }
+    ));
+    assert!(done.holds_ignored.is_empty());
+
+    std::fs::remove_file(disk.at(".delocalignore")).unwrap();
+    disk.dir(".delocalignore");
+    let done = disk.commit(&remove("d", Some(dir()), Displace::Trash), None);
+    assert!(matches!(
+        outcome(&done),
+        ApplyOutcome::ChangedUnderneath { .. }
+    ));
+    assert_eq!(disk.read("d/.DS_Store"), b"finder");
+    assert!(disk.trash().is_empty());
+}
+
 #[test]
 fn a_folder_without_its_marker_is_not_written_and_reads_as_skipped() {
     let failed = ApplyOutcome::Failed {
