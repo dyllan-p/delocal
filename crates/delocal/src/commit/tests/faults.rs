@@ -744,6 +744,57 @@ fn a_landed_commit_deleted_before_a_restart_stays_deleted() {
     assert!(!restarted.is_open(&p(scenario.path())));
 }
 
+/// Draft 65: a landed commit's row is dropped only once its directories
+/// are synced. If the start cannot sync them, the row stays open as
+/// unsynced and the scan skips the path, until a later resolve syncs them.
+#[cfg(feature = "faults")]
+#[test]
+fn a_landed_row_the_start_cannot_sync_stays_open() {
+    let disk = disk_for(Scenario::WriteOverFile);
+    let in_trash = Path::new(trash::DIR).join("2026-10-15/f");
+    std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
+    std::fs::rename(disk.at("dir/f"), disk.at(in_trash.to_str().unwrap())).unwrap();
+    std::fs::write(disk.at("dir/f"), "landed").unwrap();
+    let rows = [JournalRow {
+        path: p("dir/f"),
+        displaced_to: in_trash,
+        // Consumed by the rename.
+        temp_file: Some(Scenario::temp().with_file_name("consumed")),
+    }];
+    let rule = Rule {
+        op: Op::SyncDir,
+        path: "dir".into(),
+        at: Trigger::FromCall(1),
+        fail: Fault::Eio,
+    };
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] }).unwrap();
+    let started = Start {
+        folder: folder_id(),
+        journal: &rows,
+        trash: &[],
+        names: &disk.names,
+        disk: &disk.state,
+        claimed: &|_| true,
+        now: settled_now(),
+        policy: trash::Policy::default(),
+    }
+    .run(&*faulty.open().unwrap());
+    assert_eq!(started.undone.unsynced.len(), 1);
+    assert!(started.undone.landed.is_empty());
+    assert!(
+        started
+            .writes
+            .iter()
+            .all(|w| !matches!(w, HostWrite::RemoveJournal { .. }))
+    );
+    assert!(disk.state.is_open(&p("dir/f")));
+
+    let resolved = disk.resolve(&disk.folder());
+    assert_eq!(resolved.resolved, [p("dir/f")]);
+    assert_eq!(std::fs::read(disk.at("dir/f")).unwrap(), b"landed");
+    assert_eq!(disk.trash(), [OLD_CONTENT.to_vec()]);
+}
+
 /// Draft 65: a write that strands its displaced file keeps the temp file
 /// its row names, a symlink's scratch link included, so the next start
 /// still reads the row as a rename that never happened and puts the file
