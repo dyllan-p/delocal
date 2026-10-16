@@ -35,8 +35,11 @@
 //! appears at a target between the check and the rename makes the rename
 //! fail, and survives. A rename in that fails puts the displaced file back
 //! only if the path is still empty, so a failure leaves the disk as it found
-//! it and never replaces what the user made meanwhile; if putting it back
-//! fails too, the journal row stays open and the next start undoes it. A filesystem that
+//! it and never replaces what the user made meanwhile. If putting it back
+//! fails too, the file is stranded: the report carries `Skipped`, since the
+//! path is empty only because of this commit and must not read as a local
+//! deletion; the journal row stays open; and the next commit at the path,
+//! before anything else, or else the next start's undo, puts it back. A filesystem that
 //! cannot refuse to replace gets a fresh check and a plain rename, and
 //! [`DiskState::narrower`] says so for `status`.
 //!
@@ -64,12 +67,13 @@
 //! after the rename does not undo a commit that has landed: the report is
 //! `Ok`, and the error is returned for the host to log.
 
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use delocal_engine::path::RESERVED_DIR;
 use delocal_engine::{
@@ -96,6 +100,21 @@ pub use start::{Start, Started};
 pub struct DiskState {
     sensitivity: OnceLock<Sensitivity>,
     narrower: AtomicBool,
+    /// Displacements a failed write could not put back, by path: the next
+    /// commit at the path puts it back first (see [`Commit::run`]).
+    stranded: Mutex<BTreeMap<RelPath, Stranded>>,
+}
+
+/// A displaced file that could not be put back, and its journal row still
+/// open.
+#[derive(Clone, Debug)]
+struct Stranded {
+    /// Where it is now.
+    at: PathBuf,
+    /// Where it was found, and goes back to.
+    back: PathBuf,
+    /// Its trash row, if it is in the trash.
+    trash: Option<TrashRow>,
 }
 
 impl DiskState {
@@ -126,6 +145,10 @@ impl DiskState {
         tmp::ensure(fs)?;
         let probed = Sensitivity::probe(fs)?;
         Ok(*self.sensitivity.get_or_init(|| probed))
+    }
+
+    fn stranded(&self) -> std::sync::MutexGuard<'_, BTreeMap<RelPath, Stranded>> {
+        self.stranded.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn renamed(&self, how: Refusing) {
@@ -160,7 +183,11 @@ pub struct Committed {
     pub event: Event,
     /// The host's writes that belong with the report (§11): the journal
     /// row's removal once the rename is durable, the trash row of a delete,
-    /// the removal of a name on disk that no longer applies.
+    /// the removal of a name on disk that no longer applies. They go in the
+    /// report's group, which must be durable before the next commit at the
+    /// same path runs: that commit may put rows of its own at the same keys
+    /// (the path's journal row, a place in the trash). §11's ordering, with
+    /// effects held until the groups before them are durable, gives this.
     pub writes: Vec<HostWrite>,
     /// The directories the commit made above its path (§7.5 step 8).
     pub created: Vec<RelPath>,
@@ -196,10 +223,25 @@ enum Fail {
     Changed,
     /// `Failed`.
     Local(LocalError),
-    /// `Failed { Io }`, and what the host found is not to be trusted as an
-    /// observation: the root guard failed (§7.3), or the path is beneath a
-    /// mount point (draft 48).
-    Blind(SkipReason),
+    /// `Failed`, and what the host found is not to be trusted as an
+    /// observation, so the report carries `Skipped` for `reason`: the root
+    /// guard failed (§7.3), the path is beneath a mount point (draft 48), or
+    /// the displaced file could not be put back, so the path is empty only
+    /// because of this commit (§7.5: no failure may read as a deletion).
+    Blind {
+        error: LocalError,
+        reason: SkipReason,
+    },
+}
+
+impl Fail {
+    /// `Failed { Io }`, carrying `Skipped` for `reason`.
+    fn blind(reason: SkipReason) -> Self {
+        Self::Blind {
+            error: LocalError::Io,
+            reason,
+        }
+    }
 }
 
 /// What a commit that did not fail leaves.
@@ -306,10 +348,7 @@ impl Commit<'_> {
                 let outcome = match failed.fail {
                     Fail::Changed => ApplyOutcome::ChangedUnderneath { found },
                     Fail::Local(error) => ApplyOutcome::Failed { error, found },
-                    Fail::Blind(_) => ApplyOutcome::Failed {
-                        error: LocalError::Io,
-                        found,
-                    },
+                    Fail::Blind { error, .. } => ApplyOutcome::Failed { error, found },
                 };
                 let done = Done {
                     at,
@@ -351,7 +390,7 @@ impl Commit<'_> {
     /// would see there.
     fn found(&self, path: &RelPath, fail: &Fail) -> (ScanState, Timestamp) {
         let skipped = |reason| (ScanState::Skipped { reason }, self.clock.now());
-        if let Fail::Blind(reason) = fail {
+        if let Fail::Blind { reason, .. } = fail {
             return skipped(*reason);
         }
         let Ok(fs) = self.folder.open() else {
@@ -377,9 +416,9 @@ impl Commit<'_> {
         let fs = self
             .folder
             .open()
-            .map_err(|_| Fail::Blind(SkipReason::Io))?;
+            .map_err(|_| Fail::blind(SkipReason::Io))?;
         let fs = &*fs;
-        marker(fs).map_err(|_| Fail::Blind(SkipReason::Io))?;
+        marker(fs).map_err(|_| Fail::blind(SkipReason::Io))?;
         let sensitivity = self
             .disk
             .sensitivity(fs)
@@ -398,6 +437,7 @@ impl Commit<'_> {
             device,
             sensitivity,
         };
+        self.put_stranded_back(fs, path)?;
         match *op {
             Op::Write {
                 entry,
@@ -414,6 +454,63 @@ impl Commit<'_> {
         }
     }
 
+    /// Before anything else at `path`: put back a displaced file an
+    /// earlier write there could not put back, if the path is still empty.
+    /// The rows that change with it are made durable at once, before this
+    /// commit can make rows of its own for the same places (it may displace
+    /// into the very place the file just left). While the file cannot be
+    /// put back, no commit at the path goes ahead, and each reports
+    /// `Skipped`: the path is empty only because of this host.
+    fn put_stranded_back(&self, fs: &dyn Fs, path: &RelPath) -> Result<(), Failed> {
+        let Some(stranded) = self.disk.stranded().get(path).cloned() else {
+            return Ok(());
+        };
+        let journal_gone = HostWrite::RemoveJournal {
+            folder: self.id,
+            path: path.clone(),
+        };
+        let writes = match rename_refusing(fs, &stranded.at, &stranded.back) {
+            Ok(how) => {
+                self.disk.renamed(how);
+                let mut writes = vec![journal_gone];
+                writes.extend(
+                    stranded
+                        .trash
+                        .as_ref()
+                        .map(|row| remove_trash(self.id, row)),
+                );
+                writes
+            }
+            // The path was taken meanwhile, or the file went: nothing is
+            // left to undo, and the file stays where it is.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::AlreadyExists | io::ErrorKind::NotFound
+                ) =>
+            {
+                vec![journal_gone]
+            }
+            Err(e) => {
+                return Err(Fail::Blind {
+                    error: local(&e),
+                    reason: SkipReason::Io,
+                }
+                .into());
+            }
+        };
+        self.disk.stranded().remove(path);
+        match self.journal.durable(writes.clone()) {
+            Ok(()) => Ok(()),
+            // The file is back, but its rows still say otherwise: the
+            // report carries their changes, and this commit stops here.
+            Err(e) => Err(Failed {
+                fail: Fail::Local(local(&e)),
+                writes,
+            }),
+        }
+    }
+
     /// Step 6's look at the path: the walk to its parent, then the path
     /// itself. A walk onto another device, or a path that is itself a mount
     /// point, stops the commit (draft 48).
@@ -422,7 +519,7 @@ impl Commit<'_> {
             Ok(Walk::Reached) => {}
             Ok(Walk::Missing { first }) => return Ok(Found::Missing { first }),
             Ok(Walk::NotADirectory { .. }) => return Ok(Found::Unreachable),
-            Ok(Walk::Crossed { .. }) => return Err(Fail::Blind(SkipReason::Ignored)),
+            Ok(Walk::Crossed { .. }) => return Err(Fail::blind(SkipReason::Ignored)),
             Err(e) => return Err(Fail::Local(local(&e))),
         }
         let name = at.disk.file_name().unwrap_or_default();
@@ -437,7 +534,7 @@ impl Commit<'_> {
             }) => {
                 // The path itself is a mount point.
                 if seen.kind == Kind::Dir && stat.dev != at.device {
-                    return Err(Fail::Blind(SkipReason::Ignored));
+                    return Err(Fail::blind(SkipReason::Ignored));
                 }
                 Ok(Found::Entry {
                     disk: at.parent.join(name),
@@ -516,17 +613,29 @@ impl Commit<'_> {
         };
         if let Err(e) = renamed {
             incoming.discard(fs);
+            let mut fail = changed_or_local(&e);
             let writes = match (&displaced, &found) {
                 (Some(displaced), Found::Entry { disk, .. }) => {
-                    self.put_back(at.path, fs, displaced, disk)
+                    match self.put_back(at.path, fs, displaced, disk) {
+                        Some(writes) => writes,
+                        None => {
+                            // Stranded: the path is empty because of this
+                            // commit, which must not read as a deletion.
+                            fail = Fail::Blind {
+                                error: match fail {
+                                    Fail::Local(error) => error,
+                                    _ => LocalError::Io,
+                                },
+                                reason: SkipReason::Io,
+                            };
+                            Vec::new()
+                        }
+                    }
                 }
                 _ => Vec::new(),
             };
             undo_parents(fs);
-            return Err(Failed {
-                fail: changed_or_local(&e),
-                writes,
-            });
+            return Err(Failed { fail, writes });
         }
         let now = self.clock.now();
         // Step 9: what changed is durable before the report.
@@ -695,16 +804,16 @@ impl Commit<'_> {
     /// One that cannot go back because the path was taken meanwhile stays
     /// where it went, with its trash row, and the journal row goes too:
     /// there is nothing left to undo. One that cannot go back for an I/O
-    /// error keeps the journal row open, so the next start's undo moves it
-    /// back if the path is still empty; until then the path is absent, and
-    /// the report says so.
+    /// error is stranded: `None`. Its journal row stays open, so the next
+    /// start's undo moves it back if the path is still empty, and so does
+    /// the next commit at the path before anything else.
     fn put_back(
         &self,
         path: &RelPath,
         fs: &dyn Fs,
         displaced: &Displaced,
         to: &Path,
-    ) -> Vec<HostWrite> {
+    ) -> Option<Vec<HostWrite>> {
         let journal_gone = HostWrite::RemoveJournal {
             folder: self.id,
             path: path.clone(),
@@ -719,10 +828,18 @@ impl Commit<'_> {
                         .as_ref()
                         .map(|row| remove_trash(self.id, row)),
                 );
-                writes
+                Some(writes)
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => vec![journal_gone],
-            Err(_) => Vec::new(),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Some(vec![journal_gone]),
+            Err(_) => {
+                let stranded = Stranded {
+                    at: displaced.to.clone(),
+                    back: to.to_path_buf(),
+                    trash: displaced.trash.clone(),
+                };
+                self.disk.stranded().insert(path.clone(), stranded);
+                None
+            }
         }
     }
 
