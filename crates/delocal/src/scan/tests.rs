@@ -1199,6 +1199,34 @@ fn one_path_observed_alone_follows_the_scans_rules() {
     assert_eq!(observe(&folder, &none, "file"), skip(SkipReason::Io));
 }
 
+/// §7.3, draft 56: one path observed alone is dated by its `stat`, not by
+/// the end of the hash after it, as a scan's report is.
+#[test]
+fn one_path_observed_alone_is_dated_by_its_stat() {
+    let disk = Disk::new();
+    disk.file("f", b"to hash", OLD, false);
+    let fs = disk.folder().open().unwrap();
+    // A clock that moves a second each time it is read.
+    let ticks = std::sync::atomic::AtomicI64::new(settled_now());
+    let clock = || at(ticks.fetch_add(SECOND, std::sync::atomic::Ordering::SeqCst));
+    let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let none: BTreeMap<RelPath, Entry> = BTreeMap::new();
+    let observer = Observer {
+        fs: &*fs,
+        records: &none,
+        names: &names,
+        clock: &clock,
+        sensitivity: Sensitivity::probe(&*fs).unwrap(),
+    };
+    let start = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    let (state, taken) = observer.observe(&p("f"));
+    assert_eq!(state, observed_file(b"to hash", OLD, false));
+    // Read once for the stat, once more for the settle check before the
+    // hash; the observation is the first.
+    assert_eq!(taken, at(start));
+    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > start + SECOND);
+}
+
 #[cfg(feature = "faults")]
 mod faults {
     use proptest::prelude::*;

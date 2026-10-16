@@ -692,15 +692,19 @@ pub struct Observer<'a> {
 
 impl Observer<'_> {
     /// What a scan would report for `path` now, and when the host took the
-    /// observation (§7.3, draft 56). `Absent` stands for what a scan would
-    /// leave unreported: nothing there, a FIFO or the like, or a name on
-    /// disk that is another path's.
+    /// observation (§7.3, draft 56): as for a scan, the time of the `stat`,
+    /// not of the end of a hash that followed it. `Absent` stands for what a
+    /// scan would leave unreported: nothing there, a FIFO or the like, or a
+    /// name on disk that is another path's.
     pub fn observe(&self, path: &RelPath) -> (ScanState, Timestamp) {
-        let state = self.state(path);
-        (state, self.clock.now())
+        let mut taken = None;
+        let state = self.state(path, &mut taken);
+        (state, taken.unwrap_or_else(|| self.clock.now()))
     }
 
-    fn state(&self, path: &RelPath) -> ScanState {
+    /// The state, and in `taken` the time of the `stat` it rests on, if
+    /// it got that far.
+    fn state(&self, path: &RelPath, taken: &mut Option<Timestamp>) -> ScanState {
         let fs = self.fs;
         // The rules decide first, as for a scan: with them unknown nothing
         // can be told, and an ignored path is skipped whatever is there.
@@ -743,7 +747,9 @@ impl Observer<'_> {
         }
         let parent = disk.parent().unwrap_or(Path::new(""));
         let name = disk.file_name().unwrap_or_default();
-        let (name, stat, seen) = match reach::look(fs, parent, path, name, self.sensitivity) {
+        let looked = reach::look(fs, parent, path, name, self.sensitivity);
+        *taken = Some(self.clock.now());
+        let (name, stat, seen) = match looked {
             Ok(Look::Present {
                 name,
                 stat,
