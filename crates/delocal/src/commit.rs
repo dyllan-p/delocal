@@ -85,8 +85,10 @@ use crate::tmp;
 use crate::trash::{self, Moving, NotMoved};
 
 pub mod journal;
+pub mod start;
 
 pub use journal::{Journal, StoreJournal, undo};
+pub use start::{Start, Started};
 
 /// What the host keeps about one folder's disk from one commit to the
 /// next.

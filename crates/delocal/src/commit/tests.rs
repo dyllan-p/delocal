@@ -1059,3 +1059,74 @@ proptest! {
         }
     }
 }
+
+/// §7.5, §8.4: a folder's start undoes the journal, reconciles and prunes
+/// the trash, and clears `tmp/`, in that order.
+#[test]
+fn a_start_undoes_reconciles_prunes_and_clears_tmp() {
+    let disk = Disk::new();
+    let now = settled_now();
+    let day = trash::day(now);
+    let trashed = |name: &str| Path::new(trash::DIR).join(&day).join(name);
+    let row = |name: &str, at: Timestamp| TrashRow {
+        trashed_path: Path::new(&day).join(name),
+        original_path: p(name),
+        hash: blake3_of(name.as_bytes()),
+        trashed_at: at,
+        size: name.len() as u64,
+    };
+    std::fs::create_dir_all(disk.at(trashed("").to_str().unwrap())).unwrap();
+    // A displacement a crash left open, whose temp file a want claims.
+    std::fs::write(disk.at(trashed("back").to_str().unwrap()), "back").unwrap();
+    let claimed_temp = PathBuf::from(tmp::DIR).join("claimed");
+    std::fs::write(disk.at(claimed_temp.to_str().unwrap()), "partial").unwrap();
+    let open = JournalRow {
+        path: p("back"),
+        displaced_to: trashed("back"),
+        temp_file: Some(claimed_temp.clone()),
+    };
+    // An entry with no row, and one old enough to prune.
+    std::fs::write(disk.at(trashed("orphan").to_str().unwrap()), "orphan").unwrap();
+    std::fs::write(disk.at(trashed("old").to_str().unwrap()), "old").unwrap();
+    let rows = [
+        row("back", now),
+        row("old", now.plus_nanos(-40 * 86_400 * SECOND)),
+    ];
+    std::fs::write(disk.at(tmp::DIR).join("unclaimed"), "stale").unwrap();
+
+    let fs = disk.folder().open().unwrap();
+    let started = Start {
+        folder: folder_id(),
+        journal: &[open],
+        trash: &rows,
+        names: &disk.names,
+        claimed: &|name| name == "claimed",
+        now,
+        policy: trash::Policy::default(),
+    }
+    .run(&*fs);
+
+    assert_eq!(disk.read("back"), b"back");
+    assert_eq!(disk.trash(), [b"orphan".to_vec()]);
+    assert!(disk.exists(claimed_temp.to_str().unwrap()));
+    assert_eq!(started.temps, [OsString::from("unclaimed")]);
+    assert!(started.unpruned.is_empty() && started.tmp_error.is_none());
+    let f = folder_id();
+    let removed = |name: &str| HostWrite::RemoveTrash {
+        folder: f,
+        trashed_path: Path::new(&day).join(name),
+    };
+    assert_eq!(started.writes.len(), 4, "{:?}", started.writes);
+    assert_eq!(
+        started.writes[0],
+        HostWrite::RemoveJournal {
+            folder: f,
+            path: p("back")
+        }
+    );
+    assert_eq!(started.writes[1], removed("back"));
+    assert!(
+        matches!(&started.writes[2], HostWrite::PutTrash { row, .. } if row.trashed_path == Path::new(&day).join("orphan"))
+    );
+    assert_eq!(started.writes[3], removed("old"));
+}
