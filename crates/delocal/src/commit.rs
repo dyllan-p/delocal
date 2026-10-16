@@ -126,6 +126,9 @@ enum Open {
         /// Its place in the trash, relative to `.delocal/trash/`, if it is
         /// there: its row goes when it comes back.
         trash: Option<PathBuf>,
+        /// The temp file the commit was to rename in: if it is gone, the
+        /// rename happened after all, and nothing goes back (draft 65).
+        temp: Option<PathBuf>,
     },
     /// A commit landed, but an fsync after it failed, so its rename is not
     /// known to be durable. Resolved once these directories are synced.
@@ -179,12 +182,30 @@ impl DiskState {
     }
 
     /// Keep `path` open: a journal row the start's undo could not resolve,
-    /// whose displaced file is at `at` (relative to the folder root) and
-    /// goes back to `back`.
-    pub(crate) fn keep_displaced(&self, path: RelPath, at: PathBuf, back: PathBuf) {
+    /// whose displaced file is at `at` (relative to the folder root), goes
+    /// back to `back` if its rename never happened, and whose commit was to
+    /// rename in `temp`.
+    pub(crate) fn keep_displaced(
+        &self,
+        path: RelPath,
+        at: PathBuf,
+        back: PathBuf,
+        temp: Option<PathBuf>,
+    ) {
         let trash = at.strip_prefix(trash::DIR).ok().map(Path::to_path_buf);
-        self.opened()
-            .insert(path, Open::Displaced { at, back, trash });
+        let open = Open::Displaced {
+            at,
+            back,
+            trash,
+            temp,
+        };
+        self.opened().insert(path, open);
+    }
+
+    /// Keep `path` open: a commit that landed, whose directories `dirs`
+    /// could not be synced.
+    pub(crate) fn keep_unsynced(&self, path: RelPath, dirs: Vec<PathBuf>) {
+        self.opened().insert(path, Open::Unsynced { dirs });
     }
 
     fn renamed(&self, how: Refusing) {
@@ -557,8 +578,27 @@ impl Commit<'_> {
             folder: self.id,
             path: path.clone(),
         };
+        // Draft 65: a temp file that is gone means the rename happened, so
+        // the commit landed and only its durability is left to make sure of.
+        let open = match open {
+            Open::Displaced {
+                at,
+                back,
+                temp: Some(temp),
+                ..
+            } if matches!(fs.lstat(&temp), Err(e) if e.kind() == io::ErrorKind::NotFound) => {
+                let dirs = journal::landed_dirs(&back, &at);
+                self.disk
+                    .opened()
+                    .insert(path.clone(), Open::Unsynced { dirs: dirs.clone() });
+                Open::Unsynced { dirs }
+            }
+            open => open,
+        };
         let writes = match open {
-            Open::Displaced { at, back, trash } => match rename_refusing(fs, &at, &back) {
+            Open::Displaced {
+                at, back, trash, ..
+            } => match rename_refusing(fs, &at, &back) {
                 Ok(how) => {
                     self.disk.renamed(how);
                     let back_from_trash = trash.map(|trashed_path| HostWrite::RemoveTrash {
@@ -587,7 +627,7 @@ impl Commit<'_> {
                 }
             },
             Open::Unsynced { dirs } => {
-                if let Some(error) = dirs.iter().find_map(|dir| fs.sync_dir(dir).err()) {
+                if let Err(error) = journal::sync_landed(fs, &dirs) {
                     return Resolution::Open {
                         displaced: false,
                         error,
@@ -739,12 +779,16 @@ impl Commit<'_> {
             None => fs.create_dir(&target),
         };
         if let Err(e) = renamed {
-            incoming.discard(fs);
             let mut fail = changed_or_local(&e);
             let writes = match (&displaced, &found) {
                 (Some(displaced), Found::Entry { disk, .. }) => {
-                    match self.put_back(at.path, fs, displaced, disk) {
-                        Some(writes) => writes,
+                    match self.put_back(at.path, fs, displaced, disk, incoming.path()) {
+                        Some(writes) => {
+                            incoming.discard(fs);
+                            writes
+                        }
+                        // The temp file stays, so that the row still says
+                        // its rename never happened (draft 65).
                         None => {
                             // Stranded: the path is empty because of this
                             // commit, which must not read as a deletion.
@@ -759,7 +803,10 @@ impl Commit<'_> {
                         }
                     }
                 }
-                _ => Vec::new(),
+                _ => {
+                    incoming.discard(fs);
+                    Vec::new()
+                }
             };
             undo_parents(fs);
             return Err(Failed { fail, writes });
@@ -959,6 +1006,7 @@ impl Commit<'_> {
         fs: &dyn Fs,
         displaced: &Displaced,
         to: &Path,
+        temp: Option<&Path>,
     ) -> Option<Vec<HostWrite>> {
         let journal_gone = HostWrite::RemoveJournal {
             folder: self.id,
@@ -982,6 +1030,7 @@ impl Commit<'_> {
                     at: displaced.to.clone(),
                     back: to.to_path_buf(),
                     trash: displaced.trash.as_ref().map(|row| row.trashed_path.clone()),
+                    temp: temp.map(Path::to_path_buf),
                 };
                 self.disk.opened().insert(path.clone(), stranded);
                 None

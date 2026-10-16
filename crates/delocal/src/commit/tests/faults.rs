@@ -443,9 +443,10 @@ fn a_fault_at_any_step_never_loses_the_displaced_file() {
                 );
                 assert_eq!(!open.is_empty(), unsure && displaces, "{what}: {open:?}");
                 if !open.is_empty() {
-                    // The next start leaves the landed commit alone.
+                    // The next start leaves the landed commit alone: its
+                    // temp file is gone, so it drops the row (draft 65).
                     let undone = undo_rows(&disk, &open);
-                    assert_eq!(undone.left, [p(scenario.path())], "{what}");
+                    assert_eq!(undone.landed, [p(scenario.path())], "{what}");
                     landed(&disk, scenario)
                         .map_err(|e| format!("{what}: {e}"))
                         .unwrap();
@@ -687,6 +688,121 @@ fn an_unsynced_commit_is_skipped_until_its_directories_sync() {
         disk.scanned().get(&path),
         Some(ScanState::Observed(_))
     ));
+}
+
+/// Draft 65, the ruling on reading 8: an fsync fails after the rename in,
+/// so the row stays open; the user then deletes the file; the daemon
+/// restarts. The file stays deleted, and the old version stays in the
+/// trash with its row: the start's undo sees the temp file gone, so the
+/// rename happened, and puts nothing back.
+#[cfg(feature = "faults")]
+#[test]
+fn a_landed_commit_deleted_before_a_restart_stays_deleted() {
+    let scenario = Scenario::WriteOverFile;
+    let disk = disk_for(scenario);
+    let temp = Scenario::temp();
+    let rule = Rule {
+        op: Op::SyncDir,
+        path: "dir".into(),
+        at: Trigger::FromCall(1),
+        fail: Fault::Eio,
+    };
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] }).unwrap();
+    let (action, _) = scenario.action();
+    let done = disk.commit_with(&faulty, &action, Some(&temp));
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    let mut rows = disk.journal.taken();
+    rows.extend(done.writes);
+    let open = open_rows(&rows, &[]);
+    assert_eq!(open.len(), 1, "the row stays open");
+
+    // The user deletes the file; the daemon restarts, with a fresh state.
+    std::fs::remove_file(disk.at(scenario.path())).unwrap();
+    let restarted = DiskState::new();
+    let fs = disk.folder().open().unwrap();
+    let started = Start {
+        folder: folder_id(),
+        journal: &open,
+        trash: &[],
+        names: &disk.names,
+        disk: &restarted,
+        claimed: &|_| true,
+        now: settled_now(),
+        policy: trash::Policy::default(),
+    }
+    .run(&*fs);
+    assert_eq!(started.undone.landed, [p(scenario.path())]);
+    assert!(!disk.exists(scenario.path()), "the file stays deleted");
+    assert_eq!(
+        disk.trash(),
+        [OLD_CONTENT.to_vec()],
+        "the old version stays in the trash"
+    );
+    rows.extend(started.writes);
+    assert!(open_rows(&rows, &[]).is_empty());
+    rows_match_the_trash(&disk, &[], &rows).unwrap();
+    assert!(!restarted.is_open(&p(scenario.path())));
+}
+
+/// Draft 65: a write that strands its displaced file keeps the temp file
+/// its row names, a symlink's scratch link included, so the next start
+/// still reads the row as a rename that never happened and puts the file
+/// back.
+#[cfg(feature = "faults")]
+#[test]
+fn a_stranded_symlink_write_keeps_its_temp_for_the_next_start() {
+    let disk = disk_for(Scenario::WriteOverFile);
+    let old = Observed {
+        kind: Kind::File,
+        size: OLD_CONTENT.len() as u64,
+        mtime_ns: OLD,
+        exec: false,
+        hash: blake3_of(OLD_CONTENT),
+    };
+    let target = Scenario::temp();
+    std::fs::write(disk.at(target.to_str().unwrap()), "elsewhere").unwrap();
+    let rules = vec![
+        Rule {
+            op: Op::RenameNoreplace,
+            path: ".delocal/tmp/link-*".into(),
+            at: Trigger::Call(1),
+            fail: Fault::Eio,
+        },
+        // The displacement, the rename in, then putting it back.
+        Rule {
+            op: Op::RenameNoreplace,
+            path: "dir/f".into(),
+            at: Trigger::Call(3),
+            fail: Fault::Eio,
+        },
+    ];
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules }).unwrap();
+    let incoming = entry("dir/f", Kind::Symlink, b"elsewhere", 0, false);
+    let done = disk.commit_with(
+        &faulty,
+        &write("dir/f", incoming, Some(old), Displace::Trash),
+        Some(&target),
+    );
+    assert_eq!(faulty.injected().len(), 2);
+    assert!(matches!(
+        outcome(&done),
+        ApplyOutcome::Failed {
+            found: ScanState::Skipped { .. },
+            ..
+        }
+    ));
+    let mut rows = disk.journal.taken();
+    rows.extend(done.writes);
+    let open = open_rows(&rows, &[]);
+    let link = open[0].temp_file.clone().unwrap();
+    assert!(
+        link.starts_with(tmp::DIR) && disk.exists(link.to_str().unwrap()),
+        "{link:?}"
+    );
+
+    let undone = undo_rows(&disk, &open);
+    assert_eq!(undone.back, [p("dir/f")]);
+    assert_eq!(std::fs::read(disk.at("dir/f")).unwrap(), OLD_CONTENT);
 }
 
 /// While a stranded file cannot be put back, no commit at its path goes

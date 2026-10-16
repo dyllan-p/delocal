@@ -4,9 +4,11 @@
 //!
 //! 1. Undo every open row of the commit journal, into an empty path only
 //!    ([`undo`]). The temp file a row names is left for the fetch to resume.
-//!    A row the undo could not resolve stays open in the folder's
-//!    [`DiskState`], so the scan reports its path `Skipped` until a later
-//!    resolve or commit there puts the displaced file back (draft 64).
+//!    A row whose temp file is gone belongs to a commit that landed, and is
+//!    synced and dropped instead (draft 65). A row the undo could not
+//!    resolve, or a landed one whose directories could not be synced, stays
+//!    open in the folder's [`DiskState`], so the scan reports its path
+//!    `Skipped` until a later resolve or commit there settles it (draft 64).
 //! 2. Bring the trash's rows into line with the trash ([`trash::reconcile`]):
 //!    an entry a crash left without its row gets one, and a row whose entry
 //!    is gone goes. This runs after the undo, which moves entries out of the
@@ -76,9 +78,12 @@ impl Start<'_> {
         for (path, _) in &started.undone.failed {
             if let Some(row) = self.journal.iter().find(|row| row.path == *path) {
                 let back = crate::reach::disk_path(path, self.names);
-                self.disk
-                    .keep_displaced(path.clone(), row.displaced_to.clone(), back);
+                let (at, temp) = (row.displaced_to.clone(), row.temp_file.clone());
+                self.disk.keep_displaced(path.clone(), at, back, temp);
             }
+        }
+        for (path, dirs, _) in &started.undone.unsynced {
+            self.disk.keep_unsynced(path.clone(), dirs.clone());
         }
         // The rows as the undo left them, then as reconciled.
         let mut rows: Vec<TrashRow> = self.trash.to_vec();
