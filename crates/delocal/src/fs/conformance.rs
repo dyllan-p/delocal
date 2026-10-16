@@ -42,6 +42,7 @@ macro_rules! conformance_tests {
             open_read_reads_from_the_start_and_seeks,
             create_new_refuses_anything_already_there,
             open_append_writes_at_the_end_and_needs_a_file,
+            sync_file_accepts_a_file_and_nothing_else,
             sync_dir_accepts_a_directory,
             rename_moves_and_replaces_a_file,
             remove_file_removes_files_and_symlinks_not_targets,
@@ -240,6 +241,19 @@ pub fn open_append_writes_at_the_end_and_needs_a_file(fs: &dyn Fs, _root: &Path)
 
     assert_eq!(kind_of(fs.open_append(p("missing"))), ErrorKind::NotFound);
     assert_eq!(kind_of(fs.lstat(p("missing"))), ErrorKind::NotFound);
+}
+
+pub fn sync_file_accepts_a_file_and_nothing_else(fs: &dyn Fs, _root: &Path) {
+    write(fs, p("f"), b"x");
+    fs.sync_file(p("f")).unwrap();
+    // A file nobody may write is still synced: the descriptor reads.
+    fs.set_mode(p("f"), 0o444).unwrap();
+    fs.sync_file(p("f")).unwrap();
+    fs.create_dir(p("d")).unwrap();
+    fs.symlink(p("f"), p("s")).unwrap();
+    assert_eq!(not_a_file(fs.sync_file(p("d"))), FileKind::Dir);
+    assert_eq!(not_a_file(fs.sync_file(p("s"))), FileKind::Symlink);
+    assert_eq!(kind_of(fs.sync_file(p("missing"))), ErrorKind::NotFound);
 }
 
 pub fn sync_dir_accepts_a_directory(fs: &dyn Fs, _root: &Path) {

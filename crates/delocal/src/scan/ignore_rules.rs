@@ -48,6 +48,15 @@ pub struct IgnoreRules {
     invalid: Vec<InvalidRule>,
 }
 
+/// Where the rule that ignores a path comes from (§7.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuleSource {
+    /// One of [`DEFAULTS`].
+    Default,
+    /// A line of the user's `.delocalignore`.
+    User,
+}
+
 /// A line of `.delocalignore` that was left out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidRule {
@@ -140,6 +149,35 @@ impl IgnoreRules {
         self.ignores_entry(path, is_dir)
     }
 
+    /// Which rules ignore `path`, a directory or not, or a directory above
+    /// it: the defaults or the user's (§7.3, draft 64). `None` if it is not
+    /// ignored. A directory to be removed takes what only the defaults
+    /// ignore with it to the trash, and waits on what a user rule ignores.
+    pub fn source(&self, path: &RelPath, is_dir: bool) -> Option<RuleSource> {
+        let mut above: Vec<RelPath> = Vec::new();
+        let mut dir = path.parent();
+        while let Some(d) = dir {
+            dir = d.parent();
+            above.push(d);
+        }
+        // The highest ignored directory decides for everything beneath it.
+        for dir in above.iter().rev() {
+            if let Some(source) = self.entry_source(dir, true) {
+                return Some(source);
+            }
+        }
+        self.entry_source(path, is_dir)
+    }
+
+    fn entry_source(&self, path: &RelPath, is_dir: bool) -> Option<RuleSource> {
+        match self.matcher.matched(path.as_str(), is_dir) {
+            // Defaults are added without a file, the user's from theirs.
+            ignore::Match::Ignore(glob) if glob.from().is_none() => Some(RuleSource::Default),
+            ignore::Match::Ignore(_) => Some(RuleSource::User),
+            ignore::Match::Whitelist(_) | ignore::Match::None => None,
+        }
+    }
+
     /// The lines of `.delocalignore` that were left out, in order.
     pub fn invalid(&self) -> &[InvalidRule] {
         &self.invalid
@@ -194,6 +232,31 @@ mod tests {
             } else {
                 assert_eq!(entry, ignored, "{path}: the entry alone");
             }
+        }
+    }
+
+    /// §7.3, draft 64: which rules ignore a path, the defaults or the
+    /// user's, with the highest ignored directory deciding for everything
+    /// beneath it, and a user's `!` taking a default back.
+    #[test]
+    fn a_path_is_ignored_by_the_defaults_or_by_the_user() {
+        let rules = IgnoreRules::new(Some(b"secret.env\nbuild/\n!keep.swp\n")).unwrap();
+        let source = |path: &str, is_dir| rules.source(&p(path), is_dir);
+        assert_eq!(source("d/.DS_Store", false), Some(RuleSource::Default));
+        assert_eq!(source("d/.Trashes", true), Some(RuleSource::Default));
+        assert_eq!(source("d/.Trashes/x", false), Some(RuleSource::Default));
+        assert_eq!(source("d/secret.env", false), Some(RuleSource::User));
+        assert_eq!(source("build", true), Some(RuleSource::User));
+        assert_eq!(source("build/.DS_Store", false), Some(RuleSource::User));
+        assert_eq!(source("keep.swp", false), None);
+        assert_eq!(source("d/notes.txt", false), None);
+        // `source` and `ignores` always agree on whether.
+        for path in ["d/.DS_Store", "d/secret.env", "build/x", "keep.swp", "d/n"] {
+            assert_eq!(
+                rules.source(&p(path), false).is_some(),
+                rules.ignores(&p(path), false),
+                "{path}"
+            );
         }
     }
 

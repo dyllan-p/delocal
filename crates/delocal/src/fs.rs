@@ -43,6 +43,7 @@
 //! | [`create_new`](Fs::create_new) | §7.5 step 3 a new temp file in `.delocal/tmp/`; §8.4 restore's copy |
 //! | [`open_append`](Fs::open_append) | §7.5 steps 2 and 3 resuming a temp file; §13 crash during a transfer |
 //! | [`WriteFile::sync`] | §7.5 the data is durable before the rename (step 8) |
+//! | [`sync_file`](Fs::sync_file) | §7.5 a temp file's data and metadata are durable before the rename in (step 8); a `SetMeta`'s new mtime and exec bit before its report |
 //! | [`sync_dir`](Fs::sync_dir) | §7.5 step 9 the parent directory is durable before the report, and after the displacement of step 7 |
 //! | [`rename_noreplace`](Fs::rename_noreplace) | §7.5 every commit rename: the displacement of step 7 (to the trash, a trash name's `~N`, or §7.6's conflict path), the rename in of step 8 (a symlink's temp included), deletes to the trash, the journal's undo |
 //! | [`rename`](Fs::rename) | §7.5 the fallback for a filesystem that cannot refuse to replace, after a fresh check |
@@ -72,9 +73,9 @@
 //! never follow a symlink at the last component either, and `read_dir`,
 //! `sync_dir` and `available_space` refuse one there with `NotADirectory`.
 //!
-//! **Opening a file.** `open_read`, `open_append` and `set_mode` open the
-//! last component without following a symlink and without waiting on a
-//! FIFO, then check what the descriptor is. Anything but a file (or, for
+//! **Opening a file.** `open_read`, `open_append`, `sync_file` and
+//! `set_mode` open the last component without following a symlink and
+//! without waiting on a FIFO, then check what the descriptor is. Anything but a file (or, for
 //! `set_mode`, a directory) is refused with [`NotAFile`], which says what
 //! was there: a file swapped for a symlink or a FIFO between a caller's
 //! `lstat` and the open is observed as what it has become.
@@ -98,6 +99,8 @@ mod conformance;
 #[cfg(feature = "faults")]
 pub mod faulty;
 pub mod real;
+#[cfg(test)]
+pub(crate) mod spy;
 
 #[cfg(feature = "faults")]
 pub use faulty::{FaultyFolder, FaultyFs};
@@ -154,6 +157,12 @@ pub trait Fs: Send + Sync {
     /// [`NotAFile`], neither followed nor waited on.
     fn open_append(&self, path: &Path) -> io::Result<Box<dyn WriteFile>>;
 
+    /// Make the file at `path` durable, its data and its metadata (`fsync`),
+    /// through a descriptor opened for reading. Anything else there, a
+    /// symlink included, is refused with [`NotAFile`], neither followed nor
+    /// waited on.
+    fn sync_file(&self, path: &Path) -> io::Result<()>;
+
     /// Make the entries of the directory at `path` durable: creations,
     /// removals and renames in it survive a power loss once this returns. A
     /// symlink at `path` is not followed: it is `NotADirectory`.
@@ -199,6 +208,36 @@ pub trait Fs: Send + Sync {
     /// Bytes an unprivileged process can still write on the filesystem that
     /// holds the directory at `path`.
     fn available_space(&self, path: &Path) -> io::Result<u64>;
+}
+
+/// How [`rename_refusing`] made its rename (§7.5, "Renames never replace").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusing {
+    /// The filesystem refused to replace, atomically.
+    Atomic,
+    /// The filesystem cannot refuse to replace, so the target was checked
+    /// empty a moment before a plain rename: the narrower guarantee, which
+    /// `status` notes for the folder.
+    Checked,
+}
+
+/// Rename `from` to `to` without replacing anything at `to` (§7.5):
+/// [`Fs::rename_noreplace`], and where the filesystem cannot refuse
+/// ([`NoReplaceUnsupported`]), a fresh check that `to` is empty and then
+/// [`Fs::rename`]. Something at `to` is `AlreadyExists` either way.
+pub fn rename_refusing(fs: &dyn Fs, from: &Path, to: &Path) -> io::Result<Refusing> {
+    match fs.rename_noreplace(from, to) {
+        Ok(()) => Ok(Refusing::Atomic),
+        Err(e) if NoReplaceUnsupported::of(&e) => match fs.lstat(to) {
+            Ok(_) => Err(io::ErrorKind::AlreadyExists.into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs.rename(from, to)?;
+                Ok(Refusing::Checked)
+            }
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// A directory held open within one operation ([`Fs::open_dir`]), and the
@@ -383,5 +422,54 @@ impl std::error::Error for NoReplaceUnsupported {}
 impl From<NoReplaceUnsupported> for io::Error {
     fn from(error: NoReplaceUnsupported) -> Self {
         io::Error::new(io::ErrorKind::Unsupported, error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rename_refusing_to_replace_never_replaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a"), "a").unwrap();
+        std::fs::write(tmp.path().join("taken"), "user").unwrap();
+        let fs = RealFolder::new(tmp.path()).open().unwrap();
+        let err = rename_refusing(&*fs, Path::new("a"), Path::new("taken")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            rename_refusing(&*fs, Path::new("a"), Path::new("b")).unwrap(),
+            Refusing::Atomic
+        );
+        assert_eq!(std::fs::read(tmp.path().join("taken")).unwrap(), b"user");
+    }
+
+    /// §7.5: a filesystem that cannot refuse to replace gets a fresh check
+    /// and a plain rename, and still never replaces what the check finds.
+    #[cfg(feature = "faults")]
+    #[test]
+    fn without_the_flag_a_rename_is_checked_first() {
+        use faulty::{Fault, Op, Rule, Spec, Trigger};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a"), "a").unwrap();
+        std::fs::write(tmp.path().join("taken"), "user").unwrap();
+        let spec = Spec {
+            rules: vec![Rule {
+                op: Op::RenameNoreplace,
+                path: "**".into(),
+                at: Trigger::FromCall(1),
+                fail: Fault::Unsupported,
+            }],
+        };
+        let folder = FaultyFolder::new(RealFolder::new(tmp.path()), spec).unwrap();
+        let fs = folder.open().unwrap();
+        let err = rename_refusing(&*fs, Path::new("a"), Path::new("taken")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(tmp.path().join("taken")).unwrap(), b"user");
+        assert_eq!(
+            rename_refusing(&*fs, Path::new("a"), Path::new("b")).unwrap(),
+            Refusing::Checked
+        );
+        assert_eq!(std::fs::read(tmp.path().join("b")).unwrap(), b"a");
     }
 }

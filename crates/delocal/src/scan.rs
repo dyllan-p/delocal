@@ -50,6 +50,15 @@
 //! `Skipped { Ignored }`, whether or not it is on disk: the record stays,
 //! frozen, and a rule that hides a file never reads as its deletion (§7.3).
 //!
+//! **Mount points** (§7.3, draft 48). The walk never crosses onto another
+//! device. A directory whose device is not the root's is a mount point:
+//! treated as an ignored path, it is neither reported nor walked into, and
+//! never tracked. Every tracked path at or beneath one (something was
+//! mounted over a tracked directory) is reported `Skipped { Ignored }` with
+//! the paths the rules ignore, until the mount goes: a disk mounted inside
+//! the folder that later unmounts must not read as its whole subtree
+//! deleted, for the same reason as the root guard.
+//!
 //! **An unreadable `.delocalignore`** (an I/O error, permission denied, or
 //! something other than a file at that name) makes the root `Skipped` with
 //! that reason, covering the whole folder (§7.3): with the rules unknown the
@@ -71,6 +80,22 @@
 //! as a mass deletion. An aborted scan closes the bracket with
 //! `ScanAborted`, which announces no deletions (§7.3).
 //!
+//! **Open journal rows** (§7.5, draft 64). A path whose commit journal row
+//! is open, and everything beneath it, is reported `Skipped` and not looked
+//! at: its disk is in a state no record describes. The walk does not go
+//! into one, and after it every open path it did not reach is reported too,
+//! since a displaced file not yet back leaves its path absent.
+//!
+//! **One path at a time.** [`Observer::observe`] observes a single path as
+//! the scan would report it, by the same rules: ignored and mounted paths
+//! skipped, a path with an open journal row skipped, the fast path against
+//! the record, a file hashed only once settled. It is what a failed
+//! commit's report carries (§7.5 step 6), what the host answers the
+//! engine's `Observe` with (§8.3), and what the watcher reports. It reaches the
+//! path from the root through its names on disk ([`crate::reach`]) rather
+//! than walking to it, so on a filesystem that folds names it confirms the
+//! name through the parent's listing.
+//!
 //! **What the host keeps** of a scan is its [`ScanReport`]: the names on
 //! disk, the unobservable names, the skips by reason, and the rules left out
 //! of `.delocalignore`, all for `status` and the store; and the unstable
@@ -90,8 +115,9 @@ use delocal_engine::{
     Timestamp,
 };
 
-use crate::fs::{Dir, FileKind, Folder, NotAFile, Stat};
+use crate::fs::{Dir, FileKind, Folder, Fs, NotAFile, Stat};
 use crate::names::{self, IndexName, Name, Unobservable};
+use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
 use crate::store::DiskName;
 
 pub mod hash;
@@ -145,6 +171,36 @@ impl Records for BTreeMap<RelPath, Entry> {
     }
 }
 
+/// The paths whose journal row is open (§7.5, draft 64): a commit
+/// displaced what was there and could not put it back, or landed without
+/// knowing its rename durable, or the start's undo could not run. Their disk
+/// is in a state no record describes, so the scan and every single
+/// observation report them, and everything beneath them, `Skipped` until
+/// the row is resolved: unknown never advances anything. The commit path's
+/// `DiskState` is the host's; a set is for tests.
+pub trait OpenRows: Send + Sync {
+    /// Whether `path`, or a directory above it, has an open row.
+    fn is_open(&self, path: &RelPath) -> bool;
+    /// Every path with an open row.
+    fn open_paths(&self) -> Vec<RelPath>;
+}
+
+impl OpenRows for BTreeSet<RelPath> {
+    fn is_open(&self, path: &RelPath) -> bool {
+        self.iter()
+            .any(|open| open == path || open.is_ancestor_of(path))
+    }
+
+    fn open_paths(&self) -> Vec<RelPath> {
+        self.iter().cloned().collect()
+    }
+}
+
+/// What a path with an open journal row is reported as: `Skipped`, for an
+/// I/O reason, since the host cannot say what is there. The reason is only
+/// for `status`; the engine treats every reason alike (§7.3).
+pub const OPEN_ROW: SkipReason = SkipReason::Io;
+
 /// The time as the host tells it to the engine: the monotonic now of §7.8.
 /// A scan reads it as it states each file, for the stability check.
 pub trait Clock {
@@ -170,6 +226,8 @@ pub struct Scan<'a> {
     pub folder: &'a dyn Folder,
     /// Its index records, as the host last wrote them.
     pub records: &'a dyn Records,
+    /// Its paths with an open journal row, reported `Skipped`.
+    pub open: &'a dyn OpenRows,
     pub clock: &'a dyn Clock,
     /// Threads to hash on.
     pub hashers: NonZeroUsize,
@@ -245,6 +303,9 @@ impl Scan<'_> {
     fn walk(&self, report: &mut ScanReport, emit: &mut dyn FnMut(Event)) -> Result<(), Abort> {
         let fs = self.folder.open().map_err(Abort::Root)?;
         let root: Arc<dyn Dir> = Arc::from(fs.open_dir(Path::new("")).map_err(Abort::Root)?);
+        // The device the walk stays on (§7.3, mount points): the root's,
+        // stated through the descriptor the operation holds.
+        let device = fs.lstat(Path::new("")).map_err(Abort::Root)?.dev;
         let delocal = marker(&*root)?;
         let names = root.read_dir().map_err(Abort::List)?;
         let rules = match IgnoreRules::read(&*root) {
@@ -270,8 +331,12 @@ impl Scan<'_> {
         std::thread::scope(|scope| {
             let mut walker = Walker {
                 records: self.records,
+                open: self.open,
+                skipped_open: BTreeSet::new(),
                 clock: self.clock,
                 rules: &rules,
+                device,
+                mounts: Vec::new(),
                 disk_names: &mut report.disk_names,
                 unobservable: &mut report.unobservable,
                 pipe: Ordered::start(scope, self.hashers, &hash_job),
@@ -283,6 +348,7 @@ impl Scan<'_> {
                 },
             };
             walker.walk(root, names);
+            walker.open_records();
             walker.ignored_records();
             let Walker { pipe, mut out, .. } = walker;
             pipe.finish(&mut |found| out.take(found));
@@ -351,8 +417,16 @@ fn check_marker(delocal: &dyn Dir) -> Result<(), Abort> {
 /// The walk's state: everything but the stack of directories it is in.
 struct Walker<'a, 'e> {
     records: &'a dyn Records,
+    open: &'a dyn OpenRows,
+    /// The paths reported `Skipped` for an open journal row so far.
+    skipped_open: BTreeSet<RelPath>,
     clock: &'a dyn Clock,
     rules: &'a IgnoreRules,
+    /// The root's device, which the walk never leaves.
+    device: u64,
+    /// The mount points the walk met: directories on another device, at
+    /// their index paths.
+    mounts: Vec<RelPath>,
     disk_names: &'a mut Vec<DiskName>,
     unobservable: &'a mut Vec<(PathBuf, Unobservable)>,
     pipe: Ordered<Job, Found>,
@@ -478,6 +552,12 @@ impl Walker<'_, '_> {
         path: RelPath,
         differs: bool,
     ) -> Option<(Arc<dyn Dir>, RelPath, Vec<OsString>)> {
+        // A path with an open journal row is not looked at, nor anything
+        // beneath it: the skip covers them all (draft 64).
+        if self.open.is_open(&path) {
+            self.skip_open(path);
+            return None;
+        }
         let stat = match dir.lstat(disk) {
             Ok(stat) => stat,
             Err(e) if gone(&e) => return None,
@@ -499,6 +579,12 @@ impl Walker<'_, '_> {
             FileKind::Other => return None,
         };
         if self.rules.ignores_entry(&path, kind == Kind::Dir) {
+            return None;
+        }
+        // A mount point is an ignored path: not reported, not walked into,
+        // and what is tracked beneath it is skipped after the walk.
+        if kind == Kind::Dir && stat.dev != self.device {
+            self.mounts.push(path);
             return None;
         }
         self.keep_name(&path, disk, differs);
@@ -590,12 +676,42 @@ impl Walker<'_, '_> {
         }
     }
 
-    /// Every tracked path the rules ignore, reported `Skipped`, on disk or
-    /// not: frozen until the rule goes (§7.3).
+    /// Every path with an open journal row that the walk did not reach,
+    /// on disk or not, reported `Skipped` (draft 64): a displaced file not
+    /// yet back leaves its path absent, and the bracket's end must not take
+    /// that for a deletion.
+    fn open_records(&mut self) {
+        for path in self.open.open_paths() {
+            let covered = self
+                .skipped_open
+                .iter()
+                .any(|done| *done == path || done.is_ancestor_of(&path));
+            if !covered {
+                self.skip_open(path);
+            }
+        }
+    }
+
+    fn skip_open(&mut self, path: RelPath) {
+        self.skipped_open.insert(path.clone());
+        self.ready(path, ScanState::Skipped { reason: OPEN_ROW });
+    }
+
+    /// Every tracked path the rules ignore, on disk or not, and every one
+    /// at or beneath a mount point, reported `Skipped`: frozen until the
+    /// rule or the mount goes (§7.3). One an open row's skip already covers
+    /// is not reported again.
     fn ignored_records(&mut self) {
         let records = self.records;
         for entry in records.live_entries() {
-            if self.rules.ignores(&entry.path, entry.kind == Kind::Dir) {
+            if self.open.is_open(&entry.path) {
+                continue;
+            }
+            let mounted = self
+                .mounts
+                .iter()
+                .any(|m| *m == entry.path || m.is_ancestor_of(&entry.path));
+            if mounted || self.rules.ignores(&entry.path, entry.kind == Kind::Dir) {
                 let reason = SkipReason::Ignored;
                 self.ready(entry.path.clone(), ScanState::Skipped { reason });
             }
@@ -634,6 +750,135 @@ impl Walker<'_, '_> {
         let at = self.clock.now();
         self.pipe
             .ready(Some((path, state, at)), &mut |found| self.out.take(found));
+    }
+}
+
+/// Observes one path as a scan would report it (see the module docs), in
+/// one operation's `fs`.
+pub struct Observer<'a> {
+    pub fs: &'a dyn Fs,
+    /// The folder's index records, as the host last wrote them.
+    pub records: &'a dyn Records,
+    /// Its names on disk that are not their index paths' (§7.3).
+    pub names: &'a dyn DiskNames,
+    /// Its paths with an open journal row, reported `Skipped`.
+    pub open: &'a dyn OpenRows,
+    pub clock: &'a dyn Clock,
+    /// How its filesystem compares names.
+    pub sensitivity: Sensitivity,
+}
+
+impl Observer<'_> {
+    /// What a scan would report for `path` now, and when the host took the
+    /// observation (§7.3, draft 56): as for a scan, the time of the `stat`,
+    /// not of the end of a hash that followed it. `Absent` stands for what a
+    /// scan would leave unreported: nothing there, a FIFO or the like, or a
+    /// name on disk that is another path's.
+    pub fn observe(&self, path: &RelPath) -> (ScanState, Timestamp) {
+        let mut taken = None;
+        let state = self.state(path, &mut taken);
+        (state, taken.unwrap_or_else(|| self.clock.now()))
+    }
+
+    /// The state, and in `taken` the time of the `stat` it rests on, if
+    /// it got that far.
+    fn state(&self, path: &RelPath, taken: &mut Option<Timestamp>) -> ScanState {
+        // An open journal row: what is there is no record's (draft 64).
+        if self.open.is_open(path) {
+            return ScanState::Skipped { reason: OPEN_ROW };
+        }
+        let fs = self.fs;
+        // The rules decide first, as for a scan: with them unknown nothing
+        // can be told, and an ignored path is skipped whatever is there.
+        let rules = match fs
+            .open_dir(Path::new(""))
+            .and_then(|root| IgnoreRules::read(&*root))
+        {
+            Ok(rules) => rules,
+            Err(e) => {
+                return ScanState::Skipped {
+                    reason: ignore_file_reason(&e),
+                };
+            }
+        };
+        let ignored = |is_dir: bool| -> Option<ScanState> {
+            rules.ignores(path, is_dir).then_some(ScanState::Skipped {
+                reason: SkipReason::Ignored,
+            })
+        };
+        let tracked_dir = self
+            .records
+            .live(path)
+            .is_some_and(|record| record.kind == Kind::Dir);
+        let absent = || ignored(tracked_dir).unwrap_or(ScanState::Absent);
+        let device = match fs.lstat(Path::new("")) {
+            Ok(stat) => stat.dev,
+            Err(e) => return skipped(&e),
+        };
+        let disk = reach::disk_path(path, self.names);
+        match reach::walk(fs, path, &disk, device) {
+            Ok(Walk::Reached) => {}
+            Ok(Walk::Missing { .. } | Walk::NotADirectory { .. }) => return absent(),
+            // Beneath a mount point: an ignored path (§7.3).
+            Ok(Walk::Crossed { .. }) => {
+                return ScanState::Skipped {
+                    reason: SkipReason::Ignored,
+                };
+            }
+            Err(e) => return skipped(&e),
+        }
+        let parent = disk.parent().unwrap_or(Path::new(""));
+        let name = disk.file_name().unwrap_or_default();
+        let looked = reach::look(fs, parent, path, name, self.sensitivity);
+        *taken = Some(self.clock.now());
+        let (name, stat, seen) = match looked {
+            Ok(Look::Present {
+                name,
+                stat,
+                seen: Some(seen),
+            }) => (name, stat, seen),
+            Ok(Look::Present { seen: None, .. } | Look::Absent | Look::Taken { .. }) => {
+                return absent();
+            }
+            Ok(Look::Coinciding) => {
+                return ScanState::Skipped {
+                    reason: SkipReason::CoincidingNames,
+                };
+            }
+            Err(e) => return skipped(&e),
+        };
+        if let Some(skip) = ignored(seen.kind == Kind::Dir) {
+            return skip;
+        }
+        if seen.kind == Kind::Dir && stat.dev != device {
+            return ScanState::Skipped {
+                reason: SkipReason::Ignored,
+            };
+        }
+        if self
+            .records
+            .live(path)
+            .is_some_and(|record| record.unchanged_by_stat(&seen))
+        {
+            return ScanState::Unchanged;
+        }
+        if seen.kind != Kind::File {
+            return ScanState::Observed(seen);
+        }
+        if !settled(stat.ctime_ns, self.clock.now()) {
+            return unstable();
+        }
+        let dir = match fs.open_dir(parent) {
+            Ok(dir) => dir,
+            Err(e) if gone(&e) => return absent(),
+            Err(e) => return skipped(&e),
+        };
+        match hash_file(&*dir, &name, &stat) {
+            Hashed::Stable(hash) => ScanState::Observed(Observed { hash, ..seen }),
+            Hashed::Unstable => unstable(),
+            Hashed::Vanished => absent(),
+            Hashed::Failed(e) => skipped(&e),
+        }
     }
 }
 

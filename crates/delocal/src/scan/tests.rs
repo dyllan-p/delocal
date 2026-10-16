@@ -3,7 +3,7 @@
 //! nothing a scan could not see is ever tombstoned) a real engine sits
 //! behind the scanner.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules, Version};
 
@@ -11,9 +11,8 @@ use super::*;
 use crate::fs::RealFolder;
 
 mod reference;
-mod spy;
 
-use spy::Spy;
+use crate::fs::spy::Spy;
 
 const SECOND: i64 = 1_000_000_000;
 const DAY: i64 = 86_400 * SECOND;
@@ -70,7 +69,7 @@ struct Disk {
 impl Disk {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(RESERVED_DIR)).unwrap();
+        std::fs::create_dir_all(tmp.path().join(crate::tmp::DIR)).unwrap();
         std::fs::write(tmp.path().join(RESERVED_DIR).join(MARKER), "{}").unwrap();
         Self { tmp }
     }
@@ -118,12 +117,24 @@ fn scan_at(
     now: i64,
     hashers: usize,
 ) -> (Vec<Event>, ScanReport) {
+    scan_open(folder, records, &BTreeSet::new(), now, hashers)
+}
+
+/// [`scan_at`] with paths whose journal row is open.
+fn scan_open(
+    folder: &dyn Folder,
+    records: &dyn Records,
+    open: &dyn OpenRows,
+    now: i64,
+    hashers: usize,
+) -> (Vec<Event>, ScanReport) {
     let clock = move || at(now);
     let mut events = Vec::new();
     let report = Scan {
         id: id(),
         folder,
         records,
+        open,
         clock: &clock,
         hashers: NonZeroUsize::new(hashers).unwrap(),
     }
@@ -558,6 +569,85 @@ fn ignored_paths_are_left_alone_and_tracked_ones_are_frozen() {
     );
 }
 
+/// §7.3, draft 48: the walk never crosses onto another device. A mount
+/// point is an ignored path, never reported or tracked; what is tracked
+/// beneath one is frozen until the mount goes, so a disk that unmounts
+/// never reads as its subtree deleted.
+#[test]
+fn a_mount_point_is_never_crossed_and_what_it_covers_is_frozen() {
+    let disk = Disk::new();
+    disk.dir("data/sub");
+    disk.file("data/a", b"a", OLD, false);
+    disk.file("data/sub/b", b"b", OLD, false);
+    disk.file("other", b"o", OLD, false);
+    disk.dir("media");
+    disk.file("media/photo", b"p", OLD, false);
+
+    // Tracked before anything is mounted, except `media`, which is a mount
+    // point from the start: neither it nor anything in it is reported.
+    let mut engine = engine();
+    let spy = Spy::new(disk.root());
+    spy.mount("media");
+    let (events, _) = scan(&spy, &BTreeMap::new());
+    let paths: Vec<RelPath> = reports(&events).into_iter().map(|(p, _)| p).collect();
+    assert_eq!(
+        paths,
+        [
+            p("data"),
+            p("data/a"),
+            p("data/sub"),
+            p("data/sub/b"),
+            p("other")
+        ]
+    );
+    assert!(
+        spy.calls("dir.open_dir")
+            .iter()
+            .all(|d| !d.starts_with("media"))
+    );
+    feed(&mut engine, events);
+
+    // Something is mounted over `data`: everything tracked there is
+    // skipped after the walk, nothing beneath it is walked, and nothing is
+    // tombstoned.
+    let spy = Spy::new(disk.root());
+    spy.mount("media");
+    spy.mount("data");
+    let (events, _) = scan(&spy, &index(&engine));
+    assert_eq!(
+        reports(&events),
+        [
+            (p("other"), ScanState::Unchanged),
+            (p("data"), skip(SkipReason::Ignored)),
+            (p("data/a"), skip(SkipReason::Ignored)),
+            (p("data/sub"), skip(SkipReason::Ignored)),
+            (p("data/sub/b"), skip(SkipReason::Ignored)),
+        ]
+    );
+    assert!(
+        spy.calls("dir.open_dir")
+            .iter()
+            .all(|d| !d.starts_with("data"))
+    );
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+
+    // The mounted disk holds none of it: still frozen.
+    std::fs::remove_dir_all(disk.at("data")).unwrap();
+    disk.dir("data");
+    let (events, _) = scan(&spy, &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+    assert!(live(&engine).contains_key(&p("data/sub/b")));
+
+    // Once it is unmounted, the next bracket sees the paths as they are.
+    let spy = Spy::new(disk.root());
+    spy.mount("media");
+    let (events, _) = scan(&spy, &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert_eq!(tombstoned, [p("data/a"), p("data/sub"), p("data/sub/b")]);
+}
+
 /// Damage done to a tracked tree before a scan, which must abort before
 /// observing anything: the root guard's cases.
 fn guarded(damage: impl FnOnce(&Disk), why: fn(&Abort) -> bool) {
@@ -744,6 +834,7 @@ fn a_folder_deleted_while_it_is_scanned_is_not_a_mass_deletion() {
         id: id(),
         folder: &folder,
         records: &records,
+        open: &BTreeSet::new(),
         clock: &clock,
         hashers: NonZeroUsize::MIN,
     }
@@ -1002,12 +1093,14 @@ fn the_walk_opens_each_directory_once() {
     assert_eq!(opened, dirs, "each directory opened exactly once");
     assert_eq!(spy.calls("open_root"), [PathBuf::new()]);
     // Nothing reached by a whole path: the root is held as it is, and
-    // everything else is reached from the directory it is in.
+    // stated once for its device (§7.3, mount points), and everything else
+    // is reached from the directory it is in.
     assert_eq!(spy.calls("fs.open_dir"), [PathBuf::new()]);
+    assert_eq!(spy.calls("fs.lstat"), [PathBuf::new()]);
     let by_path: Vec<_> = spy
         .all()
         .into_iter()
-        .filter(|(op, _)| op.starts_with("fs.") && *op != "fs.open_dir")
+        .filter(|(op, _)| op.starts_with("fs.") && !["fs.open_dir", "fs.lstat"].contains(op))
         .collect();
     assert!(by_path.is_empty(), "{by_path:?}");
     // And each directory listed once.
@@ -1019,6 +1112,203 @@ fn the_walk_opens_each_directory_once() {
         .collect();
     walked.sort();
     assert_eq!(listed, walked);
+}
+
+/// One path observed as the scan sees it, with the clock at `now`.
+fn observe_at(folder: &dyn Folder, records: &dyn Records, path: &str, now: i64) -> ScanState {
+    let fs = folder.open().unwrap();
+    let clock = move || at(now);
+    let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let open = BTreeSet::new();
+    let observer = Observer {
+        fs: &*fs,
+        records,
+        names: &names,
+        open: &open,
+        clock: &clock,
+        sensitivity: Sensitivity::probe(&*fs).unwrap(),
+    };
+    let (state, taken) = observer.observe(&p(path));
+    assert_eq!(taken, at(now));
+    state
+}
+
+fn observe(folder: &dyn Folder, records: &dyn Records, path: &str) -> ScanState {
+    observe_at(folder, records, path, settled_now())
+}
+
+/// §7.3, §7.5 step 6: one path observed alone is reported as the scan
+/// reports it, for every path a scan reports, against the records it was
+/// compared with.
+#[test]
+fn one_path_observed_alone_is_what_the_scan_reports() {
+    let disk = Disk::new();
+    disk.dir("d/e");
+    disk.file("d/e/f", b"deep", OLD, false);
+    disk.file("x", b"x", OLD, true);
+    disk.file("y", b"y", OLD, false);
+    disk.symlink("s", "x");
+    disk.file("skip.log", b"l", OLD, false);
+    disk.file(ignore_rules::IGNORE_FILE, b"*.log\n", OLD, false);
+    let mut engine = engine();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    feed(&mut engine, events);
+    // Changes after the records were taken: a touch, a retarget, a new file.
+    disk.touch("y", OLD + SECOND);
+    std::fs::remove_file(disk.at("s")).unwrap();
+    disk.symlink("s", "y");
+    disk.file("d/new", b"n", OLD, false);
+    let records = index(&engine);
+    let (events, _) = scan(&disk.folder(), &records);
+    let reported = reports(&events);
+    assert!(reported.len() > 6);
+    for (path, state) in reported {
+        assert_eq!(
+            observe(&disk.folder(), &records, path.as_str()),
+            state,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn one_path_observed_alone_follows_the_scans_rules() {
+    let disk = Disk::new();
+    disk.file("file", b"x", OLD, false);
+    disk.dir("mnt/in");
+    disk.file("mnt/in/f", b"f", OLD, false);
+    let none: BTreeMap<RelPath, Entry> = BTreeMap::new();
+    let folder = disk.folder();
+
+    // Nothing there, beneath a file, or something that is not an entry.
+    assert_eq!(observe(&folder, &none, "missing"), ScanState::Absent);
+    assert_eq!(observe(&folder, &none, "missing/deeper"), ScanState::Absent);
+    assert_eq!(observe(&folder, &none, "file/x"), ScanState::Absent);
+    let _socket = std::os::unix::net::UnixListener::bind(disk.at("sock")).unwrap();
+    assert_eq!(observe(&folder, &none, "sock"), ScanState::Absent);
+
+    // A file that has not settled is not hashed (§7.3).
+    disk.file("fresh", b"new", OLD, false);
+    assert_eq!(
+        observe_at(&folder, &none, "fresh", wall()),
+        skip(SkipReason::Unstable)
+    );
+
+    // A mount point and what is beneath it are ignored paths (draft 48).
+    let spy = Spy::new(disk.root());
+    spy.mount("mnt");
+    assert_eq!(observe(&spy, &none, "mnt"), skip(SkipReason::Ignored));
+    assert_eq!(observe(&spy, &none, "mnt/in/f"), skip(SkipReason::Ignored));
+    assert_eq!(
+        observe(&spy, &none, "mnt/in/gone"),
+        skip(SkipReason::Ignored)
+    );
+
+    // So is what a rule ignores, there or not; and with the rules
+    // unreadable nothing can be told.
+    disk.file(ignore_rules::IGNORE_FILE, b"file\nghost\n", OLD, false);
+    assert_eq!(observe(&folder, &none, "file"), skip(SkipReason::Ignored));
+    assert_eq!(observe(&folder, &none, "ghost"), skip(SkipReason::Ignored));
+    std::fs::remove_file(disk.at(ignore_rules::IGNORE_FILE)).unwrap();
+    disk.dir(ignore_rules::IGNORE_FILE);
+    assert_eq!(observe(&folder, &none, "file"), skip(SkipReason::Io));
+}
+
+/// §7.3, draft 56: one path observed alone is dated by its `stat`, not by
+/// the end of the hash after it, as a scan's report is.
+#[test]
+fn one_path_observed_alone_is_dated_by_its_stat() {
+    let disk = Disk::new();
+    disk.file("f", b"to hash", OLD, false);
+    let fs = disk.folder().open().unwrap();
+    // A clock that moves a second each time it is read.
+    let ticks = std::sync::atomic::AtomicI64::new(settled_now());
+    let clock = || at(ticks.fetch_add(SECOND, std::sync::atomic::Ordering::SeqCst));
+    let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let none: BTreeMap<RelPath, Entry> = BTreeMap::new();
+    let open = BTreeSet::new();
+    let observer = Observer {
+        fs: &*fs,
+        records: &none,
+        names: &names,
+        open: &open,
+        clock: &clock,
+        sensitivity: Sensitivity::probe(&*fs).unwrap(),
+    };
+    let start = ticks.load(std::sync::atomic::Ordering::SeqCst);
+    let (state, taken) = observer.observe(&p("f"));
+    assert_eq!(state, observed_file(b"to hash", OLD, false));
+    // Read once for the stat, once more for the settle check before the
+    // hash; the observation is the first.
+    assert_eq!(taken, at(start));
+    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > start + SECOND);
+}
+
+/// §7.5, draft 64: a path with an open journal row, and everything
+/// beneath it, is reported `Skipped` and never looked at, whether it is on
+/// disk or not, until the row is resolved. Nothing is tombstoned for it.
+#[test]
+fn a_path_with_an_open_journal_row_is_skipped_until_it_is_resolved() {
+    let disk = Disk::new();
+    disk.file("a", b"a", OLD, false);
+    disk.dir("d");
+    disk.file("d/x", b"x", OLD, false);
+    disk.file("b", b"b", OLD, false);
+    let mut engine = engine();
+    let (events, _) = scan(&disk.folder(), &BTreeMap::new());
+    feed(&mut engine, events);
+
+    // A write displaced `a` and could not put it back; `d` holds a commit
+    // not yet known durable.
+    std::fs::remove_file(disk.at("a")).unwrap();
+    let open: BTreeSet<RelPath> = [p("a"), p("d")].into();
+    let spy = Spy::new(disk.root());
+    let (events, report) = scan_open(&spy, &index(&engine), &open, settled_now(), 4);
+    assert_eq!(
+        reports(&events),
+        [
+            (p("b"), ScanState::Unchanged),
+            (p("d"), skip(SkipReason::Io)),
+            (p("a"), skip(SkipReason::Io)),
+        ]
+    );
+    assert_eq!(report.skipped.get(&SkipReason::Io), Some(&2));
+    assert!(
+        spy.calls("dir.open_dir")
+            .iter()
+            .all(|d| !d.starts_with("d"))
+    );
+    assert!(spy.calls("dir.lstat").iter().all(|d| d != Path::new("d")));
+    let (_, tombstoned) = written(&feed(&mut engine, events));
+    assert!(tombstoned.is_empty());
+
+    // Observed alone, the same, beneath an open path too.
+    let fs = disk.folder().open().unwrap();
+    let clock = || at(settled_now());
+    let names: BTreeMap<RelPath, std::ffi::OsString> = BTreeMap::new();
+    let records = index(&engine);
+    let observer = Observer {
+        fs: &*fs,
+        records: &records,
+        names: &names,
+        open: &open,
+        clock: &clock,
+        sensitivity: Sensitivity::probe(&*fs).unwrap(),
+    };
+    assert_eq!(observer.observe(&p("a")).0, skip(SkipReason::Io));
+    assert_eq!(observer.observe(&p("d/x")).0, skip(SkipReason::Io));
+    assert_eq!(observer.observe(&p("b")).0, ScanState::Unchanged);
+
+    // Resolved: `a` is back, and both are seen as they are.
+    disk.file("a", b"a", OLD, false);
+    let (events, _) = scan(&disk.folder(), &index(&engine));
+    let (_, tombstoned) = written(&feed(&mut engine, events.clone()));
+    assert!(tombstoned.is_empty());
+    assert!(
+        reports(&events)
+            .iter()
+            .all(|(_, state)| *state == ScanState::Unchanged)
+    );
 }
 
 #[cfg(feature = "faults")]
