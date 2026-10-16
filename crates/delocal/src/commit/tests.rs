@@ -657,7 +657,18 @@ fn trouble_in_the_trash_is_a_local_failure() {
     std::fs::create_dir(disk.at(trash::DIR)).unwrap();
     let today = Path::new(trash::DIR).join(trash::day(settled_now()));
     std::fs::write(disk.at(today.to_str().unwrap()), "not a directory").unwrap();
-    let done = disk.commit(&move_to_trash("f", old), None);
+    let done = disk.commit(&move_to_trash("f", old.clone()), None);
+    assert!(local(&done), "{:?}", outcome(&done));
+    assert_eq!(disk.read("f"), b"old");
+    // Today's directory goes between its making and the move into it: the
+    // rename fails `ENOENT` for the trash's reasons, not the path's.
+    std::fs::remove_file(disk.at(today.to_str().unwrap())).unwrap();
+    let spy = Spy::new(disk.root());
+    let day = disk.at(today.to_str().unwrap());
+    spy.before("fs.rename_noreplace", "f", move || {
+        std::fs::remove_dir_all(day).unwrap();
+    });
+    let done = disk.commit_with(&spy, &remove("f", Some(old), Displace::Trash), None);
     assert!(local(&done), "{:?}", outcome(&done));
     assert_eq!(disk.read("f"), b"old");
 }
