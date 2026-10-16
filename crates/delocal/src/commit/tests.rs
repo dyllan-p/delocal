@@ -625,6 +625,43 @@ fn a_directory_with_a_disk_mounted_inside_is_never_moved() {
     assert_eq!(disk.trash(), [b"on another device".to_vec()]);
 }
 
+/// Trouble in the trash's own directories is the host's: a local failure
+/// that backs off, never the path changing underneath, which would wait
+/// for an observation that changes nothing.
+#[test]
+fn trouble_in_the_trash_is_a_local_failure() {
+    let disk = Disk::new();
+    let old = disk.file("f", b"old", OLD, false);
+    let local = |done: &Committed| {
+        matches!(
+            outcome(done),
+            ApplyOutcome::Failed {
+                error: LocalError::Io,
+                ..
+            }
+        )
+    };
+    // The trash is a file.
+    std::fs::write(disk.at(trash::DIR), "not a directory").unwrap();
+    let done = disk.commit(&remove("f", Some(old.clone()), Displace::Trash), None);
+    assert!(local(&done), "{:?}", outcome(&done));
+    let temp = disk.temp(b"new");
+    let incoming = entry("f", Kind::File, b"new", OLD, false);
+    let done = disk.commit(
+        &write("f", incoming, Some(old.clone()), Displace::Trash),
+        Some(&temp),
+    );
+    assert!(local(&done), "{:?}", outcome(&done));
+    // Today's directory is a file.
+    std::fs::remove_file(disk.at(trash::DIR)).unwrap();
+    std::fs::create_dir(disk.at(trash::DIR)).unwrap();
+    let today = Path::new(trash::DIR).join(trash::day(settled_now()));
+    std::fs::write(disk.at(today.to_str().unwrap()), "not a directory").unwrap();
+    let done = disk.commit(&move_to_trash("f", old), None);
+    assert!(local(&done), "{:?}", outcome(&done));
+    assert_eq!(disk.read("f"), b"old");
+}
+
 #[test]
 fn a_folder_without_its_marker_is_not_written_and_reads_as_skipped() {
     let failed = ApplyOutcome::Failed {

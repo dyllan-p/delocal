@@ -39,7 +39,7 @@ use delocal_engine::path::MAX_COMPONENT_LEN;
 use delocal_engine::time::format_utc_compact;
 use delocal_engine::{ContentHash, FolderId, Kind, RelPath, Timestamp};
 
-use crate::fs::{FileKind, Fs, Refusing, rename_refusing};
+use crate::fs::{FileKind, Fs, NotAFile, ParentNotADirectory, Refusing, rename_refusing};
 use crate::scan::hash::{CHUNK, hash_target};
 use crate::store::{HostWrite, TrashRow};
 
@@ -194,7 +194,7 @@ pub fn move_in(
     before: &mut dyn FnMut(&Place) -> io::Result<()>,
 ) -> Result<Moved, NotMoved> {
     let day = day(what.at);
-    let parent = parents(fs, &day, what.original).map_err(NotMoved::Failed)?;
+    let parent = parents(fs, &day, what.original).map_err(|e| NotMoved::Failed(own(e)))?;
     let name = what.original.file_name();
     let place = |n: u32| {
         let row = parent.join(numbered(name, what.kind, n));
@@ -210,7 +210,7 @@ pub fn move_in(
     };
     let mut from_n = 0;
     loop {
-        let n = free_number(&taken, from_n).map_err(NotMoved::Failed)?;
+        let n = free_number(&taken, from_n).map_err(|e| NotMoved::Failed(own(e)))?;
         let place = place(n);
         before(&place).map_err(NotMoved::Failed)?;
         match rename_refusing(fs, from, &place.disk) {
@@ -221,16 +221,42 @@ pub fn move_in(
                     NotMoved::Failed(io::Error::other("no free name in the trash"))
                 })?;
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // The trash's own directories were made just now, so what
-                // is missing is the entry.
+            // Anything else: if the entry went, or what holds it stopped
+            // being a directory, the path changed; otherwise the trouble
+            // is the trash's own, a local failure.
+            Err(e) => {
                 return match fs.lstat(from) {
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Err(NotMoved::Gone),
-                    _ => Err(NotMoved::Failed(e)),
+                    Err(gone)
+                        if gone.kind() == io::ErrorKind::NotFound
+                            || ParentNotADirectory::of(&gone).is_some() =>
+                    {
+                        Err(NotMoved::Gone)
+                    }
+                    _ => Err(NotMoved::Failed(own(e))),
                 };
             }
-            Err(e) => return Err(NotMoved::Failed(e)),
         }
+    }
+}
+
+/// An error in the trash's own directories, as a commit must read it: as a
+/// local failure, never as its path changing underneath, which a missing
+/// place or one that is not a directory would otherwise look like. An
+/// error that is a local failure already (`ENOSPC`, `EIO`) keeps its
+/// number.
+fn own(e: io::Error) -> io::Error {
+    let looks_changed = matches!(
+        e.kind(),
+        io::ErrorKind::NotFound
+            | io::ErrorKind::NotADirectory
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::DirectoryNotEmpty
+    ) || ParentNotADirectory::of(&e).is_some()
+        || NotAFile::of(&e).is_some();
+    if looks_changed {
+        io::Error::other(format!("in the trash: {e}"))
+    } else {
+        e
     }
 }
 
@@ -276,14 +302,25 @@ fn free_number(taken: &dyn Fn(u32) -> io::Result<bool>, from: u32) -> io::Result
 fn parents(fs: &dyn Fs, day: &str, original: &RelPath) -> io::Result<PathBuf> {
     let trash = Path::new(DIR);
     let mut at = PathBuf::from(day);
-    directory(fs, trash, Path::new(""))?;
-    directory(fs, trash, &at)?;
+    for fixed in [Path::new(""), at.as_path()] {
+        if directory(fs, trash, fixed)? == Directory::Taken {
+            return Err(io::Error::other(format!(
+                "{} is not a directory",
+                trash.join(fixed).display()
+            )));
+        }
+    }
     let names: Vec<&str> = original.components().collect();
     for name in &names[..names.len().saturating_sub(1)] {
         let mut n = 0;
         loop {
             let next = at.join(numbered(name, Kind::Dir, n));
-            if directory(fs, trash, &next)? {
+            let usable = match directory(fs, trash, &next)? {
+                Directory::Made => true,
+                Directory::Found => exact(fs, trash, &next)?,
+                Directory::Taken => false,
+            };
+            if usable {
                 at = next;
                 break;
             }
@@ -293,15 +330,26 @@ fn parents(fs: &dyn Fs, day: &str, original: &RelPath) -> io::Result<PathBuf> {
     Ok(at)
 }
 
+/// What [`directory`] found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Directory {
+    /// Nothing was there, and it made one.
+    Made,
+    /// A directory was there.
+    Found,
+    /// Something else was there.
+    Taken,
+}
+
 /// Make sure `trash/at` is a directory, making it if nothing is there.
-/// False if something else is there.
-fn directory(fs: &dyn Fs, trash: &Path, at: &Path) -> io::Result<bool> {
+fn directory(fs: &dyn Fs, trash: &Path, at: &Path) -> io::Result<Directory> {
     let path = trash.join(at);
     loop {
         match fs.lstat(&path) {
-            Ok(stat) => return Ok(stat.kind == FileKind::Dir),
+            Ok(stat) if stat.kind == FileKind::Dir => return Ok(Directory::Found),
+            Ok(_) => return Ok(Directory::Taken),
             Err(e) if e.kind() == io::ErrorKind::NotFound => match fs.create_dir(&path) {
-                Ok(()) => return Ok(true),
+                Ok(()) => return Ok(Directory::Made),
                 // Made by someone else a moment ago: look again.
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e),
@@ -309,6 +357,19 @@ fn directory(fs: &dyn Fs, trash: &Path, at: &Path) -> io::Result<bool> {
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Whether the directory found at `trash/at` is listed by its parent
+/// under exactly that name. On a filesystem that folds names (§7.3) a
+/// `stat` finds a differently spelt directory too, and an entry put there
+/// would get a row naming a path the disk does not hold; such a name is
+/// numbered instead.
+fn exact(fs: &dyn Fs, trash: &Path, at: &Path) -> io::Result<bool> {
+    let parent = trash.join(at.parent().unwrap_or(Path::new("")));
+    let Some(name) = at.file_name() else {
+        return Ok(true);
+    };
+    Ok(fs.read_dir(&parent)?.iter().any(|listed| listed == name))
 }
 
 /// The bytes in what is at `path`: a file's size, a symlink's target
