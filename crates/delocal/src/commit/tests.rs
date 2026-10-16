@@ -171,6 +171,41 @@ impl Disk {
         .unwrap()
     }
 
+    /// [`Commit::resolve`] through `folder`.
+    pub fn resolve(&self, folder: &dyn Folder) -> Resolved {
+        let clock = settled_now;
+        Commit {
+            id: folder_id(),
+            folder,
+            records: &self.records,
+            names: &self.names,
+            journal: &self.journal,
+            clock: &clock,
+            disk: &self.state,
+        }
+        .resolve()
+    }
+
+    /// What a scan reports for each path, with this disk's open rows.
+    pub fn scanned(&self) -> BTreeMap<RelPath, ScanState> {
+        let clock = settled_now;
+        let mut out = BTreeMap::new();
+        crate::scan::Scan {
+            id: folder_id(),
+            folder: &self.folder(),
+            records: &self.records,
+            open: &self.state,
+            clock: &clock,
+            hashers: std::num::NonZeroUsize::MIN,
+        }
+        .run(&mut |event| {
+            if let Event::Scanned { path, state, .. } = event {
+                out.insert(path, state);
+            }
+        });
+        out
+    }
+
     pub fn commit(&self, action: &Action, temp: Option<&Path>) -> Committed {
         self.commit_with(&self.folder(), action, temp)
     }
@@ -1166,6 +1201,61 @@ fn an_undo_that_cannot_look_keeps_its_row() {
     assert_eq!(disk.read("dir/f"), b"displaced");
 }
 
+/// §7.5, draft 64: a row the start's undo cannot resolve stays open, so
+/// the scan skips its path, until a later resolve puts the displaced file
+/// back.
+#[test]
+fn a_row_the_start_cannot_undo_keeps_its_path_skipped() {
+    let disk = Disk::new();
+    disk.dir("dir");
+    let in_trash = Path::new(trash::DIR).join("2026-10-15/f");
+    std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
+    std::fs::write(disk.at(in_trash.to_str().unwrap()), "displaced").unwrap();
+    let rows = [row("dir/f", &in_trash)];
+    let spy = Spy::new(disk.root());
+    spy.mount("dir");
+    let started = Start {
+        folder: folder_id(),
+        journal: &rows,
+        trash: &[],
+        names: &disk.names,
+        disk: &disk.state,
+        claimed: &|_| true,
+        now: settled_now(),
+        policy: trash::Policy::default(),
+    }
+    .run(&*spy.open().unwrap());
+    assert_eq!(started.undone.failed.len(), 1);
+    assert!(disk.state.is_open(&p("dir/f")));
+    let reason = ScanState::Skipped {
+        reason: crate::scan::OPEN_ROW,
+    };
+    assert_eq!(disk.scanned().get(&p("dir/f")), Some(&reason));
+
+    // The disk is unmounted: the next resolve puts the file back.
+    let resolved = disk.resolve(&disk.folder());
+    assert_eq!(resolved.resolved, [p("dir/f")]);
+    assert!(!disk.state.is_open(&p("dir/f")));
+    assert_eq!(disk.read("dir/f"), b"displaced");
+    assert_eq!(
+        disk.journal.taken(),
+        [
+            HostWrite::RemoveJournal {
+                folder: folder_id(),
+                path: p("dir/f")
+            },
+            HostWrite::RemoveTrash {
+                folder: folder_id(),
+                trashed_path: "2026-10-15/f".into()
+            },
+        ]
+    );
+    assert!(matches!(
+        disk.scanned().get(&p("dir/f")),
+        Some(ScanState::Observed(_))
+    ));
+}
+
 /// What a test tree holds at `path`: a file's content, a directory, or
 /// nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1281,6 +1371,7 @@ fn a_start_undoes_reconciles_prunes_and_clears_tmp() {
         journal: &[open],
         trash: &rows,
         names: &disk.names,
+        disk: &disk.state,
         claimed: &|name| name == "claimed",
         now,
         policy: trash::Policy::default(),

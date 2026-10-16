@@ -4,6 +4,9 @@
 //!
 //! 1. Undo every open row of the commit journal, into an empty path only
 //!    ([`undo`]). The temp file a row names is left for the fetch to resume.
+//!    A row the undo could not resolve stays open in the folder's
+//!    [`DiskState`], so the scan reports its path `Skipped` until a later
+//!    resolve or commit there puts the displaced file back (draft 64).
 //! 2. Bring the trash's rows into line with the trash ([`trash::reconcile`]):
 //!    an entry a crash left without its row gets one, and a row whose entry
 //!    is gone goes. This runs after the undo, which moves entries out of the
@@ -21,6 +24,7 @@ use std::path::PathBuf;
 
 use delocal_engine::{FolderId, Timestamp};
 
+use super::DiskState;
 use super::journal::{Undone, undo};
 use crate::fs::Fs;
 use crate::reach::DiskNames;
@@ -37,6 +41,9 @@ pub struct Start<'a> {
     pub trash: &'a [TrashRow],
     /// Its names on disk that are not their index paths'.
     pub names: &'a dyn DiskNames,
+    /// What the host keeps about its disk: rows the undo leaves open go
+    /// here.
+    pub disk: &'a DiskState,
     /// Whether a want claims a temp file, by its name (see
     /// [`tmp::claimed`]).
     pub claimed: &'a dyn Fn(&OsStr) -> bool,
@@ -66,6 +73,13 @@ impl Start<'_> {
             ..Started::default()
         };
         started.writes.extend(started.undone.writes.iter().cloned());
+        for (path, _) in &started.undone.failed {
+            if let Some(row) = self.journal.iter().find(|row| row.path == *path) {
+                let back = crate::reach::disk_path(path, self.names);
+                self.disk
+                    .keep_displaced(path.clone(), row.displaced_to.clone(), back);
+            }
+        }
         // The rows as the undo left them, then as reconciled.
         let mut rows: Vec<TrashRow> = self.trash.to_vec();
         apply(&mut rows, &started.undone.writes);

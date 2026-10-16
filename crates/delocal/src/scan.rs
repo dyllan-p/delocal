@@ -80,11 +80,18 @@
 //! as a mass deletion. An aborted scan closes the bracket with
 //! `ScanAborted`, which announces no deletions (§7.3).
 //!
+//! **Open journal rows** (§7.5, draft 64). A path whose commit journal row
+//! is open, and everything beneath it, is reported `Skipped` and not looked
+//! at: its disk is in a state no record describes. The walk does not go
+//! into one, and after it every open path it did not reach is reported too,
+//! since a displaced file not yet back leaves its path absent.
+//!
 //! **One path at a time.** [`Observer::observe`] observes a single path as
 //! the scan would report it, by the same rules: ignored and mounted paths
-//! skipped, the fast path against the record, a file hashed only once
-//! settled. It is what a failed commit's report carries (§7.5 step 6) and
-//! what the host answers the engine's `Observe` with (§8.3). It reaches the
+//! skipped, a path with an open journal row skipped, the fast path against
+//! the record, a file hashed only once settled. It is what a failed
+//! commit's report carries (§7.5 step 6), what the host answers the
+//! engine's `Observe` with (§8.3), and what the watcher reports. It reaches the
 //! path from the root through its names on disk ([`crate::reach`]) rather
 //! than walking to it, so on a filesystem that folds names it confirms the
 //! name through the parent's listing.
@@ -164,6 +171,36 @@ impl Records for BTreeMap<RelPath, Entry> {
     }
 }
 
+/// The paths whose journal row is open (§7.5, draft 64): a commit
+/// displaced what was there and could not put it back, or landed without
+/// knowing its rename durable, or the start's undo could not run. Their disk
+/// is in a state no record describes, so the scan and every single
+/// observation report them, and everything beneath them, `Skipped` until
+/// the row is resolved: unknown never advances anything. The commit path's
+/// `DiskState` is the host's; a set is for tests.
+pub trait OpenRows: Send + Sync {
+    /// Whether `path`, or a directory above it, has an open row.
+    fn is_open(&self, path: &RelPath) -> bool;
+    /// Every path with an open row.
+    fn open_paths(&self) -> Vec<RelPath>;
+}
+
+impl OpenRows for BTreeSet<RelPath> {
+    fn is_open(&self, path: &RelPath) -> bool {
+        self.iter()
+            .any(|open| open == path || open.is_ancestor_of(path))
+    }
+
+    fn open_paths(&self) -> Vec<RelPath> {
+        self.iter().cloned().collect()
+    }
+}
+
+/// What a path with an open journal row is reported as: `Skipped`, for an
+/// I/O reason, since the host cannot say what is there. The reason is only
+/// for `status`; the engine treats every reason alike (§7.3).
+pub const OPEN_ROW: SkipReason = SkipReason::Io;
+
 /// The time as the host tells it to the engine: the monotonic now of §7.8.
 /// A scan reads it as it states each file, for the stability check.
 pub trait Clock {
@@ -189,6 +226,8 @@ pub struct Scan<'a> {
     pub folder: &'a dyn Folder,
     /// Its index records, as the host last wrote them.
     pub records: &'a dyn Records,
+    /// Its paths with an open journal row, reported `Skipped`.
+    pub open: &'a dyn OpenRows,
     pub clock: &'a dyn Clock,
     /// Threads to hash on.
     pub hashers: NonZeroUsize,
@@ -292,6 +331,8 @@ impl Scan<'_> {
         std::thread::scope(|scope| {
             let mut walker = Walker {
                 records: self.records,
+                open: self.open,
+                skipped_open: BTreeSet::new(),
                 clock: self.clock,
                 rules: &rules,
                 device,
@@ -307,6 +348,7 @@ impl Scan<'_> {
                 },
             };
             walker.walk(root, names);
+            walker.open_records();
             walker.ignored_records();
             let Walker { pipe, mut out, .. } = walker;
             pipe.finish(&mut |found| out.take(found));
@@ -375,6 +417,9 @@ fn check_marker(delocal: &dyn Dir) -> Result<(), Abort> {
 /// The walk's state: everything but the stack of directories it is in.
 struct Walker<'a, 'e> {
     records: &'a dyn Records,
+    open: &'a dyn OpenRows,
+    /// The paths reported `Skipped` for an open journal row so far.
+    skipped_open: BTreeSet<RelPath>,
     clock: &'a dyn Clock,
     rules: &'a IgnoreRules,
     /// The root's device, which the walk never leaves.
@@ -507,6 +552,12 @@ impl Walker<'_, '_> {
         path: RelPath,
         differs: bool,
     ) -> Option<(Arc<dyn Dir>, RelPath, Vec<OsString>)> {
+        // A path with an open journal row is not looked at, nor anything
+        // beneath it: the skip covers them all (draft 64).
+        if self.open.is_open(&path) {
+            self.skip_open(path);
+            return None;
+        }
         let stat = match dir.lstat(disk) {
             Ok(stat) => stat,
             Err(e) if gone(&e) => return None,
@@ -625,12 +676,37 @@ impl Walker<'_, '_> {
         }
     }
 
+    /// Every path with an open journal row that the walk did not reach,
+    /// on disk or not, reported `Skipped` (draft 64): a displaced file not
+    /// yet back leaves its path absent, and the bracket's end must not take
+    /// that for a deletion.
+    fn open_records(&mut self) {
+        for path in self.open.open_paths() {
+            let covered = self
+                .skipped_open
+                .iter()
+                .any(|done| *done == path || done.is_ancestor_of(&path));
+            if !covered {
+                self.skip_open(path);
+            }
+        }
+    }
+
+    fn skip_open(&mut self, path: RelPath) {
+        self.skipped_open.insert(path.clone());
+        self.ready(path, ScanState::Skipped { reason: OPEN_ROW });
+    }
+
     /// Every tracked path the rules ignore, on disk or not, and every one
     /// at or beneath a mount point, reported `Skipped`: frozen until the
-    /// rule or the mount goes (§7.3).
+    /// rule or the mount goes (§7.3). One an open row's skip already covers
+    /// is not reported again.
     fn ignored_records(&mut self) {
         let records = self.records;
         for entry in records.live_entries() {
+            if self.open.is_open(&entry.path) {
+                continue;
+            }
             let mounted = self
                 .mounts
                 .iter()
@@ -685,6 +761,8 @@ pub struct Observer<'a> {
     pub records: &'a dyn Records,
     /// Its names on disk that are not their index paths' (§7.3).
     pub names: &'a dyn DiskNames,
+    /// Its paths with an open journal row, reported `Skipped`.
+    pub open: &'a dyn OpenRows,
     pub clock: &'a dyn Clock,
     /// How its filesystem compares names.
     pub sensitivity: Sensitivity,
@@ -705,6 +783,10 @@ impl Observer<'_> {
     /// The state, and in `taken` the time of the `stat` it rests on, if
     /// it got that far.
     fn state(&self, path: &RelPath, taken: &mut Option<Timestamp>) -> ScanState {
+        // An open journal row: what is there is no record's (draft 64).
+        if self.open.is_open(path) {
+            return ScanState::Skipped { reason: OPEN_ROW };
+        }
         let fs = self.fs;
         // The rules decide first, as for a scan: with them unknown nothing
         // can be told, and an ignored path is skipped whatever is there.
