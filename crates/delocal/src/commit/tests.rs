@@ -1079,6 +1079,45 @@ fn the_journal_undoes_a_displacement_into_an_empty_path_only() {
     assert_eq!(disk.read("c.conflict"), b"kept");
 }
 
+/// §7.5: a row whose path cannot be looked at, or is beneath a mount
+/// point, stays open for the next start, which then undoes it.
+#[test]
+fn an_undo_that_cannot_look_keeps_its_row() {
+    let disk = Disk::new();
+    disk.dir("dir");
+    let in_trash = Path::new(trash::DIR).join("2026-10-15/f");
+    std::fs::create_dir_all(disk.at(in_trash.parent().unwrap().to_str().unwrap())).unwrap();
+    std::fs::write(disk.at(in_trash.to_str().unwrap()), "displaced").unwrap();
+    let rows = [row("dir/f", &in_trash)];
+
+    let spy = Spy::new(disk.root());
+    spy.mount("dir");
+    let undone = undo(&*spy.open().unwrap(), folder_id(), &rows, &disk.names);
+    assert_eq!(undone.failed.len(), 1);
+    assert!(undone.writes.is_empty(), "the row stays");
+
+    #[cfg(feature = "faults")]
+    {
+        use crate::fs::FaultyFolder;
+        use crate::fs::faulty::{Fault, Op, Rule, Spec, Trigger};
+        let rule = Rule {
+            op: Op::Lstat,
+            path: "dir".into(),
+            at: Trigger::FromCall(1),
+            fail: Fault::Eacces,
+        };
+        let faulty = FaultyFolder::new(disk.folder(), Spec { rules: vec![rule] }).unwrap();
+        let undone = undo(&*faulty.open().unwrap(), folder_id(), &rows, &disk.names);
+        assert_eq!(undone.failed.len(), 1);
+        assert!(undone.writes.is_empty(), "the row stays");
+    }
+    assert!(!disk.exists("dir/f"));
+
+    let undone = undo_rows(&disk, &rows);
+    assert_eq!(undone.back, [p("dir/f")]);
+    assert_eq!(disk.read("dir/f"), b"displaced");
+}
+
 /// What a test tree holds at `path`: a file's content, a directory, or
 /// nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]

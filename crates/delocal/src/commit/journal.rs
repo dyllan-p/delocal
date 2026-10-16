@@ -78,7 +78,9 @@ pub struct Undone {
 
 /// Undo every open row of `folder`'s commit journal, `rows`, at daemon
 /// start, before the first scan (see the module docs). `names` are the
-/// folder's names on disk, which address the path as the commit did.
+/// folder's names on disk, which address the path as the commit did. A row
+/// whose path could not be looked at, or lies beneath a mount point, is
+/// left open and listed as failed, for the next start.
 pub fn undo(fs: &dyn Fs, folder: FolderId, rows: &[JournalRow], names: &dyn DiskNames) -> Undone {
     let mut undone = Undone::default();
     let device = match fs.lstat(Path::new("")) {
@@ -120,11 +122,18 @@ pub fn undo(fs: &dyn Fs, folder: FolderId, rows: &[JournalRow], names: &dyn Disk
             }
         }
         let disk = reach::disk_path(&row.path, names);
-        let reached = matches!(reach::walk(fs, &row.path, &disk, device), Ok(Walk::Reached));
-        let moved = if reached {
-            rename_refusing(fs, &row.displaced_to, &disk)
-        } else {
-            Err(io::ErrorKind::AlreadyExists.into())
+        let moved = match reach::walk(fs, &row.path, &disk, device) {
+            Ok(Walk::Reached) => rename_refusing(fs, &row.displaced_to, &disk),
+            // The parent went, or is not a directory: there is no empty
+            // path to go back into.
+            Ok(Walk::Missing { .. } | Walk::NotADirectory { .. }) => {
+                Err(io::ErrorKind::NotFound.into())
+            }
+            // A disk is mounted over the parent: what is beneath it is not
+            // the folder's until it goes, so the row waits for it.
+            Ok(Walk::Crossed { at }) => Err(io::Error::other(format!("{at} is a mount point"))),
+            // It could not be looked at: the row stays for the next start.
+            Err(e) => Err(e),
         };
         match moved {
             Ok(_) => {
