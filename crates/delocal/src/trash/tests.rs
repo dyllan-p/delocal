@@ -483,3 +483,40 @@ fn nothing_in_the_trash_enters_a_mounted_disk() {
         b"on another device"
     );
 }
+
+/// On a filesystem that folds names (APFS), a trash directory found under
+/// another spelling is not used under this one: every row names a path
+/// the disk holds byte for byte. On one that keeps names, the two
+/// spellings are two directories anyway.
+#[test]
+fn every_row_names_its_place_byte_for_byte() {
+    let (tmp, fs) = folder();
+    let root = tmp.path();
+    let mut rows = Vec::new();
+    for (path, content) in [("docs/x", "x"), ("Docs/y", "y"), ("DOCS/z", "z")] {
+        std::fs::write(root.join("victim"), content).unwrap();
+        let original = p(path);
+        let what = moving(&original, content.as_bytes(), NOON);
+        rows.push(
+            move_in(&*fs, Path::new("victim"), &what, &mut |_| Ok(()))
+                .unwrap()
+                .place
+                .row,
+        );
+    }
+    for row in rows {
+        let mut at = root.join(DIR);
+        for part in row.iter() {
+            let listed: Vec<std::ffi::OsString> = std::fs::read_dir(&at)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert!(
+                listed.iter().any(|l| l == part),
+                "{} not in {listed:?}",
+                row.display()
+            );
+            at = at.join(part);
+        }
+    }
+}
