@@ -25,7 +25,10 @@
 //!
 //! **Pruning** ([`prune`]): every entry moved in more than 30 days ago, and
 //! then the oldest first while the trash holds more than 10 GiB (§8.4,
-//! §17 question 8), with the directories left empty.
+//! §17 question 8), with the directories left empty. Nothing here enters a
+//! directory on another device than the folder's: the commit path never
+//! moves a mounted disk into the trash, and if one is mounted there anyway,
+//! pruning, sizing and reconciling all stop at it.
 
 use std::collections::BTreeSet;
 use std::io::{self, Read};
@@ -309,17 +312,19 @@ fn directory(fs: &dyn Fs, trash: &Path, at: &Path) -> io::Result<bool> {
 }
 
 /// The bytes in what is at `path`: a file's size, a symlink's target
-/// length, and for a directory everything in it. What cannot be read counts
-/// for nothing.
-pub fn size_of(fs: &dyn Fs, path: &Path) -> u64 {
+/// length, and for a directory everything in it on `device`, the folder
+/// root's. What cannot be read counts for nothing, and neither does a disk
+/// mounted inside.
+pub fn size_of(fs: &dyn Fs, path: &Path, device: u64) -> u64 {
     let Ok(stat) = fs.lstat(path) else {
         return 0;
     };
     match stat.kind {
+        FileKind::Dir if stat.dev != device => 0,
         FileKind::Dir => fs.read_dir(path).map_or(0, |names| {
             names
                 .iter()
-                .map(|name| size_of(fs, &path.join(name)))
+                .map(|name| size_of(fs, &path.join(name), device))
                 .fold(0, u64::saturating_add)
         }),
         FileKind::File | FileKind::Symlink => stat.size,
@@ -328,16 +333,24 @@ pub fn size_of(fs: &dyn Fs, path: &Path) -> u64 {
 }
 
 /// Remove what is at `path` in the trash, a directory with everything in
-/// it. Nothing there is not an error.
-fn remove_all(fs: &dyn Fs, path: &Path) -> io::Result<()> {
+/// it. Nothing there is not an error. A directory on another device than
+/// `device` (a disk mounted in the trash) is never entered or removed:
+/// that is an error, and what is beneath it stays.
+fn remove_all(fs: &dyn Fs, path: &Path, device: u64) -> io::Result<()> {
     let stat = match fs.lstat(path) {
         Ok(stat) => stat,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     let gone = if stat.kind == FileKind::Dir {
+        if stat.dev != device {
+            return Err(io::Error::other(format!(
+                "{} is on another device: a disk is mounted there",
+                path.display()
+            )));
+        }
         for name in fs.read_dir(path)? {
-            remove_all(fs, &path.join(name))?;
+            remove_all(fs, &path.join(name), device)?;
         }
         fs.remove_dir(path)
     } else {
@@ -385,12 +398,19 @@ pub fn prune(
     rows.sort_by(|a, b| (a.trashed_at, &a.trashed_path).cmp(&(b.trashed_at, &b.trashed_path)));
     let mut total = rows.iter().map(|row| row.size).fold(0, u64::saturating_add);
     let mut pruned = Pruned::default();
+    let device = match fs.lstat(Path::new("")) {
+        Ok(stat) => stat.dev,
+        Err(e) => {
+            pruned.failed.push((PathBuf::new(), e));
+            return pruned;
+        }
+    };
     for row in rows {
         let old = now.since(row.trashed_at) > policy.max_age_nanos;
         if !old && total <= policy.max_bytes {
             break;
         }
-        match remove_all(fs, &Path::new(DIR).join(&row.trashed_path)) {
+        match remove_all(fs, &Path::new(DIR).join(&row.trashed_path), device) {
             Ok(()) => {
                 total = total.saturating_sub(row.size);
                 remove_empty_parents(fs, &row.trashed_path);
@@ -418,6 +438,9 @@ pub fn reconcile(
     now: Timestamp,
 ) -> Vec<HostWrite> {
     let mut writes = Vec::new();
+    let Ok(device) = fs.lstat(Path::new("")).map(|stat| stat.dev) else {
+        return writes;
+    };
     let known: BTreeSet<&Path> = rows.iter().map(|row| row.trashed_path.as_path()).collect();
     for row in rows {
         let at = Path::new(DIR).join(&row.trashed_path);
@@ -443,6 +466,8 @@ pub fn reconcile(
                 continue;
             };
             let hash = match stat.kind {
+                // A disk mounted in the trash is not the trash's.
+                FileKind::Dir if stat.dev != device => continue,
                 FileKind::Dir => {
                     stack.push(row);
                     continue;

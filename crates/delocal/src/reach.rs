@@ -235,6 +235,33 @@ pub fn walk(fs: &dyn Fs, path: &RelPath, disk: &Path, device: u64) -> io::Result
     Ok(Walk::Reached)
 }
 
+/// Whether a directory anywhere beneath `dir` is on another device than
+/// `device`: a disk mounted inside it (§7.3, draft 48). A commit never
+/// moves such a directory, since a rename takes the mounted disk with it,
+/// into the trash or to a conflict copy. A directory that cannot be listed
+/// is an error, as nothing can be said of what is inside it.
+pub fn mounted_beneath(fs: &dyn Fs, dir: &Path, device: u64) -> io::Result<bool> {
+    // A stack, not recursion, so a deep tree costs heap, as for the scan.
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for name in fs.read_dir(&dir)? {
+            let path = dir.join(name);
+            match fs.lstat(&path) {
+                Ok(stat) if stat.kind == FileKind::Dir => {
+                    if stat.dev != device {
+                        return Ok(true);
+                    }
+                    todo.push(path);
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// What is at a path, as the guard and the fast path see it (§7.5 step 6).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Look {

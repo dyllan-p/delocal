@@ -586,6 +586,9 @@ impl Commit<'_> {
         temp: Option<&Path>,
     ) -> Result<Displaced, Failed> {
         let fs = at.fs;
+        if seen.kind == Kind::Dir {
+            refuse_mounts(at, disk)?;
+        }
         let row = |to: &Path| JournalRow {
             path: at.path.clone(),
             displaced_to: to.to_path_buf(),
@@ -610,7 +613,7 @@ impl Commit<'_> {
                         hash
                     },
                     size: match seen.kind {
-                        Kind::Dir => trash::size_of(fs, disk),
+                        Kind::Dir => trash::size_of(fs, disk, at.device),
                         Kind::File | Kind::Symlink => seen.size,
                     },
                     at: self.clock.now(),
@@ -754,6 +757,9 @@ impl Commit<'_> {
                 None
             }
             (_, Displace::ConflictCopy(copy)) => {
+                if seen.kind == Kind::Dir {
+                    refuse_mounts(at, &disk)?;
+                }
                 let to = reach::disk_path(copy, self.names);
                 let how = rename_refusing(fs, &disk, &to).map_err(|e| changed_or_local(&e))?;
                 self.disk.renamed(how);
@@ -1069,6 +1075,19 @@ fn make_parents(at: &At<'_>, first: Option<&RelPath>) -> Result<Vec<RelPath>, Fa
         }
     }
     Ok(created)
+}
+
+/// `Failed { Io }` if a disk is mounted anywhere inside the directory at
+/// `disk`, which a commit would otherwise move whole (§7.3, draft 48): into
+/// the trash, where pruning would delete what is on it, or to a conflict
+/// copy. Nothing is moved until the mount goes. The directory itself is on
+/// the root's device, so the report carries what is observed there.
+fn refuse_mounts(at: &At<'_>, disk: &Path) -> Result<(), Fail> {
+    match reach::mounted_beneath(at.fs, disk, at.device) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(Fail::Local(LocalError::Io)),
+        Err(e) => Err(changed_or_local(&e)),
+    }
 }
 
 /// Step 6's guard: what the engine expected at the path against what is
