@@ -165,12 +165,15 @@ fn a_file_created_at_a_target_before_any_rename_survives() {
     let disk = Disk::new();
     let spy = Spy::new(disk.root());
     let old = disk.file("g", b"old", OLD, false);
-    let place = Path::new(trash::DIR)
-        .join(trash::day(settled_now()))
-        .join("g");
-    let taken = disk.at(place.to_str().unwrap());
+    let trash_dir = disk.at(trash::DIR);
     spy.before("fs.rename_noreplace", "g", move || {
-        std::fs::write(taken, "in the trash already").unwrap();
+        // The commit has made today's directory: take the place in it.
+        let day = std::fs::read_dir(&trash_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::write(day.path().join("g"), "in the trash already").unwrap();
     });
     let done = disk.commit_with(&spy, &remove("g", Some(old), Displace::Trash), None);
     assert_eq!(outcome(&done), &ApplyOutcome::Ok);
