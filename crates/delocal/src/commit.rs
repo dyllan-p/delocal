@@ -35,7 +35,8 @@
 //! appears at a target between the check and the rename makes the rename
 //! fail, and survives. A rename in that fails puts the displaced file back
 //! only if the path is still empty, so a failure leaves the disk as it found
-//! it and never replaces what the user made meanwhile. A filesystem that
+//! it and never replaces what the user made meanwhile; if putting it back
+//! fails too, the journal row stays open and the next start undoes it. A filesystem that
 //! cannot refuse to replace gets a fresh check and a plain rename, and
 //! [`DiskState::narrower`] says so for `status`.
 //!
@@ -513,10 +514,12 @@ impl Commit<'_> {
         };
         if let Err(e) = renamed {
             incoming.discard(fs);
-            let mut writes = journal_rows(&displaced);
-            if let (Some(displaced), Found::Entry { disk, .. }) = (&displaced, &found) {
-                writes.extend(self.put_back(fs, displaced, disk));
-            }
+            let writes = match (&displaced, &found) {
+                (Some(displaced), Found::Entry { disk, .. }) => {
+                    self.put_back(at.path, fs, displaced, disk)
+                }
+                _ => Vec::new(),
+            };
             undo_parents(fs);
             return Err(Failed {
                 fail: changed_or_local(&e),
@@ -681,20 +684,39 @@ impl Commit<'_> {
     }
 
     /// Undo a displacement after a failed rename in: move it back to
-    /// where it was found, `path`, only if that is still empty (§7.5). The
-    /// writes that go with it: a displaced file that came back out of the
-    /// trash loses its trash row; one that stays keeps it.
-    fn put_back(&self, fs: &dyn Fs, displaced: &Displaced, path: &Path) -> Vec<HostWrite> {
-        match rename_refusing(fs, &displaced.to, path) {
+    /// where it was found, `to`, only if that is still empty (§7.5), and
+    /// return the writes that go with the report. A displaced file that came
+    /// back out of the trash loses its trash row, and the journal row goes.
+    /// One that cannot go back because the path was taken meanwhile stays
+    /// where it went, with its trash row, and the journal row goes too:
+    /// there is nothing left to undo. One that cannot go back for an I/O
+    /// error keeps the journal row open, so the next start's undo moves it
+    /// back if the path is still empty; until then the path is absent, and
+    /// the report says so.
+    fn put_back(
+        &self,
+        path: &RelPath,
+        fs: &dyn Fs,
+        displaced: &Displaced,
+        to: &Path,
+    ) -> Vec<HostWrite> {
+        let journal_gone = HostWrite::RemoveJournal {
+            folder: self.id,
+            path: path.clone(),
+        };
+        match rename_refusing(fs, &displaced.to, to) {
             Ok(how) => {
                 self.disk.renamed(how);
-                displaced
-                    .trash
-                    .as_ref()
-                    .map(|row| remove_trash(self.id, row))
-                    .into_iter()
-                    .collect()
+                let mut writes = vec![journal_gone];
+                writes.extend(
+                    displaced
+                        .trash
+                        .as_ref()
+                        .map(|row| remove_trash(self.id, row)),
+                );
+                writes
             }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => vec![journal_gone],
             Err(_) => Vec::new(),
         }
     }
