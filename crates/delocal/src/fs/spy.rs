@@ -137,6 +137,12 @@ impl Spy {
         *self.state.meddled.lock().unwrap()
     }
 
+    /// Every call so far with all of its paths, in order: what a FaultyFs
+    /// rule counts a call by.
+    pub fn steps(&self) -> Vec<(&'static str, Vec<PathBuf>)> {
+        self.state.steps.lock().unwrap().clone()
+    }
+
     /// Stop logging calls; they are still counted, and hooks still run.
     pub fn quiet(&self) {
         self.state.quiet.store(true, Ordering::Relaxed);
@@ -160,6 +166,12 @@ impl Spy {
             .lock()
             .unwrap()
             .push((op, path.into(), Box::new(hook)));
+    }
+
+    /// Run `hook` once, just before the call with index `index`, counting
+    /// every call from 0.
+    pub fn at_call(&self, index: usize, hook: impl FnOnce() + Send + 'static) {
+        self.state.at.lock().unwrap().push((index, Box::new(hook)));
     }
 
     /// Make the directory at `path` read as a mount point: it and

@@ -1,8 +1,9 @@
 //! Tests of the commit path (DESIGN.md §7.5 steps 6 to 9, §8.3 step 2) on
 //! real directories: each action and each way it ends, one at a time, and
 //! the journal's undo at start. The reference table ported from the
-//! simulator's host is in [`reference`], and the races with a user writing
-//! at the path in [`races`].
+//! simulator's host is in [`reference`], the races with a user writing at
+//! the path in [`races`], and a fault and a `kill -9` at every step of a
+//! commit in [`faults`].
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -16,6 +17,7 @@ use crate::fs::RealFolder;
 use crate::fs::spy::Spy;
 use crate::scan::hash::hash_target;
 
+mod faults;
 mod races;
 mod reference;
 
