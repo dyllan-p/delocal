@@ -18,6 +18,8 @@
 //!   guard (§7.3)
 //! - [`store`]: the SQLite database, the persisted parts and the host's
 //!   tables (§11, §8.5)
+//! - [`tailscale`]: everything delocal asks of Tailscale, behind one trait
+//!   (§6.1)
 //! - [`tmp`]: `.delocal/tmp/`, its names and what goes at start (§7.5)
 //! - [`trash`]: `.delocal/trash/`, its names, rows and pruning (§8.4)
 
@@ -31,5 +33,6 @@ pub mod names;
 pub mod reach;
 pub mod scan;
 pub mod store;
+pub mod tailscale;
 pub mod tmp;
 pub mod trash;
