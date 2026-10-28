@@ -4,8 +4,8 @@
 //! [`Tailscale`] has three methods: this machine, its peers, and who is at
 //! an address. They are async because the preferred implementation is an
 //! HTTP client on the LocalAPI's socket. v1 polls the peer list every 30 s
-//! (§6.2, §6.4); the LocalAPI's event stream is a v1.1 item, so the trait
-//! has no stream type.
+//! ([`tier::POLL`], §6.2, §6.4); the LocalAPI's event stream is a v1.1
+//! item, so the trait has no stream type.
 //!
 //! **Addresses carry a port.** A machine's addresses, its own and its
 //! peers', are socket addresses. The real implementation will pair each
@@ -17,7 +17,8 @@
 //! So far:
 //!
 //! - [`fake`]: a Tailscale made from a config, for tests (§14.2)
-//! - [`tier`]: connection tiers from path info (§6.4)
+//! - [`tier`]: connection tiers from path info, and the poll that keeps the
+//!   engine's up to date (§6.4)
 //!
 //! The real implementations, the LocalAPI and the CLI fallback with their
 //! recorded fixtures, are Phase 3's (§15).
