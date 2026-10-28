@@ -35,6 +35,18 @@ impl Clock {
         Self { wall, start }
     }
 
+    /// A clock `by` nanoseconds off the wall clock: one that stopped while
+    /// the machine slept (behind), or counted on while the wall clock was set
+    /// back (ahead).
+    #[cfg(test)]
+    pub fn shifted(by: i64) -> Self {
+        let clock = Self::start();
+        Self {
+            wall: clock.wall.saturating_add(by),
+            ..clock
+        }
+    }
+
     /// The wall clock at start plus the monotonic time elapsed since.
     pub fn now(&self) -> Timestamp {
         Timestamp::from_unix_nanos(self.wall.saturating_add(nanos(self.start.elapsed())))
