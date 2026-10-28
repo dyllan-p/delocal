@@ -467,10 +467,19 @@ impl Commit<'_> {
     /// would report for the path now, unless the host cannot trust what it
     /// would see there.
     fn found(&self, path: &RelPath, fail: &Fail) -> (ScanState, Timestamp) {
-        let skipped = |reason| (ScanState::Skipped { reason }, self.clock.now());
         if let Fail::Blind { reason, .. } = fail {
-            return skipped(*reason);
+            return (ScanState::Skipped { reason: *reason }, self.clock.now());
         }
+        self.observe(path)
+    }
+
+    /// What a scan would report for `path` now, and when the host took the
+    /// observation ([`Observer`]), in an operation of its own: the answer to
+    /// the engine's `Observe` (§8.3), and what a failed report carries. A
+    /// folder whose marker is gone reports `Skipped`, never `Absent` (§7.3,
+    /// the root guard).
+    pub fn observe(&self, path: &RelPath) -> (ScanState, Timestamp) {
+        let skipped = |reason| (ScanState::Skipped { reason }, self.clock.now());
         let Ok(fs) = self.folder.open() else {
             return skipped(SkipReason::Io);
         };
