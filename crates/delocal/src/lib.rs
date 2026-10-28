@@ -18,8 +18,8 @@
 //!   guard (§7.3)
 //! - [`store`]: the SQLite database, the persisted parts and the host's
 //!   tables (§11, §8.5)
-//! - [`tailscale`]: everything delocal asks of Tailscale, behind one trait
-//!   (§6.1)
+//! - [`tailscale`]: everything delocal asks of Tailscale, behind one trait,
+//!   its fake, and connection tiers (§6.1, §6.4)
 //! - [`tmp`]: `.delocal/tmp/`, its names and what goes at start (§7.5)
 //! - [`trash`]: `.delocal/trash/`, its names, rows and pruning (§8.4)
 
