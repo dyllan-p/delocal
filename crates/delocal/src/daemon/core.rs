@@ -150,6 +150,10 @@ pub(crate) struct Watch {
     pub names: BTreeMap<RelPath, OsString>,
     /// Paths the running scan reported `Skipped`: their names stay.
     pub skipped: Vec<RelPath>,
+    /// Paths whose names on disk a commit changed while the scan ran: the
+    /// scan may have walked past them before, so what it found there is
+    /// not taken.
+    pub touched: BTreeSet<RelPath>,
     /// `IndexChanged`s the running scan's events produced.
     pub changes: usize,
 }
@@ -307,6 +311,23 @@ impl Core {
             debug!(folder = %folder.short(), %path, "unchanged against a record that moved");
         }
         let unstable = unstable(&event);
+        if source != Source::Scan
+            && let Some(folder) = folder_of(&event)
+            && let Some(watch) = self.folders.get_mut(&folder)
+            && watch.scanning
+        {
+            for write in &writes {
+                match write {
+                    HostWrite::PutDiskName { name, .. } => {
+                        watch.touched.insert(name.path.clone());
+                    }
+                    HostWrite::RemoveDiskName { path, .. } => {
+                        watch.touched.insert(path.clone());
+                    }
+                    _ => {}
+                }
+            }
+        }
         if source == Source::Scan
             && let Event::Scanned {
                 folder,
@@ -575,6 +596,7 @@ impl Core {
         watch.scanning = true;
         watch.next_scan = None;
         watch.skipped.clear();
+        watch.touched.clear();
         watch.changes = 0;
         self.direct(Job::Scan { folder: id })
     }
@@ -614,12 +636,21 @@ impl Core {
 /// found (§7.3, `disk_names` in §11): a pair for every name that differs
 /// from its index path, and none for a path the scan saw by its index name.
 /// A path the scan skipped keeps its pair, and so does everything beneath
-/// it, since the scan did not look.
+/// it, since the scan did not look. So does a path a commit renamed while
+/// the scan ran, with everything beneath it: the scan may have walked past
+/// it first, and the commit's pair is the newer.
 fn names_written(id: FolderId, watch: &Watch, report: &ScanReport) -> Vec<HostWrite> {
+    let touched = |path: &RelPath| {
+        watch
+            .touched
+            .iter()
+            .any(|t| t == path || t.is_ancestor_of(path))
+    };
     let found: BTreeMap<&RelPath, &OsString> = report
         .disk_names
         .iter()
         .map(|n| (&n.path, &n.name))
+        .filter(|(path, _)| !touched(path))
         .collect();
     let mut writes = Vec::new();
     for (path, name) in &found {
@@ -638,7 +669,7 @@ fn names_written(id: FolderId, watch: &Watch, report: &ScanReport) -> Vec<HostWr
             .skipped
             .iter()
             .any(|s| s == path || s.is_ancestor_of(path));
-        if !found.contains_key(path) && !skipped {
+        if !found.contains_key(path) && !skipped && !touched(path) {
             writes.push(HostWrite::RemoveDiskName {
                 folder: id,
                 path: path.clone(),
@@ -698,6 +729,16 @@ fn relative(
         reason: SkipReason::Unstable,
     };
     Some((folder, path.clone()))
+}
+
+/// The folder an event is for, if it is a report about a path.
+fn folder_of(event: &Event) -> Option<FolderId> {
+    match event {
+        Event::Scanned { folder, .. }
+        | Event::Applied { folder, .. }
+        | Event::Trashed { folder, .. } => Some(*folder),
+        _ => None,
+    }
 }
 
 /// The path an event reports `Skipped { Unstable }` for, to look at again.
@@ -969,7 +1010,7 @@ mod tests {
     }
 
     /// §7.3, §11: a finished scan's names on disk replace the store's,
-    /// except at and beneath what it skipped.
+    /// except at and beneath what it skipped or a commit renamed meanwhile.
     #[test]
     fn a_scan_keeps_the_names_it_found_and_those_it_could_not_look_at() {
         let name = |s: &str| DiskName {
@@ -981,8 +1022,12 @@ mod tests {
             watch.names.insert(p(path), name(path).name);
         }
         watch.skipped = vec![p("kept")];
+        // A commit renamed `moved` while the scan ran, after the scan had
+        // found its old name; and made `fresh` beneath `made`.
+        watch.names.insert(p("made/fresh"), name("made/fresh").name);
+        watch.touched = [p("moved"), p("made")].into();
         let report = ScanReport {
-            disk_names: vec![name("new"), name("same")],
+            disk_names: vec![name("new"), name("same"), name("moved"), name("made/old")],
             ..ScanReport::default()
         };
         assert_eq!(
