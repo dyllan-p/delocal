@@ -96,10 +96,8 @@ pub struct JournalRow {
     /// The temp step 8 renames in, relative to the folder root. Every
     /// write has one since draft 65, a directory's included (made empty at
     /// a temp name), and the undo judges a row by whether it is still
-    /// there. The column stays nullable, since migrations are append-only;
-    /// a row without one has nothing to say its rename never happened, and
-    /// the undo takes it for landed.
-    pub temp_file: Option<PathBuf>,
+    /// there: a rename consumes it.
+    pub temp_file: PathBuf,
 }
 
 /// One of this user's machines (§5, §10 `machines`).

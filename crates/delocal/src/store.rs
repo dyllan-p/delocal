@@ -274,4 +274,33 @@ mod tests {
         assert!(matches!(Store::open(&path), Err(StoreError::Sqlite(_))));
         assert_eq!(std::fs::read(&path).unwrap(), [0x42; 4096]);
     }
+
+    /// Draft 65: every write goes through a temp, so every journal row
+    /// names one, and the schema refuses a row that does not.
+    #[test]
+    fn a_journal_row_without_a_temp_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("delocal.db")).unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO folders (id, name, created_by, rules_json, meta_version) \
+                 VALUES (?1, 'Sync', ?1, '{}', 0)",
+                [[7u8; 16]],
+            )
+            .unwrap();
+        let insert = |temp: Option<&[u8]>| {
+            store.conn.execute(
+                "INSERT INTO commit_journal (folder, path, displaced_to, temp_file) \
+                 VALUES (?1, 'a', X'00', ?2)",
+                rusqlite::params![[7u8; 16], temp],
+            )
+        };
+        assert!(matches!(
+            insert(None),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation
+        ));
+        insert(Some(b".delocal/tmp/t")).unwrap();
+    }
 }

@@ -201,12 +201,14 @@ CREATE TABLE disk_names (
 ) STRICT;
 
 -- The commit journal (§7.5): a commit between its displacement and its
--- rename. temp_file is NULL when nothing is renamed in (a directory).
+-- rename. temp_file is what the rename brings in. Every write has one, a
+-- directory's included (draft 65), and the undo judges a row by whether it
+-- is still there.
 CREATE TABLE commit_journal (
     folder       BLOB NOT NULL REFERENCES folders (id),
     path         TEXT NOT NULL,
     displaced_to BLOB NOT NULL,
-    temp_file    BLOB,
+    temp_file    BLOB NOT NULL,
     PRIMARY KEY (folder, path)
 ) STRICT;
 

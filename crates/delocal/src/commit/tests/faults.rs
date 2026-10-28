@@ -742,7 +742,7 @@ fn a_landed_commit_deleted_before_a_restart_stays_deleted() {
         rows.extend(done.writes);
         let open = open_rows(&rows, &[]);
         assert_eq!(open.len(), 1, "{scenario:?}: the row stays open");
-        let named = open[0].temp_file.clone().unwrap();
+        let named = open[0].temp_file.clone();
         assert!(
             !disk.exists(named.to_str().unwrap()),
             "{scenario:?}: consumed by the rename"
@@ -822,7 +822,7 @@ fn a_stranded_directory_write_keeps_its_temp_for_the_next_start() {
     let mut rows = disk.journal.taken();
     rows.extend(done.writes);
     let open = open_rows(&rows, &[]);
-    let temp = open[0].temp_file.clone().unwrap();
+    let temp = open[0].temp_file.clone();
     assert!(disk.at(temp.to_str().unwrap()).is_dir(), "{temp:?}");
 
     let undone = undo_rows(&disk, &open);
@@ -848,7 +848,7 @@ fn a_landed_row_the_start_cannot_sync_stays_open() {
         path: p("dir/f"),
         displaced_to: in_trash,
         // Consumed by the rename.
-        temp_file: Some(Scenario::temp().with_file_name("consumed")),
+        temp_file: Scenario::temp().with_file_name("consumed"),
     }];
     let rule = Rule {
         op: Op::SyncDir,
@@ -934,7 +934,7 @@ fn a_stranded_symlink_write_keeps_its_temp_for_the_next_start() {
     let mut rows = disk.journal.taken();
     rows.extend(done.writes);
     let open = open_rows(&rows, &[]);
-    let link = open[0].temp_file.clone().unwrap();
+    let link = open[0].temp_file.clone();
     assert!(
         link.starts_with(tmp::DIR) && disk.exists(link.to_str().unwrap()),
         "{link:?}"

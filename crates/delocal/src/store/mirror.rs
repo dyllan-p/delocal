@@ -629,7 +629,7 @@ fn host_write() -> BoxedStrategy<HostWrite> {
                 name: DiskName { path, name: OsString::from_vec(name) },
             }),
             1 => path().prop_map(move |path| HostWrite::RemoveDiskName { folder, path }),
-            2 => (path(), path_buf(), option::of(path_buf())).prop_map(
+            2 => (path(), path_buf(), path_buf()).prop_map(
                 move |(path, displaced_to, temp_file)| HostWrite::PutJournal {
                     folder,
                     row: JournalRow { path, displaced_to, temp_file },
