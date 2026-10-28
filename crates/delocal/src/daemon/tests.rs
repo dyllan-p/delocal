@@ -944,3 +944,5 @@ fn observe_is_answered_as_a_scan_would_behind_the_root_guard() {
     assert_eq!(stored, engine);
     daemon.stop().unwrap();
 }
+
+mod kill;
