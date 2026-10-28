@@ -24,7 +24,7 @@ blake3 = "1.8.7"
 # The gitignore matcher only (DESIGN.md §7.3, Appendix A): the scanner walks
 # through the filesystem layer itself, so its walker is never used.
 ignore = "0.4.33"
-rustix = { version = "1.1.5", features = ["fs"] }
+rustix = { version = "1.1.5", features = ["fs", "process", "system"] }
 tempfile = "3.27.0"
 unicode-normalization = "0.1.25"
 # `bundled` compiles SQLite from source into the binary, so it is static on
@@ -32,6 +32,16 @@ unicode-normalization = "0.1.25"
 # prepared statements across a transaction's rows. The default features also
 # pull in a WebAssembly build of SQLite, which no target here needs.
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
+# The daemon's runtime (DESIGN.md Appendix A): one engine task, its timers,
+# the channels between it and the threads that do the I/O, and the signals
+# that stop it. `macros` is for `select!`, not for `#[tokio::main]`.
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+clap = { version = "4.6.7", features = ["derive"] }
+tracing = "0.1.44"
+# `fmt` writes the log lines; ANSI colours and the `log` bridge are left out,
+# since the lines go to files and nothing here logs through `log`.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
+tracing-appender = "0.2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
