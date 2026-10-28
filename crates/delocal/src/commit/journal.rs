@@ -167,27 +167,29 @@ pub fn undo(fs: &dyn Fs, folder: FolderId, rows: &[JournalRow], names: &dyn Disk
         // that is gone means the commit landed, its report or its sync lost.
         // Only a rename that never happened is undone: a landed one is made
         // durable and its row dropped, its displaced file left where it
-        // went. A row with no temp file (a directory made in place) cannot
-        // be told this way, and is undone into an empty path as before.
-        if let Some(temp) = &row.temp_file {
-            match fs.lstat(temp) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    let dirs = landed_dirs(&disk, &row.displaced_to);
-                    match sync_landed(fs, &dirs) {
-                        Ok(()) => {
-                            undone.writes.push(gone);
-                            undone.landed.push(row.path.clone());
-                        }
-                        Err(e) => undone.unsynced.push((row.path.clone(), dirs, e)),
-                    }
-                    continue;
-                }
+        // went. Every write goes through a temp, a directory's included, so
+        // a row without one has nothing to say its rename never happened.
+        let temp_there = match &row.temp_file {
+            Some(temp) => match fs.lstat(temp) {
+                Ok(_) => true,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
                 Err(e) => {
                     undone.failed.push((row.path.clone(), e));
                     continue;
                 }
+            },
+            None => false,
+        };
+        if !temp_there {
+            let dirs = landed_dirs(&disk, &row.displaced_to);
+            match sync_landed(fs, &dirs) {
+                Ok(()) => {
+                    undone.writes.push(gone);
+                    undone.landed.push(row.path.clone());
+                }
+                Err(e) => undone.unsynced.push((row.path.clone(), dirs, e)),
             }
+            continue;
         }
         let moved = match reach::walk(fs, &row.path, &disk, device) {
             Ok(Walk::Reached) => rename_refusing(fs, &row.displaced_to, &disk),

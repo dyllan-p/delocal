@@ -51,6 +51,9 @@ enum Scenario {
     WriteOverDirectory,
     /// A file where there was nothing, beneath missing parents.
     WriteNew,
+    /// A directory over a file, which goes to the trash: the directory
+    /// comes in as an empty one at a temp name (draft 65).
+    WriteDirOverFile,
     /// A delete, to the trash.
     Remove,
     /// A revert's move to the trash.
@@ -60,10 +63,11 @@ enum Scenario {
 }
 
 impl Scenario {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::WriteOverFile,
         Self::WriteToConflictCopy,
         Self::WriteOverDirectory,
+        Self::WriteDirOverFile,
         Self::WriteNew,
         Self::Remove,
         Self::MoveToTrash,
@@ -126,6 +130,10 @@ impl Scenario {
             }
             Self::WriteOverDirectory => (write(path, incoming, Some(dir()), Displace::Trash), temp),
             Self::WriteNew => (write(path, incoming, None, Displace::Trash), temp),
+            Self::WriteDirOverFile => {
+                let incoming = entry(path, Kind::Dir, b"", 0, false);
+                (write(path, incoming, Some(old), Displace::Trash), None)
+            }
             Self::Remove => (remove(path, Some(old), Displace::Trash), None),
             Self::MoveToTrash => (move_to_trash(path, old), None),
             Self::SetMeta => (set_meta(path, Some(old), OLD + 7, true), None),
@@ -289,6 +297,7 @@ fn landed(disk: &Disk, scenario: Scenario) -> Result<(), String> {
         Scenario::SetMeta => {
             at_path.is_some_and(|m| m.mtime() * SECOND + m.mtime_nsec() == OLD + 7)
         }
+        Scenario::WriteDirOverFile => at_path.is_some_and(|m| m.is_dir()),
         _ => std::fs::read(disk.at(scenario.path())).ok().as_deref() == Some(NEW_CONTENT),
     };
     if ok {
@@ -379,17 +388,34 @@ fn op(name: &str) -> Op {
 #[cfg(feature = "faults")]
 fn rule_at(steps: &[(&'static str, Vec<PathBuf>)], k: usize, fail: Fault) -> Rule {
     let (name, paths) = &steps[k];
-    let pattern = paths[0].clone();
+    let pattern = pattern_of(&paths[0]);
     let matching = steps[..=k]
         .iter()
-        .filter(|(n, ps)| *n != JOURNAL && op(n) == op(name) && ps.contains(&pattern))
+        .filter(|(n, ps)| {
+            *n != JOURNAL && op(n) == op(name) && ps.iter().any(|p| pattern_of(p) == pattern)
+        })
         .count();
     Rule {
         op: op(name),
-        path: pattern.to_str().unwrap().to_owned(),
+        path: pattern,
         at: Trigger::Call(matching as u64),
         fail,
     }
+}
+
+/// A path as a fault rule's pattern: itself, but for the fresh names the
+/// commit gives what it makes in `tmp/` (a directory, a symlink), which
+/// differ from run to run and so become a wildcard (FaultyFs's `*`).
+#[cfg(feature = "faults")]
+fn pattern_of(path: &Path) -> String {
+    let text = path.to_str().unwrap().to_owned();
+    for fresh in ["dir-", "link-"] {
+        let prefix = format!("{}/{fresh}", tmp::DIR);
+        if text.starts_with(&prefix) {
+            return format!("{prefix}*");
+        }
+    }
+    text
 }
 
 /// §7.5, §14.2: a fault at each step of each scenario, `EIO` and `ENOSPC`.
@@ -440,6 +466,7 @@ fn a_fault_at_any_step_never_loses_the_displaced_file() {
                     Scenario::WriteOverFile
                         | Scenario::WriteToConflictCopy
                         | Scenario::WriteOverDirectory
+                        | Scenario::WriteDirOverFile
                 );
                 assert_eq!(!open.is_empty(), unsure && displaces, "{what}: {open:?}");
                 if !open.is_empty() {
@@ -690,58 +717,120 @@ fn an_unsynced_commit_is_skipped_until_its_directories_sync() {
     ));
 }
 
-/// Draft 65, the ruling on reading 8: an fsync fails after the rename in,
-/// so the row stays open; the user then deletes the file; the daemon
-/// restarts. The file stays deleted, and the old version stays in the
-/// trash with its row: the start's undo sees the temp file gone, so the
-/// rename happened, and puts nothing back.
+/// Draft 65, the ruling on reading 8, for a file and, with every write
+/// going through a temp, for a directory replacing a file: an fsync fails
+/// after the rename in, so the row stays open; the user then deletes what
+/// landed; the daemon restarts. It stays deleted, and the old file stays in
+/// the trash with its row: the start's undo sees the row's temp gone, so
+/// the rename happened, and puts nothing back.
 #[cfg(feature = "faults")]
 #[test]
 fn a_landed_commit_deleted_before_a_restart_stays_deleted() {
-    let scenario = Scenario::WriteOverFile;
+    for scenario in [Scenario::WriteOverFile, Scenario::WriteDirOverFile] {
+        let disk = disk_for(scenario);
+        let rule = Rule {
+            op: Op::SyncDir,
+            path: "dir".into(),
+            at: Trigger::FromCall(1),
+            fail: Fault::Eio,
+        };
+        let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] }).unwrap();
+        let (action, temp) = scenario.action();
+        let done = disk.commit_with(&faulty, &action, temp.as_deref());
+        assert_eq!(outcome(&done), &ApplyOutcome::Ok, "{scenario:?}");
+        let mut rows = disk.journal.taken();
+        rows.extend(done.writes);
+        let open = open_rows(&rows, &[]);
+        assert_eq!(open.len(), 1, "{scenario:?}: the row stays open");
+        let named = open[0].temp_file.clone().unwrap();
+        assert!(
+            !disk.exists(named.to_str().unwrap()),
+            "{scenario:?}: consumed by the rename"
+        );
+
+        // The user deletes what landed; the daemon restarts, afresh.
+        let landed = disk.at(scenario.path());
+        if landed.is_dir() {
+            std::fs::remove_dir(&landed).unwrap();
+        } else {
+            std::fs::remove_file(&landed).unwrap();
+        }
+        let restarted = DiskState::new();
+        let fs = disk.folder().open().unwrap();
+        let started = Start {
+            folder: folder_id(),
+            journal: &open,
+            trash: &[],
+            names: &disk.names,
+            disk: &restarted,
+            claimed: &|_| true,
+            now: settled_now(),
+            policy: trash::Policy::default(),
+        }
+        .run(&*fs);
+        assert_eq!(started.undone.landed, [p(scenario.path())], "{scenario:?}");
+        assert!(
+            !disk.exists(scenario.path()),
+            "{scenario:?}: it stays deleted"
+        );
+        assert_eq!(
+            disk.trash(),
+            [OLD_CONTENT.to_vec()],
+            "{scenario:?}: the old file stays in the trash"
+        );
+        rows.extend(started.writes);
+        assert!(open_rows(&rows, &[]).is_empty());
+        rows_match_the_trash(&disk, &[], &rows).unwrap();
+        assert!(!restarted.is_open(&p(scenario.path())));
+    }
+}
+
+/// Draft 65: a directory write whose rename in and put-back both fail
+/// keeps the empty directory its row names in `tmp/`, so the next start
+/// reads the row as a rename that never happened and puts the file back.
+#[cfg(feature = "faults")]
+#[test]
+fn a_stranded_directory_write_keeps_its_temp_for_the_next_start() {
+    let scenario = Scenario::WriteDirOverFile;
     let disk = disk_for(scenario);
-    let temp = Scenario::temp();
-    let rule = Rule {
-        op: Op::SyncDir,
-        path: "dir".into(),
-        at: Trigger::FromCall(1),
-        fail: Fault::Eio,
-    };
-    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules: vec![rule] }).unwrap();
+    let rules = vec![
+        Rule {
+            op: Op::RenameNoreplace,
+            path: format!("{}/dir-*", tmp::DIR),
+            at: Trigger::Call(1),
+            fail: Fault::Eio,
+        },
+        // The displacement, the rename in, then putting it back.
+        Rule {
+            op: Op::RenameNoreplace,
+            path: scenario.path().into(),
+            at: Trigger::Call(3),
+            fail: Fault::Eio,
+        },
+    ];
+    let faulty = FaultyFolder::new(Spy::new(disk.root()), Spec { rules }).unwrap();
     let (action, _) = scenario.action();
-    let done = disk.commit_with(&faulty, &action, Some(&temp));
-    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    let done = disk.commit_with(&faulty, &action, None);
+    assert_eq!(faulty.injected().len(), 2);
+    assert!(matches!(
+        outcome(&done),
+        ApplyOutcome::Failed {
+            found: ScanState::Skipped { .. },
+            ..
+        }
+    ));
     let mut rows = disk.journal.taken();
     rows.extend(done.writes);
     let open = open_rows(&rows, &[]);
-    assert_eq!(open.len(), 1, "the row stays open");
+    let temp = open[0].temp_file.clone().unwrap();
+    assert!(disk.at(temp.to_str().unwrap()).is_dir(), "{temp:?}");
 
-    // The user deletes the file; the daemon restarts, with a fresh state.
-    std::fs::remove_file(disk.at(scenario.path())).unwrap();
-    let restarted = DiskState::new();
-    let fs = disk.folder().open().unwrap();
-    let started = Start {
-        folder: folder_id(),
-        journal: &open,
-        trash: &[],
-        names: &disk.names,
-        disk: &restarted,
-        claimed: &|_| true,
-        now: settled_now(),
-        policy: trash::Policy::default(),
-    }
-    .run(&*fs);
-    assert_eq!(started.undone.landed, [p(scenario.path())]);
-    assert!(!disk.exists(scenario.path()), "the file stays deleted");
+    let undone = undo_rows(&disk, &open);
+    assert_eq!(undone.back, [p(scenario.path())]);
     assert_eq!(
-        disk.trash(),
-        [OLD_CONTENT.to_vec()],
-        "the old version stays in the trash"
+        std::fs::read(disk.at(scenario.path())).unwrap(),
+        OLD_CONTENT
     );
-    rows.extend(started.writes);
-    assert!(open_rows(&rows, &[]).is_empty());
-    rows_match_the_trash(&disk, &[], &rows).unwrap();
-    assert!(!restarted.is_open(&p(scenario.path())));
 }
 
 /// Draft 65: a landed commit's row is dropped only once its directories
@@ -1060,6 +1149,10 @@ fn a_kill_at_any_step_never_loses_the_displaced_file() {
                         std::fs::read(path_now.join("c")).ok().as_deref() == Some(CHILD_CONTENT);
                     let committed = std::fs::read(&path_now).ok().as_deref() == Some(NEW_CONTENT);
                     assert!(as_found || committed, "{what}");
+                }
+                Scenario::WriteDirOverFile => {
+                    let as_found = std::fs::read(&path_now).ok().as_deref() == Some(OLD_CONTENT);
+                    assert!(as_found || path_now.is_dir(), "{what}");
                 }
                 _ => {}
             }

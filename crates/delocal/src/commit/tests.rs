@@ -969,6 +969,59 @@ fn symlinks_and_directories_are_written_in_place_of_anything() {
     assert_eq!(disk.trash(), [b"inside".to_vec(), b"was a file".to_vec()]);
 }
 
+/// §7.5, draft 65: a directory comes in as an empty one made at a temp
+/// name and renamed in, so the journal row of a write that displaced
+/// something names a temp like any other, and nothing is left in `tmp/`.
+#[test]
+fn a_directory_comes_in_through_a_temp_and_a_rename() {
+    let disk = Disk::new();
+    let old = disk.file("d", b"a file", OLD, false);
+    let done = disk.commit(
+        &write(
+            "d",
+            entry("d", Kind::Dir, b"", 0, false),
+            Some(old),
+            Displace::Trash,
+        ),
+        None,
+    );
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    assert!(disk.at("d").is_dir());
+    let durable = disk.journal.taken();
+    let temp = durable
+        .iter()
+        .find_map(|w| match w {
+            HostWrite::PutJournal { row, .. } => row.temp_file.clone(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(temp.starts_with(tmp::DIR), "{temp:?}");
+    assert!(
+        temp.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("dir-")
+    );
+    assert!(
+        !disk.exists(temp.to_str().unwrap()),
+        "consumed by the rename"
+    );
+    // Where nothing was displaced, likewise through a temp.
+    let done = disk.commit(
+        &write(
+            "e/f",
+            entry("e/f", Kind::Dir, b"", 0, false),
+            None,
+            Displace::Trash,
+        ),
+        None,
+    );
+    assert_eq!(outcome(&done), &ApplyOutcome::Ok);
+    assert!(disk.at("e/f").is_dir());
+    assert_eq!(std::fs::read_dir(disk.at(tmp::DIR)).unwrap().count(), 0);
+}
+
 #[test]
 fn a_delete_moves_a_file_to_the_trash_and_removes_only_an_empty_directory() {
     let disk = Disk::new();
@@ -1433,6 +1486,16 @@ fn the_journal_drops_the_row_of_a_commit_that_landed() {
         assert_eq!(disk.exists("a"), present);
         assert_eq!(disk.trash(), [b"old".to_vec()]);
     }
+    // A row with no temp at all (none is written since every write has
+    // one) has nothing to say its rename never happened: the same rule.
+    let none = JournalRow {
+        temp_file: None,
+        ..row("a", &in_trash)
+    };
+    let undone = undo_rows(&disk, &[none]);
+    assert_eq!(undone.landed, [p("a")]);
+    assert!(!disk.exists("a"));
+    assert_eq!(disk.trash(), [b"old".to_vec()]);
 }
 
 /// Draft 65 at a later resolve: a row the start could not undo, whose temp
@@ -1459,6 +1522,58 @@ fn a_resolve_drops_the_row_of_a_commit_that_landed() {
             path: p("dir/f")
         }]
     );
+}
+
+/// Draft 65: the start's cleanup of `tmp/` never removes a temp an open
+/// journal row still names, claimed by a want or not, since the row is
+/// judged by whether its temp is there. A row the start resolved leaves its
+/// temp to the wants, like any other.
+#[test]
+fn the_start_never_removes_a_temp_an_open_row_names() {
+    let disk = Disk::new();
+    disk.dir("held");
+    let day = Path::new(trash::DIR).join("2026-10-15");
+    std::fs::create_dir_all(disk.at(day.to_str().unwrap())).unwrap();
+    let mut rows = Vec::new();
+    for name in ["held/f", "free"] {
+        let to = day.join(name.replace('/', "-"));
+        std::fs::write(disk.at(to.to_str().unwrap()), name).unwrap();
+        let temp = PathBuf::from(tmp::DIR).join(format!("unclaimed-{}", name.replace('/', "-")));
+        std::fs::write(disk.at(temp.to_str().unwrap()), "fetched").unwrap();
+        rows.push(JournalRow {
+            path: p(name),
+            displaced_to: to,
+            temp_file: Some(temp),
+        });
+    }
+    std::fs::write(disk.at(tmp::DIR).join("stale"), "x").unwrap();
+    // `held` is a mount point at start: its row cannot be undone.
+    let spy = Spy::new(disk.root());
+    spy.mount("held");
+    let started = Start {
+        folder: folder_id(),
+        journal: &rows,
+        trash: &[],
+        names: &disk.names,
+        disk: &disk.state,
+        claimed: &|_| false,
+        now: settled_now(),
+        policy: trash::Policy::default(),
+    }
+    .run(&*spy.open().unwrap());
+    assert_eq!(started.undone.failed.len(), 1);
+    assert_eq!(started.undone.back, [p("free")]);
+    let mut removed = started.temps.clone();
+    removed.sort();
+    assert_eq!(
+        removed,
+        [OsString::from("stale"), OsString::from("unclaimed-free")]
+    );
+    assert!(
+        disk.exists(".delocal/tmp/unclaimed-held-f"),
+        "the open row's temp stays"
+    );
+    assert!(disk.state.is_open(&p("held/f")));
 }
 
 /// What a test tree holds at `path`: a file's content, a directory, or

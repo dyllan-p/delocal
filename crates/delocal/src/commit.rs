@@ -22,12 +22,14 @@
 //! the path: a file's exec bit (written like git's, §7.1: execute added
 //! wherever read is set, or every execute bit cleared) and mtime are set on
 //! its temp file and the temp file is fsynced; a symlink is made in
-//! `.delocal/tmp/` from the target its temp file holds. Missing parent
-//! directories are made. If something is at the path, a journal row naming
-//! where it goes is made durable (with its trash row, for the trash), and
-//! it is renamed aside (step 7), to the trash or the conflict-copy path the
-//! engine chose; then what comes in is renamed to the path, or a directory
-//! made there (step 8). The directories whose entries changed are fsynced
+//! `.delocal/tmp/` from the target its temp file holds; a directory is made
+//! empty there. Every write is thus a rename of a temp (draft 65), and its
+//! journal row names that temp, whose absence later says the rename
+//! happened. Missing parent directories are made. If something is at the
+//! path, a journal row naming where it goes is made durable (with its trash
+//! row, for the trash), and it is renamed aside (step 7), to the trash or
+//! the conflict-copy path the engine chose; then what comes in is renamed
+//! to the path (step 8). The directories whose entries changed are fsynced
 //! before the report (step 9), and the journal row is removed with the
 //! report: by then the rename is durable.
 //!
@@ -581,12 +583,11 @@ impl Commit<'_> {
         // Draft 65: a temp file that is gone means the rename happened, so
         // the commit landed and only its durability is left to make sure of.
         let open = match open {
-            Open::Displaced {
-                at,
-                back,
-                temp: Some(temp),
-                ..
-            } if matches!(fs.lstat(&temp), Err(e) if e.kind() == io::ErrorKind::NotFound) => {
+            Open::Displaced { at, back, temp, .. }
+                if temp.as_ref().is_none_or(
+                    |temp| matches!(fs.lstat(temp), Err(e) if e.kind() == io::ErrorKind::NotFound),
+                ) =>
+            {
                 let dirs = journal::landed_dirs(&back, &at);
                 self.disk
                     .opened()
@@ -750,7 +751,7 @@ impl Commit<'_> {
         let displaced = match &found {
             Found::Entry { disk, seen, .. } => {
                 let hash = expected.map_or(seen.hash, |e| e.hash);
-                match self.displace(at, disk, seen, hash, displace, incoming.path()) {
+                match self.displace(at, disk, seen, hash, displace, Some(incoming.path())) {
                     Ok(displaced) => Some(displaced),
                     Err(failed) => {
                         incoming.discard(fs);
@@ -774,15 +775,13 @@ impl Commit<'_> {
         // Step 8: the rename in, never replacing; received paths are
         // written as they are (§7.3), so at the index name.
         let target = at.parent.join(at.path.file_name());
-        let renamed = match incoming.path() {
-            Some(from) => rename_refusing(fs, from, &target).map(|how| self.disk.renamed(how)),
-            None => fs.create_dir(&target),
-        };
+        let renamed =
+            rename_refusing(fs, incoming.path(), &target).map(|how| self.disk.renamed(how));
         if let Err(e) = renamed {
             let mut fail = changed_or_local(&e);
             let writes = match (&displaced, &found) {
                 (Some(displaced), Found::Entry { disk, .. }) => {
-                    match self.put_back(at.path, fs, displaced, disk, incoming.path()) {
+                    match self.put_back(at.path, fs, displaced, disk, Some(incoming.path())) {
                         Some(writes) => {
                             incoming.discard(fs);
                             writes
@@ -830,9 +829,7 @@ impl Commit<'_> {
         if let Some(displaced) = &displaced {
             sync(displaced.to.parent().unwrap_or(Path::new("")));
         }
-        if incoming.path().is_some() {
-            sync(Path::new(tmp::DIR));
-        }
+        sync(Path::new(tmp::DIR));
         incoming.finish(fs);
         // The journal row goes once the rename is durable (§7.5). If an
         // fsync failed, that is not known, and the row stays for the next
@@ -1392,25 +1389,33 @@ enum Incoming {
     File(PathBuf),
     /// A symlink made in `tmp/`, and the temp file its target came from.
     Symlink { link: PathBuf, temp: PathBuf },
-    /// A directory, made in place.
-    Dir,
+    /// An empty directory made in `tmp/` (draft 65: every write goes
+    /// through a temp and a rename, so every journal row has a temp that
+    /// says whether its rename happened).
+    Dir(PathBuf),
 }
 
 impl Incoming {
-    /// What is renamed to the path; `None` for a directory.
-    fn path(&self) -> Option<&Path> {
+    /// What is renamed to the path: the temp the journal row names.
+    fn path(&self) -> &Path {
         match self {
-            Self::File(temp) => Some(temp),
-            Self::Symlink { link, .. } => Some(link),
-            Self::Dir => None,
+            Self::File(temp) | Self::Dir(temp) => temp,
+            Self::Symlink { link, .. } => link,
         }
     }
 
-    /// After a failure: a symlink made for the commit goes, and a fetched
-    /// temp file stays for the next attempt to resume (§7.5).
+    /// After a failure: what the commit made for itself goes (a symlink, an
+    /// empty directory), and a fetched temp file stays for the next attempt
+    /// to resume (§7.5).
     fn discard(&self, fs: &dyn Fs) {
-        if let Self::Symlink { link, .. } = self {
-            let _ = fs.remove_file(link);
+        match self {
+            Self::Symlink { link, .. } => {
+                let _ = fs.remove_file(link);
+            }
+            Self::Dir(dir) => {
+                let _ = fs.remove_dir(dir);
+            }
+            Self::File(_) => {}
         }
     }
 
@@ -1429,7 +1434,12 @@ impl Incoming {
 fn ready(fs: &dyn Fs, entry: &Entry, temp: Option<&Path>) -> Result<Incoming, Fail> {
     let io = |e: &io::Error| Fail::Local(local(e));
     match entry.kind {
-        Kind::Dir => Ok(Incoming::Dir),
+        Kind::Dir => {
+            tmp::ensure(fs).map_err(|e| io(&e))?;
+            let dir = tmp::scratch("dir");
+            fs.create_dir(&dir).map_err(|e| io(&e))?;
+            Ok(Incoming::Dir(dir))
+        }
         Kind::File => {
             let temp = temp.ok_or(Fail::Local(LocalError::Io))?;
             let mode = fs.lstat(temp).map_err(|e| io(&e))?.mode;
