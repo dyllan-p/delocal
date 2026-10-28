@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use delocal_engine::{FolderParts, Kind};
+use delocal_engine::{FolderId, FolderParts, Kind};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -416,108 +416,92 @@ fn the_watcher_reports_nothing_beneath_an_open_journal_row() {
     daemon.stop().unwrap();
 }
 
-/// §7.3 **[verify]**: what FSEvents' coalescing does under
-/// notify-debouncer-full, on macOS, beside what inotify does on Linux.
-/// Each case's debounced events are written to the real stderr, past the
-/// test harness's capture, for CI's log; nothing is asserted.
+/// §7.3, draft 67, and its **[verify]**: whatever the platform coalesces
+/// or reorders, every path a change touches is passed on once it has had
+/// 2 s of quiet. Each case's paths are also written to the real stderr,
+/// past the test harness's capture, for CI's log on Linux and macOS.
 #[test]
-fn what_the_debouncer_passes_on_for_each_kind_of_change() {
-    use notify::RecursiveMode;
-    use notify_debouncer_full::{DebounceEventResult, new_debouncer};
-
+fn every_path_a_change_touches_is_passed_on_once_quiet() {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<DebounceEventResult>();
-    let mut debouncer = new_debouncer(QUIET, None, tx).unwrap();
-    debouncer.watch(&root, RecursiveMode::Recursive).unwrap();
+    let folder = FolderId::from_bytes([9; 16]);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+    let mut watcher = super::super::watch::Watcher::new(tx).unwrap();
+    watcher.watch(folder, &root).unwrap();
     let at = |name: &str| root.join(name);
-    let settle = || std::thread::sleep(QUIET + Duration::from_millis(1500));
-    let report = |case: &str| {
-        let mut seen = Vec::new();
-        while let Ok(result) = rx.try_recv() {
-            match result {
-                Ok(events) => {
-                    for event in events {
-                        let paths: Vec<String> = event
-                            .paths
-                            .iter()
-                            .map(|p| p.strip_prefix(&root).unwrap_or(p).display().to_string())
-                            .collect();
-                        seen.push(format!("{:?} {}", event.kind, paths.join(" -> ")));
-                    }
-                }
-                Err(errors) => seen.push(format!("errors {errors:?}")),
+    let mut case = |what: &str, expected: &[&str]| {
+        std::thread::sleep(QUIET + Duration::from_millis(1000));
+        let mut named: Vec<String> = Vec::new();
+        while let Ok(input) = rx.try_recv() {
+            if let Input::Watched { paths, .. } = input {
+                named.extend(paths.into_iter().map(|seen| seen.path.to_string()));
             }
         }
         let line = format!(
-            "VERIFY {} {case}: {}\n",
+            "VERIFY {} {what}: {}\n",
             std::env::consts::OS,
-            if seen.is_empty() {
-                "NO EVENT".to_owned()
+            if named.is_empty() {
+                "NOTHING".to_owned()
             } else {
-                seen.join("; ")
+                named.join(", ")
             }
         );
         let _ = std::io::stderr().write_all(line.as_bytes());
+        for path in expected {
+            assert!(
+                named.iter().any(|n| n == path),
+                "{what}: {path} not passed on: {named:?}"
+            );
+        }
+        named
     };
-    settle();
-    report("watch start");
+    case("watch start", &[]);
 
     std::fs::write(at("a"), b"a").unwrap();
-    settle();
-    report("create a");
+    case("create a", &["a"]);
     std::fs::remove_file(at("a")).unwrap();
-    settle();
-    report("delete a, made 3.5 s before");
+    case("delete a, made 3 s before", &["a"]);
 
     std::fs::write(at("b"), b"b").unwrap();
-    settle();
-    report("create b");
+    case("create b", &["b"]);
     std::fs::remove_file(at("b")).unwrap();
     std::fs::write(at("b"), b"b again").unwrap();
-    settle();
-    report("delete b and write it again at once");
+    case("delete b and write it again at once", &["b"]);
 
     std::fs::write(at("c"), b"c").unwrap();
     std::fs::remove_file(at("c")).unwrap();
-    settle();
-    report("create c and delete it at once");
+    case("create c and delete it at once", &["c"]);
 
     std::fs::write(at("d"), b"d").unwrap();
-    settle();
-    report("create d");
+    case("create d", &["d"]);
     for i in 0..10 {
         std::fs::write(at("d"), format!("d {i}")).unwrap();
         std::thread::sleep(Duration::from_millis(100));
     }
-    settle();
-    report("write d ten times in a second");
+    let named = case("write d ten times in a second", &["d"]);
+    assert_eq!(
+        named.iter().filter(|n| *n == "d").count(),
+        1,
+        "passed on before it was quiet"
+    );
 
     std::fs::write(at("e"), b"e").unwrap();
-    settle();
-    report("create e");
+    case("create e", &["e"]);
     std::fs::rename(at("e"), at("f")).unwrap();
-    settle();
-    report("rename e to f");
+    case("rename e to f", &["e", "f"]);
 
     std::fs::create_dir_all(at("t/u")).unwrap();
     std::fs::write(at("t/u/v"), b"v").unwrap();
-    settle();
-    report("make t/u/v");
+    case("make t/u/v", &["t"]);
     std::fs::remove_dir_all(at("t")).unwrap();
-    settle();
-    report("remove t whole");
+    case("remove t whole", &["t"]);
 
-    // The debouncer files a rename under its destination; a directory's
-    // removal drops the queues beneath it.
     std::fs::create_dir(at("g")).unwrap();
     std::fs::create_dir(at("h")).unwrap();
-    settle();
-    report("make g and h");
+    case("make g and h", &["g", "h"]);
     std::fs::rename(at("g"), at("h/g")).unwrap();
     std::fs::remove_dir_all(at("h")).unwrap();
-    settle();
-    report("rename g into h, then remove h whole at once (does anything name g?)");
+    case("rename g into h, then remove h whole at once", &["g", "h"]);
 }
 
 /// What a directory that appears with contents brings, and what one that
