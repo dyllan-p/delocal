@@ -169,8 +169,7 @@ impl Edits {
 /// the folder and moved in with contents; symlinks) leave the index as the
 /// disk is. A full scan afterwards makes no index change, and the watcher
 /// never needed a full scan to catch up.
-#[test]
-fn after_a_thousand_random_edits_with_the_watcher_on_a_full_scan_changes_nothing() {
+fn a_thousand_edits(seed: u64) {
     let fixture = Fixture::new();
     let outside = fixture.dir.path().join("outside");
     std::fs::create_dir(&outside).unwrap();
@@ -183,7 +182,7 @@ fn after_a_thousand_random_edits_with_the_watcher_on_a_full_scan_changes_nothing
     let mut edits = Edits {
         root: fixture.root(),
         outside,
-        rng: StdRng::seed_from_u64(0x0077_6174_6368),
+        rng: StdRng::seed_from_u64(seed),
         made: 0,
     };
     for _ in 0..1000 {
@@ -213,6 +212,32 @@ fn after_a_thousand_random_edits_with_the_watcher_on_a_full_scan_changes_nothing
     assert_eq!(rescans, 0, "the watcher needed a full scan");
     assert_eq!(daemon.trace.guards.load(Ordering::SeqCst), 0);
     daemon.stop().unwrap();
+}
+
+/// [`a_thousand_edits`] for each of seeds 0 to 39, as tests of their own
+/// so that the harness runs them side by side.
+macro_rules! thousand_edits {
+    ($($name:ident: $seed:expr),* $(,)?) => {
+        mod after_a_thousand_random_edits_a_full_scan_changes_nothing {
+            $(
+                #[test]
+                fn $name() {
+                    super::a_thousand_edits($seed);
+                }
+            )*
+        }
+    };
+}
+
+thousand_edits! {
+    seed_00: 0, seed_01: 1, seed_02: 2, seed_03: 3, seed_04: 4,
+    seed_05: 5, seed_06: 6, seed_07: 7, seed_08: 8, seed_09: 9,
+    seed_10: 10, seed_11: 11, seed_12: 12, seed_13: 13, seed_14: 14,
+    seed_15: 15, seed_16: 16, seed_17: 17, seed_18: 18, seed_19: 19,
+    seed_20: 20, seed_21: 21, seed_22: 22, seed_23: 23, seed_24: 24,
+    seed_25: 25, seed_26: 26, seed_27: 27, seed_28: 28, seed_29: 29,
+    seed_30: 30, seed_31: 31, seed_32: 32, seed_33: 33, seed_34: 34,
+    seed_35: 35, seed_36: 36, seed_37: 37, seed_38: 38, seed_39: 39,
 }
 
 /// §7.3, the root guard: `rm -rf` of the root reaches the engine as no
