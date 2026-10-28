@@ -733,9 +733,13 @@ impl Core {
         };
         if watch.scanning {
             watch.rescan_after = true;
+            #[cfg(test)]
+            self.trace.rescans.fetch_add(1, Ordering::SeqCst);
             return Ok(());
         }
         info!(folder = %id.short(), "the watcher lost events: scanning");
+        #[cfg(test)]
+        self.trace.rescans.fetch_add(1, Ordering::SeqCst);
         self.start_scan(id)
     }
 
@@ -759,6 +763,8 @@ impl Core {
                  scan finds it"
             );
             watch.guarded = true;
+            #[cfg(test)]
+            self.trace.guards.fetch_add(1, Ordering::SeqCst);
         }
     }
 
