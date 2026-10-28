@@ -1135,4 +1135,86 @@ fn names_on_disk_are_kept_and_dropped_as_the_disk_changes() {
     daemon.stop().unwrap();
 }
 
+/// A minute, for the clocks below.
+const MINUTE: i64 = 60 * 1_000_000_000;
+
+/// A daemon on the real folder whose engine clock is `clock` and whose
+/// stability check reads `realtime`.
+fn start_with_clocks(
+    fixture: &Fixture,
+    clock: Clock,
+    realtime: Arc<dyn crate::scan::Clock + Send + Sync>,
+) -> Daemon {
+    let folder: Arc<dyn Folder> = Arc::new(RealFolder::new(fixture.root()));
+    let mut setup = fixture.setup(folder, Box::new(super::NoTransport));
+    setup.clock = Arc::new(clock);
+    setup.realtime = realtime;
+    Daemon::start(setup).unwrap()
+}
+
+/// The real-time clock, read `by` nanoseconds off.
+fn realtime_off(by: i64) -> Arc<dyn crate::scan::Clock + Send + Sync> {
+    Arc::new(move || {
+        Timestamp::from_unix_nanos(crate::scan::stability::realtime().as_unix_nanos() + by)
+    })
+}
+
+/// §7.3, draft 66: a laptop slept for a minute, so the engine's clock,
+/// which stops while it sleeps (§7.8), is a minute behind the real-time
+/// clock that sets `ctime`. A file written after it wakes is still hashed
+/// once it is 2 s old, not once the engine's clock has caught up a minute.
+#[test]
+fn a_file_written_after_a_sleep_is_hashed_once_it_has_settled() {
+    let fixture = Fixture::new();
+    let daemon = start_with_clocks(&fixture, Clock::shifted(-MINUTE), realtime_off(0));
+    daemon.settle();
+    std::fs::write(fixture.at("f"), "written after waking").unwrap();
+    // Written a moment ago: not yet.
+    assert_eq!(daemon.scan(fixture.folder), 0);
+    assert!(daemon.record(fixture.folder, "f").is_none());
+    // The second look, 2 s later, hashes it.
+    daemon.settled(Duration::from_secs(20)).unwrap();
+    assert!(daemon.record(fixture.folder, "f").is_some());
+    daemon.stop().unwrap();
+}
+
+/// §7.3, draft 66: the real-time clock was set back a minute after the
+/// daemon started, so the engine's clock, which counted on (§7.8), is a
+/// minute ahead of it. A file written now is still left 2 s to settle, not
+/// hashed at the first look as if it were a minute old.
+#[test]
+fn after_the_clock_is_set_back_a_new_file_still_waits_to_settle() {
+    let fixture = Fixture::new();
+    let daemon = start_with_clocks(&fixture, Clock::shifted(MINUTE), realtime_off(0));
+    daemon.settle();
+    std::fs::write(fixture.at("f"), "half written").unwrap();
+    assert_eq!(daemon.scan(fixture.folder), 0, "hashed at the first look");
+    assert!(daemon.record(fixture.folder, "f").is_none());
+    daemon.settled(Duration::from_secs(20)).unwrap();
+    assert!(daemon.record(fixture.folder, "f").is_some());
+    daemon.stop().unwrap();
+}
+
+/// §7.3, draft 66: the real-time clock was set back a minute after a file
+/// changed, before the daemon started, so the file's `ctime` is a minute in
+/// the future by every clock the daemon has. Its age says nothing; it is
+/// hashed once two looks 2 s apart find it unchanged. One that changes
+/// between the looks starts again from the look that finds it changed.
+#[test]
+fn a_file_changed_before_the_clock_was_set_back_is_stable_after_two_looks() {
+    let fixture = Fixture::new();
+    let daemon = start_with_clocks(&fixture, Clock::shifted(-MINUTE), realtime_off(-MINUTE));
+    daemon.settle();
+    std::fs::write(fixture.at("f"), "left alone").unwrap();
+    std::fs::write(fixture.at("g"), "changed").unwrap();
+    assert_eq!(daemon.scan(fixture.folder), 0, "hashed at the first look");
+    std::fs::write(fixture.at("g"), "changed again").unwrap();
+    daemon.settled(Duration::from_secs(20)).unwrap();
+    let f = daemon.record(fixture.folder, "f").unwrap();
+    assert_eq!(f.entry.size, "left alone".len() as u64);
+    let g = daemon.record(fixture.folder, "g").unwrap();
+    assert_eq!(g.entry.size, "changed again".len() as u64);
+    daemon.stop().unwrap();
+}
+
 mod kill;
