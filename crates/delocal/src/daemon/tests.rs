@@ -119,6 +119,8 @@ use delocal_engine::{
 use super::clock::Clock;
 use super::core::{Input, Report, Source};
 use super::{Daemon, FolderAt, Outbox, Setup, lock};
+#[cfg(feature = "faults")]
+use crate::fs::faulty::{FaultyFolder, Spec};
 use crate::fs::{Folder, RealFolder};
 use crate::scan::MARKER;
 use crate::store::{FolderRow, HostWrite, Member, Mode};
@@ -741,6 +743,166 @@ fn a_folder_whose_disk_is_gone_is_left_alone_until_it_is_back() {
     daemon.settle();
     assert_eq!(daemon.scan(fixture.folder), 0);
     assert_eq!(daemon.parts().1[0].records, records);
+    daemon.stop().unwrap();
+}
+
+/// A folder on disk whose filesystem layer injects `spec`'s faults.
+#[cfg(feature = "faults")]
+fn faulty(fixture: &Fixture, spec: &str) -> Arc<FaultyFolder<RealFolder>> {
+    Arc::new(
+        FaultyFolder::new(RealFolder::new(fixture.root()), Spec::parse(spec).unwrap()).unwrap(),
+    )
+}
+
+/// §7.5 "local failures": a commit that finds the disk full pauses the
+/// folder's inbound, the host checks for space every `space_check` while it
+/// is paused, and once a check finds room the want commits again.
+#[cfg(feature = "faults")]
+#[test]
+fn a_full_disk_pauses_inbound_until_a_check_finds_space() {
+    let fixture = Fixture::new();
+    // The directory's temp cannot be made, and the first check finds no
+    // space; the second finds what the disk has.
+    let folder = faulty(
+        &fixture,
+        r#"{ "rules": [
+            { "op": "create_dir", "path": ".delocal/tmp/dir-*", "at": { "call": 1 }, "fail": "ENOSPC" },
+            { "op": "available_space", "path": "", "at": { "call": 1 }, "fail": "ENOSPC" }
+        ] }"#,
+    );
+    let mut setup = fixture.setup(
+        Arc::clone(&folder) as Arc<dyn Folder>,
+        Box::new(super::NoTransport),
+    );
+    setup.space_check = Duration::from_millis(200);
+    let daemon = Daemon::start(setup).unwrap();
+    daemon.settle();
+    let id = fixture.folder;
+    daemon.inject(Event::BatchReceived {
+        from: fixture.peer,
+        batch: batch(
+            fixture.peer,
+            id,
+            0,
+            vec![from_peer(fixture.peer, "d", None)],
+        ),
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !fixture.at("d").is_dir() {
+        assert!(
+            Instant::now() < deadline,
+            "never committed: {:?}",
+            folder.injected()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    daemon.settle();
+    let injected: Vec<crate::fs::faulty::Op> = folder.injected().iter().map(|i| i.op).collect();
+    assert_eq!(
+        injected,
+        [
+            crate::fs::faulty::Op::CreateDir,
+            crate::fs::faulty::Op::AvailableSpace
+        ]
+    );
+    assert!(!daemon.engine(move |e| e.folder(id).unwrap().disk_full()));
+    assert!(daemon.record(id, "d").is_some());
+    let (stored, engine) = daemon.parts();
+    assert_eq!(stored, engine);
+    daemon.stop().unwrap();
+}
+
+/// The start (§7.5, draft 65): every open journal row is resolved before
+/// the first scan, and `tmp/` is cleared of every temp no want claims and
+/// no row still open names. A row the undo cannot resolve stays open: its
+/// path is skipped, not tombstoned, its temp is kept, and a resolve before
+/// a later scan puts its file back.
+#[cfg(feature = "faults")]
+#[test]
+fn the_start_resolves_the_journal_and_keeps_the_temps_of_rows_still_open() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.at("f"), "f's old content").unwrap();
+    std::fs::write(fixture.at("g"), "g's old content").unwrap();
+    let daemon = fixture.start();
+    daemon.settle();
+    daemon.stop().unwrap();
+
+    // A crash between the displacements and the renames of two commits:
+    // both files in the trash, both temps in tmp/, both rows open, and a
+    // temp no one claims beside them.
+    let day = fixture.at(".delocal/trash/2026-10-28");
+    std::fs::create_dir_all(&day).unwrap();
+    let tmp = fixture.at(crate::tmp::DIR);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let mut group = Group::new(Timestamp::from_unix_nanos(2));
+    for name in ["f", "g"] {
+        std::fs::rename(fixture.at(name), day.join(name)).unwrap();
+        std::fs::write(tmp.join(format!("0000000000000000-{name}")), "new").unwrap();
+        group.host(HostWrite::PutJournal {
+            folder: fixture.folder,
+            row: crate::store::JournalRow {
+                path: p(name),
+                displaced_to: PathBuf::from(format!(".delocal/trash/2026-10-28/{name}")),
+                temp_file: PathBuf::from(format!("{}/0000000000000000-{name}", crate::tmp::DIR)),
+            },
+        });
+    }
+    std::fs::write(tmp.join("stray"), "unclaimed").unwrap();
+    Store::open(&fixture.state().join(super::STORE))
+        .unwrap()
+        .commit(&[group])
+        .unwrap();
+
+    // g's undo fails at the start, and again at the resolve before the
+    // startup scan.
+    let folder = faulty(
+        &fixture,
+        r#"{ "rules": [
+            { "op": "rename_noreplace", "path": "g", "at": { "call": 1 }, "fail": "EIO" },
+            { "op": "rename_noreplace", "path": "g", "at": { "call": 2 }, "fail": "EIO" }
+        ] }"#,
+    );
+    let daemon = Daemon::start(fixture.setup(
+        Arc::clone(&folder) as Arc<dyn Folder>,
+        Box::new(super::NoTransport),
+    ))
+    .unwrap();
+    daemon.settle();
+    assert_eq!(
+        std::fs::read_to_string(fixture.at("f")).unwrap(),
+        "f's old content"
+    );
+    assert!(!fixture.at("g").exists());
+    let mut temps: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    temps.sort();
+    assert_eq!(temps, ["0000000000000000-g"]);
+    // g was skipped by the startup scan, not taken for deleted.
+    assert!(daemon.record(fixture.folder, "g").is_some());
+    let (stored, engine) = daemon.parts();
+    assert_eq!(stored, engine);
+    let journal = Store::open(&fixture.state().join(super::STORE))
+        .unwrap()
+        .journal(fixture.folder)
+        .unwrap();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].path, p("g"));
+
+    // The next scan's resolve puts g back and drops its row and its
+    // trash row.
+    assert_eq!(daemon.scan(fixture.folder), 0);
+    daemon.settle();
+    assert_eq!(
+        std::fs::read_to_string(fixture.at("g")).unwrap(),
+        "g's old content"
+    );
+    let store = Store::open(&fixture.state().join(super::STORE)).unwrap();
+    assert!(store.journal(fixture.folder).unwrap().is_empty());
+    assert!(store.trash(fixture.folder).unwrap().is_empty());
+    let (stored, engine) = daemon.parts();
+    assert_eq!(stored, engine);
     daemon.stop().unwrap();
 }
 
