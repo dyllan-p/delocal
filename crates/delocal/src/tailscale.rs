@@ -14,6 +14,10 @@
 //! without `sudo` (§14.2). `whois` takes the socket address a connection
 //! came from.
 //!
+//! So far:
+//!
+//! - [`tier`]: connection tiers from path info (§6.4)
+//!
 //! The real implementations, the LocalAPI and the CLI fallback with their
 //! recorded fixtures, are Phase 3's (§15).
 
@@ -21,6 +25,8 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+
+pub mod tier;
 
 /// A Tailscale node's stable ID (§4), what a peer's node ID is bound to
 /// (§5, `machines` in §11).
