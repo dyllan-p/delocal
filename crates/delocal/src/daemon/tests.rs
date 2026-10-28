@@ -1081,4 +1081,57 @@ fn a_scan_that_panics_is_aborted_and_the_next_one_runs() {
     daemon.stop().unwrap();
 }
 
+/// §7.3, `disk_names` in §11: a name on disk that is not its index path's
+/// is kept for the path, commits address the file through it, and a
+/// commit that writes the path anew writes the index name and drops the
+/// pair. A decomposed `é` stands for a name from macOS or a Linux user.
+#[test]
+fn names_on_disk_are_kept_and_dropped_as_the_disk_changes() {
+    let fixture = Fixture::new();
+    let nfd = "cafe\u{301}";
+    let nfc = "caf\u{e9}";
+    std::fs::write(fixture.at(nfd), "a decomposed name").unwrap();
+    let daemon = fixture.start();
+    daemon.settle();
+    let names = |fixture: &Fixture| {
+        Store::open(&fixture.state().join(super::STORE))
+            .unwrap()
+            .disk_names(fixture.folder)
+            .unwrap()
+    };
+    let pairs = names(&fixture);
+    assert_eq!(pairs.len(), 1, "{pairs:?}");
+    assert_eq!(pairs[0].path, p(nfc));
+    assert_eq!(pairs[0].name, std::ffi::OsString::from(nfd));
+    let record = daemon.record(fixture.folder, nfc).unwrap();
+
+    // The peer puts a directory where the file is.
+    daemon.inject(Event::BatchReceived {
+        from: fixture.peer,
+        batch: batch(
+            fixture.peer,
+            fixture.folder,
+            0,
+            vec![from_peer(fixture.peer, nfc, Some(&record))],
+        ),
+    });
+    daemon.settle();
+    assert_eq!(
+        daemon.record(fixture.folder, nfc).unwrap().entry.kind,
+        Kind::Dir
+    );
+    let listed: Vec<_> = std::fs::read_dir(fixture.root())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n != ".delocal")
+        .collect();
+    assert_eq!(listed, [std::ffi::OsString::from(nfc)]);
+    assert!(names(&fixture).is_empty());
+    assert_eq!(daemon.scan(fixture.folder), 0);
+    assert!(names(&fixture).is_empty());
+    let (stored, engine) = daemon.parts();
+    assert_eq!(stored, engine);
+    daemon.stop().unwrap();
+}
+
 mod kill;

@@ -55,7 +55,7 @@ use super::core::{Input, Report, Source};
 use crate::commit::{Commit, DiskState, StoreJournal};
 use crate::fs::Folder;
 use crate::scan::{Scan, ScanReport};
-use crate::store::Writer;
+use crate::store::{HostWrite, Writer};
 
 /// Free space below which a folder paused for a full disk stays paused
 /// (§7.5). The design names no figure: 64 MiB is room for the next commit
@@ -276,7 +276,7 @@ impl Executor {
         }
     }
 
-    fn commit(&self, id: FolderId, action: &Action, version: &Version) -> Result<(), Stopped> {
+    fn commit(&mut self, id: FolderId, action: &Action, version: &Version) -> Result<(), Stopped> {
         let Some(kept) = self.folders.get(&id) else {
             return Ok(());
         };
@@ -284,6 +284,25 @@ impl Executor {
         let commit = kept.commit(id, &journal, &self.clock);
         // No transfer has a temp file to commit before Phase 3's fetches.
         let Some(committed) = commit.run(action, version, None) else {
+            return Ok(());
+        };
+        // The names on disk the commit changed are what the disk holds now,
+        // whatever the store has yet: the next job here that reaches the
+        // path, an observation included, must use them.
+        if let Some(kept) = self.folders.get_mut(&id) {
+            for write in &committed.writes {
+                match write {
+                    HostWrite::PutDiskName { name, .. } => {
+                        kept.names.insert(name.path.clone(), name.name.clone());
+                    }
+                    HostWrite::RemoveDiskName { path, .. } => {
+                        kept.names.remove(path);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let Some(kept) = self.folders.get(&id) else {
             return Ok(());
         };
         let path = committed_path(&committed.event);
@@ -482,5 +501,154 @@ pub(crate) fn log_report(id: FolderId, report: &ScanReport) {
     }
     if let Some(error) = &report.ignore_file {
         warn!(%folder, %error, ".delocalignore unreadable: the folder was skipped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use delocal_engine::{Displace, HostName, Kind, Observed, ScanState, Timestamp};
+
+    use super::*;
+    use crate::fs::RealFolder;
+    use crate::scan::MARKER;
+    use crate::store::Store;
+
+    fn p(s: &str) -> RelPath {
+        RelPath::new(s).unwrap()
+    }
+
+    /// A commit that writes a path by its index name drops the path's name
+    /// on disk at once, here, before the store has the removal: a second
+    /// look at the path straight after must reach the new file, not take
+    /// the old name's absence for a deletion.
+    #[test]
+    fn a_commit_s_names_on_disk_apply_here_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("folder");
+        std::fs::create_dir_all(root.join(".delocal")).unwrap();
+        std::fs::write(root.join(".delocal").join(MARKER), "{}").unwrap();
+        let (nfd, nfc) = ("cafe\u{301}", "caf\u{e9}");
+        std::fs::write(root.join(nfd), "old").unwrap();
+        let fs = RealFolder::new(&root).open().unwrap();
+        // The guard compares a file's size, mtime and exec bit.
+        let seen = Observed {
+            kind: Kind::File,
+            size: 3,
+            mtime_ns: fs.lstat(Path::new(nfd)).unwrap().mtime_ns,
+            exec: false,
+            hash: ContentHash::from_bytes([1; 32]),
+        };
+        drop(fs);
+        let folder_id = FolderId::from_bytes([9; 16]);
+        let node = NodeId::from_bytes([1; 16]);
+        let entry = |kind, observed: &Observed| Entry {
+            path: p(nfc),
+            kind,
+            size: observed.size,
+            mtime_ns: observed.mtime_ns,
+            stamp: 1,
+            exec: false,
+            hash: observed.hash,
+            prev_hash: ContentHash::EMPTY,
+            version: Version::empty().incremented(node),
+            deleted: false,
+            modified_by: node,
+            author_host: HostName::new("here").unwrap(),
+        };
+        let file = entry(Kind::File, &seen);
+        let mut store = Store::open(&dir.path().join("delocal.db")).unwrap();
+        let mut group = crate::store::Group::new(Timestamp::from_unix_nanos(1));
+        group.host(HostWrite::PutFolder(crate::store::FolderRow {
+            id: folder_id,
+            name: "folder".to_owned(),
+            created_by: node,
+            rules: delocal_engine::Rules::default(),
+            meta_version: 0,
+        }));
+        store.commit(&[group]).unwrap();
+        let (inputs, mut reports) = tokio_mpsc::channel(16);
+        let mut executor = Executor {
+            folders: BTreeMap::from([(
+                folder_id,
+                Kept {
+                    folder: Arc::new(RealFolder::new(&root)),
+                    records: Arc::new(BTreeMap::from([(p(nfc), file.clone())])),
+                    names: BTreeMap::from([(p(nfc), OsString::from(nfd))]),
+                    disk: Arc::new(DiskState::new()),
+                },
+            )]),
+            writer: Arc::new(store.writer().unwrap()),
+            clock: Arc::new(Clock::start()),
+            inputs,
+            outbox: Box::new(NoTransport),
+            hashers: NonZeroUsize::MIN,
+            busy: Arc::default(),
+            stopping: Arc::default(),
+            trace: Arc::default(),
+        };
+        let dir_entry = Entry {
+            stamp: 2,
+            prev_hash: file.hash,
+            version: file.version.incremented(NodeId::from_bytes([2; 16])),
+            ..entry(
+                Kind::Dir,
+                &Observed {
+                    kind: Kind::Dir,
+                    size: 0,
+                    mtime_ns: 0,
+                    exec: false,
+                    hash: ContentHash::EMPTY,
+                },
+            )
+        };
+        let write = Action::Write {
+            folder: folder_id,
+            path: p(nfc),
+            entry: dir_entry.clone(),
+            expected: Some(seen),
+            displace: Displace::Trash,
+        };
+        executor
+            .job(Job::Commit {
+                folder: folder_id,
+                action: write,
+                version: dir_entry.version.clone(),
+            })
+            .map_err(|_| "stopped")
+            .unwrap();
+        let Some(Input::Report(report)) = reports.blocking_recv() else {
+            panic!("no report")
+        };
+        assert!(
+            matches!(
+                report.event,
+                Event::Applied {
+                    outcome: delocal_engine::ApplyOutcome::Ok,
+                    ..
+                }
+            ),
+            "{:?}",
+            report.event
+        );
+        assert!(root.join(nfc).is_dir());
+        executor
+            .job(Job::Again {
+                folder: folder_id,
+                path: p(nfc),
+            })
+            .map_err(|_| "stopped")
+            .unwrap();
+        let Some(Input::Report(report)) = reports.blocking_recv() else {
+            panic!("no report")
+        };
+        let Event::Scanned { state, .. } = report.event else {
+            panic!("{:?}", report.event)
+        };
+        assert!(
+            matches!(&state, ScanState::Observed(o) if o.kind == Kind::Dir),
+            "{state:?}"
+        );
     }
 }
