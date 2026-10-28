@@ -7,7 +7,9 @@
 //!   the monotonic time since (§7.8)
 //! - [`node`]: `node.json`, this installation's node ID (§5)
 //! - [`lock`]: one daemon per state directory (§11)
+//! - [`limits`]: the open-file limit, raised at start
 
 pub mod clock;
+pub mod limits;
 pub mod lock;
 pub mod node;
