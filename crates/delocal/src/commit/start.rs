@@ -15,14 +15,17 @@
 //!    trash and drops their rows.
 //! 3. Prune the trash ([`trash::prune`]), with the rows as reconciled.
 //! 4. Remove every temp file no want claims ([`tmp::remove_unclaimed`]),
-//!    after the undo, which may name a temp file a want still claims.
+//!    after the undo, which may name a temp file a want still claims. A
+//!    temp an open row still names is never removed, claimed or not: the
+//!    row is judged by whether its temp is there (draft 65).
 //!
 //! The host makes the writes durable before the first scan, which
 //! observes whatever is at the paths now.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use delocal_engine::{FolderId, Timestamp};
 
@@ -94,7 +97,19 @@ impl Start<'_> {
         let pruned = trash::prune(fs, self.folder, &rows, self.now, self.policy);
         started.writes.extend(pruned.writes);
         started.unpruned = pruned.failed;
-        match tmp::remove_unclaimed(fs, self.claimed) {
+        // A row still open keeps its temp, whoever claims it: its absence
+        // would later read as the rename having happened (draft 65).
+        let kept: BTreeSet<OsString> = started
+            .undone
+            .failed
+            .iter()
+            .filter_map(|(path, _)| self.journal.iter().find(|row| row.path == *path))
+            .filter_map(|row| row.temp_file.as_deref())
+            .filter(|temp| temp.parent() == Some(Path::new(tmp::DIR)))
+            .filter_map(|temp| temp.file_name().map(OsStr::to_os_string))
+            .collect();
+        let keep = |name: &OsStr| kept.contains(name) || (self.claimed)(name);
+        match tmp::remove_unclaimed(fs, &keep) {
             Ok(removed) => started.temps = removed,
             Err(e) => started.tmp_error = Some(e),
         }

@@ -118,7 +118,8 @@ fn a_file_created_at_a_target_before_any_rename_survives() {
     let disk = Disk::new();
     let spy = Spy::new(disk.root());
     let target = disk.at("d");
-    spy.before("fs.create_dir", "d", move || {
+    // A directory comes in as an empty one at a temp name (draft 65).
+    spy.before_prefix("fs.rename_noreplace", ".delocal/tmp/dir-", move || {
         std::fs::write(target, "the user's").unwrap();
     });
     let done = disk.commit_with(
@@ -136,6 +137,11 @@ fn a_file_created_at_a_target_before_any_rename_survives() {
         ApplyOutcome::ChangedUnderneath { .. }
     ));
     assert_eq!(disk.read("d"), b"the user's");
+    assert_eq!(
+        std::fs::read_dir(disk.at(tmp::DIR)).unwrap().count(),
+        0,
+        "the temp directory went with the failure"
+    );
 
     // Where a missing parent is to be made: what the user made is left,
     // and nothing is written beneath a file.

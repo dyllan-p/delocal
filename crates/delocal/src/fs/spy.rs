@@ -42,6 +42,8 @@ struct State {
     no_sync: AtomicBool,
     /// What to run before the call of an op at a path, by its first path.
     before: Mutex<Vec<(&'static str, PathBuf, Hook)>>,
+    /// The same, by the start of its first path.
+    before_prefix: Mutex<Vec<(&'static str, String, Hook)>>,
     /// What to run before the call with this index, counting from 0.
     at: Mutex<Vec<(usize, Hook)>>,
     /// Directories that read as the root of another device, with
@@ -80,6 +82,17 @@ impl State {
             before
                 .iter()
                 .position(|(o, p, _)| *o == op && p == first)
+                .map(|i| before.remove(i).2)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+        let hook = {
+            let mut before = self.before_prefix.lock().unwrap();
+            let first = first.to_string_lossy();
+            before
+                .iter()
+                .position(|(o, prefix, _)| *o == op && first.starts_with(prefix.as_str()))
                 .map(|i| before.remove(i).2)
         };
         if let Some(hook) = hook {
@@ -166,6 +179,21 @@ impl Spy {
             .lock()
             .unwrap()
             .push((op, path.into(), Box::new(hook)));
+    }
+
+    /// Run `hook` once, just before the first call of `op` whose first path
+    /// starts with `prefix`: for a call on a temp whose name is fresh.
+    pub fn before_prefix(
+        &self,
+        op: &'static str,
+        prefix: &str,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        self.state
+            .before_prefix
+            .lock()
+            .unwrap()
+            .push((op, prefix.to_owned(), Box::new(hook)));
     }
 
     /// Count and log a step that is not a filesystem call (a journal write,
