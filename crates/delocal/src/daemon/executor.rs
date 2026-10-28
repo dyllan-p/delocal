@@ -39,6 +39,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
@@ -47,7 +48,7 @@ use delocal_engine::{
     Action, ContentHash, Entry, Event, FolderId, NodeId, Outbound, RelPath, Version,
 };
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::clock::Clock;
 use super::core::{Input, Report, Source};
@@ -432,7 +433,7 @@ impl Scanner {
         // A send fails only once the engine task has stopped; the scan
         // then runs to its end with nobody reading, which a stop at most
         // costs.
-        let report = scan.run(&mut |event| {
+        let send = |event| {
             let compared = match &event {
                 Event::Scanned { path, .. } => self.records.get(path).cloned(),
                 _ => None,
@@ -443,10 +444,23 @@ impl Scanner {
                 compared,
                 source: Source::Scan,
             }));
-        });
+        };
+        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| scan.run(&mut |event| send(event))));
+        let report = match ran {
+            Ok(report) => Some(report),
+            // A bug, but not one to stop the folder's scans for good: the
+            // bracket closes as aborted, without its deletion pass, so
+            // nothing the scan never reached is taken for deleted (§7.3),
+            // and the next scan is scheduled as after any other.
+            Err(_) => {
+                error!(folder = %self.id.short(), "the scan panicked; aborted");
+                send(Event::ScanAborted { folder: self.id });
+                None
+            }
+        };
         let _ = self.inputs.blocking_send(Input::ScanDone {
             folder: self.id,
-            report: Some(report),
+            report,
         });
     }
 }
