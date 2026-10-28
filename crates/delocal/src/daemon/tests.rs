@@ -1033,4 +1033,52 @@ fn a_stop_under_load_is_clean() {
     assert!(stopped.is_ok(), "{stopped:?}");
 }
 
+/// A scan whose thread panics closes its bracket as aborted, so the folder
+/// is scanned again rather than left with a bracket open for good.
+#[test]
+fn a_scan_that_panics_is_aborted_and_the_next_one_runs() {
+    struct Panicky {
+        inner: RealFolder,
+        panic: std::sync::atomic::AtomicBool,
+    }
+    impl Folder for Panicky {
+        fn open(&self) -> std::io::Result<Box<dyn crate::fs::Fs>> {
+            assert!(
+                !self.panic.load(std::sync::atomic::Ordering::SeqCst),
+                "a bug in the scan"
+            );
+            self.inner.open()
+        }
+    }
+    let fixture = Fixture::new();
+    std::fs::write(fixture.at("f"), "one").unwrap();
+    let folder = Arc::new(Panicky {
+        inner: RealFolder::new(fixture.root()),
+        panic: std::sync::atomic::AtomicBool::new(false),
+    });
+    let daemon = Daemon::start(fixture.setup(
+        Arc::clone(&folder) as Arc<dyn Folder>,
+        Box::new(super::NoTransport),
+    ))
+    .unwrap();
+    daemon.settle();
+    let id = fixture.folder;
+    folder
+        .panic
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let (reply, _answer) = oneshot::channel();
+    daemon
+        .inputs
+        .blocking_send(Input::Probe(Probe::Scan(id, reply)))
+        .unwrap();
+    daemon.settled(Duration::from_secs(20)).unwrap();
+    assert!(!daemon.engine(move |e| e.folder(id).unwrap().scan_open()));
+    assert!(daemon.record(id, "f").is_some());
+    folder
+        .panic
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(daemon.scan(id), 0);
+    daemon.stop().unwrap();
+}
+
 mod kill;
