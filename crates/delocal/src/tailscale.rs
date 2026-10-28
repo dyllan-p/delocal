@@ -16,6 +16,7 @@
 //!
 //! So far:
 //!
+//! - [`fake`]: a Tailscale made from a config, for tests (§14.2)
 //! - [`tier`]: connection tiers from path info (§6.4)
 //!
 //! The real implementations, the LocalAPI and the CLI fallback with their
@@ -26,6 +27,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
+pub mod fake;
 pub mod tier;
 
 /// A Tailscale node's stable ID (§4), what a peer's node ID is bound to
