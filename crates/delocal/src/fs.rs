@@ -95,6 +95,8 @@ use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
+pub(crate) mod coarse;
+#[cfg(test)]
 mod conformance;
 #[cfg(feature = "faults")]
 pub mod faulty;
