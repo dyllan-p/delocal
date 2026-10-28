@@ -408,11 +408,12 @@ impl Daemon {
         }
     }
 
-    /// Stop: the engine task returns, effects not yet performed are dropped
-    /// (a restart redoes them, as after a crash), and the writer commits
-    /// what is queued before the lock goes.
+    /// Stop: the engine task returns once it reaches the stop, effects not
+    /// yet performed then are dropped (a restart redoes them, as after a
+    /// crash), and the writer commits what is queued before the lock goes.
+    /// The executor runs on until the engine task has returned, so that its
+    /// going cannot read as a failure.
     pub fn stop(mut self) -> Result<(), DaemonError> {
-        self.stopping.store(true, Ordering::SeqCst);
         let inputs = self.inputs.clone();
         let core = &mut self.core;
         let result = self.runtime.block_on(async {
