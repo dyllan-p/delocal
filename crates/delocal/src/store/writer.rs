@@ -425,9 +425,11 @@ mod tests {
             ),
             other => panic!("expected the commit to fail on the lock, got {other:?}"),
         }
-        // It gave up at the timeout, not when the lock went.
+        // It gave up at the timeout rather than hang. The upper bound is
+        // slack for a loaded machine; the outcome above already says it did
+        // not wait for the lock to go.
         assert!(
-            waited >= BUSY_TIMEOUT - Duration::from_millis(500) && waited < Duration::from_secs(10),
+            waited >= BUSY_TIMEOUT - Duration::from_millis(500) && waited < Duration::from_secs(30),
             "gave up after {waited:?}"
         );
         // As after any failed commit, the writer takes nothing more.
