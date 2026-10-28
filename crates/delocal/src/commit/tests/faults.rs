@@ -1063,6 +1063,7 @@ fn kill_child() {
         names: &names,
         journal: &journal,
         clock: &clock,
+        stability: &settled(),
         disk: &state,
     }
     .run(&action, &version(), temp.as_deref());

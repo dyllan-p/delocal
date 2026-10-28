@@ -40,8 +40,9 @@ pub const SETTLE_NANOS: i64 = 2_000_000_000;
 pub const CHUNK: usize = 1 << 20;
 
 /// Whether a file whose inode change time is `ctime_ns` has been left
-/// alone for 2 s at `now`. A change time ahead of `now` (this machine's
-/// clock stepped back) has not.
+/// alone for 2 s at `now` by the real-time clock. A change time ahead of
+/// `now` has not by this test; [`super::stability`] judges such a file by
+/// two looks instead.
 pub fn settled(ctime_ns: i64, now: Timestamp) -> bool {
     now.since(Timestamp::from_unix_nanos(ctime_ns)) >= SETTLE_NANOS
 }

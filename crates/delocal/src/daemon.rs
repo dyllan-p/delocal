@@ -100,7 +100,11 @@ pub struct Setup {
     /// The state directory's lock, held for as long as the daemon runs.
     pub lock: StateLock,
     pub node: NodeConfig,
+    /// The engine's clock (§7.8), which dates every event.
     pub clock: Arc<Clock>,
+    /// The real-time clock the stability check compares `ctime` with
+    /// (§7.3, draft 66): [`scan::stability::realtime`].
+    pub realtime: Arc<dyn scan::Clock + Send + Sync>,
     pub folder: FolderAt,
     pub outbox: Box<dyn Outbox>,
     /// How often a folder is scanned in full: [`RESCAN`].
@@ -120,6 +124,7 @@ impl Setup {
             lock,
             node,
             clock,
+            realtime: Arc::new(scan::stability::realtime as fn() -> delocal_engine::Timestamp),
             folder: Box::new(|path| Arc::new(RealFolder::new(path))),
             outbox: Box::new(NoTransport),
             rescan: RESCAN,
@@ -280,6 +285,7 @@ impl Daemon {
             lock,
             node: _,
             clock,
+            realtime: _,
             folder: _,
             outbox,
             rescan,
@@ -318,6 +324,7 @@ impl Daemon {
                     records: Arc::new(opened.records),
                     names: opened.names,
                     disk: opened.disk,
+                    stability: opened.stability,
                 },
             );
         }

@@ -134,6 +134,7 @@ fn child() {
         lock: lock::lock(&state).unwrap(),
         node: ids.node.clone(),
         clock: std::sync::Arc::new(Clock::start()),
+        realtime: std::sync::Arc::new(crate::scan::stability::realtime as fn() -> Timestamp),
         folder: Box::new(move |_| std::sync::Arc::new(RealFolder::new(&root_folder))),
         outbox: Box::new(NoTransport),
         rescan: super::super::RESCAN,

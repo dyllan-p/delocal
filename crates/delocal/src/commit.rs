@@ -90,6 +90,7 @@ use crate::fs::{
 use crate::names::{self, IndexName, Name};
 use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
 use crate::scan::ignore_rules::{IgnoreRules, RuleSource};
+use crate::scan::stability::Stability;
 use crate::scan::{Clock, MARKER, Observer, OpenRows, Records};
 use crate::store::{HostWrite, JournalRow, TrashRow};
 use crate::tmp;
@@ -226,6 +227,9 @@ pub struct Commit<'a> {
     pub journal: &'a dyn Journal,
     /// The engine's clock (§7.8): reports are dated by it.
     pub clock: &'a dyn Clock,
+    /// Whether a file has settled enough to hash, for the observation a
+    /// failed report carries (§7.3).
+    pub stability: &'a Stability,
     pub disk: &'a DiskState,
 }
 
@@ -495,6 +499,7 @@ impl Commit<'_> {
             names: self.names,
             open: self.disk,
             clock: self.clock,
+            stability: self.stability,
             sensitivity,
         }
         .observe(path)
