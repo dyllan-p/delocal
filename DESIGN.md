@@ -1,6 +1,8 @@
 # delocal — v1 Design
 
-> Draft 66 · 16 October 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 65: the stability check compares `ctime` with the real-time clock that set it, falling back to two looks 2 s apart by the monotonic clock when the two disagree (§7.3).
+> Draft 67 · 16 October 2026 · Status: **Phase 2 in progress** (Phase 1 complete: 100,000 of 100,000 seeds, every slice, on c9f5fbc) · Changes from draft 66: the watcher debounces `notify`'s raw events itself, every path any event names, and `notify-debouncer-full` leaves Appendix A (§7.3).
+>
+> Changes from draft 65: the stability check compares `ctime` with the real-time clock that set it, falling back to two looks 2 s apart by the monotonic clock when the two disagree (§7.3).
 >
 > Changes from draft 64: the journal undoes a row only if its rename never happened, told by whether the temp file is still there (§7.5); a revert's move of a directory holding user-ignored files gives up and keeps the directory, as for any non-empty directory (§7.3).
 >
@@ -346,7 +348,7 @@ Wall-clock time never participates in ordering. See §7.8.
 
 ### 7.3 Local change detection
 
-- `notify` watches every folder root recursively. Events are debounced (2 s of quiet per path). **[verify]** FSEvents coalescing on macOS under `notify-debouncer-full`.
+- `notify` watches every folder root recursively, and the host debounces its **raw** events itself: every path any event names (both ends of a rename, every flag of a coalesced FSEvents record) is held until it has had 2 s of quiet, then observed as it is on disk. The event's kind is never trusted, only the path it names; an event that says a subtree must be rescanned, or that events were lost, brings a walk of that subtree or a full scan. The `notify-debouncer-full` crate was tried and dropped: it pairs a create with a later remove and discards both, files a rename only under its destination, and drops what was queued beneath a removed directory, so on macOS a removed tree arrived as nothing and on Linux a renamed-then-removed file was never seen to go (verified in PR 7).
 - A **full scan** runs at daemon start, every hour **[decision]**, and on `delocal scan`. Watchers drop events under load; the scan is the ground truth.
 - Fast path: a file whose `size`, `mtime_ns` **and exec bit** match the index is unchanged; a directory whose kind matches is unchanged; a symlink is unchanged only if its kind **and target** match, because the target is its content and a retarget changes neither size nor anything else the fast path sees (`readlink` is one call). Anything else is hashed. The exec bit is in the fast path because `chmod` changes neither size nor mtime: if its watcher event is dropped, a fast path on size and mtime alone would never notice, and the index would disagree with the disk forever. `stat` returns the mode anyway, so this costs nothing.
 - **A change in mtime alone** (size and hash unchanged) is still a change: it produces a new version with `hash == prev_hash` and propagates, so that every machine holds the same `mtime_ns` for the same version and the conflict tie-break stays deterministic. Receivers apply it as a metadata-only apply (§7.5); it is invisible to the brake (§8.1); and it loses to any real content change in a conflict (§7.6).
@@ -923,7 +925,7 @@ For the record, so they are not reopened by accident:
 | Purpose | Crate |
 |---|---|
 | async runtime | `tokio` |
-| filesystem watching | `notify`, `notify-debouncer-full` |
+| filesystem watching | `notify` (raw events, debounced by the host, §7.3) |
 | scanning & ignore rules | `ignore` (wraps `walkdir`) |
 | hashing | `blake3` |
 | database | `rusqlite` (bundled feature; **[verify]** the static build under `cross` for aarch64-musl) |
