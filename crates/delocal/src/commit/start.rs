@@ -104,7 +104,7 @@ impl Start<'_> {
             .failed
             .iter()
             .filter_map(|(path, _)| self.journal.iter().find(|row| row.path == *path))
-            .filter_map(|row| row.temp_file.as_deref())
+            .map(|row| row.temp_file.as_path())
             .filter(|temp| temp.parent() == Some(Path::new(tmp::DIR)))
             .filter_map(|temp| temp.file_name().map(OsStr::to_os_string))
             .collect();

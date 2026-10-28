@@ -562,7 +562,7 @@ fn host_write(tx: &Transaction<'_>, write: &HostWrite) -> Result<(), StoreError>
                 folder.as_bytes(),
                 &row.path.as_str(),
                 &disk_bytes(&row.displaced_to),
-                &row.temp_file.as_deref().map(disk_bytes),
+                &disk_bytes(&row.temp_file),
             ],
         ),
         HostWrite::RemoveJournal { folder, path } => run(
@@ -975,11 +975,11 @@ mod tests {
         });
         g.host(HostWrite::PutJournal {
             folder: f,
-            row: journal_row("j1", true),
+            row: journal_row("j1"),
         });
         g.host(HostWrite::PutJournal {
             folder: f,
-            row: journal_row("j2", false),
+            row: journal_row("j2"),
         });
         g.host(HostWrite::PutMachine(machine(3)));
         g.host(HostWrite::PutMachine(machine(4)));
@@ -992,7 +992,7 @@ mod tests {
         assert_eq!(store.disk_names(f).unwrap(), [disk_name("d")]);
         assert_eq!(
             store.journal(f).unwrap(),
-            [journal_row("j1", true), journal_row("j2", false)]
+            [journal_row("j1"), journal_row("j2")]
         );
         assert_eq!(store.machines().unwrap(), [machine(3), machine(4)]);
         // No small rest yet: the engine never reported the folder.
@@ -1044,7 +1044,7 @@ mod tests {
         assert_eq!(store.trash(f).unwrap(), [resized]);
         assert!(store.shims(f).unwrap().is_empty());
         assert!(store.disk_names(f).unwrap().is_empty());
-        assert_eq!(store.journal(f).unwrap(), [journal_row("j2", false)]);
+        assert_eq!(store.journal(f).unwrap(), [journal_row("j2")]);
         assert_eq!(store.machines().unwrap(), [machine(4)]);
     }
 

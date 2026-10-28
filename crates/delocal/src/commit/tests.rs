@@ -423,7 +423,7 @@ fn a_file_written_over_goes_to_the_trash_behind_a_durable_row() {
         panic!("expected the journal and trash rows, got {durable:?}");
     };
     assert_eq!(row.path, p("report.txt"));
-    assert_eq!(row.temp_file.as_deref(), Some(temp.as_path()));
+    assert_eq!(row.temp_file, temp);
     assert_eq!(
         row.displaced_to,
         Path::new(trash::DIR).join(&trashed.trashed_path)
@@ -991,7 +991,7 @@ fn a_directory_comes_in_through_a_temp_and_a_rename() {
     let temp = durable
         .iter()
         .find_map(|w| match w {
-            HostWrite::PutJournal { row, .. } => row.temp_file.clone(),
+            HostWrite::PutJournal { row, .. } => Some(row.temp_file.clone()),
             _ => None,
         })
         .unwrap();
@@ -1283,7 +1283,7 @@ fn row(path: &str, to: &Path) -> JournalRow {
     JournalRow {
         path: p(path),
         displaced_to: to.to_path_buf(),
-        temp_file: Some(PathBuf::from(tmp::DIR).join("t")),
+        temp_file: PathBuf::from(tmp::DIR).join("t"),
     }
 }
 
@@ -1486,16 +1486,6 @@ fn the_journal_drops_the_row_of_a_commit_that_landed() {
         assert_eq!(disk.exists("a"), present);
         assert_eq!(disk.trash(), [b"old".to_vec()]);
     }
-    // A row with no temp at all (none is written since every write has
-    // one) has nothing to say its rename never happened: the same rule.
-    let none = JournalRow {
-        temp_file: None,
-        ..row("a", &in_trash)
-    };
-    let undone = undo_rows(&disk, &[none]);
-    assert_eq!(undone.landed, [p("a")]);
-    assert!(!disk.exists("a"));
-    assert_eq!(disk.trash(), [b"old".to_vec()]);
 }
 
 /// Draft 65 at a later resolve: a row the start could not undo, whose temp
@@ -1510,7 +1500,7 @@ fn a_resolve_drops_the_row_of_a_commit_that_landed() {
     std::fs::write(disk.at(in_trash.to_str().unwrap()), "old").unwrap();
     let temp = PathBuf::from(tmp::DIR).join("gone");
     disk.state
-        .keep_displaced(p("dir/f"), in_trash.clone(), "dir/f".into(), Some(temp));
+        .keep_displaced(p("dir/f"), in_trash.clone(), "dir/f".into(), temp);
     let resolved = disk.resolve(&disk.folder());
     assert_eq!(resolved.resolved, [p("dir/f")]);
     assert!(!disk.exists("dir/f"), "nothing put back");
@@ -1543,7 +1533,7 @@ fn the_start_never_removes_a_temp_an_open_row_names() {
         rows.push(JournalRow {
             path: p(name),
             displaced_to: to,
-            temp_file: Some(temp),
+            temp_file: temp,
         });
     }
     std::fs::write(disk.at(tmp::DIR).join("stale"), "x").unwrap();
@@ -1684,7 +1674,7 @@ fn a_start_undoes_reconciles_prunes_and_clears_tmp() {
     let open = JournalRow {
         path: p("back"),
         displaced_to: trashed("back"),
-        temp_file: Some(claimed_temp.clone()),
+        temp_file: claimed_temp.clone(),
     };
     // An entry with no row, and one old enough to prune.
     std::fs::write(disk.at(trashed("orphan").to_str().unwrap()), "orphan").unwrap();

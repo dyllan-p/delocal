@@ -291,11 +291,11 @@ pub fn disk_name(p: &str) -> DiskName {
     }
 }
 
-pub fn journal_row(p: &str, temp: bool) -> JournalRow {
+pub fn journal_row(p: &str) -> JournalRow {
     JournalRow {
         path: path(p),
         displaced_to: PathBuf::from(format!(".delocal/trash/2026-09-27/{p}")),
-        temp_file: temp.then(|| PathBuf::from(".delocal/tmp/abcd1234-5678")),
+        temp_file: PathBuf::from(format!(".delocal/tmp/abcd1234-{p}")),
     }
 }
 

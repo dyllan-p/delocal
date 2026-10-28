@@ -168,17 +168,14 @@ pub fn undo(fs: &dyn Fs, folder: FolderId, rows: &[JournalRow], names: &dyn Disk
         // Only a rename that never happened is undone: a landed one is made
         // durable and its row dropped, its displaced file left where it
         // went. Every write goes through a temp, a directory's included, so
-        // a row without one has nothing to say its rename never happened.
-        let temp_there = match &row.temp_file {
-            Some(temp) => match fs.lstat(temp) {
-                Ok(_) => true,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-                Err(e) => {
-                    undone.failed.push((row.path.clone(), e));
-                    continue;
-                }
-            },
-            None => false,
+        // every row has one to judge it by.
+        let temp_there = match fs.lstat(&row.temp_file) {
+            Ok(_) => true,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                undone.failed.push((row.path.clone(), e));
+                continue;
+            }
         };
         if !temp_there {
             let dirs = landed_dirs(&disk, &row.displaced_to);

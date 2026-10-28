@@ -130,7 +130,7 @@ enum Open {
         trash: Option<PathBuf>,
         /// The temp file the commit was to rename in: if it is gone, the
         /// rename happened after all, and nothing goes back (draft 65).
-        temp: Option<PathBuf>,
+        temp: PathBuf,
     },
     /// A commit landed, but an fsync after it failed, so its rename is not
     /// known to be durable. Resolved once these directories are synced.
@@ -187,13 +187,7 @@ impl DiskState {
     /// whose displaced file is at `at` (relative to the folder root), goes
     /// back to `back` if its rename never happened, and whose commit was to
     /// rename in `temp`.
-    pub(crate) fn keep_displaced(
-        &self,
-        path: RelPath,
-        at: PathBuf,
-        back: PathBuf,
-        temp: Option<PathBuf>,
-    ) {
+    pub(crate) fn keep_displaced(&self, path: RelPath, at: PathBuf, back: PathBuf, temp: PathBuf) {
         let trash = at.strip_prefix(trash::DIR).ok().map(Path::to_path_buf);
         let open = Open::Displaced {
             at,
@@ -583,10 +577,7 @@ impl Commit<'_> {
         // Draft 65: a temp file that is gone means the rename happened, so
         // the commit landed and only its durability is left to make sure of.
         let open = match open {
-            Open::Displaced { at, back, temp, .. }
-                if temp.as_ref().is_none_or(
-                    |temp| matches!(fs.lstat(temp), Err(e) if e.kind() == io::ErrorKind::NotFound),
-                ) =>
+            Open::Displaced { at, back, temp, .. } if matches!(fs.lstat(&temp), Err(e) if e.kind() == io::ErrorKind::NotFound) =>
             {
                 let dirs = journal::landed_dirs(&back, &at);
                 self.disk
@@ -751,7 +742,7 @@ impl Commit<'_> {
         let displaced = match &found {
             Found::Entry { disk, seen, .. } => {
                 let hash = expected.map_or(seen.hash, |e| e.hash);
-                match self.displace(at, disk, seen, hash, displace, Some(incoming.path())) {
+                match self.displace(at, disk, seen, hash, displace, incoming.path()) {
                     Ok(displaced) => Some(displaced),
                     Err(failed) => {
                         incoming.discard(fs);
@@ -781,7 +772,7 @@ impl Commit<'_> {
             let mut fail = changed_or_local(&e);
             let writes = match (&displaced, &found) {
                 (Some(displaced), Found::Entry { disk, .. }) => {
-                    match self.put_back(at.path, fs, displaced, disk, Some(incoming.path())) {
+                    match self.put_back(at.path, fs, displaced, disk, incoming.path()) {
                         Some(writes) => {
                             incoming.discard(fs);
                             writes
@@ -882,7 +873,7 @@ impl Commit<'_> {
         seen: &Observed,
         hash: ContentHash,
         displace: &Displace,
-        temp: Option<&Path>,
+        temp: &Path,
     ) -> Result<Displaced, Failed> {
         let fs = at.fs;
         if seen.kind == Kind::Dir {
@@ -891,7 +882,7 @@ impl Commit<'_> {
         let row = |to: &Path| JournalRow {
             path: at.path.clone(),
             displaced_to: to.to_path_buf(),
-            temp_file: temp.map(Path::to_path_buf),
+            temp_file: temp.to_path_buf(),
         };
         let journal_gone = |extra: Option<HostWrite>| -> Vec<HostWrite> {
             let mut writes = vec![HostWrite::RemoveJournal {
@@ -1003,7 +994,7 @@ impl Commit<'_> {
         fs: &dyn Fs,
         displaced: &Displaced,
         to: &Path,
-        temp: Option<&Path>,
+        temp: &Path,
     ) -> Option<Vec<HostWrite>> {
         let journal_gone = HostWrite::RemoveJournal {
             folder: self.id,
@@ -1027,7 +1018,7 @@ impl Commit<'_> {
                     at: displaced.to.clone(),
                     back: to.to_path_buf(),
                     trash: displaced.trash.as_ref().map(|row| row.trashed_path.clone()),
-                    temp: temp.map(Path::to_path_buf),
+                    temp: temp.to_path_buf(),
                 };
                 self.disk.opened().insert(path.clone(), stranded);
                 None

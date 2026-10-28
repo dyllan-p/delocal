@@ -344,7 +344,7 @@ impl Store {
                 Ok(JournalRow {
                     path: rel_path(T, row.get(0)?)?,
                     displaced_to: disk_path(row.get(1)?),
-                    temp_file: row.get::<_, Option<Vec<u8>>>(2)?.map(disk_path),
+                    temp_file: disk_path(row.get(2)?),
                 })
             },
         )
