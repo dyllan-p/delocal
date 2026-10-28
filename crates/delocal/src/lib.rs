@@ -6,7 +6,9 @@
 //!
 //! - [`commit`]: the commit path, the host side of `Write`, `Remove`,
 //!   `SetMeta` and `MoveToTrash`, and its journal (§7.5, §8.3)
-//! - [`daemon`]: `delocal daemon`, as it is built up (§10, §11, §7.8)
+//! - [`daemon`]: `delocal daemon`, the engine driven by real events: its
+//!   start, the engine task, group commit with effects after durability,
+//!   the executor and the timers (§10, §11, §7.8)
 //! - [`fs`]: the filesystem layer, every operation on a folder (§14.2)
 //! - [`names`]: names on disk and the index paths they map to (§7.1, §7.3)
 //! - [`reach`]: an index path on disk: its names, the walk to it that never
