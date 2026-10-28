@@ -42,6 +42,11 @@ tracing = "0.1.44"
 # since the lines go to files and nothing here logs through `log`.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 tracing-appender = "0.2.5"
+# The watcher (DESIGN.md §7.3, Appendix A): notify for the platform's file
+# events, the debouncer for its 2 s of quiet per path. Default features:
+# notify picks inotify on Linux and FSEvents on macOS.
+notify = "8.2.0"
+notify-debouncer-full = "0.7.0"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
