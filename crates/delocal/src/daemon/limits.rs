@@ -5,9 +5,9 @@
 //! operation. macOS starts processes with a soft limit of 256, which a deep
 //! tree scanned with eight hashers beside a commit can run into, and a scan
 //! that ran out would skip what it could not open. The soft limit is raised
-//! to the hard one, which needs no privilege. macOS refuses a soft limit
-//! above `OPEN_MAX` (10,240) for most hard limits, unlimited included, so
-//! that is tried next.
+//! to the hard one, which needs no privilege; where the hard limit is
+//! unlimited, so is the soft one then, if the system allows it. macOS can
+//! refuse a soft limit above `OPEN_MAX` (10,240), so that is tried next.
 
 use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
 
@@ -17,8 +17,8 @@ const OPEN_MAX: u64 = 10_240;
 /// What [`raise_open_files`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Raised {
-    /// The soft limit went from `from` to `to`.
-    To { from: u64, to: u64 },
+    /// The soft limit went from `from` to `to`; `None` is unlimited.
+    To { from: u64, to: Option<u64> },
     /// It was already as high as it can go.
     Already { at: Option<u64> },
     /// Every higher value was refused; it stays at `at`.
@@ -39,15 +39,13 @@ pub fn raise_open_files() -> Raised {
         if target <= current {
             return Raised::Already { at: Some(current) };
         }
+        let to = (target != u64::MAX).then_some(target);
         let new = Rlimit {
-            current: (target != u64::MAX).then_some(target),
+            current: to,
             maximum: limit.maximum,
         };
         if setrlimit(Resource::Nofile, new).is_ok() {
-            return Raised::To {
-                from: current,
-                to: target,
-            };
+            return Raised::To { from: current, to };
         }
     }
     Raised::Refused { at: current }
@@ -66,8 +64,8 @@ mod tests {
         let hard = limit.maximum.unwrap_or(u64::MAX);
         match raised {
             Raised::To { from, to } => {
-                assert!(to > from);
-                assert_eq!(limit.current, Some(to));
+                assert!(to.is_none_or(|to| to > from));
+                assert_eq!(limit.current, to);
             }
             Raised::Already { .. } => {}
             Raised::Refused { at } => panic!("refused at {at}, hard {hard}"),
