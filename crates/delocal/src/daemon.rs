@@ -209,7 +209,7 @@ pub fn run(options: &Options) -> Result<(), DaemonError> {
     let _logs = logs::init(dir).map_err(DaemonError::Logs)?;
     info!(version = delocal_engine::VERSION, state_dir = %dir.display(), "starting");
     match limits::raise_open_files() {
-        limits::Raised::To { from, to } => info!(from, to, "open-file limit raised"),
+        limits::Raised::To { from, to } => info!(from, ?to, "open-file limit raised"),
         limits::Raised::Already { at } => info!(?at, "open-file limit"),
         limits::Raised::Refused { at } => warn!(at, "open-file limit could not be raised"),
     }
