@@ -22,7 +22,9 @@
 //!   durable, in order, and only then passes its effects on;
 //! - the **executor** (`executor`), one thread that performs them in order
 //!   (commits, sends, `Observe` answers) and starts each scan on a thread
-//!   of its own.
+//!   of its own;
+//! - the **watcher** ([`watch`]), `notify` and its debouncer on threads of
+//!   their own, whose events the engine task hands the executor to observe.
 //!
 //! The store's writer is a thread of its own too ([`crate::store::writer`]).
 //!
@@ -36,8 +38,7 @@
 //! **What is not here yet.** No transport (Phase 3): sends and fetches go
 //! to an [`Outbox`] that drops them, and no peer ever connects. No real
 //! Tailscale (Phase 3): `delocal daemon` runs with none, so it polls no
-//! tiers; tests give it the fake. No watcher: local changes are seen by the
-//! startup scan and the hourly one. No mtime shim (§7.3) and no CLI socket
+//! tiers; tests give it the fake. No mtime shim (§7.3) and no CLI socket
 //! (Phase 4).
 
 use std::fmt;
@@ -71,6 +72,7 @@ pub mod node;
 mod startup;
 #[cfg(test)]
 mod tests;
+pub mod watch;
 
 pub use self::core::{QUEUE, SETTLE, SPACE_CHECK};
 pub use executor::{Fetch, NoTransport, Outbox, SPACE_FLOOR};
@@ -125,6 +127,9 @@ pub struct Setup {
     pub tailscale: Option<Arc<dyn Tailscale>>,
     /// How often the tiers are polled: [`tier::POLL`].
     pub tier_poll: Duration,
+    /// Whether to watch the folders (§7.3). Without the watcher, local
+    /// changes are seen by the startup scan and the hourly one.
+    pub watch: bool,
 }
 
 impl Setup {
@@ -144,6 +149,7 @@ impl Setup {
             hashers: scan::default_hashers(),
             tailscale: None,
             tier_poll: tier::POLL,
+            watch: true,
         }
     }
 }
@@ -307,6 +313,7 @@ impl Daemon {
             hashers,
             tailscale,
             tier_poll,
+            watch,
         } = setup;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -325,11 +332,36 @@ impl Daemon {
 
         let mut watches = std::collections::BTreeMap::new();
         let mut kept = std::collections::BTreeMap::new();
+        // Watched before the startup scan, so that nothing changed while
+        // it runs goes unseen.
+        let mut watcher = if watch {
+            match self::watch::Watcher::new(inputs.clone()) {
+                Ok(watcher) => Some(watcher),
+                Err(error) => {
+                    warn!(%error, "no watcher: local changes wait for the scans");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         for opened in started.folders {
+            let unwatched = match watcher.as_mut() {
+                Some(watcher) => match watcher.watch(opened.id, &opened.root) {
+                    Ok(()) => false,
+                    Err(error) => {
+                        warn!(folder = %opened.id.short(), %error, "not watched");
+                        true
+                    }
+                },
+                None => false,
+            };
             watches.insert(
                 opened.id,
                 Watch {
                     names: opened.names.clone(),
+                    root: opened.root.clone(),
+                    unwatched,
                     ..Watch::default()
                 },
             );
@@ -373,7 +405,9 @@ impl Daemon {
             joins: started.joins,
             bindings: started.bindings,
             reobserve: self::core::Reobserve::default(),
+            rewatch: self::core::Reobserve::default(),
             busy: Arc::clone(&busy),
+            watcher,
             #[cfg(test)]
             trace: Arc::clone(&trace),
             #[cfg(test)]
@@ -496,6 +530,7 @@ impl Trace {
             Job::Records { .. }
             | Job::Names { .. }
             | Job::Again { .. }
+            | Job::Watched { .. }
             | Job::Scan { .. }
             | Job::Space { .. } => {
                 return None;

@@ -52,11 +52,14 @@ use tracing::{debug, error, info, warn};
 
 use super::clock::Clock;
 use super::core::{Input, Report, Source};
+use super::watch::Seen;
 use crate::commit::{Commit, DiskState, StoreJournal};
 use crate::fs::Folder;
 use crate::scan::stability::Stability;
 use crate::scan::{Scan, ScanReport};
 use crate::store::{HostWrite, Writer};
+
+mod watched;
 
 /// Free space below which a folder paused for a full disk stays paused
 /// (§7.5). The design names no figure: 64 MiB is room for the next commit
@@ -127,6 +130,8 @@ pub(crate) enum Job {
     /// The host's second look at a path it observed as unstable (§7.3),
     /// reported the same way.
     Again { folder: FolderId, path: RelPath },
+    /// Paths the watcher's events named, to observe (§7.3).
+    Watched { folder: FolderId, paths: Vec<Seen> },
     /// Resolve the open journal rows, then scan.
     Scan { folder: FolderId },
     /// Check a paused folder's free space.
@@ -275,6 +280,7 @@ impl Executor {
             Job::Observe { folder, path } | Job::Again { folder, path } => {
                 self.observe(folder, path)
             }
+            Job::Watched { folder, paths } => self.watched(folder, paths),
             Job::Scan { folder } => self.scan(folder),
             Job::Space { folder } => self.space(folder),
         }
@@ -350,6 +356,38 @@ impl Executor {
             compared,
             source: Source::Observe,
         }))
+    }
+
+    /// Observe what the watcher's events named, and report it, or report
+    /// the root guard tripped and nothing else (see [`watched`]).
+    fn watched(&self, id: FolderId, paths: Vec<Seen>) -> Result<(), Stopped> {
+        let Some(kept) = self.folders.get(&id) else {
+            return Ok(());
+        };
+        let journal = self.journal();
+        match watched::observe(id, kept, &journal, &self.clock, paths) {
+            Ok(found) => {
+                if !found.again.is_empty() {
+                    self.report(Input::Rewatch {
+                        folder: id,
+                        paths: found.again,
+                    })?;
+                }
+                for (event, compared) in found.observations {
+                    self.report(Input::report(Report {
+                        event,
+                        writes: Vec::new(),
+                        compared,
+                        source: Source::Watch,
+                    }))?;
+                }
+                Ok(())
+            }
+            Err(watched::Gone) => self.report(Input::Guard {
+                folder: id,
+                root_gone: kept.folder.open().is_err(),
+            }),
+        }
     }
 
     fn scan(&self, id: FolderId) -> Result<(), Stopped> {

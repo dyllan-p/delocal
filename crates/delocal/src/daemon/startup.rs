@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use delocal_engine::path::RESERVED_DIR;
@@ -47,6 +47,8 @@ use crate::trash::Policy;
 /// One folder, started.
 pub(crate) struct Opened {
     pub id: FolderId,
+    /// Where the folder is on this machine: its member row's path.
+    pub root: PathBuf,
     pub folder: Arc<dyn Folder>,
     pub records: BTreeMap<RelPath, Entry>,
     pub names: BTreeMap<RelPath, OsString>,
@@ -159,6 +161,7 @@ pub(crate) fn start(
         }
         folders.push(Opened {
             id: row.id,
+            root: me.path.clone(),
             folder,
             records: BTreeMap::new(),
             names,

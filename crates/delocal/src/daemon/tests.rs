@@ -77,7 +77,8 @@ impl Core {
                 let idle = !self.probes.queued
                     && self.busy.load(std::sync::atomic::Ordering::SeqCst) == 0
                     && self.folders.values().all(|w| !w.scanning)
-                    && self.reobserve.is_empty();
+                    && self.reobserve.is_empty()
+                    && self.rewatch.is_empty();
                 let _ = reply.send(idle);
             }
             Probe::State(reply) => {
@@ -223,6 +224,8 @@ impl Fixture {
             hashers: std::num::NonZeroUsize::MIN,
             tailscale: None,
             tier_poll: crate::tailscale::tier::POLL,
+            // The tests that want the watcher turn it on.
+            watch: false,
         }
     }
 

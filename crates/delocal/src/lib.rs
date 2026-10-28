@@ -8,7 +8,7 @@
 //!   `SetMeta` and `MoveToTrash`, and its journal (§7.5, §8.3)
 //! - [`daemon`]: `delocal daemon`, the engine driven by real events: its
 //!   start, the engine task, group commit with effects after durability,
-//!   the executor and the timers (§10, §11, §7.8)
+//!   the executor, the timers and the watcher (§10, §11, §7.8, §7.3)
 //! - [`fs`]: the filesystem layer, every operation on a folder (§14.2)
 //! - [`names`]: names on disk and the index paths they map to (§7.1, §7.3)
 //! - [`reach`]: an index path on disk: its names, the walk to it that never

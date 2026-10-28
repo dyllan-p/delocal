@@ -48,6 +48,14 @@
 //! `Unstable` (§7.3, draft 47); and, while a full disk pauses a folder's
 //! inbound, a check for free space every 30 s (§7.5).
 //!
+//! **The watcher** ([`super::watch`]) sends the paths its events name, and
+//! this task hands them to the executor to observe. If the watcher lost
+//! events, the folder is scanned in full (after the scan running, if one
+//! is). If its root or marker went (§7.3, the root guard), the folder is
+//! treated as after an aborted scan: what the watcher sees is dropped, and
+//! nothing reaches the engine, until a scan finds the marker again and
+//! the folder is watched afresh.
+//!
 //! **`Unchanged` is relative to a record** (§7.3). The executor and the
 //! scanner compare against their own copies of the records, which can lag
 //! the engine's. Each report of `Unchanged` comes with the record the host
@@ -58,6 +66,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -73,6 +82,7 @@ use tracing::{debug, info, warn};
 use super::DaemonError;
 use super::clock::Clock;
 use super::executor::{self, Job};
+use super::watch::{Seen, Watcher};
 use crate::scan::ScanReport;
 use crate::scan::hash::SETTLE_NANOS;
 use crate::store::{DiskName, Durable, Group, HostWrite, WriteError, Writer};
@@ -95,6 +105,8 @@ pub(crate) enum Source {
     Scan,
     Commit,
     Observe,
+    /// The watcher's observations (§7.3).
+    Watch,
     /// The host's own: a space check, or a test.
     Host,
 }
@@ -124,6 +136,28 @@ pub(crate) enum Input {
     },
     /// What a tier poll found (§6.4).
     Tiers(Tiers),
+    /// Paths the watcher's events named, to observe (§7.3).
+    Watched {
+        folder: FolderId,
+        paths: Vec<Seen>,
+    },
+    /// Paths to look at again as the watcher would, 2 s from now: their
+    /// first look found the opposite of what their event said.
+    Rewatch {
+        folder: FolderId,
+        paths: Vec<RelPath>,
+    },
+    /// The watcher lost events for the folder: a full scan finds them.
+    Rescan {
+        folder: FolderId,
+    },
+    /// The folder's root or its marker is gone, as the watcher found it
+    /// (§7.3, the root guard). `root_gone` if the root itself went, and its
+    /// watch with it.
+    Guard {
+        folder: FolderId,
+        root_gone: bool,
+    },
     Stop,
     #[cfg(test)]
     Probe(super::tests::Probe),
@@ -174,6 +208,16 @@ pub(crate) struct Watch {
     pub touched: BTreeSet<RelPath>,
     /// `IndexChanged`s the running scan's events produced.
     pub changes: usize,
+    /// Where the folder is on disk, for its watch.
+    pub root: PathBuf,
+    /// The root guard tripped for the watcher (§7.3): its observations are
+    /// dropped until a scan finds the marker again.
+    pub guarded: bool,
+    /// The folder has no watch: it could not be set, or its root went.
+    /// The next scan that finds the marker sets it again.
+    pub unwatched: bool,
+    /// The watcher lost events while a scan ran: another follows it.
+    pub rescan_after: bool,
 }
 
 /// Paths to observe again once they have had time to settle (§7.3).
@@ -237,8 +281,12 @@ pub(crate) struct Core {
     /// task has written them.
     pub bindings: BTreeMap<NodeId, StableId>,
     pub reobserve: Reobserve,
+    /// Paths to look at again as the watcher would (see [`Input::Rewatch`]).
+    pub rewatch: Reobserve,
     /// Jobs and releases handed off and not yet done.
     pub busy: Arc<AtomicUsize>,
+    /// The watcher (§7.3), unless the daemon runs without one.
+    pub watcher: Option<Watcher>,
     #[cfg(test)]
     pub trace: Arc<super::Trace>,
     #[cfg(test)]
@@ -312,6 +360,22 @@ impl Core {
             Input::Writes(writes) => self.emit(self.clock.now(), Vec::new(), writes).await,
             Input::ScanDone { folder, report } => self.scan_done(folder, report).await,
             Input::Tiers(tiers) => self.tiers(&tiers).await,
+            Input::Watched { folder, paths } => match self.folders.get(&folder) {
+                Some(watch) if !watch.guarded => self.direct(Job::Watched { folder, paths }),
+                _ => Ok(()),
+            },
+            Input::Rewatch { folder, paths } => {
+                let at = Instant::now() + SETTLE;
+                for path in paths {
+                    self.rewatch.at(folder, path, at);
+                }
+                Ok(())
+            }
+            Input::Rescan { folder } => self.rescan(folder),
+            Input::Guard { folder, root_gone } => {
+                self.guard(folder, root_gone);
+                Ok(())
+            }
             // Handled by `run`.
             Input::Stop => Ok(()),
             #[cfg(test)]
@@ -579,7 +643,7 @@ impl Core {
             .folders
             .values()
             .flat_map(|watch| [watch.next_scan, watch.space_at]);
-        [wake, self.reobserve.next()]
+        [wake, self.reobserve.next(), self.rewatch.next()]
             .into_iter()
             .chain(folders)
             .flatten()
@@ -610,6 +674,21 @@ impl Core {
         }
         for (folder, path) in self.reobserve.take(now) {
             self.direct(Job::Again { folder, path })?;
+        }
+        let mut rewatch: BTreeMap<FolderId, Vec<Seen>> = BTreeMap::new();
+        for (folder, path) in self.rewatch.take(now) {
+            rewatch.entry(folder).or_default().push(Seen {
+                path,
+                came: false,
+                went: false,
+                again: true,
+                names: Vec::new(),
+            });
+        }
+        for (folder, paths) in rewatch {
+            if self.folders.get(&folder).is_some_and(|w| !w.guarded) {
+                self.direct(Job::Watched { folder, paths })?;
+            }
         }
         let checks: Vec<FolderId> = self
             .folders
@@ -646,6 +725,43 @@ impl Core {
         self.direct(Job::Scan { folder: id })
     }
 
+    /// The watcher lost events for `id`: scan it in full now, or as soon as
+    /// the scan running ends.
+    fn rescan(&mut self, id: FolderId) -> Result<(), DaemonError> {
+        let Some(watch) = self.folders.get_mut(&id) else {
+            return Ok(());
+        };
+        if watch.scanning {
+            watch.rescan_after = true;
+            return Ok(());
+        }
+        info!(folder = %id.short(), "the watcher lost events: scanning");
+        self.start_scan(id)
+    }
+
+    /// The root guard tripped for the watcher (§7.3): the folder is treated
+    /// as after an aborted scan. Nothing the watcher sees is observed until
+    /// a scan finds the marker again, and nothing is announced meanwhile. A
+    /// root that went took its watch with it, so the folder is watched again
+    /// once it is back; one that is still there keeps its watch, which a
+    /// second watch would only open a gap in.
+    fn guard(&mut self, id: FolderId, root_gone: bool) {
+        let Some(watch) = self.folders.get_mut(&id) else {
+            return;
+        };
+        if root_gone {
+            watch.unwatched = true;
+        }
+        if !watch.guarded {
+            warn!(
+                folder = %id.short(),
+                "the folder's root or marker is gone: paused, announcing nothing, until a \
+                 scan finds it"
+            );
+            watch.guarded = true;
+        }
+    }
+
     /// A scan ended: schedule the next, keep its names on disk, log what
     /// it found.
     async fn scan_done(
@@ -669,6 +785,31 @@ impl Core {
         if report.aborted.is_some() {
             return Ok(());
         }
+        // The scan found the marker: the guard lifts, and a folder left
+        // without a watch gets one again.
+        if watch.guarded {
+            info!(folder = %id.short(), "the folder is back: watching again");
+            watch.guarded = false;
+        }
+        // What changed between this scan's walk and the new watch, the
+        // next scan finds.
+        if watch.unwatched
+            && let Some(watcher) = self.watcher.as_mut()
+        {
+            match watcher.watch(id, &watch.root) {
+                Ok(()) => {
+                    watch.unwatched = false;
+                    watch.rescan_after = true;
+                }
+                Err(error) => warn!(folder = %id.short(), %error, "not watched"),
+            }
+        }
+        if std::mem::take(&mut watch.rescan_after) {
+            self.start_scan(id)?;
+        }
+        let Some(watch) = self.folders.get_mut(&id) else {
+            return Ok(());
+        };
         let writes = names_written(id, watch, &report);
         if writes.is_empty() {
             return Ok(());
