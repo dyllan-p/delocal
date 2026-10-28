@@ -1570,6 +1570,12 @@ fn marker(fs: &dyn Fs) -> io::Result<()> {
     }
 }
 
+/// Whether `folder`'s root opens afresh and holds the root guard's marker
+/// (§7.3): what the watcher checks before it reports anything absent.
+pub fn marked(folder: &dyn Folder) -> bool {
+    folder.open().is_ok_and(|fs| marker(&*fs).is_ok())
+}
+
 /// The mode bits for a file whose exec bit is to be `exec`, written as git
 /// writes it (§7.1, draft 47): execute added wherever read is set, or every
 /// execute bit cleared, the other bits as they are.
