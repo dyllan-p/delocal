@@ -29,10 +29,16 @@
 //! **Time** is [`clock::Clock`]: the wall clock at start plus the monotonic
 //! time since (§7.8).
 //!
+//! **Tailscale** (§6.1) is [`Setup::tailscale`]. Given one, the daemon polls
+//! it for every connected peer's tier ([`tier::poll`], §6.4), on a task of
+//! its own that hands what it finds to the engine task.
+//!
 //! **What is not here yet.** No transport (Phase 3): sends and fetches go
-//! to an [`Outbox`] that drops them, and no peer ever connects. No watcher:
-//! local changes are seen by the startup scan and the hourly one. No mtime
-//! shim (§7.3) and no CLI socket (Phase 4).
+//! to an [`Outbox`] that drops them, and no peer ever connects. No real
+//! Tailscale (Phase 3): `delocal daemon` runs with none, so it polls no
+//! tiers; tests give it the fake. No watcher: local changes are seen by the
+//! startup scan and the hourly one. No mtime shim (§7.3) and no CLI socket
+//! (Phase 4).
 
 use std::fmt;
 use std::fs::DirBuilder;
@@ -53,6 +59,7 @@ use tracing::{error, info, warn};
 use crate::fs::{Folder, RealFolder};
 use crate::scan;
 use crate::store::{StoreError, WriteError};
+use crate::tailscale::{Tailscale, tier};
 
 pub mod clock;
 mod core;
@@ -113,11 +120,16 @@ pub struct Setup {
     /// [`SPACE_CHECK`].
     pub space_check: Duration,
     pub hashers: NonZeroUsize,
+    /// Tailscale (§6.1): none until Phase 3 brings the real one; the fake
+    /// in tests. With one, the tiers are polled.
+    pub tailscale: Option<Arc<dyn Tailscale>>,
+    /// How often the tiers are polled: [`tier::POLL`].
+    pub tier_poll: Duration,
 }
 
 impl Setup {
-    /// The daemon as it runs for real: folders on disk, no transport yet,
-    /// a full scan every hour.
+    /// The daemon as it runs for real: folders on disk, no transport or
+    /// Tailscale yet, a full scan every hour.
     pub fn new(state_dir: PathBuf, lock: StateLock, node: NodeConfig, clock: Arc<Clock>) -> Self {
         Self {
             state_dir,
@@ -130,6 +142,8 @@ impl Setup {
             rescan: RESCAN,
             space_check: SPACE_CHECK,
             hashers: scan::default_hashers(),
+            tailscale: None,
+            tier_poll: tier::POLL,
         }
     }
 }
@@ -291,6 +305,8 @@ impl Daemon {
             rescan,
             space_check,
             hashers,
+            tailscale,
+            tier_poll,
         } = setup;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -355,6 +371,7 @@ impl Daemon {
             rescan,
             space_check,
             joins: started.joins,
+            bindings: started.bindings,
             reobserve: self::core::Reobserve::default(),
             busy: Arc::clone(&busy),
             #[cfg(test)]
@@ -369,6 +386,9 @@ impl Daemon {
             Arc::clone(&busy),
         ));
         let core = runtime.spawn(core.run(inputs_rx, failed_rx));
+        if let Some(tailscale) = tailscale {
+            runtime.spawn(tier::poll(tailscale, tier_poll, inputs.clone()));
+        }
         Ok(Self {
             runtime,
             inputs,

@@ -221,6 +221,8 @@ impl Fixture {
             rescan: super::RESCAN,
             space_check: super::SPACE_CHECK,
             hashers: std::num::NonZeroUsize::MIN,
+            tailscale: None,
+            tier_poll: crate::tailscale::tier::POLL,
         }
     }
 
@@ -1218,3 +1220,4 @@ fn a_file_changed_before_the_clock_was_set_back_is_stable_after_two_looks() {
 }
 
 mod kill;
+mod tiers;

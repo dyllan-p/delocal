@@ -3,8 +3,16 @@
 //!
 //! **Events in.** Everything the engine is told arrives on one queue
 //! ([`Input`]): scan and observation reports, commit reports with the host
-//! writes that go with them, and the task's own timers. Each is stamped with
-//! the clock's `now` (§7.8) and handed to [`Engine::handle`].
+//! writes that go with them, the tier poll's findings, and the task's own
+//! timers. Each is stamped with the clock's `now` (§7.8) and handed to
+//! [`Engine::handle`].
+//!
+//! **Tiers** (§6.4). The tier poll ([`poll`](crate::tailscale::tier::poll))
+//! sends the tier Tailscale's path info gives each node, and this task tells
+//! the engine `PeerTierChanged` for each connected peer whose tier that
+//! changes ([`Tiers::changes`]). A peer is matched to its Tailscale node by
+//! its binding (§5): the `machines` rows, read at start and kept up to date
+//! as this task writes them.
 //!
 //! **Writes to the group-commit writer.** The actions an event returns are
 //! sorted ([`Group::push`]): every persistence hook and `RecordBatch` joins
@@ -55,8 +63,8 @@ use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use delocal_engine::{
-    Action, ApplyOutcome, BatchId, Engine, Entry, Event, FolderId, RelPath, ScanState, SkipReason,
-    Timestamp,
+    Action, ApplyOutcome, BatchId, Engine, Entry, Event, FolderId, NodeId, RelPath, ScanState,
+    SkipReason, Timestamp,
 };
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio::time::Instant;
@@ -68,6 +76,8 @@ use super::executor::{self, Job};
 use crate::scan::ScanReport;
 use crate::scan::hash::SETTLE_NANOS;
 use crate::store::{DiskName, Durable, Group, HostWrite, WriteError, Writer};
+use crate::tailscale::StableId;
+use crate::tailscale::tier::Tiers;
 
 /// How many groups may wait to be durable before the engine task waits.
 pub const QUEUE: usize = 256;
@@ -112,6 +122,8 @@ pub(crate) enum Input {
         folder: FolderId,
         report: Option<ScanReport>,
     },
+    /// What a tier poll found (§6.4).
+    Tiers(Tiers),
     Stop,
     #[cfg(test)]
     Probe(super::tests::Probe),
@@ -120,6 +132,12 @@ pub(crate) enum Input {
 impl Input {
     pub fn report(report: Report) -> Self {
         Self::Report(Box::new(report))
+    }
+}
+
+impl From<Tiers> for Input {
+    fn from(tiers: Tiers) -> Self {
+        Self::Tiers(tiers)
     }
 }
 
@@ -215,6 +233,9 @@ pub(crate) struct Core {
     /// `FolderJoined` for the folders the store has no parts of, handled
     /// before anything else.
     pub joins: Vec<Event>,
+    /// Each known peer's Tailscale node (§5): the `machines` rows as this
+    /// task has written them.
+    pub bindings: BTreeMap<NodeId, StableId>,
     pub reobserve: Reobserve,
     /// Jobs and releases handed off and not yet done.
     pub busy: Arc<AtomicUsize>,
@@ -290,6 +311,7 @@ impl Core {
             Input::Report(report) => self.report(*report).await,
             Input::Writes(writes) => self.emit(self.clock.now(), Vec::new(), writes).await,
             Input::ScanDone { folder, report } => self.scan_done(folder, report).await,
+            Input::Tiers(tiers) => self.tiers(&tiers).await,
             // Handled by `run`.
             Input::Stop => Ok(()),
             #[cfg(test)]
@@ -383,6 +405,13 @@ impl Core {
                 }
                 HostWrite::RemoveDiskName { folder, path } => {
                     names.entry(*folder).or_default().push((path.clone(), None));
+                }
+                HostWrite::PutMachine(machine) => {
+                    let id = StableId(machine.ts_stable_id.clone());
+                    self.bindings.insert(machine.node, id);
+                }
+                HostWrite::RemoveMachine(node) => {
+                    self.bindings.remove(node);
                 }
                 _ => {}
             }
@@ -509,6 +538,22 @@ impl Core {
                 warn!(?effect, "a write handed back as an effect; ignored");
             }
         }
+    }
+
+    /// A tier poll's findings (§6.4): `PeerTierChanged` for each connected
+    /// peer whose tier they change, one event at a time.
+    async fn tiers(&mut self, tiers: &Tiers) -> Result<(), DaemonError> {
+        for (peer, tier) in tiers.changes(self.engine.peers(), &self.bindings) {
+            info!(peer = %peer.short(), ?tier, "tier changed");
+            self.report(Report {
+                event: Event::PeerTierChanged { peer, tier },
+                writes: Vec::new(),
+                compared: None,
+                source: Source::Host,
+            })
+            .await?;
+        }
+        Ok(())
     }
 
     /// Check for free space every 30 s while a folder's inbound is paused

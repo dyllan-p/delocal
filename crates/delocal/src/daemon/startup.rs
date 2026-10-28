@@ -16,6 +16,9 @@
 //!    back (§7.3, the root guard).
 //! 4. The writes those make are **durable before the first scan**, which
 //!    the engine task starts as soon as it runs.
+//!
+//! It also reads each known peer's Tailscale node from `machines` (§5), for
+//! the engine task's tiers (§6.4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -24,7 +27,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use delocal_engine::path::RESERVED_DIR;
-use delocal_engine::{ContentHash, Engine, Entry, Event, FolderId, Kind, NodeConfig, RelPath};
+use delocal_engine::{
+    ContentHash, Engine, Entry, Event, FolderId, Kind, NodeConfig, NodeId, RelPath,
+};
 use tracing::{info, warn};
 
 use super::clock::Clock;
@@ -35,6 +40,7 @@ use crate::reach;
 use crate::scan::MARKER;
 use crate::scan::stability::Stability;
 use crate::store::{Group, Store, Writer};
+use crate::tailscale::StableId;
 use crate::tmp;
 use crate::trash::Policy;
 
@@ -55,6 +61,8 @@ pub(crate) struct Started {
     pub folders: Vec<Opened>,
     /// `FolderJoined` for each folder with no parts.
     pub joins: Vec<Event>,
+    /// Each known peer's Tailscale node (§5).
+    pub bindings: BTreeMap<NodeId, StableId>,
 }
 
 /// Steps 1 to 4 (see the module docs).
@@ -168,6 +176,11 @@ pub(crate) fn start(
                 .collect();
         }
     }
+    let bindings = store
+        .machines()?
+        .into_iter()
+        .map(|machine| (machine.node, StableId(machine.ts_stable_id)))
+        .collect();
     let writer = store.writer()?;
     if !writes.is_empty() {
         let mut group = Group::new(clock.now());
@@ -181,6 +194,7 @@ pub(crate) fn start(
         writer,
         folders,
         joins,
+        bindings,
     })
 }
 

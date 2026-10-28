@@ -140,6 +140,8 @@ fn child() {
         rescan: super::super::RESCAN,
         space_check: super::super::SPACE_CHECK,
         hashers: std::num::NonZeroUsize::new(2).unwrap(),
+        tailscale: None,
+        tier_poll: crate::tailscale::tier::POLL,
     };
     let daemon = Daemon::start(setup).unwrap();
     if let Err(e) = daemon.settled(Duration::from_secs(60)) {
