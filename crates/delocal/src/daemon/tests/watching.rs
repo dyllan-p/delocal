@@ -28,8 +28,8 @@ fn real(fixture: &Fixture) -> Arc<dyn Folder> {
     Arc::new(RealFolder::new(fixture.root()))
 }
 
-/// Wait for every event so far to pass the debouncer, then for the daemon
-/// to settle.
+/// Wait for every path the events named so far to have had its 2 s of
+/// quiet, then for the daemon to settle.
 fn quiet(daemon: &Daemon) {
     std::thread::sleep(QUIET + Duration::from_millis(1500));
     daemon.settle();
@@ -311,8 +311,9 @@ fn the_watcher_reports_nothing_beneath_a_mount_point() {
 }
 
 /// An observation caught between a creation and a removal is taken again:
-/// the debouncer drops a create followed by a remove as a pair, so no
-/// event follows, and the first look saw what was there for a moment.
+/// the first look saw what was there for a moment, and the creation's and
+/// the removal's events name the path, so it is looked at again once it
+/// has been quiet for 2 s.
 #[test]
 fn an_observation_caught_between_a_creation_and_a_removal_is_taken_again() {
     let fixture = Fixture::new();
@@ -322,7 +323,7 @@ fn an_observation_caught_between_a_creation_and_a_removal_is_taken_again() {
     daemon.settle();
     assert!(daemon.record(fixture.folder, "e").is_some());
     // When the watcher looks at `e` after its removal, `e` is back, for a
-    // moment: a creation and a removal, which the debouncer drops.
+    // moment: a creation and a removal.
     let e = fixture.at("e");
     spy.before("fs.lstat", "e", move || {
         std::fs::create_dir(&e).unwrap();

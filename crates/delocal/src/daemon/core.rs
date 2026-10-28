@@ -141,12 +141,6 @@ pub(crate) enum Input {
         folder: FolderId,
         paths: Vec<Seen>,
     },
-    /// Paths to look at again as the watcher would, 2 s from now: their
-    /// first look found the opposite of what their event said.
-    Rewatch {
-        folder: FolderId,
-        paths: Vec<RelPath>,
-    },
     /// The watcher lost events for the folder: a full scan finds them.
     Rescan {
         folder: FolderId,
@@ -281,8 +275,6 @@ pub(crate) struct Core {
     /// task has written them.
     pub bindings: BTreeMap<NodeId, StableId>,
     pub reobserve: Reobserve,
-    /// Paths to look at again as the watcher would (see [`Input::Rewatch`]).
-    pub rewatch: Reobserve,
     /// Jobs and releases handed off and not yet done.
     pub busy: Arc<AtomicUsize>,
     /// The watcher (§7.3), unless the daemon runs without one.
@@ -364,13 +356,6 @@ impl Core {
                 Some(watch) if !watch.guarded => self.direct(Job::Watched { folder, paths }),
                 _ => Ok(()),
             },
-            Input::Rewatch { folder, paths } => {
-                let at = Instant::now() + SETTLE;
-                for path in paths {
-                    self.rewatch.at(folder, path, at);
-                }
-                Ok(())
-            }
             Input::Rescan { folder } => self.rescan(folder),
             Input::Guard { folder, root_gone } => {
                 self.guard(folder, root_gone);
@@ -643,7 +628,7 @@ impl Core {
             .folders
             .values()
             .flat_map(|watch| [watch.next_scan, watch.space_at]);
-        [wake, self.reobserve.next(), self.rewatch.next()]
+        [wake, self.reobserve.next()]
             .into_iter()
             .chain(folders)
             .flatten()
@@ -674,21 +659,6 @@ impl Core {
         }
         for (folder, path) in self.reobserve.take(now) {
             self.direct(Job::Again { folder, path })?;
-        }
-        let mut rewatch: BTreeMap<FolderId, Vec<Seen>> = BTreeMap::new();
-        for (folder, path) in self.rewatch.take(now) {
-            rewatch.entry(folder).or_default().push(Seen {
-                path,
-                came: false,
-                went: false,
-                again: true,
-                names: Vec::new(),
-            });
-        }
-        for (folder, paths) in rewatch {
-            if self.folders.get(&folder).is_some_and(|w| !w.guarded) {
-                self.direct(Job::Watched { folder, paths })?;
-            }
         }
         let checks: Vec<FolderId> = self
             .folders
