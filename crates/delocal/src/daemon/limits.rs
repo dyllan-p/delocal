@@ -72,9 +72,11 @@ mod tests {
             Raised::Already { .. } => {}
             Raised::Refused { at } => panic!("refused at {at}, hard {hard}"),
         }
+        // At the hard limit, or where macOS stopped it: OPEN_MAX, or above
+        // it if the soft limit already was.
         let current = limit.current.unwrap_or(u64::MAX);
         assert!(
-            current == hard || current == OPEN_MAX.min(hard),
+            current == hard || current >= OPEN_MAX.min(hard),
             "{limit:?}"
         );
         assert!(matches!(raise_open_files(), Raised::Already { .. }));
