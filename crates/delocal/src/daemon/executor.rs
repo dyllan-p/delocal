@@ -366,14 +366,8 @@ impl Executor {
         };
         let journal = self.journal();
         match watched::observe(id, kept, &journal, &self.clock, paths) {
-            Ok(found) => {
-                if !found.again.is_empty() {
-                    self.report(Input::Rewatch {
-                        folder: id,
-                        paths: found.again,
-                    })?;
-                }
-                for (event, compared) in found.observations {
+            Ok(observations) => {
+                for (event, compared) in observations {
                     self.report(Input::report(Report {
                         event,
                         writes: Vec::new(),

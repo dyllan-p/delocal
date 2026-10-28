@@ -405,7 +405,6 @@ impl Daemon {
             joins: started.joins,
             bindings: started.bindings,
             reobserve: self::core::Reobserve::default(),
-            rewatch: self::core::Reobserve::default(),
             busy: Arc::clone(&busy),
             watcher,
             #[cfg(test)]

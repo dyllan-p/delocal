@@ -78,7 +78,7 @@ impl Core {
                     && self.busy.load(std::sync::atomic::Ordering::SeqCst) == 0
                     && self.folders.values().all(|w| !w.scanning)
                     && self.reobserve.is_empty()
-                    && self.rewatch.is_empty();
+                    && self.watcher.as_ref().is_none_or(|w| !w.holding());
                 let _ = reply.send(idle);
             }
             Probe::State(reply) => {

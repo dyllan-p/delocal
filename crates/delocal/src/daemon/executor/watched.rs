@@ -1,5 +1,6 @@
-//! The executor's half of the watcher (DESIGN.md §7.3): the paths its
-//! events name, observed as a scan would observe them.
+//! The executor's half of the watcher (DESIGN.md §7.3, draft 67): the
+//! paths its events named, once quiet, observed as a scan would observe
+//! them.
 //!
 //! Each path is observed by [`Commit::observe`], the scanner's single-path
 //! observation behind the root guard, and reported with the time of its
@@ -20,25 +21,18 @@
 //!   marker is gone, and before anything absent is reported the marker is
 //!   checked again. A folder that fails either check reports nothing, and
 //!   the engine task treats it as after an aborted scan.
-//! - **What went with a directory.** A directory that is gone took every
-//!   tracked path beneath it with it, and an event names only the
-//!   directory (the debouncer keeps one removal for a whole tree): each is
-//!   observed too, children before parents.
-//! - **What came with one.** A directory that came or went whole (created,
-//!   removed, renamed) and is there now, or that the index did not hold as
-//!   a directory, may have been replaced, bringing contents no event
-//!   names and taking the ones the index knew: it is listed, each name in
-//!   it observed, parents before children, and then every tracked path
-//!   beneath it that the listing did not reach.
+//! - **Directories, whole.** No event names what moves with a directory:
+//!   inotify reports a directory renamed in or out, or removed whole, and
+//!   nothing beneath it. So a directory that is gone takes every tracked
+//!   path beneath it with it, each observed too, children before parents;
+//!   and a directory that is there is walked, whatever the event said: each
+//!   name in it observed, parents before children, then every tracked path
+//!   beneath it that the walk did not reach. A directory moved in brings its
+//!   contents, and one moved away and made again at the same path loses the
+//!   ones the index knew.
 //!
-//! - **The opposite of what the event said.** A path an event said went
-//!   that is there, or one it said came that is not, may have been caught
-//!   between a creation and a removal that the debouncer then drops as a
-//!   pair, so that no event follows. It is observed again 2 s later, by
-//!   the same rules, once.
-//!
-//! A path named twice in one job is observed once, with everything its
-//! events said.
+//! A path named twice in one job is observed once. An empty job checks the
+//! root guard and nothing else: an event named the root itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -78,13 +72,6 @@ pub(super) struct Gone;
 /// against, for the engine task's check of an `Unchanged` (§7.3).
 pub(super) type Observation = (Event, Option<Entry>);
 
-/// What one job found: what to report, and the paths to look at again.
-#[derive(Default)]
-pub(super) struct Found {
-    pub observations: Vec<Observation>,
-    pub again: Vec<RelPath>,
-}
-
 /// One job's worth of the watcher's paths.
 struct Watched<'a> {
     id: FolderId,
@@ -97,7 +84,6 @@ struct Watched<'a> {
     /// Directory listings made in this job, by the directory on disk.
     listings: BTreeMap<PathBuf, Option<Vec<(OsString, Name)>>>,
     out: Vec<Observation>,
-    again: Vec<RelPath>,
 }
 
 /// Observe what `seen` names in `id` (see the module docs), or `Gone` if
@@ -108,7 +94,7 @@ pub(super) fn observe(
     journal: &StoreJournal<'_>,
     clock: &Clock,
     seen: Vec<Seen>,
-) -> Result<Found, Gone> {
+) -> Result<Vec<Observation>, Gone> {
     if !commit::marked(&*kept.folder) {
         return Err(Gone);
     }
@@ -124,36 +110,16 @@ pub(super) fn observe(
         done: BTreeSet::new(),
         listings: BTreeMap::new(),
         out: Vec::new(),
-        again: Vec::new(),
     };
-    // Each path once, with everything its events said, in the order first
-    // named.
-    let mut order: Vec<RelPath> = Vec::new();
-    let mut said: BTreeMap<RelPath, Said> = BTreeMap::new();
+    let mut paths = Vec::with_capacity(seen.len());
     for one in seen {
         for (path, name) in one.names {
             watched.names.learned.insert(path, name);
         }
-        let this = Said {
-            came: one.came,
-            went: one.went,
-            again: one.again,
-        };
-        match said.get_mut(&one.path) {
-            Some(was) => {
-                was.came |= this.came;
-                was.went |= this.went;
-                was.again |= this.again;
-            }
-            None => {
-                order.push(one.path.clone());
-                said.insert(one.path, this);
-            }
-        }
+        paths.push(one.path);
     }
-    for path in order {
-        let this = said.get(&path).copied().unwrap_or_default();
-        watched.path(&path, this)?;
+    for path in paths {
+        watched.path(&path)?;
     }
     // Before anything absent goes to the engine, the marker once more: a
     // folder deleted wholesale while this job ran is the guard's (§7.3).
@@ -169,26 +135,7 @@ pub(super) fn observe(
     if absent && !commit::marked(&*kept.folder) {
         return Err(Gone);
     }
-    Ok(Found {
-        observations: watched.out,
-        again: watched.again,
-    })
-}
-
-/// What a job's events said of one path.
-#[derive(Clone, Copy, Debug, Default)]
-struct Said {
-    came: bool,
-    went: bool,
-    again: bool,
-}
-
-impl Said {
-    /// The path came or went whole, or is looked at again: what is beneath
-    /// a directory may have changed with it.
-    fn whole(self) -> bool {
-        self.came || self.went || self.again
-    }
+    Ok(watched.out)
 }
 
 impl Watched<'_> {
@@ -217,8 +164,7 @@ impl Watched<'_> {
     }
 
     /// Observe `path`, which an event named, and what came or went with it.
-    fn path(&mut self, path: &RelPath, said: Said) -> Result<(), Gone> {
-        let whole = said.whole();
+    fn path(&mut self, path: &RelPath) -> Result<(), Gone> {
         if !self.done.insert(path.clone()) || self.kept.disk.is_open(path) {
             return Ok(());
         }
@@ -234,10 +180,6 @@ impl Watched<'_> {
             .records
             .get(path)
             .is_some_and(|record| record.kind == Kind::Dir);
-        let present = !matches!(state, ScanState::Absent | ScanState::Skipped { .. });
-        if !said.again && ((said.went && present) || (said.came && state == ScanState::Absent)) {
-            self.again.push(path.clone());
-        }
         match &state {
             ScanState::Skipped {
                 reason: SkipReason::Ignored,
@@ -258,17 +200,11 @@ impl Watched<'_> {
             }
             ScanState::Observed(seen) if seen.kind == Kind::Dir => {
                 self.push(path, state, at);
-                if whole || !tracked_dir {
-                    self.subtree(path)?;
-                }
-                Ok(())
+                self.subtree(path)
             }
             ScanState::Unchanged if tracked_dir => {
                 self.push(path, state, at);
-                if whole {
-                    self.subtree(path)?;
-                }
-                Ok(())
+                self.subtree(path)
             }
             _ => {
                 self.push(path, state, at);
@@ -316,14 +252,7 @@ impl Watched<'_> {
                 if differs {
                     self.names.learned.insert(path.clone(), name);
                 }
-                let came = Said {
-                    came: true,
-                    went: false,
-                    // Found by listing, not named by an event: nothing to
-                    // contradict.
-                    again: true,
-                };
-                self.path(&path, came)?;
+                self.path(&path)?;
             }
         }
         Ok(())
