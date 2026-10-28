@@ -362,6 +362,22 @@ pub fn touch(peer: NodeId, record: &IndexRecord) -> Entry {
     }
 }
 
+/// A directory at `path`, observed outside a scan: an event with writes.
+pub fn observed_dir(folder: FolderId, path: &str) -> Event {
+    Event::Scanned {
+        folder,
+        path: p(path),
+        state: delocal_engine::ScanState::Observed(delocal_engine::Observed {
+            kind: Kind::Dir,
+            size: 0,
+            mtime_ns: 0,
+            exec: false,
+            hash: ContentHash::EMPTY,
+        }),
+        at: Timestamp::from_unix_nanos(i64::MAX / 2),
+    }
+}
+
 /// A batch from `peer` with `entries`, after `seq_low`.
 pub fn batch(peer: NodeId, folder: FolderId, seq_low: u64, entries: Vec<Entry>) -> Batch {
     Batch {
@@ -566,20 +582,8 @@ fn the_engine_task_waits_while_the_writer_is_full() {
 
     let held = Held::on(&fixture);
     let more = super::QUEUE + 64;
-    let dir = delocal_engine::Observed {
-        kind: Kind::Dir,
-        size: 0,
-        mtime_ns: 0,
-        exec: false,
-        hash: ContentHash::EMPTY,
-    };
     for n in 0..more {
-        daemon.inject(Event::Scanned {
-            folder: fixture.folder,
-            path: p(&format!("x{n}")),
-            state: delocal_engine::ScanState::Observed(dir.clone()),
-            at: Timestamp::from_unix_nanos(i64::MAX / 2),
-        });
+        daemon.inject(observed_dir(fixture.folder, &format!("x{n}")));
     }
     std::thread::sleep(Duration::from_millis(1500));
     let waiting = daemon
@@ -655,7 +659,10 @@ fn a_folder_is_scanned_again_after_the_rescan_interval() {
 
 /// §11: if the writer fails, the daemon stops, and performs none of the
 /// effects whose writes were lost. A write lock held past the store's busy
-/// timeout fails the commit holding a peer's batch.
+/// timeout fails the commit holding a peer's batch, with more events
+/// queued behind it than the queue to the store takes, so the engine task
+/// is waiting on that queue when the failure comes; the store's error is
+/// still the one the daemon stops with.
 #[test]
 fn if_the_writer_fails_the_daemon_stops_and_performs_nothing_more() {
     let fixture = Fixture::new();
@@ -677,6 +684,9 @@ fn if_the_writer_fails_the_daemon_stops_and_performs_nothing_more() {
             vec![from_peer(fixture.peer, "d", None)],
         ),
     });
+    for n in 0..super::QUEUE + 64 {
+        daemon.inject(observed_dir(fixture.folder, &format!("x{n}")));
+    }
     let deadline = Instant::now() + crate::store::BUSY_TIMEOUT + Duration::from_secs(10);
     while !daemon.core.is_finished() {
         assert!(Instant::now() < deadline, "the daemon ran on");
@@ -943,6 +953,84 @@ fn observe_is_answered_as_a_scan_would_behind_the_root_guard() {
     let (stored, engine) = daemon.parts();
     assert_eq!(stored, engine);
     daemon.stop().unwrap();
+}
+
+/// The engine task's timers come before its inputs: a queue that never
+/// empties still lets the engine tick, so a batch forms on time.
+#[test]
+fn the_timers_fire_while_inputs_keep_coming() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.at("f"), "one").unwrap();
+    let daemon = fixture.start();
+    daemon.settle();
+    let id = fixture.folder;
+    assert!(daemon.engine(move |e| e.folder(id).unwrap().due().is_some()));
+    let flooding = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let floods: Vec<_> = (0..2)
+        .map(|_| {
+            let inputs = daemon.inputs.clone();
+            let flooding = Arc::clone(&flooding);
+            std::thread::spawn(move || {
+                while flooding.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Seen, and nothing more: no group, no effect.
+                    let event = Event::Scanned {
+                        folder: id,
+                        path: p("f"),
+                        state: delocal_engine::ScanState::Skipped {
+                            reason: delocal_engine::SkipReason::Io,
+                        },
+                        at: Timestamp::from_unix_nanos(1),
+                    };
+                    let _ = inputs.blocking_send(Input::report(Report {
+                        event,
+                        writes: Vec::new(),
+                        compared: None,
+                        source: Source::Host,
+                    }));
+                }
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ticked = false;
+    while Instant::now() < deadline {
+        if daemon.engine(move |e| e.folder(id).unwrap().index().announced_seq() > 0) {
+            ticked = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    flooding.store(false, std::sync::atomic::Ordering::SeqCst);
+    for flood in floods {
+        flood.join().unwrap();
+    }
+    assert!(ticked, "the batch never formed while inputs kept coming");
+    daemon.stop().unwrap();
+}
+
+/// A stop under load is a clean stop: the engine task reaches it before
+/// the executor goes, so the executor's going is never read as a failure.
+#[test]
+fn a_stop_under_load_is_clean() {
+    let fixture = Fixture::new();
+    let daemon = fixture.start();
+    daemon.settle();
+    let held = Held::on(&fixture);
+    // More batches than the queue to the store takes, each with effects.
+    for n in 0..super::QUEUE as u64 + 100 {
+        let entry = from_peer(fixture.peer, &format!("d{n}"), None);
+        daemon.inject(Event::BatchReceived {
+            from: fixture.peer,
+            batch: batch(fixture.peer, fixture.folder, n, vec![entry]),
+        });
+    }
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(1));
+        held.release();
+    });
+    let stopped = daemon.stop();
+    release.join().unwrap();
+    assert!(stopped.is_ok(), "{stopped:?}");
 }
 
 mod kill;

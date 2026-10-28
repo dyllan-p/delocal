@@ -249,14 +249,13 @@ impl Core {
                     None => std::future::pending().await,
                 }
             };
-            tokio::select! {
+            // Timers before inputs: a queue that never empties (a long
+            // scan behind a slow store) must not keep the engine from its
+            // ticks, nor a path from its second look.
+            let step = tokio::select! {
                 biased;
-                failure = &mut failed => {
-                    return Err(match failure {
-                        Ok(Failure::Store(error)) => DaemonError::Write(error),
-                        Ok(Failure::Executor) | Err(_) => DaemonError::Stopped,
-                    });
-                }
+                failure = &mut failed => return Err(why(failure)),
+                () = sleep => self.due().await,
                 input = inputs.recv() => match input {
                     None | Some(Input::Stop) => return Ok(()),
                     Some(input) => {
@@ -264,10 +263,20 @@ impl Core {
                         {
                             self.probes.queued = !inputs.is_empty();
                         }
-                        self.input(input).await?;
+                        self.input(input).await
                     }
                 },
-                () = sleep => self.due().await?,
+            };
+            if let Err(error) = step {
+                // A send to the releaser fails once it has stopped, and it
+                // says why before it stops.
+                return Err(match error {
+                    DaemonError::Stopped => match failed.try_recv() {
+                        Ok(failure) => why(Ok(failure)),
+                        Err(_) => DaemonError::Stopped,
+                    },
+                    error => error,
+                });
             }
         }
     }
@@ -723,6 +732,14 @@ fn unstable(event: &Event) -> Option<(FolderId, RelPath)> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// The daemon's error for the releaser's reason to stop.
+fn why(failure: Result<Failure, oneshot::error::RecvError>) -> DaemonError {
+    match failure {
+        Ok(Failure::Store(error)) => DaemonError::Write(error),
+        Ok(Failure::Executor) | Err(_) => DaemonError::Stopped,
     }
 }
 
