@@ -99,7 +99,7 @@ jobs:
         run: rustup toolchain install
       # The shards build the same binary under the same cache key. Only the
       # first saves it, so they do not race to upload identical caches.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: simulate
           save-if: ${{ strategy.job-index == 0 }}
@@ -322,7 +322,7 @@ jobs:
         run: rustup toolchain install
       # The script builds in target directories of its own, outside
       # ./target, so the cache holds only the downloaded crates.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: pins
 
