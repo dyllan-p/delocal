@@ -1,5 +1,5 @@
 //! Connection tiers (DESIGN.md §6.4): how each connected peer is reached,
-//! from Tailscale's path info.
+//! from Tailscale's path info, recomputed every 30 s.
 //!
 //! **The rule** ([`classify`]). A peer reached directly at a private
 //! address is `lan`; one reached directly at any other address is `direct`;
@@ -13,16 +13,30 @@
 //! Phase 3's. Until then such a peer is `direct`: the size rules (§6.5)
 //! defer more for it than they will, never less.
 //!
-//! **Changes** ([`Tiers::changes`]). A connected peer is matched to its
-//! Tailscale node by its binding (§5, `machines` in §11), and named only if
-//! its tier differs from the one the engine holds.
+//! **The poll** ([`poll`]). Every [`POLL`] it lists Tailscale's peers and
+//! sends the tier of each to the engine task as [`Tiers`]. There each
+//! connected peer is matched to its Tailscale node by its binding (§5,
+//! `machines` in §11), and every one whose tier differs from the engine's
+//! is told to it as `PeerTierChanged` ([`Tiers::changes`]). The comparison
+//! is made where the engine runs, in order with the connections and
+//! disconnections it is told of, so a poll can never name a peer that has
+//! gone: the engine takes a tier for a peer that is not connected as a
+//! connection.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use delocal_engine::{NodeId, Tier};
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+use tracing::{info, warn};
 
-use super::{PathInfo, Peer, StableId};
+use super::{PathInfo, Peer, StableId, Tailscale};
+
+/// How often the tiers are recomputed (§6.4).
+pub const POLL: Duration = Duration::from_secs(30);
 
 /// A peer's tier from its path info; see the module docs.
 pub fn classify(path: Option<&PathInfo>) -> Tier {
@@ -82,11 +96,50 @@ impl Tiers {
     }
 }
 
+/// List `tailscale`'s peers now and every `every` after, and send the tiers
+/// each listing gives to `out`, until it closes. A listing that fails sends
+/// no tiers at all, so every connected peer is `relay` until one succeeds.
+pub async fn poll<M: From<Tiers>>(
+    tailscale: Arc<dyn Tailscale>,
+    every: Duration,
+    out: mpsc::Sender<M>,
+) {
+    let mut ticks = tokio::time::interval(every);
+    // A slow answer delays the next poll rather than bunching up the ones
+    // it made late.
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut failing = false;
+    loop {
+        ticks.tick().await;
+        let tiers = match tailscale.peers().await {
+            Ok(peers) => {
+                if failing {
+                    info!("tailscale lists its peers again");
+                }
+                failing = false;
+                Tiers::of(&peers)
+            }
+            Err(error) => {
+                if !failing {
+                    warn!(%error, "tailscale did not list its peers: every peer is relay");
+                }
+                failing = true;
+                Tiers::default()
+            }
+        };
+        if out.send(M::from(tiers)).await.is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
 
     use super::*;
+    use crate::tailscale::fake::{Config, FakeTailscale};
+    use crate::tailscale::{SelfInfo, TailscaleError};
 
     fn path(direct: Option<&str>, relay: Option<&str>) -> Option<PathInfo> {
         Some(PathInfo {
@@ -260,5 +313,85 @@ mod tests {
                 (node(5), Tier::Relay),
             ]
         );
+    }
+
+    fn fake(path: Option<PathInfo>) -> Arc<FakeTailscale> {
+        Arc::new(FakeTailscale::new(Config {
+            self_info: SelfInfo {
+                addrs: Vec::new(),
+                stable_id: id("self"),
+                user: "me@example.com".to_owned(),
+                hostname: "self".to_owned(),
+            },
+            peers: vec![peer("a", path)],
+            whois: BTreeMap::new(),
+            running: true,
+        }))
+    }
+
+    /// The next listing `want` accepts, counting each one taken. Up to
+    /// three: a test slow to change the fake may see one more listing from
+    /// before the change. A poll that stops sending fails the test rather
+    /// than hanging it.
+    async fn until(
+        tiers: &mut mpsc::Receiver<Tiers>,
+        taken: &mut u32,
+        want: impl Fn(&Tiers) -> bool,
+    ) -> Tiers {
+        for _ in 0..3 {
+            let listing = tokio::time::timeout(Duration::from_secs(10), tiers.recv())
+                .await
+                .expect("no listing within 10 s")
+                .unwrap();
+            *taken += 1;
+            if want(&listing) {
+                return listing;
+            }
+        }
+        panic!("three listings, none as wanted");
+    }
+
+    /// The poll sends a listing at once and then one per interval, each
+    /// following the fake as it stands; a listing Tailscale does not answer
+    /// sends no tiers; and the poll ends when its receiver goes.
+    #[tokio::test]
+    async fn the_poll_sends_what_each_listing_finds_until_its_receiver_goes() {
+        let fake = fake(path(Some("10.0.0.1:1"), None));
+        let (out, mut tiers) = mpsc::channel::<Tiers>(1);
+        let every = Duration::from_millis(500);
+        let started = tokio::time::Instant::now();
+        let poll = tokio::spawn(poll(Arc::clone(&fake) as Arc<dyn Tailscale>, every, out));
+        let tier_of_a = |tier| move |listing: &Tiers| listing.get(&id("a")) == tier;
+        let mut taken = 0;
+        until(&mut tiers, &mut taken, tier_of_a(Tier::Lan)).await;
+        assert_eq!(taken, 1);
+        assert!(started.elapsed() < every, "{:?}", started.elapsed());
+
+        fake.update(|config| config.peers[0].path = path(Some("203.0.113.7:1"), None));
+        until(&mut tiers, &mut taken, tier_of_a(Tier::Direct)).await;
+        assert!(
+            started.elapsed() >= every * (taken - 1),
+            "{:?}",
+            started.elapsed()
+        );
+
+        fake.update(|config| config.running = false);
+        let down = Err(TailscaleError::Unavailable("not running".to_owned()));
+        assert_eq!(fake.peers().await, down);
+        until(&mut tiers, &mut taken, |listing| {
+            *listing == Tiers::default()
+        })
+        .await;
+
+        fake.update(|config| config.running = true);
+        until(&mut tiers, &mut taken, tier_of_a(Tier::Direct)).await;
+        assert!(
+            started.elapsed() >= every * (taken - 1),
+            "{:?}",
+            started.elapsed()
+        );
+
+        drop(tiers);
+        poll.await.unwrap();
     }
 }
