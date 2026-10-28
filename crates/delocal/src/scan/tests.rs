@@ -53,6 +53,11 @@ fn id() -> FolderId {
     FolderId::from_bytes([7; 16])
 }
 
+/// A stability check whose real-time clock reads `now`.
+fn stable_at(now: i64) -> stability::Stability {
+    stability::Stability::new(Arc::new(move || at(now)))
+}
+
 fn at(nanos: i64) -> Timestamp {
     Timestamp::from_unix_nanos(nanos)
 }
@@ -136,6 +141,7 @@ fn scan_open(
         records,
         open,
         clock: &clock,
+        stability: &stable_at(now),
         hashers: NonZeroUsize::new(hashers).unwrap(),
     }
     .run(&mut |event| events.push(event));
@@ -836,6 +842,7 @@ fn a_folder_deleted_while_it_is_scanned_is_not_a_mass_deletion() {
         records: &records,
         open: &BTreeSet::new(),
         clock: &clock,
+        stability: &stable_at(now),
         hashers: NonZeroUsize::MIN,
     }
     .run(&mut |event| {
@@ -1126,6 +1133,7 @@ fn observe_at(folder: &dyn Folder, records: &dyn Records, path: &str, now: i64) 
         names: &names,
         open: &open,
         clock: &clock,
+        stability: &stable_at(now),
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
     };
     let (state, taken) = observer.observe(&p(path));
@@ -1233,15 +1241,19 @@ fn one_path_observed_alone_is_dated_by_its_stat() {
         names: &names,
         open: &open,
         clock: &clock,
+        stability: &stable_at(settled_now()),
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
     };
     let start = ticks.load(std::sync::atomic::Ordering::SeqCst);
     let (state, taken) = observer.observe(&p("f"));
     assert_eq!(state, observed_file(b"to hash", OLD, false));
-    // Read once for the stat, once more for the settle check before the
-    // hash; the observation is the first.
+    // Read for the stat, and not again: the settle check reads the
+    // real-time clock (draft 66), and the hash after it dates nothing.
     assert_eq!(taken, at(start));
-    assert!(ticks.load(std::sync::atomic::Ordering::SeqCst) > start + SECOND);
+    assert_eq!(
+        ticks.load(std::sync::atomic::Ordering::SeqCst),
+        start + SECOND
+    );
 }
 
 /// §7.5, draft 64: a path with an open journal row, and everything
@@ -1293,6 +1305,7 @@ fn a_path_with_an_open_journal_row_is_skipped_until_it_is_resolved() {
         names: &names,
         open: &open,
         clock: &clock,
+        stability: &stable_at(settled_now()),
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
     };
     assert_eq!(observer.observe(&p("a")).0, skip(SkipReason::Io));

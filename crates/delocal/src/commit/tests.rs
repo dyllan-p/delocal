@@ -42,6 +42,12 @@ pub fn settled_now() -> Timestamp {
     Timestamp::from_unix_nanos(i64::try_from(since.as_nanos()).unwrap() + 3600 * SECOND)
 }
 
+/// A stability check whose real-time clock is [`settled_now`]: every file
+/// the test has made has settled (§7.3).
+pub fn settled() -> Stability {
+    Stability::new(std::sync::Arc::new(settled_now as fn() -> Timestamp))
+}
+
 pub fn folder_id() -> FolderId {
     FolderId::from_bytes([7; 16])
 }
@@ -165,6 +171,7 @@ impl Disk {
             names: &self.names,
             journal,
             clock: &clock,
+            stability: &settled(),
             disk: &self.state,
         }
         .run(action, &version(), temp)
@@ -181,6 +188,7 @@ impl Disk {
             names: &self.names,
             journal: &self.journal,
             clock: &clock,
+            stability: &settled(),
             disk: &self.state,
         }
         .resolve()
@@ -196,6 +204,7 @@ impl Disk {
             records: &self.records,
             open: &self.state,
             clock: &clock,
+            stability: &settled(),
             hashers: std::num::NonZeroUsize::MIN,
         }
         .run(&mut |event| {

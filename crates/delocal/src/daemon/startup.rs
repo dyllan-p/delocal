@@ -33,6 +33,7 @@ use crate::commit::{DiskState, Start};
 use crate::fs::{FileKind, Folder, Fs};
 use crate::reach;
 use crate::scan::MARKER;
+use crate::scan::stability::Stability;
 use crate::store::{Group, Store, Writer};
 use crate::tmp;
 use crate::trash::Policy;
@@ -44,6 +45,7 @@ pub(crate) struct Opened {
     pub records: BTreeMap<RelPath, Entry>,
     pub names: BTreeMap<RelPath, OsString>,
     pub disk: Arc<DiskState>,
+    pub stability: Arc<Stability>,
 }
 
 /// What the start leaves for the engine task and the executor.
@@ -153,6 +155,7 @@ pub(crate) fn start(
             records: BTreeMap::new(),
             names,
             disk,
+            stability: Arc::new(Stability::new(Arc::clone(&setup.realtime))),
         });
     }
     let engine = Engine::restore(node.clone(), parts, clock.now());

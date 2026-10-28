@@ -54,6 +54,7 @@ use super::clock::Clock;
 use super::core::{Input, Report, Source};
 use crate::commit::{Commit, DiskState, StoreJournal};
 use crate::fs::Folder;
+use crate::scan::stability::Stability;
 use crate::scan::{Scan, ScanReport};
 use crate::store::{HostWrite, Writer};
 
@@ -140,6 +141,8 @@ pub(crate) struct Kept {
     /// Its names on disk that are not their index paths'.
     pub names: BTreeMap<RelPath, OsString>,
     pub disk: Arc<DiskState>,
+    /// Its stability check, with the first looks it keeps (§7.3).
+    pub stability: Arc<Stability>,
 }
 
 impl Kept {
@@ -157,6 +160,7 @@ impl Kept {
             names: &self.names,
             journal,
             clock,
+            stability: &self.stability,
             disk: &self.disk,
         }
     }
@@ -369,6 +373,7 @@ impl Executor {
             folder: Arc::clone(&kept.folder),
             records: Arc::clone(&kept.records),
             disk: Arc::clone(&kept.disk),
+            stability: Arc::clone(&kept.stability),
             clock: Arc::clone(&self.clock),
             inputs: self.inputs.clone(),
             hashers: self.hashers,
@@ -434,6 +439,7 @@ struct Scanner {
     /// against.
     records: Arc<BTreeMap<RelPath, Entry>>,
     disk: Arc<DiskState>,
+    stability: Arc<Stability>,
     clock: Arc<Clock>,
     inputs: tokio_mpsc::Sender<Input>,
     hashers: NonZeroUsize,
@@ -447,6 +453,7 @@ impl Scanner {
             records: &*self.records,
             open: &*self.disk,
             clock: &*self.clock,
+            stability: &self.stability,
             hashers: self.hashers,
         };
         // A send fails only once the engine task has stopped; the scan
@@ -577,6 +584,7 @@ mod tests {
                     records: Arc::new(BTreeMap::from([(p(nfc), file.clone())])),
                     names: BTreeMap::from([(p(nfc), OsString::from(nfd))]),
                     disk: Arc::new(DiskState::new()),
+                    stability: Arc::new(Stability::real()),
                 },
             )]),
             writer: Arc::new(store.writer().unwrap()),

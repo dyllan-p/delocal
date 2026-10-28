@@ -28,9 +28,10 @@
 //!   fast path compares the target's hash (§7.3).
 //! - A file whose size, mtime and exec bit match its record is `Unchanged`,
 //!   and is not read (the fast path, [`Entry::unchanged_by_stat`]). Any other
-//!   file is hashed on one of the hashing threads, if its change time has
-//!   settled ([`hash`]); one that changed within the last 2 s, or changes
-//!   while it is hashed, is `Skipped { Unstable }`.
+//!   file is hashed on one of the hashing threads, if it has settled
+//!   ([`stability`]: its change time 2 s old by the real-time clock, or two
+//!   unchanged looks 2 s apart if that clock was set back); one that has
+//!   not, or changes while it is hashed ([`hash`]), is `Skipped { Unstable }`.
 //! - Anything else (a FIFO, a socket, a device) is not an entry (§3.1) and
 //!   is not reported, as if absent.
 //!
@@ -123,10 +124,12 @@ use crate::store::DiskName;
 pub mod hash;
 pub mod ignore_rules;
 pub mod ordered;
+pub mod stability;
 
-use hash::{Hashed, hash_file, hash_target, settled};
+use hash::{Hashed, hash_file, hash_target};
 use ignore_rules::{IgnoreRules, InvalidRule};
 use ordered::Ordered;
+use stability::Stability;
 
 /// The root guard's marker, in `.delocal/` (§7.3, §11).
 pub const MARKER: &str = "folder.json";
@@ -202,7 +205,8 @@ impl OpenRows for BTreeSet<RelPath> {
 pub const OPEN_ROW: SkipReason = SkipReason::Io;
 
 /// The time as the host tells it to the engine: the monotonic now of §7.8.
-/// A scan reads it as it states each file, for the stability check.
+/// A scan dates each report by it, at the `stat` (§7.3, draft 56). The
+/// stability check reads the real-time clock instead ([`Stability`]).
 pub trait Clock {
     fn now(&self) -> Timestamp;
 }
@@ -229,6 +233,8 @@ pub struct Scan<'a> {
     /// Its paths with an open journal row, reported `Skipped`.
     pub open: &'a dyn OpenRows,
     pub clock: &'a dyn Clock,
+    /// Whether a file has settled enough to hash.
+    pub stability: &'a Stability,
     /// Threads to hash on.
     pub hashers: NonZeroUsize,
 }
@@ -252,9 +258,12 @@ pub struct ScanReport {
     /// The paths reported `Skipped`, counted by reason (§7.3).
     pub skipped: BTreeMap<SkipReason, u64>,
     /// Every path reported `Skipped { Unstable }`, in the order reported: a
-    /// file that changed within the last 2 s, or while it was hashed, or an
-    /// entry that became something else while the scan looked at it. The
-    /// host observes each again 2 s from now (§7.3; see above).
+    /// file that changed within the last 2 s by the real-time clock, or
+    /// whose change time is ahead of that clock and that has not yet been
+    /// seen unchanged across two looks 2 s apart, or that changed while it
+    /// was hashed; or an entry that became something else while the scan
+    /// looked at it. The host observes each again 2 s from now (§7.3; see
+    /// above).
     pub unstable: Vec<RelPath>,
     /// The lines of `.delocalignore` that were left out.
     pub invalid_rules: Vec<InvalidRule>,
@@ -334,6 +343,7 @@ impl Scan<'_> {
                 open: self.open,
                 skipped_open: BTreeSet::new(),
                 clock: self.clock,
+                stability: self.stability,
                 rules: &rules,
                 device,
                 mounts: Vec::new(),
@@ -421,6 +431,7 @@ struct Walker<'a, 'e> {
     /// The paths reported `Skipped` for an open journal row so far.
     skipped_open: BTreeSet<RelPath>,
     clock: &'a dyn Clock,
+    stability: &'a Stability,
     rules: &'a IgnoreRules,
     /// The root's device, which the walk never leaves.
     device: u64,
@@ -661,7 +672,7 @@ impl Walker<'_, '_> {
         };
         if self.unchanged(&path, &seen) {
             self.ready(path, ScanState::Unchanged);
-        } else if !settled(stat.ctime_ns, self.clock.now()) {
+        } else if !self.stability.settled(&path, &stat) {
             self.ready(path, unstable());
         } else {
             let job = Job {
@@ -764,6 +775,8 @@ pub struct Observer<'a> {
     /// Its paths with an open journal row, reported `Skipped`.
     pub open: &'a dyn OpenRows,
     pub clock: &'a dyn Clock,
+    /// Whether a file has settled enough to hash.
+    pub stability: &'a Stability,
     /// How its filesystem compares names.
     pub sensitivity: Sensitivity,
 }
@@ -865,7 +878,7 @@ impl Observer<'_> {
         if seen.kind != Kind::File {
             return ScanState::Observed(seen);
         }
-        if !settled(stat.ctime_ns, self.clock.now()) {
+        if !self.stability.settled(path, &stat) {
             return unstable();
         }
         let dir = match fs.open_dir(parent) {

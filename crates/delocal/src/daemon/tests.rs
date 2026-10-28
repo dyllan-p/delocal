@@ -215,6 +215,7 @@ impl Fixture {
             lock: lock::lock(&self.state()).unwrap(),
             node: self.node.clone(),
             clock: Arc::new(Clock::start()),
+            realtime: Arc::new(crate::scan::stability::realtime as fn() -> Timestamp),
             folder: at,
             outbox,
             rescan: super::RESCAN,
