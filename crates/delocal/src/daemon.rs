@@ -517,6 +517,10 @@ pub(crate) struct Trace {
     performed: std::sync::Mutex<Vec<String>>,
     /// Reports the engine task has handed to the engine.
     pub(crate) handled: AtomicUsize,
+    /// Full scans the watcher asked for, having lost events.
+    pub(crate) rescans: AtomicUsize,
+    /// Times the root guard tripped for the watcher.
+    pub(crate) guards: AtomicUsize,
 }
 
 #[cfg(test)]
