@@ -142,6 +142,7 @@ fn child() {
         hashers: std::num::NonZeroUsize::new(2).unwrap(),
         tailscale: None,
         tier_poll: crate::tailscale::tier::POLL,
+        watch: false,
     };
     let daemon = Daemon::start(setup).unwrap();
     if let Err(e) = daemon.settled(Duration::from_secs(60)) {
