@@ -30,7 +30,7 @@
 //! **What the executor knows of the index** is its own copy of each
 //! folder's live records and names on disk, kept up to date by jobs the
 //! engine task releases in the same order as the effects, and of its mtime
-//! shim's pairs (§7.3). A commit or an
+//! shim's pairs (§7.3), which only its own commits change. A commit or an
 //! observation therefore compares against the records as of the event that
 //! asked for it. A scan compares against a copy of the records and pairs
 //! taken when it starts. Each
@@ -302,9 +302,10 @@ impl Executor {
         let Some(committed) = commit.run(action, version, None) else {
             return Ok(());
         };
-        // The names on disk the commit changed are what the disk holds now,
-        // whatever the store has yet: the next job here that reaches the
-        // path, an observation included, must use them.
+        // The names on disk and the shim's pairs the commit changed are
+        // what the disk holds now, whatever the store has yet: the next job
+        // here that reaches the path, an observation included, must use
+        // them.
         if let Some(kept) = self.folders.get_mut(&id) {
             for write in &committed.writes {
                 match write {
@@ -313,6 +314,12 @@ impl Executor {
                     }
                     HostWrite::RemoveDiskName { path, .. } => {
                         kept.names.remove(path);
+                    }
+                    HostWrite::PutShim { shim, .. } => {
+                        Arc::make_mut(&mut kept.shims).insert(shim.path.clone(), shim.clone());
+                    }
+                    HostWrite::RemoveShim { path, .. } => {
+                        Arc::make_mut(&mut kept.shims).remove(path);
                     }
                     _ => {}
                 }

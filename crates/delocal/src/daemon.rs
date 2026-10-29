@@ -36,8 +36,8 @@
 //! its own that hands what it finds to the engine task.
 //!
 //! **The mtime shim** (§7.3, [`crate::shim`]): each folder's pairs are read
-//! at start, kept by the executor, and handed to each scan as they are when
-//! it starts.
+//! at start, kept by the executor as its commits change them, and handed to
+//! each scan as they are when it starts.
 //!
 //! **What is not here yet.** No transport (Phase 3): sends and fetches go
 //! to an [`Outbox`] that drops them, and no peer ever connects. No real

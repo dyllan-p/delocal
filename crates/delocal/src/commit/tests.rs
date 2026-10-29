@@ -20,6 +20,7 @@ use crate::scan::hash::hash_target;
 mod faults;
 mod races;
 mod reference;
+mod shim;
 
 pub const SECOND: i64 = 1_000_000_000;
 /// An mtime an hour before the clock the tests run at.

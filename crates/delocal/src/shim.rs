@@ -13,12 +13,28 @@
 //! is reported with the requested one ([`Shims::reported`]). The engine
 //! never sees the difference. Any other mtime there, a user's edit for
 //! one, is reported as it is.
+//!
+//! **Which writes keep the pairs.** A commit that set an mtime puts the
+//! pair if the filesystem kept another, and removes the path's old pair if
+//! it kept the one asked for ([`kept`]). A commit that leaves the path
+//! empty removes its pair ([`gone`]). A file displaced to a conflict copy
+//! takes its pair with it, since the copy's record carries the mtime the
+//! pair stands for (§7.6). A pair is otherwise left as it is: one whose
+//! stored mtime is no longer on disk translates nothing.
+//!
+//! **Durability.** A `Write`'s pair goes with its report, in its group
+//! (§11), like every write a commit leaves. A `SetMeta`'s is made durable
+//! before the commit reports. A crash that lost it would leave the landed
+//! `SetMeta` (a revert's reset among them) looking like a local touch at
+//! the restart: the retry's guard would find the stored mtime with nothing
+//! to translate it, so its observation would not be what the commit leaves,
+//! which is what lets a failure count as the landing (§7.5).
 
 use std::collections::BTreeMap;
 
-use delocal_engine::{Kind, Observed, RelPath};
+use delocal_engine::{FolderId, Kind, Observed, RelPath};
 
-use crate::store::Shim;
+use crate::store::{HostWrite, Shim};
 
 /// One folder's pairs, as the host keeps them (`mtime_shim`, §11).
 pub trait Shims: Send + Sync {
@@ -56,6 +72,53 @@ impl Shims for BTreeMap<RelPath, Shim> {
     }
 }
 
+/// The write that keeps `path`'s pair true once the host has asked for
+/// `requested_ns` there and read back `stored_ns`: the pair if the two
+/// differ and it is not already kept, the removal of an old pair if they
+/// agree, and otherwise nothing.
+pub fn kept(
+    folder: FolderId,
+    path: &RelPath,
+    requested_ns: i64,
+    stored_ns: i64,
+    shims: &dyn Shims,
+) -> Option<HostWrite> {
+    if requested_ns == stored_ns {
+        return gone(folder, path, shims);
+    }
+    let shim = Shim {
+        path: path.clone(),
+        requested_ns,
+        stored_ns,
+    };
+    (shims.pair(path) != Some(&shim)).then_some(HostWrite::PutShim { folder, shim })
+}
+
+/// The removal of `path`'s pair, if it has one.
+pub fn gone(folder: FolderId, path: &RelPath, shims: &dyn Shims) -> Option<HostWrite> {
+    shims.pair(path).map(|_| HostWrite::RemoveShim {
+        folder,
+        path: path.clone(),
+    })
+}
+
+/// The pair of a file displaced from `from` to `to`, its conflict copy,
+/// if it had one (§7.6).
+pub fn moved(
+    folder: FolderId,
+    from: &RelPath,
+    to: &RelPath,
+    shims: &dyn Shims,
+) -> Option<HostWrite> {
+    shims.pair(from).map(|shim| HostWrite::PutShim {
+        folder,
+        shim: Shim {
+            path: to.clone(),
+            ..shim.clone()
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use delocal_engine::ContentHash;
@@ -64,6 +127,10 @@ mod tests {
 
     fn p(s: &str) -> RelPath {
         RelPath::new(s).unwrap()
+    }
+
+    fn folder() -> FolderId {
+        FolderId::from_bytes([7; 16])
     }
 
     fn pairs(list: &[(&str, i64, i64)]) -> BTreeMap<RelPath, Shim> {
@@ -110,5 +177,51 @@ mod tests {
             shims.observed(&p("f"), seen(Kind::Symlink, 0)),
             seen(Kind::Symlink, 0)
         );
+    }
+
+    #[test]
+    fn kept_puts_a_pair_that_differs_and_removes_one_that_no_longer_does() {
+        let none = pairs(&[]);
+        let some = pairs(&[("f", 5, 4)]);
+        let put = |requested_ns, stored_ns| {
+            Some(HostWrite::PutShim {
+                folder: folder(),
+                shim: Shim {
+                    path: p("f"),
+                    requested_ns,
+                    stored_ns,
+                },
+            })
+        };
+        let remove = Some(HostWrite::RemoveShim {
+            folder: folder(),
+            path: p("f"),
+        });
+        // Kept to the nanosecond: no pair, and an old one goes.
+        assert_eq!(kept(folder(), &p("f"), 7, 7, &none), None);
+        assert_eq!(kept(folder(), &p("f"), 7, 7, &some), remove);
+        // Kept coarser: a pair, unless that very pair is kept already.
+        assert_eq!(kept(folder(), &p("f"), 7, 6, &none), put(7, 6));
+        assert_eq!(kept(folder(), &p("f"), 7, 6, &some), put(7, 6));
+        assert_eq!(kept(folder(), &p("f"), 5, 4, &some), None);
+        assert_eq!(gone(folder(), &p("f"), &some), remove);
+        assert_eq!(gone(folder(), &p("f"), &none), None);
+    }
+
+    #[test]
+    fn a_displaced_file_takes_its_pair_to_its_copy() {
+        let some = pairs(&[("f", 5, 4)]);
+        assert_eq!(
+            moved(folder(), &p("f"), &p("f.conflict"), &some),
+            Some(HostWrite::PutShim {
+                folder: folder(),
+                shim: Shim {
+                    path: p("f.conflict"),
+                    requested_ns: 5,
+                    stored_ns: 4,
+                },
+            })
+        );
+        assert_eq!(moved(folder(), &p("g"), &p("g.conflict"), &some), None);
     }
 }
