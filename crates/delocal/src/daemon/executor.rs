@@ -14,9 +14,9 @@
 //!   [`Commit::run`], with the folder's journal in the store
 //!   ([`StoreJournal`]). The report goes back with the host writes that
 //!   belong in its group (§11).
-//! - **Sends and fetches** go to the [`Outbox`], the transport. Phase 3
-//!   brings one; until then [`NoTransport`] drops them, and there is no peer
-//!   to connect anyway.
+//! - **Sends and fetches** go to the [`Outbox`], the transport. Until the
+//!   daemon is given [`crate::net`]'s, [`NoTransport`] drops them, and there
+//!   is no peer to connect anyway.
 //! - **`Observe { path }`** is answered with [`Commit::observe`], the
 //!   scanner's single-path observation behind the root guard (§8.3).
 //! - **A scan** first resolves every open journal row it can
@@ -89,9 +89,10 @@ pub trait Outbox: Send {
     fn fetch(&mut self, fetch: Fetch);
 }
 
-/// No transport yet (Phase 3): messages are dropped, which is what a
-/// disconnected peer would do with them. The engine sends only to
-/// connected peers, and with no transport none connects.
+/// No transport yet ([`crate::net`] is not wired in): messages are
+/// dropped, which is what a disconnected peer would do with them. The
+/// engine sends only to connected peers, and with no transport none
+/// connects.
 #[derive(Debug, Default)]
 pub struct NoTransport;
 
