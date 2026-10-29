@@ -9,10 +9,14 @@ use delocal_engine::{Action, Engine, HostName, NodeConfig, NodeId, Rules, Versio
 
 use super::*;
 use crate::fs::RealFolder;
+use crate::store::Shim;
 
 mod reference;
 
 use crate::fs::spy::Spy;
+
+/// No mtime shim pairs (§7.3): every mtime reported as it is on disk.
+const NO_SHIMS: &BTreeMap<RelPath, Shim> = &BTreeMap::new();
 
 const SECOND: i64 = 1_000_000_000;
 const DAY: i64 = 86_400 * SECOND;
@@ -140,6 +144,7 @@ fn scan_open(
         folder,
         records,
         open,
+        shims: NO_SHIMS,
         clock: &clock,
         stability: &stable_at(now),
         hashers: NonZeroUsize::new(hashers).unwrap(),
@@ -841,6 +846,7 @@ fn a_folder_deleted_while_it_is_scanned_is_not_a_mass_deletion() {
         folder: &folder,
         records: &records,
         open: &BTreeSet::new(),
+        shims: NO_SHIMS,
         clock: &clock,
         stability: &stable_at(now),
         hashers: NonZeroUsize::MIN,
@@ -1132,6 +1138,7 @@ fn observe_at(folder: &dyn Folder, records: &dyn Records, path: &str, now: i64) 
         records,
         names: &names,
         open: &open,
+        shims: NO_SHIMS,
         clock: &clock,
         stability: &stable_at(now),
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
@@ -1240,6 +1247,7 @@ fn one_path_observed_alone_is_dated_by_its_stat() {
         records: &none,
         names: &names,
         open: &open,
+        shims: NO_SHIMS,
         clock: &clock,
         stability: &stable_at(settled_now()),
         sensitivity: Sensitivity::probe(&*fs).unwrap(),
@@ -1304,6 +1312,7 @@ fn a_path_with_an_open_journal_row_is_skipped_until_it_is_resolved() {
         records: &records,
         names: &names,
         open: &open,
+        shims: NO_SHIMS,
         clock: &clock,
         stability: &stable_at(settled_now()),
         sensitivity: Sensitivity::probe(&*fs).unwrap(),

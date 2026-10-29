@@ -35,11 +35,14 @@
 //! it for every connected peer's tier ([`tier::poll`], §6.4), on a task of
 //! its own that hands what it finds to the engine task.
 //!
+//! **The mtime shim** (§7.3, [`crate::shim`]): each folder's pairs are read
+//! at start, kept by the executor, and handed to each scan as they are when
+//! it starts.
+//!
 //! **What is not here yet.** No transport (Phase 3): sends and fetches go
 //! to an [`Outbox`] that drops them, and no peer ever connects. No real
 //! Tailscale (Phase 3): `delocal daemon` runs with none, so it polls no
-//! tiers; tests give it the fake. No mtime shim (§7.3) and no CLI socket
-//! (Phase 4).
+//! tiers; tests give it the fake. No CLI socket (Phase 4).
 
 use std::fmt;
 use std::fs::DirBuilder;
@@ -371,6 +374,7 @@ impl Daemon {
                     folder: opened.folder,
                     records: Arc::new(opened.records),
                     names: opened.names,
+                    shims: Arc::new(opened.shims),
                     disk: opened.disk,
                     stability: opened.stability,
                 },

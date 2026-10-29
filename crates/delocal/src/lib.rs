@@ -16,6 +16,8 @@
 //!   (§7.3, §7.5)
 //! - [`scan`]: the full scan, its fast path, hashing, ignore rules and root
 //!   guard (§7.3)
+//! - [`shim`]: the mtime precision shim, for filesystems that keep coarser
+//!   mtimes than they are given (§7.3)
 //! - [`store`]: the SQLite database, the persisted parts and the host's
 //!   tables (§11, §8.5)
 //! - [`tailscale`]: everything delocal asks of Tailscale, behind one trait,
@@ -32,6 +34,7 @@ pub mod fs;
 pub mod names;
 pub mod reach;
 pub mod scan;
+pub mod shim;
 pub mod store;
 pub mod tailscale;
 pub mod tmp;

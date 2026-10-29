@@ -55,6 +55,9 @@
 //! **A metadata-only apply** sets the exec bit and mtime of the file it
 //! guarded, and fsyncs it before the report.
 //!
+//! **The mtime shim** (§7.3, [`crate::shim`]). The guard sees a file's
+//! mtime as the engine is told it, through the folder's pairs.
+//!
 //! **Reports** (drafts 52, 58). Every report carries the time its
 //! operation ran: just after the rename or the change, or, for a failure,
 //! when the host took the observation the report carries, which is what a
@@ -92,6 +95,7 @@ use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
 use crate::scan::ignore_rules::{IgnoreRules, RuleSource};
 use crate::scan::stability::Stability;
 use crate::scan::{Clock, MARKER, Observer, OpenRows, Records};
+use crate::shim::Shims;
 use crate::store::{HostWrite, JournalRow, TrashRow};
 use crate::tmp;
 use crate::trash::{self, Moving, NotMoved};
@@ -223,6 +227,8 @@ pub struct Commit<'a> {
     pub records: &'a dyn Records,
     /// Its names on disk that are not their index paths' (§7.3).
     pub names: &'a dyn DiskNames,
+    /// Its mtime shim's pairs (§7.3).
+    pub shims: &'a dyn Shims,
     /// Where a displacement's journal row is made durable (§7.5).
     pub journal: &'a dyn Journal,
     /// The engine's clock (§7.8): reports are dated by it.
@@ -498,6 +504,7 @@ impl Commit<'_> {
             records: self.records,
             names: self.names,
             open: self.disk,
+            shims: self.shims,
             clock: self.clock,
             stability: self.stability,
             sensitivity,
@@ -711,7 +718,7 @@ impl Commit<'_> {
                 }
                 Ok(Found::Entry {
                     disk: at.parent.join(name),
-                    seen,
+                    seen: self.shims.observed(at.path, seen),
                     mode: stat.mode,
                 })
             }

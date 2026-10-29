@@ -27,7 +27,10 @@
 //! - A symlink is read, never followed; its content is its target, so the
 //!   fast path compares the target's hash (§7.3).
 //! - A file whose size, mtime and exec bit match its record is `Unchanged`,
-//!   and is not read (the fast path, [`Entry::unchanged_by_stat`]). Any other
+//!   and is not read (the fast path, [`Entry::unchanged_by_stat`]). Its mtime
+//!   is the one the engine is told, through the folder's mtime shim
+//!   ([`crate::shim`]): where the filesystem stored a coarser mtime than a
+//!   commit asked for, and still holds it, the one asked for. Any other
 //!   file is hashed on one of the hashing threads, if it has settled
 //!   ([`stability`]: its change time 2 s old by the real-time clock, or two
 //!   unchanged looks 2 s apart if that clock was set back); one that has
@@ -90,10 +93,10 @@
 //! **One path at a time.** [`Observer::observe`] observes a single path as
 //! the scan would report it, by the same rules: ignored and mounted paths
 //! skipped, a path with an open journal row skipped, the fast path against
-//! the record, a file hashed only once settled. It is what a failed
-//! commit's report carries (§7.5 step 6), what the host answers the
-//! engine's `Observe` with (§8.3), and what the watcher reports. It reaches the
-//! path from the root through its names on disk ([`crate::reach`]) rather
+//! the record (a file's mtime through the shim), a file hashed only once
+//! settled. It is what a failed commit's report carries (§7.5 step 6), what
+//! the host answers the engine's `Observe` with (§8.3), and what the watcher
+//! reports. It reaches the path from the root through its names on disk ([`crate::reach`]) rather
 //! than walking to it, so on a filesystem that folds names it confirms the
 //! name through the parent's listing.
 //!
@@ -119,6 +122,7 @@ use delocal_engine::{
 use crate::fs::{Dir, FileKind, Folder, Fs, NotAFile, Stat};
 use crate::names::{self, IndexName, Name, Unobservable};
 use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
+use crate::shim::Shims;
 use crate::store::DiskName;
 
 pub mod hash;
@@ -232,6 +236,8 @@ pub struct Scan<'a> {
     pub records: &'a dyn Records,
     /// Its paths with an open journal row, reported `Skipped`.
     pub open: &'a dyn OpenRows,
+    /// Its mtime shim's pairs (§7.3).
+    pub shims: &'a dyn Shims,
     pub clock: &'a dyn Clock,
     /// Whether a file has settled enough to hash.
     pub stability: &'a Stability,
@@ -341,6 +347,7 @@ impl Scan<'_> {
             let mut walker = Walker {
                 records: self.records,
                 open: self.open,
+                shims: self.shims,
                 skipped_open: BTreeSet::new(),
                 clock: self.clock,
                 stability: self.stability,
@@ -428,6 +435,7 @@ fn check_marker(delocal: &dyn Dir) -> Result<(), Abort> {
 struct Walker<'a, 'e> {
     records: &'a dyn Records,
     open: &'a dyn OpenRows,
+    shims: &'a dyn Shims,
     /// The paths reported `Skipped` for an open journal row so far.
     skipped_open: BTreeSet<RelPath>,
     clock: &'a dyn Clock,
@@ -666,7 +674,7 @@ impl Walker<'_, '_> {
         let seen = Observed {
             kind: Kind::File,
             size: stat.size,
-            mtime_ns: stat.mtime_ns,
+            mtime_ns: self.shims.reported(&path, stat.mtime_ns),
             exec: stat.mode & EXEC_BIT != 0,
             hash: ContentHash::EMPTY,
         };
@@ -774,6 +782,8 @@ pub struct Observer<'a> {
     pub names: &'a dyn DiskNames,
     /// Its paths with an open journal row, reported `Skipped`.
     pub open: &'a dyn OpenRows,
+    /// Its mtime shim's pairs (§7.3).
+    pub shims: &'a dyn Shims,
     pub clock: &'a dyn Clock,
     /// Whether a file has settled enough to hash.
     pub stability: &'a Stability,
@@ -849,7 +859,7 @@ impl Observer<'_> {
                 name,
                 stat,
                 seen: Some(seen),
-            }) => (name, stat, seen),
+            }) => (name, stat, self.shims.observed(path, seen)),
             Ok(Look::Present { seen: None, .. } | Look::Absent | Look::Taken { .. }) => {
                 return absent();
             }
