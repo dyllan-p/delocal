@@ -25,8 +25,8 @@
 //! optional fields (§12). postcard writes a struct's fields one after the
 //! other, with no names, so a new field can only go at the end of a
 //! message. A frame's length says where the message ends, and the frame
-//! decoder ignores whatever follows the fields it knows (§6.3), so an
-//! older machine reads a newer one's messages.
+//! decoder ignores whatever follows the fields it knows
+//! ([`super::frame`]), so an older machine reads a newer one's messages.
 //! The other half, a newer machine reading a message without the field, is
 //! for whoever adds the first one.
 
