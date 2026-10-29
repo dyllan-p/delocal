@@ -13,6 +13,14 @@
 //!   beneath a mount point, is reported `Skipped { Ignored }` by the
 //!   observation, and the watcher reports nothing for it and never walks
 //!   into it.
+//! - **Ignored paths' directories** (draft 68). An event for such a path
+//!   is an observation of the directory holding it, so that a deletion
+//!   held because the directory holds ignored files is tried again once
+//!   the user removes the last of them. The directory is observed alone,
+//!   once the paths the events named are done, and only if no event named
+//!   it: nothing moved with it, so it is not walked, and only if it is
+//!   there: if it is not, an event of its own or of a directory above it
+//!   reports that.
 //! - **Another spelling.** Before a path is reported absent, its parent is
 //!   listed: if a name there maps to the path but is not its index name
 //!   (§7.3, names on disk), the path is observed again through that name.
@@ -81,6 +89,8 @@ struct Watched<'a> {
     names: Overlay<'a>,
     /// Paths already observed in this job.
     done: BTreeSet<RelPath>,
+    /// Directories holding an ignored path an event named.
+    holders: BTreeSet<RelPath>,
     /// Directory listings made in this job, by the directory on disk.
     listings: BTreeMap<PathBuf, Option<Vec<(OsString, Name)>>>,
     out: Vec<Observation>,
@@ -108,6 +118,7 @@ pub(super) fn observe(
             learned: BTreeMap::new(),
         },
         done: BTreeSet::new(),
+        holders: BTreeSet::new(),
         listings: BTreeMap::new(),
         out: Vec::new(),
     };
@@ -120,6 +131,9 @@ pub(super) fn observe(
     }
     for path in paths {
         watched.path(&path)?;
+    }
+    for dir in std::mem::take(&mut watched.holders) {
+        watched.holder(&dir);
     }
     // Before anything absent goes to the engine, the marker once more: a
     // folder deleted wholesale while this job ran is the guard's (§7.3).
@@ -184,7 +198,12 @@ impl Watched<'_> {
         match &state {
             ScanState::Skipped {
                 reason: SkipReason::Ignored,
-            } => Ok(()),
+            } => {
+                if let Some(dir) = path.parent() {
+                    self.holders.insert(dir);
+                }
+                Ok(())
+            }
             // An open row that came between the check above and the look.
             ScanState::Skipped { .. } if self.kept.disk.is_open(path) => Ok(()),
             ScanState::Absent => {
@@ -211,6 +230,18 @@ impl Watched<'_> {
                 self.push(path, state, at);
                 Ok(())
             }
+        }
+    }
+
+    /// Observe `dir`, the directory holding an ignored path an event named
+    /// (see the module docs).
+    fn holder(&mut self, dir: &RelPath) {
+        if !self.done.insert(dir.clone()) || self.kept.disk.is_open(dir) {
+            return;
+        }
+        let (state, at) = self.commit().observe(dir);
+        if matches!(state, ScanState::Observed(_) | ScanState::Unchanged) {
+            self.push(dir, state, at);
         }
     }
 

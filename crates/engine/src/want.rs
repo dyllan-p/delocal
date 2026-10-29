@@ -155,8 +155,9 @@ pub enum WantState {
     /// the user chose to keep out of sync and may need, so the host removed
     /// nothing. Observable meanwhile, like every deferred want, and wanted
     /// again at the next observation of the directory, the user having
-    /// perhaps taken the file away; `status` names the files, which only
-    /// the host knows.
+    /// perhaps taken the file away: a scan's, or the watcher's, whose event
+    /// for an ignored file is one (draft 68). `status` names the files,
+    /// which only the host knows.
     HoldsIgnored,
 }
 
