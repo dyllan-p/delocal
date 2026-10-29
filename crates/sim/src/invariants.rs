@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use delocal_engine::conflict::{Side, conflict_copy_name, winner};
-use delocal_engine::{ContentHash, Entry, Kind, NodeId, RelPath};
+use delocal_engine::{ContentHash, Entry, Kind, NodeId, RelPath, WantState};
 
 use crate::sim::{Failure, Sim};
 
@@ -107,26 +107,64 @@ fn no_fallbacks(sim: &Sim) -> Result<(), Failure> {
     Ok(())
 }
 
+/// The directories `id` keeps although their deletion was received, each
+/// because a file a user rule ignores is beneath it on `id`'s disk (§7.3,
+/// draft 64): the want to delete it is deferred as holding ignored files,
+/// or waits for one beneath it that is. Every other node has deleted them,
+/// so I1 and I3 leave them out on `id`, and the final phase's quiescence
+/// lets their wants wait.
+pub(crate) fn held_by_ignored(sim: &Sim, id: NodeId) -> BTreeSet<RelPath> {
+    let mut held = BTreeSet::new();
+    let (Some(f), Some(ignored)) = (
+        sim.engine(id).and_then(|e| e.folder(sim.folder_id())),
+        sim.ignored_files(id),
+    ) else {
+        return held;
+    };
+    // Deepest first: everything beneath a directory sorts after it, and a
+    // deletion waits for the nearest one beneath it.
+    let wants: Vec<_> = f.wants().iter().collect();
+    for w in wants.into_iter().rev() {
+        let waits = match &w.state {
+            WantState::HoldsIgnored => true,
+            WantState::WaitingFor { path } => held.contains(path),
+            _ => false,
+        };
+        if waits && w.entry.deleted && ignored.iter().any(|i| w.path().is_ancestor_of(i)) {
+            held.insert(w.path().clone());
+        }
+    }
+    held
+}
+
 /// I1: every node's live index is identical, and every filesystem matches
-/// its own index.
+/// its own index. A directory a node keeps for the ignored files in it
+/// (see [`held_by_ignored`]) is left out of its index for the first test.
 fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
     let ids = sim.node_ids();
     let Some(first) = ids.first() else {
         return Ok(());
     };
-    let Some(reference) = live_index(sim, *first) else {
+    let without_held = |id: NodeId, mut index: BTreeMap<RelPath, Live>| {
+        for path in held_by_ignored(sim, id) {
+            index.remove(&path);
+        }
+        index
+    };
+    let Some(reference) = live_index(sim, *first).map(|index| without_held(*first, index)) else {
         return Err(sim.failure(
             "I1 convergence",
             format!("{} has no engine at the end", first.short()),
         ));
     };
     for id in ids {
-        let Some(mine) = live_index(sim, *id) else {
+        let Some(index) = live_index(sim, *id) else {
             return Err(sim.failure(
                 "I1 convergence",
                 format!("{} has no engine at the end", id.short()),
             ));
         };
+        let mine = without_held(*id, index.clone());
         if mine != reference {
             return Err(sim.failure(
                 "I1 convergence",
@@ -139,13 +177,13 @@ fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
             ));
         }
         let disk = live_fs(sim, *id);
-        if disk != mine {
+        if disk != index {
             return Err(sim.failure(
                 "I1 convergence",
                 format!(
                     "{}: filesystem differs from its index: {}",
                     id.short(),
-                    diff(&disk, &mine)
+                    diff(&disk, &index)
                 ),
             ));
         }
@@ -215,8 +253,15 @@ pub(crate) fn i2_node(sim: &Sim, id: NodeId) -> Result<(), Failure> {
 
 /// I3: a tombstone that nothing concurrent or newer ever contradicted means
 /// the path is gone everywhere. Records discarded by their author's revert
-/// never reached anyone and take no part, on either side.
+/// never reached anyone and take no part, on either side. A directory a
+/// node keeps for the ignored files in it (see [`held_by_ignored`]) is not
+/// gone there, and not brought back either: its deletion waits.
 fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
+    let held: BTreeMap<NodeId, BTreeSet<RelPath>> = sim
+        .node_ids()
+        .iter()
+        .map(|id| (*id, held_by_ignored(sim, *id)))
+        .collect();
     for (path, versions) in sim.versions() {
         // A tombstone its author discarded with `revert` (§8.3) was pending
         // and never announced: no deletion happened as far as the mesh is
@@ -235,6 +280,9 @@ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
                 continue;
             }
             for id in sim.node_ids() {
+                if held.get(id).is_some_and(|h| h.contains(path)) {
+                    continue;
+                }
                 let live = sim
                     .engine(*id)
                     .and_then(|e| e.folder(sim.folder_id()))
