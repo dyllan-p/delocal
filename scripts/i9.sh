@@ -9,11 +9,12 @@
 # slice fail with each class.
 #
 # The slices are laid out as the nightly lays out its 100,000 seeds: the
-# default knobs from S, `--corruption 0.05` from S + 76,000, `--skip 0.02`
-# from S + 86,000, and `--steps 2000` from S + 96,000. Each slice runs N
-# seeds from its start (default 1,000), the long one N * 3 / 10, since a
-# 2,000-step seed takes about five times as long. J worker threads per
-# slice (default: a quarter of the cores each, as the four run at once).
+# default knobs from S, `--ignored-files 0.2` from S + 66,000,
+# `--corruption 0.05` from S + 76,000, `--skip 0.02` from S + 86,000, and
+# `--steps 2000` from S + 96,000. Each slice runs N seeds from its start
+# (default 1,000), the long one N * 3 / 10, since a 2,000-step seed takes
+# about five times as long. J worker threads per slice (default: a fifth
+# of the cores each, as the five run at once).
 #
 # The script builds the simulator in release first. Each slice's sweep
 # goes to target/i9/SLICE.txt. Exit status: 0 once every slice has run,
@@ -43,7 +44,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 cores=$(nproc 2> /dev/null || getconf _NPROCESSORS_ONLN)
-jobs=${jobs:-$(( cores / 4 ))}
+jobs=${jobs:-$(( cores / 5 ))}
 for n in "$start" "$seeds" "$jobs"; do
   [[ $n =~ ^[0-9]+$ ]] || { echo "--start, --seeds and --jobs take whole numbers, not '$n'" >&2; exit 2; }
 done
@@ -59,6 +60,7 @@ sim=$repo/target/release/delocal-sim
 # name, first seed, seeds, knobs
 slices=(
   "default $start $seeds"
+  "ignored $(( start + 66000 )) $seeds --ignored-files 0.2"
   "corruption $(( start + 76000 )) $seeds --corruption 0.05"
   "skip $(( start + 86000 )) $seeds --skip 0.02"
   "long $(( start + 96000 )) $(( seeds * 3 / 10 )) --steps 2000"
