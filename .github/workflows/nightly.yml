@@ -1,5 +1,6 @@
-# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds in four
-# slices (the default knobs, a tenth of the seeds with fetch corruption
+# Nightly simulator sweep (DESIGN.md §14.1): 100,000 seeds in five
+# slices (the default knobs, a tenth of the seeds with users' ignored
+# files at ten times their default rate, a tenth with fetch corruption
 # on, a tenth with the skip model at ten times its default rate, and
 # 4,000 seeds at 2,000 steps instead of 400), sharded across twenty jobs. Each night starts at a different seed, day of year ×
 # 100,000 (see the plan job).
@@ -108,15 +109,18 @@ jobs:
         run: cargo build --release --locked -p delocal-sim
 
       # This shard's share of the night's seeds: `from` and `to` count from
-      # START. The night has four slices. The first 76% run with the
-      # default knobs. The next tenth run with fetch corruption on, so the
+      # START. The night has five slices. The first 66% run with the
+      # default knobs. The next tenth runs the users' ignored files (§7.3)
+      # at 0.2, ten times their default, for the directories they hold and
+      # the deletions those wait on, for the same reason as the skip slice
+      # below. The next tenth run with fetch corruption on, so the
       # HashMismatch path is exercised every night. The tenth after that
       # runs the skip model (§7.3) at 0.02, ten times its default in
       # crates/sim/src/knobs.rs, for the paths a scan cannot inspect and
       # the ignore rules that the default meets only lightly, since a
       # higher default would move the pinned seeds' histories. The last 4%
       # run 2,000 steps instead of 400, to reach states a short run never
-      # builds up to. The first SHARDS - LONG_SHARDS shards split the three
+      # builds up to. The first SHARDS - LONG_SHARDS shards split the four
       # 400-step slices between them, as in ci.yml, and the last
       # LONG_SHARDS split the long-run slice, so every shard does about the
       # same work.
@@ -132,6 +136,7 @@ jobs:
           LONG_SHARDS: 4
         run: |
           set -uo pipefail
+          ignored_from=$(( SEEDS * 66 / 100 ))
           corrupt_from=$(( SEEDS * 76 / 100 ))
           skip_from=$(( SEEDS * 86 / 100 ))
           long_from=$(( SEEDS * 96 / 100 ))
@@ -155,7 +160,8 @@ jobs:
             ./target/release/delocal-sim --seeds "$(( hi - lo ))" --start "$(( START + lo ))" "$@" --keep-going 2>&1 | tee -a sim.log
             [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
           }
-          slice 0 "$corrupt_from"
+          slice 0 "$ignored_from"
+          slice "$ignored_from" "$corrupt_from" --ignored-files 0.2
           slice "$corrupt_from" "$skip_from" --corruption 0.05
           slice "$skip_from" "$long_from" --skip 0.02
           slice "$long_from" "$SEEDS" --steps 2000
@@ -204,6 +210,7 @@ jobs:
           shopt -s nullglob
           logs=(logs/*/sim.log)
           # Where the slices start, as in the Simulate step.
+          ignored_from=$(( SEEDS * 66 / 100 ))
           corrupt_from=$(( SEEDS * 76 / 100 ))
           skip_from=$(( SEEDS * 86 / 100 ))
           long_from=$(( SEEDS * 96 / 100 ))
@@ -249,7 +256,7 @@ jobs:
             echo "Commit: $GITHUB_SHA"
             echo "First seed: $START"
             echo
-            echo "$failed of $SEEDS seeds failed. Seeds $START to $(( START + corrupt_from - 1 )) ran with the default knobs, seeds $(( START + corrupt_from )) to $(( START + skip_from - 1 )) with \`--corruption 0.05\`, seeds $(( START + skip_from )) to $(( START + long_from - 1 )) with \`--skip 0.02\`, and seeds $(( START + long_from )) to $(( START + SEEDS - 1 )) with \`--steps 2000\`."
+            echo "$failed of $SEEDS seeds failed. Seeds $START to $(( START + ignored_from - 1 )) ran with the default knobs, seeds $(( START + ignored_from )) to $(( START + corrupt_from - 1 )) with \`--ignored-files 0.2\`, seeds $(( START + corrupt_from )) to $(( START + skip_from - 1 )) with \`--corruption 0.05\`, seeds $(( START + skip_from )) to $(( START + long_from - 1 )) with \`--skip 0.02\`, and seeds $(( START + long_from )) to $(( START + SEEDS - 1 )) with \`--steps 2000\`."
             if [ -n "$counts" ]; then
               echo
               echo '| Invariant | Seeds |'
