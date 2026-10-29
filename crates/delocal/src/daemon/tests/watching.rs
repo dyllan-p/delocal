@@ -7,13 +7,14 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use delocal_engine::{FolderId, FolderParts, Kind};
+use delocal_engine::want::WantState;
+use delocal_engine::{Event, FolderId, FolderParts, Kind, Timestamp};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 use super::super::watch::QUIET;
 use super::super::{Daemon, NoTransport};
-use super::{Fixture, Input};
+use super::{Fixture, Input, batch, p, tombstone};
 use crate::fs::{Folder, RealFolder};
 use crate::scan::MARKER;
 
@@ -559,5 +560,61 @@ fn a_directory_moved_in_brings_its_contents_and_one_moved_out_takes_them() {
         assert!(daemon.record(fixture.folder, path).is_none(), "{path}");
     }
     assert_eq!(daemon.scan(fixture.folder), 0);
+    daemon.stop().unwrap();
+}
+
+/// §7.3, draft 68: an event for an ignored path is an observation of the
+/// directory holding it. The peer deletes `d`, which holds two files the
+/// folder's rules ignore, so the deletion is held. The user removes one,
+/// and the deletion is tried again and held again; then the other, and
+/// `d` goes to the trash. No scan runs between: the watcher lost nothing,
+/// and the next one is an hour away.
+#[test]
+fn removing_the_last_ignored_file_releases_a_held_deletion_without_a_scan() {
+    let fixture = Fixture::new();
+    write(&fixture.at(".delocalignore"), b"*.env\n");
+    write(&fixture.at("d/a.env"), b"A=1");
+    write(&fixture.at("d/b.env"), b"B=2");
+    let daemon = watching(&fixture, real(&fixture));
+    daemon.settle();
+    let d = daemon.record(fixture.folder, "d").unwrap();
+    daemon.inject(Event::BatchReceived {
+        from: fixture.peer,
+        batch: batch(
+            fixture.peer,
+            fixture.folder,
+            0,
+            vec![tombstone(fixture.peer, &d, Timestamp::from_unix_nanos(5))],
+        ),
+    });
+    daemon.settle();
+    let folder = fixture.folder;
+    let state = |daemon: &Daemon| {
+        daemon.engine(move |e| {
+            e.folder(folder)
+                .and_then(|f| f.wants().get(&p("d")))
+                .map(|w| w.state.clone())
+        })
+    };
+    let tries = |daemon: &Daemon| {
+        let (emitted, _) = daemon.trace();
+        emitted.iter().filter(|e| *e == "remove d").count()
+    };
+    assert_eq!(state(&daemon), Some(WantState::HoldsIgnored));
+    assert_eq!(tries(&daemon), 1);
+
+    std::fs::remove_file(fixture.at("d/a.env")).unwrap();
+    quiet(&daemon);
+    assert_eq!(tries(&daemon), 2, "not tried again");
+    assert_eq!(state(&daemon), Some(WantState::HoldsIgnored));
+    assert!(fixture.at("d/b.env").exists());
+
+    std::fs::remove_file(fixture.at("d/b.env")).unwrap();
+    quiet(&daemon);
+    assert_eq!(tries(&daemon), 3, "not tried again");
+    assert_eq!(state(&daemon), None);
+    assert!(!fixture.at("d").exists());
+    assert!(daemon.record(folder, "d").is_none());
+    assert_eq!(daemon.trace.rescans.load(Ordering::SeqCst), 0);
     daemon.stop().unwrap();
 }

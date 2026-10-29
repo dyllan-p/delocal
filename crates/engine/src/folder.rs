@@ -1353,7 +1353,8 @@ impl FolderState {
             None => {}
         }
         // A deletion deferred because the directory held ignored files is
-        // re-evaluated on the next observation of it (§7.3, draft 64). What
+        // re-evaluated on the next observation of it (§7.3, drafts 64 and
+        // 68, the watcher's event for an ignored file in it being one). What
         // a commit's guard found belongs to that commit's report, the one
         // that deferred it, so only a scan or the watcher counts.
         if observer == Observer::Scan {
