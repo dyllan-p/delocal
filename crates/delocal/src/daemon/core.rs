@@ -74,6 +74,15 @@
 //! `Skipped { Unstable }` and the path observed again 2 s later, through the
 //! pairs as they are. A report that arrives before the commit's is no
 //! danger: the path is in flight then, and the engine ignores it.
+//!
+//! **A path with no record keeps no pair** (§7.3). When an event leaves a
+//! path without a live record (a tombstone, whatever the deletion came
+//! from: a scan, the watcher, a peer; or a record removed, as `revert`
+//! removes one peers never saw), this task drops the path's pair in the
+//! group that writes the record, and the executor drops it from its copy
+//! with the record. A pair is the host's word for a file a commit made, and
+//! a file that is gone is not that file: a new one at the path that happens
+//! to carry the stored mtime must be reported with its own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -211,9 +220,13 @@ pub(crate) struct Watch {
     /// scan may have walked past them before, so what it found there is
     /// not taken.
     pub touched: BTreeSet<RelPath>,
-    /// Paths whose mtime shim pair a commit changed while the scan ran
-    /// (§7.3): the scan's reports of them are not taken.
+    /// Paths whose mtime shim pair a commit changed, or a deletion
+    /// dropped, while the scan ran (§7.3): the scan's reports of them are
+    /// not taken.
     pub reshimmed: BTreeSet<RelPath>,
+    /// The paths with an mtime shim pair (§7.3), as the host has written
+    /// them.
+    pub shimmed: BTreeSet<RelPath>,
     /// `IndexChanged`s the running scan's events produced.
     pub changes: usize,
     /// Where the folder is on disk, for its watch.
@@ -480,6 +493,16 @@ impl Core {
                 HostWrite::RemoveDiskName { folder, path } => {
                     names.entry(*folder).or_default().push((path.clone(), None));
                 }
+                HostWrite::PutShim { folder, shim } => {
+                    if let Some(watch) = self.folders.get_mut(folder) {
+                        watch.shimmed.insert(shim.path.clone());
+                    }
+                }
+                HostWrite::RemoveShim { folder, path } => {
+                    if let Some(watch) = self.folders.get_mut(folder) {
+                        watch.shimmed.remove(path);
+                    }
+                }
                 HostWrite::PutMachine(machine) => {
                     let id = StableId(machine.ts_stable_id.clone());
                     self.bindings.insert(machine.node, id);
@@ -521,6 +544,9 @@ impl Core {
                     };
                 }
             }
+        }
+        for write in dropped_pairs(&mut self.folders, &records) {
+            group.host(write);
         }
         self.watch_space();
         if group.is_empty() && effects.is_empty() {
@@ -862,6 +888,34 @@ fn names_written(id: FolderId, watch: &Watch, report: &ScanReport) -> Vec<HostWr
                 folder: id,
                 path: path.clone(),
             });
+        }
+    }
+    writes
+}
+
+/// The pairs of the paths an event leaves without a live record (see the
+/// module docs): a `RemoveShim` for each one that has a pair, for the
+/// event's group. A scan running meanwhile has the pair in its copy, so the
+/// path is one whose pair changed under it.
+fn dropped_pairs(
+    folders: &mut BTreeMap<FolderId, Watch>,
+    records: &BTreeMap<FolderId, Vec<(RelPath, Option<Entry>)>>,
+) -> Vec<HostWrite> {
+    let mut writes = Vec::new();
+    for (folder, updates) in records {
+        let Some(watch) = folders.get_mut(folder) else {
+            continue;
+        };
+        for (path, entry) in updates {
+            if entry.is_none() && watch.shimmed.remove(path) {
+                if watch.scanning {
+                    watch.reshimmed.insert(path.clone());
+                }
+                writes.push(HostWrite::RemoveShim {
+                    folder: *folder,
+                    path: path.clone(),
+                });
+            }
         }
     }
     writes
@@ -1260,5 +1314,74 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn record(path: &str) -> Entry {
+        Entry {
+            path: p(path),
+            kind: Kind::File,
+            size: 3,
+            mtime_ns: 5,
+            stamp: 5,
+            exec: false,
+            hash: ContentHash::from_bytes([7; 32]),
+            prev_hash: ContentHash::EMPTY,
+            version: delocal_engine::Version::empty().incremented(NodeId::from_bytes([1; 16])),
+            deleted: false,
+            modified_by: NodeId::from_bytes([1; 16]),
+            author_host: HostName::new("here").unwrap(),
+        }
+    }
+
+    fn remove_shim(path: &str) -> HostWrite {
+        HostWrite::RemoveShim {
+            folder: FOLDER,
+            path: p(path),
+        }
+    }
+
+    /// §7.3: an event that leaves a path without a live record (a tombstone
+    /// or a removed record: both reach here as no record) drops the path's
+    /// pair; a live record, or a path with no pair, writes nothing. While a
+    /// scan runs, its copy of the pairs is out of date for a dropped path.
+    #[test]
+    fn a_path_left_without_a_record_loses_its_pair() {
+        let mut folders = BTreeMap::from([(
+            FOLDER,
+            Watch {
+                shimmed: ["deleted", "removed", "live", "later"].map(p).into(),
+                ..Watch::default()
+            },
+        )]);
+        let records = BTreeMap::from([(
+            FOLDER,
+            vec![
+                (p("deleted"), None),
+                (p("removed"), None),
+                (p("live"), Some(record("live"))),
+                (p("no pair"), None),
+            ],
+        )]);
+        assert_eq!(
+            dropped_pairs(&mut folders, &records),
+            [remove_shim("deleted"), remove_shim("removed")]
+        );
+        let watch = &folders[&FOLDER];
+        assert_eq!(watch.shimmed, ["live", "later"].map(p).into());
+        assert!(watch.reshimmed.is_empty());
+        // Dropped once: the same again writes nothing.
+        assert!(dropped_pairs(&mut folders, &records).is_empty());
+
+        if let Some(watch) = folders.get_mut(&FOLDER) {
+            watch.scanning = true;
+        }
+        let later = BTreeMap::from([(FOLDER, vec![(p("later"), None)])]);
+        assert_eq!(dropped_pairs(&mut folders, &later), [remove_shim("later")]);
+        assert_eq!(folders[&FOLDER].reshimmed, [p("later")].into());
+
+        // A folder this task does not keep has nothing to drop.
+        let other = FolderId::from_bytes([3; 16]);
+        let elsewhere = BTreeMap::from([(other, vec![(p("live"), None)])]);
+        assert!(dropped_pairs(&mut folders, &elsewhere).is_empty());
     }
 }

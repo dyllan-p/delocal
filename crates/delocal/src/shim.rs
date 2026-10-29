@@ -19,8 +19,12 @@
 //! it kept the one asked for ([`kept`]). A commit that leaves the path
 //! empty removes its pair ([`gone`]). A file displaced to a conflict copy
 //! takes its pair with it, since the copy's record carries the mtime the
-//! pair stands for (§7.6). A pair is otherwise left as it is: one whose
-//! stored mtime is no longer on disk translates nothing.
+//! pair stands for (§7.6). Anything else that leaves a path without a live
+//! record drops its pair too, in the group that writes the record: a
+//! deletion the scan or the watcher saw, a record `revert` removes (the
+//! engine task does this, `daemon::core`). A pair is otherwise left as it
+//! is: one whose stored mtime is no longer on disk, after a user's edit,
+//! translates nothing.
 //!
 //! **Durability.** A `Write`'s pair goes with its report, in its group
 //! (§11), like every write a commit leaves. A `SetMeta`'s is made durable
