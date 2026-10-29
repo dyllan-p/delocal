@@ -30,7 +30,8 @@
 //! **What the executor knows of the index** is its own copy of each
 //! folder's live records and names on disk, kept up to date by jobs the
 //! engine task releases in the same order as the effects, and of its mtime
-//! shim's pairs (§7.3), which only its own commits change. A commit or an
+//! shim's pairs (§7.3), which its own commits change and a record's going
+//! drops. A commit or an
 //! observation therefore compares against the records as of the event that
 //! asked for it. A scan compares against a copy of the records and pairs
 //! taken when it starts. Each
@@ -234,9 +235,19 @@ impl Executor {
                     let records = Arc::make_mut(&mut kept.records);
                     for (path, entry) in updates {
                         match entry {
-                            Some(entry) => records.insert(path, entry),
-                            None => records.remove(&path),
-                        };
+                            Some(entry) => {
+                                records.insert(path, entry);
+                            }
+                            // A path with no record keeps no shim pair
+                            // (§7.3): the engine task dropped it from the
+                            // store with the record.
+                            None => {
+                                records.remove(&path);
+                                if kept.shims.contains_key(&path) {
+                                    Arc::make_mut(&mut kept.shims).remove(&path);
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(())

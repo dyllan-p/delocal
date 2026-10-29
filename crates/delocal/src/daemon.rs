@@ -363,6 +363,7 @@ impl Daemon {
                 opened.id,
                 Watch {
                     names: opened.names.clone(),
+                    shimmed: opened.shims.keys().cloned().collect(),
                     root: opened.root.clone(),
                     unwatched,
                     ..Watch::default()

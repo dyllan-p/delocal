@@ -16,14 +16,15 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use delocal_engine::{Entry, Event, IndexRecord, Kind, Timestamp};
+use delocal_engine::{Entry, Event, IndexRecord, Kind, RelPath, Rules, Timestamp};
 
 use super::super::clock::Clock;
+use super::super::core::Input;
 use super::super::{Daemon, NoTransport, RESCAN, SETTLE, SPACE_CHECK, STORE, Setup, lock};
-use super::{Fixture, batch, touch};
+use super::{Fixture, batch, touch, windows_closed};
 use crate::fs::coarse::{Coarse, coarse};
 use crate::fs::{Folder, Fs, RealFolder};
-use crate::store::Store;
+use crate::store::{HostWrite, Shim, Store};
 use crate::tailscale::tier;
 
 const STATE: &str = "DELOCAL_SHIM_STATE";
@@ -244,6 +245,16 @@ fn received_files_survive_a_hundred_scans_and_a_kill_9() {
             assert_eq!(new, old);
         }
     }
+
+    // A deletion drops the pair of a file the restart read from the store.
+    std::fs::remove_file(fixture.at("f1")).unwrap();
+    daemon.scan(fixture.folder);
+    daemon.settle();
+    let paths: Vec<String> = stored_pairs(&fixture)
+        .iter()
+        .map(|shim| shim.path.to_string())
+        .collect();
+    assert_eq!(paths, ["f0", "f2", "f3", "f4"]);
     daemon.stop().unwrap();
 }
 
@@ -365,5 +376,130 @@ fn a_pair_a_commit_puts_while_a_scan_runs_is_not_read_as_a_touch() {
     assert_eq!(after.entry.version, entry.version);
     assert_eq!(after.entry.mtime_ns, entry.mtime_ns);
     assert_eq!(daemon.scan(fixture.folder), 0);
+    daemon.stop().unwrap();
+}
+
+/// The folder at `fixture`'s root on a 2 s filesystem.
+fn coarse_folder(fixture: &Fixture) -> Arc<dyn Folder> {
+    Arc::new(Coarse::new(Arc::new(RealFolder::new(fixture.root()))))
+}
+
+/// The pairs the store holds for `fixture`'s folder, read through a
+/// connection of its own.
+fn stored_pairs(fixture: &Fixture) -> Vec<Shim> {
+    Store::open(&fixture.state().join(STORE))
+        .unwrap()
+        .shims(fixture.folder)
+        .unwrap()
+}
+
+/// §7.3: a path whose file is deleted loses its pair. A peer's touch gives
+/// `f` a pair; the user deletes it, and the scan's tombstone drops the pair
+/// from the store. A file made again at the path, with the very mtime the
+/// filesystem stored for the pair, is recorded with that mtime rather than
+/// the one the pair was for: the executor's copy has dropped it too, since
+/// that file is observed by its second look, 2 s after the scan.
+#[test]
+fn a_deleted_path_loses_its_pair() {
+    let fixture = Fixture::new();
+    std::fs::write(fixture.at("f"), "content").unwrap();
+    let daemon =
+        Daemon::start(fixture.setup(coarse_folder(&fixture), Box::new(NoTransport))).unwrap();
+    daemon.settle();
+    let entry = touched(&daemon.record(fixture.folder, "f").unwrap());
+    daemon.inject(Event::BatchReceived {
+        from: fixture.peer,
+        batch: batch(fixture.peer, fixture.folder, 0, vec![entry.clone()]),
+    });
+    daemon.settle();
+    let stored = coarse(entry.mtime_ns);
+    let pair = Shim {
+        path: entry.path.clone(),
+        requested_ns: entry.mtime_ns,
+        stored_ns: stored,
+    };
+    assert_eq!(stored_pairs(&fixture), [pair]);
+
+    std::fs::remove_file(fixture.at("f")).unwrap();
+    assert_eq!(daemon.scan(fixture.folder), 1);
+    daemon.settle();
+    assert!(daemon.record(fixture.folder, "f").is_none());
+    assert!(stored_pairs(&fixture).is_empty());
+
+    std::fs::write(fixture.at("f"), "content").unwrap();
+    let fs = RealFolder::new(fixture.root()).open().unwrap();
+    fs.set_mtime(Path::new("f"), stored).unwrap();
+    daemon.scan(fixture.folder);
+    daemon.settle();
+    let made = daemon.record(fixture.folder, "f").unwrap();
+    assert_eq!(made.entry.mtime_ns, stored);
+    daemon.stop().unwrap();
+}
+
+/// §7.3, §8.3: a record `revert` removes loses its pair. The brake is set
+/// to hold any deletion, and the folder pauses on two. A file added
+/// meanwhile, never announced, has a pair, as a conflict copy made while
+/// the folder is paused would; it is gone from disk by the revert, so the
+/// revert's move to the trash finds nothing to do, and only the record's
+/// removal can drop the pair.
+#[test]
+fn a_record_revert_removes_loses_its_pair() {
+    let fixture = Fixture::new();
+    for name in ["a", "b", "c"] {
+        std::fs::write(fixture.at(name), name).unwrap();
+    }
+    let daemon =
+        Daemon::start(fixture.setup(coarse_folder(&fixture), Box::new(NoTransport))).unwrap();
+    daemon.settle();
+    daemon.inject(Event::RulesChanged {
+        folder: fixture.folder,
+        rules: Rules {
+            hold_count: 1,
+            hold_pct: 1,
+            ..Rules::default()
+        },
+    });
+    // The startup scan's adds are announced: the deletions below count.
+    windows_closed(&daemon, fixture.folder);
+
+    std::fs::remove_file(fixture.at("a")).unwrap();
+    std::fs::remove_file(fixture.at("b")).unwrap();
+    std::fs::write(fixture.at("n"), "new").unwrap();
+    daemon.scan(fixture.folder);
+    let folder = fixture.folder;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !daemon.engine(move |e| {
+        e.folder(folder).is_some_and(|f| {
+            f.paused().is_some() && f.index().live(&RelPath::new("n").unwrap()).is_some()
+        })
+    }) {
+        assert!(Instant::now() < deadline, "the folder never paused with n");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    daemon.settle();
+
+    let pair = Shim {
+        path: RelPath::new("n").unwrap(),
+        requested_ns: 1_700_000_001_234_567_891,
+        stored_ns: 1_700_000_000_000_000_000,
+    };
+    daemon
+        .inputs
+        .blocking_send(Input::Writes(vec![HostWrite::PutShim {
+            folder,
+            shim: pair.clone(),
+        }]))
+        .unwrap();
+    daemon.settle();
+    assert_eq!(stored_pairs(&fixture), [pair]);
+
+    std::fs::remove_file(fixture.at("n")).unwrap();
+    daemon.inject(Event::Revert { folder });
+    daemon.settle();
+    assert!(daemon.engine(move |e| {
+        e.folder(folder)
+            .is_some_and(|f| f.index().get(&RelPath::new("n").unwrap()).is_none())
+    }));
+    assert!(stored_pairs(&fixture).is_empty());
     daemon.stop().unwrap();
 }
