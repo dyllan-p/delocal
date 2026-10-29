@@ -778,9 +778,8 @@ fn a_directory_holding_only_default_ignored_files_takes_them_to_the_trash() {
 }
 
 /// §7.3, draft 64: a directory holding a file a user rule ignores is not
-/// removed, and nothing in it moves; the report names the file for
-/// `status`. Until the engine has a want state for it, the outcome is the
-/// one any directory found not empty gets.
+/// removed, and nothing in it moves. The report is `Failed { HoldsIgnored }`
+/// with the directory as found, and names the file for `status`.
 #[test]
 fn a_directory_holding_a_file_a_user_rule_ignores_is_not_removed() {
     let disk = Disk::new();
@@ -809,7 +808,8 @@ fn a_directory_holding_a_file_a_user_rule_ignores_is_not_removed() {
         assert!(
             matches!(
                 outcome(&done),
-                ApplyOutcome::ChangedUnderneath {
+                ApplyOutcome::Failed {
+                    error: LocalError::HoldsIgnored,
                     found: ScanState::Observed(Observed {
                         kind: Kind::Dir,
                         ..
