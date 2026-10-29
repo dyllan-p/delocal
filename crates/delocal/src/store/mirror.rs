@@ -9,6 +9,9 @@
 //! describes (a hook's row replaces the one with its key, `None` deletes
 //! it, history appends) and says what each of the store's readers should
 //! return.
+//!
+//! Its strategies for engine values serve the wire's tests too, which draw
+//! the protocol's messages from them (§12, [`crate::net::wire`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -72,7 +75,7 @@ impl Ops {
 /// The folders every stream records first.
 pub const FOLDERS: [u8; 2] = [1, 2];
 
-fn folder() -> BoxedStrategy<FolderId> {
+pub(crate) fn folder() -> BoxedStrategy<FolderId> {
     select(FOLDERS.to_vec())
         .prop_map(|n| FolderId::from_bytes([n; 16]))
         .boxed()
@@ -83,7 +86,7 @@ fn pooled_node() -> BoxedStrategy<NodeId> {
 }
 
 /// A node from the pool, mostly, or any node at all.
-fn node() -> BoxedStrategy<NodeId> {
+pub(crate) fn node() -> BoxedStrategy<NodeId> {
     prop_oneof![
         3 => pooled_node(),
         1 => any::<[u8; 16]>().prop_map(NodeId::from_bytes),
@@ -91,7 +94,7 @@ fn node() -> BoxedStrategy<NodeId> {
     .boxed()
 }
 
-fn batch_id() -> BoxedStrategy<BatchId> {
+pub(crate) fn batch_id() -> BoxedStrategy<BatchId> {
     prop_oneof![
         3 => (1u8..=3).prop_map(|n| BatchId::from_bytes([n; 16])),
         1 => any::<[u8; 16]>().prop_map(BatchId::from_bytes),
@@ -99,7 +102,7 @@ fn batch_id() -> BoxedStrategy<BatchId> {
     .boxed()
 }
 
-fn hash() -> BoxedStrategy<ContentHash> {
+pub(crate) fn hash() -> BoxedStrategy<ContentHash> {
     prop_oneof![
         1 => Just(ContentHash::EMPTY),
         3 => any::<[u8; 32]>().prop_map(ContentHash::from_bytes),
@@ -109,7 +112,7 @@ fn hash() -> BoxedStrategy<ContentHash> {
 
 /// Index paths: plain, nested, NFC and NFD forms of one name, a space, a
 /// component of 255 bytes.
-fn path() -> BoxedStrategy<RelPath> {
+pub(crate) fn path() -> BoxedStrategy<RelPath> {
     let long = "l".repeat(255);
     select(vec![
         "a".to_owned(),
@@ -125,7 +128,7 @@ fn path() -> BoxedStrategy<RelPath> {
     .boxed()
 }
 
-fn host_name() -> BoxedStrategy<HostName> {
+pub(crate) fn host_name() -> BoxedStrategy<HostName> {
     select(vec![
         "",
         "laptop",
@@ -136,7 +139,7 @@ fn host_name() -> BoxedStrategy<HostName> {
     .boxed()
 }
 
-fn at() -> BoxedStrategy<Timestamp> {
+pub(crate) fn at() -> BoxedStrategy<Timestamp> {
     any::<i64>().prop_map(Timestamp::from_unix_nanos).boxed()
 }
 
@@ -470,7 +473,7 @@ fn rest() -> BoxedStrategy<Rest> {
         .boxed()
 }
 
-fn batch(folder: FolderId) -> BoxedStrategy<Batch> {
+pub(crate) fn batch(folder: FolderId) -> BoxedStrategy<Batch> {
     (
         batch_id(),
         node(),
@@ -537,7 +540,7 @@ fn hook() -> BoxedStrategy<Action> {
     .boxed()
 }
 
-fn rules() -> BoxedStrategy<Rules> {
+pub(crate) fn rules() -> BoxedStrategy<Rules> {
     (
         any::<u64>(),
         any::<u8>(),

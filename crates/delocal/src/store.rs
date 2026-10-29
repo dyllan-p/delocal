@@ -28,9 +28,9 @@ mod codec;
 pub mod host;
 mod load;
 #[cfg(test)]
-mod mirror;
+pub(crate) mod mirror;
 #[cfg(test)]
-mod sample;
+pub(crate) mod sample;
 pub mod schema;
 pub mod write;
 pub mod writer;

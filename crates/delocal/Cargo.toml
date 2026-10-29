@@ -23,6 +23,8 @@ blake3.workspace = true
 clap.workspace = true
 ignore.workspace = true
 notify.workspace = true
+# The wire format of the transport's messages (§6.3, §12).
+postcard.workspace = true
 # Fresh node and batch ids (§4, §7.4), which the engine takes as inputs:
 # `thread_rng` is a CSPRNG seeded from the operating system.
 rand = { workspace = true, features = ["thread_rng"] }
@@ -39,6 +41,9 @@ unicode-normalization.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+# `test-util` pauses tokio's clock, so a test can let 45 s of silence pass
+# at once (§6.3).
+tokio = { workspace = true, features = ["test-util"] }
 
 # `faults` builds FaultyFs (DESIGN.md §14.2), the filesystem layer's
 # fault-injecting wrapper, and the JSON fault spec it reads. Tests and the

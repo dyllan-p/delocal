@@ -34,8 +34,10 @@ unicode-normalization = "0.1.25"
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
 # The daemon's runtime (DESIGN.md Appendix A): one engine task, its timers,
 # the channels between it and the threads that do the I/O, and the signals
-# that stop it. `macros` is for `select!`, not for `#[tokio::main]`.
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "signal"] }
+# that stop it. `macros` is for `select!`, not for `#[tokio::main]`. `net`
+# and `io-util` are the transport's: its TCP connections, and reading and
+# writing their frames (§6.3).
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "sync", "time", "macros", "signal", "net", "io-util"] }
 clap = { version = "4.6.7", features = ["derive"] }
 tracing = "0.1.44"
 # `fmt` writes the log lines; ANSI colours and the `log` bridge are left out,
