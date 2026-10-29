@@ -1,0 +1,26 @@
+Takes a revert's move reported `Failed { HoldsIgnored }` for a local
+failure in `FolderState::trashed`, rather than giving it up as for a
+directory found not empty (§7.3, draft 64; §8.3 step 2): the move waits
+as holding ignored files, is tried again at every observation of the
+directory, and never ends while the file is there.
+
+test: delocal-sim regressions::a_reverts_move_of_a_directory_holding_ignored_files_is_given_up
+test: delocal-engine folder::tests::a_reverts_move_of_a_directory_holding_ignored_files_keeps_it
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index bde6742..7f8f0e8 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -3116,11 +3116,7 @@ impl FolderState {
+             // A directory holding files a user rule ignores is not empty, and
+             // a revert's move gives it up and keeps it, as for any directory
+             // found not empty (§7.3, draft 64; §8.3 step 2).
+-            ApplyOutcome::ChangedUnderneath { found }
+-            | ApplyOutcome::Failed {
+-                error: LocalError::HoldsIgnored,
+-                found,
+-            } => {
++            ApplyOutcome::ChangedUnderneath { found } => {
+                 self.wants.remove(path);
+                 let records = self.observe_found(now, at, path, &found);
+                 self.reconsider(now, path, DeferredReason::ChangedUnderneath);

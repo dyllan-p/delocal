@@ -1,0 +1,46 @@
+Removes the simulator's allowance for a directory a node keeps because a
+file a user rule ignores is in it (§7.3, draft 64): I1 compares it
+between nodes, I3 takes it for a deletion brought back, and the final
+phase waits for its deletion to end, which it never does while the file
+is there (quiescence).
+
+test: delocal-sim regressions::a_directory_held_by_an_ignored_file_is_no_divergence
+test: delocal-sim sim::tests::directories_held_by_an_ignored_file_are_left_out_of_i1_and_i3
+
+diff --git a/crates/sim/src/invariants.rs b/crates/sim/src/invariants.rs
+index 43a7d5d..80a2782 100644
+--- a/crates/sim/src/invariants.rs
++++ b/crates/sim/src/invariants.rs
+@@ -146,9 +146,7 @@ fn i1_convergence(sim: &Sim) -> Result<(), Failure> {
+         return Ok(());
+     };
+     let without_held = |id: NodeId, mut index: BTreeMap<RelPath, Live>| {
+-        for path in held_by_ignored(sim, id) {
+-            index.remove(&path);
+-        }
++        let _ = id;
+         index
+     };
+     let Some(reference) = live_index(sim, *first).map(|index| without_held(*first, index)) else {
+@@ -280,9 +278,6 @@ fn i3_no_resurrection(sim: &Sim) -> Result<(), Failure> {
+                 continue;
+             }
+             for id in sim.node_ids() {
+-                if held.get(id).is_some_and(|h| h.contains(path)) {
+-                    continue;
+-                }
+                 let live = sim
+                     .engine(*id)
+                     .and_then(|e| e.folder(sim.folder_id()))
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 73ba389..0070268 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -1201,7 +1201,6 @@ impl Sim {
+                 && f.deferred().next().is_none()
+                 && f.wants().iter().all(|w| {
+                     matches!(w.state, WantState::GaveUp | WantState::NoSource)
+-                        || held.contains(w.path())
+                 })
+         })
+     }

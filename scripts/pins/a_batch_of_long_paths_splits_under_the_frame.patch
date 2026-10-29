@@ -1,0 +1,23 @@
+Removes the byte bound from `batch::batch_len` (§7.4, draft 34), so a
+batch ends only at 10,000 entries however long their paths, and 10,000
+entries of 4,096-byte paths come to some 42 MB, over §6.3's 16 MiB
+frame. The simulator's paths are a few bytes long and its batches a few
+hundred entries, so no seed reaches the bound and the rule's unit tests
+stand in.
+
+test: delocal-engine batch::tests::splits_long_paths_at_four_mebibytes
+test: delocal-engine batch::tests::the_longest_paths_split_into_batches_that_each_fit_a_frame
+
+diff --git a/crates/engine/src/batch.rs b/crates/engine/src/batch.rs
+index c9c0d3e..98804d2 100644
+--- a/crates/engine/src/batch.rs
++++ b/crates/engine/src/batch.rs
+@@ -219,7 +219,7 @@ fn batch_len(records: &[(&IndexRecord, Option<ChangeKind>)]) -> usize {
+     let mut bytes = 0;
+     for (i, (record, _)) in records.iter().enumerate() {
+         bytes += estimated_bytes(&record.entry);
+-        if i == MAX_BATCH_ENTRIES || (i > 0 && bytes > MAX_BATCH_BYTES) {
++        if i == MAX_BATCH_ENTRIES {
+             return i;
+         }
+     }
