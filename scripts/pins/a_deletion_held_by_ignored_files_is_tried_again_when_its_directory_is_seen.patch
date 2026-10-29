@@ -13,11 +13,11 @@ test: delocal-engine folder::tests::a_deletion_above_one_held_by_ignored_files_w
 test: delocal-sim sim::tests::directories_held_by_an_ignored_file_are_left_out_of_i1_and_i3
 
 diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
-index bde6742..f3cade8 100644
+index 1062e5e..fb5e47f 100644
 --- a/crates/engine/src/folder.rs
 +++ b/crates/engine/src/folder.rs
-@@ -1356,9 +1356,7 @@ impl FolderState {
-         // re-evaluated on the next observation of it (§7.3, draft 64). What
+@@ -1357,9 +1357,7 @@ impl FolderState {
+         // 68, the watcher's event for an ignored file in it being one). What
          // a commit's guard found belongs to that commit's report, the one
          // that deferred it, so only a scan or the watcher counts.
 -        if observer == Observer::Scan {

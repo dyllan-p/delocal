@@ -1,0 +1,40 @@
+Takes draft 68's rule out of both hosts (DESIGN.md §7.3): an event for a
+path a rule ignores is no longer an observation of the directory holding
+it, in the daemon's watcher (`watched.rs`) or the simulator's
+(`watch_ignored`). A received deletion held because its directory holds
+ignored files then waits for the next full scan, up to an hour, after the
+user removes the last of them. No seed fails with this patch, since the
+final phase's scans observe every directory, so the rule's tests in both
+hosts stand in.
+
+test: delocal-sim sim::tests::removing_the_last_ignored_file_releases_a_held_deletion_without_a_scan
+test: delocal daemon::tests::watching::removing_the_last_ignored_file_releases_a_held_deletion_without_a_scan
+
+diff --git a/crates/delocal/src/daemon/executor/watched.rs b/crates/delocal/src/daemon/executor/watched.rs
+index 331e504..0a381fb 100644
+--- a/crates/delocal/src/daemon/executor/watched.rs
++++ b/crates/delocal/src/daemon/executor/watched.rs
+@@ -199,9 +199,6 @@ impl Watched<'_> {
+             ScanState::Skipped {
+                 reason: SkipReason::Ignored,
+             } => {
+-                if let Some(dir) = path.parent() {
+-                    self.holders.insert(dir);
+-                }
+                 Ok(())
+             }
+             // An open row that came between the check above and the look.
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 03d8630..3c5790c 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -4105,7 +4105,8 @@ impl Sim {
+         if held {
+             self.stats.holds_observed += 1;
+         }
+-        self.report_watched(id, dir)
++        let _ = dir;
++        Ok(())
+     }
+ 
+     /// A file path a step names, as the step spells it (§7.6): with the
