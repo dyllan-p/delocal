@@ -56,7 +56,14 @@
 //! guarded, and fsyncs it before the report.
 //!
 //! **The mtime shim** (§7.3, [`crate::shim`]). The guard sees a file's
-//! mtime as the engine is told it, through the folder's pairs.
+//! mtime as the engine is told it, through the folder's pairs. A write
+//! reads back the mtime its temp file kept, once it is set and synced and
+//! before the rename, so a user's write at the path after the rename is
+//! never taken for it; its pair, or the removal of an old one, goes with
+//! the report. A metadata-only apply reads back the file it set, and makes
+//! the pair durable before it reports (see [`crate::shim`] for why). A
+//! commit that leaves the path empty removes its pair, and a file displaced
+//! to a conflict copy takes its pair there.
 //!
 //! **Reports** (drafts 52, 58). Every report carries the time its
 //! operation ran: just after the rename or the change, or, for a failure,
@@ -95,7 +102,7 @@ use crate::reach::{self, DiskNames, Look, Sensitivity, Walk};
 use crate::scan::ignore_rules::{IgnoreRules, RuleSource};
 use crate::scan::stability::Stability;
 use crate::scan::{Clock, MARKER, Observer, OpenRows, Records};
-use crate::shim::Shims;
+use crate::shim::{self, Shims};
 use crate::store::{HostWrite, JournalRow, TrashRow};
 use crate::tmp;
 use crate::trash::{self, Moving, NotMoved};
@@ -229,7 +236,8 @@ pub struct Commit<'a> {
     pub names: &'a dyn DiskNames,
     /// Its mtime shim's pairs (§7.3).
     pub shims: &'a dyn Shims,
-    /// Where a displacement's journal row is made durable (§7.5).
+    /// Where a displacement's journal row is made durable (§7.5), and a
+    /// metadata-only apply's shim pair.
     pub journal: &'a dyn Journal,
     /// The engine's clock (§7.8): reports are dated by it.
     pub clock: &'a dyn Clock,
@@ -254,8 +262,10 @@ pub struct Committed {
     pub writes: Vec<HostWrite>,
     /// The directories the commit made above its path (§7.5 step 8).
     pub created: Vec<RelPath>,
-    /// Fsyncs that failed after the commit had landed: it is reported
-    /// `Ok`, but whether it survives a power loss is not known.
+    /// What failed after the commit had landed: an fsync, or the read-back
+    /// or the durable write of a metadata-only apply's shim pair. It is
+    /// reported `Ok`, but whether it survives a power loss, or reads back
+    /// as it landed, is not known.
     pub unsynced: Vec<io::Error>,
     /// The files a user rule ignores inside a directory this commit was to
     /// remove, which it therefore did not remove (§7.3, draft 64): `status`
@@ -864,6 +874,17 @@ impl Commit<'_> {
             Vec::new()
         };
         writes.extend(self.stale_name(at.path));
+        if let (Displace::ConflictCopy(copy), Found::Entry { seen, .. }) = (displace, &found)
+            && seen.kind == Kind::File
+        {
+            writes.extend(shim::moved(self.id, at.path, copy, self.shims));
+        }
+        writes.extend(match incoming {
+            Incoming::File { stored_ns, .. } => {
+                shim::kept(self.id, at.path, entry.mtime_ns, stored_ns, self.shims)
+            }
+            Incoming::Symlink { .. } | Incoming::Dir(_) => shim::gone(self.id, at.path, self.shims),
+        });
         Ok(Done {
             at: now,
             writes,
@@ -1084,6 +1105,9 @@ impl Commit<'_> {
                 let to = reach::disk_path(copy, self.names);
                 let how = rename_refusing(fs, &disk, &to).map_err(|e| changed_or_local(&e))?;
                 self.disk.renamed(how);
+                if seen.kind == Kind::File {
+                    writes.extend(shim::moved(self.id, at.path, copy, self.shims));
+                }
                 Some(to)
             }
             (Kind::File | Kind::Symlink, Displace::Trash) => {
@@ -1104,6 +1128,7 @@ impl Commit<'_> {
             }
         }
         writes.extend(self.stale_name(at.path));
+        writes.extend(shim::gone(self.id, at.path, self.shims));
         Ok(Done {
             at: now,
             writes,
@@ -1268,10 +1293,26 @@ impl Commit<'_> {
             return Err(changed_or_local(&e).into());
         }
         let now = self.clock.now();
-        let unsynced = fs.sync_file(&disk).err().into_iter().collect();
+        let mut unsynced: Vec<io::Error> = fs.sync_file(&disk).err().into_iter().collect();
+        // The mtime the filesystem kept (§7.3). If it cannot be read back,
+        // no pair can say what it is, and an old one is dropped.
+        let pair = match fs.lstat(&disk) {
+            Ok(stat) => shim::kept(self.id, at.path, mtime_ns, stat.mtime_ns, self.shims),
+            Err(e) => {
+                unsynced.push(e);
+                shim::gone(self.id, at.path, self.shims)
+            }
+        };
+        let writes: Vec<HostWrite> = pair.into_iter().collect();
+        // Durable before the report: see `crate::shim` for why.
+        if !writes.is_empty()
+            && let Err(e) = self.journal.durable(writes.clone())
+        {
+            unsynced.push(e);
+        }
         Ok(Done {
             at: now,
-            writes: Vec::new(),
+            writes,
             created: Vec::new(),
             unsynced,
         })
@@ -1308,6 +1349,7 @@ impl Commit<'_> {
             .filter_map(|dir| fs.sync_dir(dir).err())
             .collect();
         writes.extend(self.stale_name(at.path));
+        writes.extend(shim::gone(self.id, at.path, self.shims));
         Ok(Done {
             at: now,
             writes,
@@ -1397,8 +1439,9 @@ struct Displaced {
 /// What a write renames in, readied before anything at the path is
 /// touched.
 enum Incoming {
-    /// The fetched temp file, its mode and mtime set and its data durable.
-    File(PathBuf),
+    /// The fetched temp file, its mode and mtime set and its data durable,
+    /// and the mtime the filesystem kept when asked for the entry's (§7.3).
+    File { temp: PathBuf, stored_ns: i64 },
     /// A symlink made in `tmp/`, and the temp file its target came from.
     Symlink { link: PathBuf, temp: PathBuf },
     /// An empty directory made in `tmp/` (draft 65: every write goes
@@ -1411,7 +1454,7 @@ impl Incoming {
     /// What is renamed to the path: the temp the journal row names.
     fn path(&self) -> &Path {
         match self {
-            Self::File(temp) | Self::Dir(temp) => temp,
+            Self::File { temp, .. } | Self::Dir(temp) => temp,
             Self::Symlink { link, .. } => link,
         }
     }
@@ -1427,7 +1470,7 @@ impl Incoming {
             Self::Dir(dir) => {
                 let _ = fs.remove_dir(dir);
             }
-            Self::File(_) => {}
+            Self::File { .. } => {}
         }
     }
 
@@ -1461,7 +1504,13 @@ fn ready(fs: &dyn Fs, entry: &Entry, temp: Option<&Path>) -> Result<Incoming, Fa
             }
             fs.set_mtime(temp, entry.mtime_ns).map_err(|e| io(&e))?;
             fs.sync_file(temp).map_err(|e| io(&e))?;
-            Ok(Incoming::File(temp.to_path_buf()))
+            // Read back from the temp file, which nothing else writes: at
+            // the path after the rename it could be a user's write.
+            let stored_ns = fs.lstat(temp).map_err(|e| io(&e))?.mtime_ns;
+            Ok(Incoming::File {
+                temp: temp.to_path_buf(),
+                stored_ns,
+            })
         }
         Kind::Symlink => {
             let temp = temp.ok_or(Fail::Local(LocalError::Io))?;
