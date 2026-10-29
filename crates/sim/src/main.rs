@@ -329,6 +329,7 @@ fn main() -> ExitCode {
                 totals.ignored_put += outcome.stats.ignored_put;
                 totals.ignored_taken += outcome.stats.ignored_taken;
                 totals.holds_ignored += outcome.stats.holds_ignored;
+                totals.holds_observed += outcome.stats.holds_observed;
                 if args.digests {
                     println!("seed {seed} digest {}", hex(&outcome.fingerprint));
                 }
