@@ -302,9 +302,9 @@ enum Fail {
     Local(LocalError),
     /// A directory to be removed holds files a user rule ignores (§7.3,
     /// draft 64): nothing was removed, and these are the files, which
-    /// `status` names. The engine has no want state for this yet, so it is
-    /// reported as `ChangedUnderneath`, as any directory found not empty,
-    /// and the delete waits for the next observation of the directory.
+    /// `status` names. Reported as `Failed { HoldsIgnored }`: the engine
+    /// defers a received deletion until the next observation of the
+    /// directory, and gives a revert's move up.
     HoldsIgnored(Vec<RelPath>),
     /// `Failed`, and what the host found is not to be trusted as an
     /// observation, so the report carries `Skipped` for `reason`: the root
@@ -433,7 +433,10 @@ impl Commit<'_> {
                     Fail::Changed => ApplyOutcome::ChangedUnderneath { found },
                     Fail::HoldsIgnored(files) => {
                         holds_ignored = files;
-                        ApplyOutcome::ChangedUnderneath { found }
+                        ApplyOutcome::Failed {
+                            error: LocalError::HoldsIgnored,
+                            found,
+                        }
                     }
                     Fail::Local(error) => ApplyOutcome::Failed { error, found },
                     Fail::Blind { error, .. } => ApplyOutcome::Failed { error, found },
