@@ -82,6 +82,8 @@ pub struct Disk {
     pub tmp: tempfile::TempDir,
     pub records: BTreeMap<RelPath, Entry>,
     pub names: BTreeMap<RelPath, OsString>,
+    /// The mtime shim's pairs, as the host keeps them (§7.3).
+    pub shims: BTreeMap<RelPath, crate::store::Shim>,
     pub journal: MemJournal,
     pub state: DiskState,
 }
@@ -95,6 +97,7 @@ impl Disk {
             tmp,
             records: BTreeMap::new(),
             names: BTreeMap::new(),
+            shims: BTreeMap::new(),
             journal: MemJournal::default(),
             state: DiskState::new(),
         }
@@ -169,6 +172,7 @@ impl Disk {
             folder,
             records: &self.records,
             names: &self.names,
+            shims: &self.shims,
             journal,
             clock: &clock,
             stability: &settled(),
@@ -186,6 +190,7 @@ impl Disk {
             folder,
             records: &self.records,
             names: &self.names,
+            shims: &self.shims,
             journal: &self.journal,
             clock: &clock,
             stability: &settled(),
@@ -203,6 +208,7 @@ impl Disk {
             folder: &self.folder(),
             records: &self.records,
             open: &self.state,
+            shims: &self.shims,
             clock: &clock,
             stability: &settled(),
             hashers: std::num::NonZeroUsize::MIN,

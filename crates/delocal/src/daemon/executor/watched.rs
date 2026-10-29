@@ -145,6 +145,7 @@ impl Watched<'_> {
             folder: &*self.kept.folder,
             records: &*self.kept.records,
             names: &self.names,
+            shims: &*self.kept.shims,
             journal: self.journal,
             clock: self.clock,
             stability: &self.kept.stability,

@@ -29,9 +29,11 @@
 //!
 //! **What the executor knows of the index** is its own copy of each
 //! folder's live records and names on disk, kept up to date by jobs the
-//! engine task releases in the same order as the effects. A commit or an
+//! engine task releases in the same order as the effects, and of its mtime
+//! shim's pairs (§7.3). A commit or an
 //! observation therefore compares against the records as of the event that
-//! asked for it. A scan compares against a copy taken when it starts. Each
+//! asked for it. A scan compares against a copy of the records and pairs
+//! taken when it starts. Each
 //! report of `Unchanged` goes back with the record it was compared against,
 //! for the engine task to check against the engine's record now (§7.3:
 //! `Unchanged` is relative to a record).
@@ -57,7 +59,7 @@ use crate::commit::{Commit, DiskState, StoreJournal};
 use crate::fs::Folder;
 use crate::scan::stability::Stability;
 use crate::scan::{Scan, ScanReport};
-use crate::store::{HostWrite, Writer};
+use crate::store::{HostWrite, Shim, Writer};
 
 mod watched;
 
@@ -145,6 +147,9 @@ pub(crate) struct Kept {
     pub records: Arc<BTreeMap<RelPath, Entry>>,
     /// Its names on disk that are not their index paths'.
     pub names: BTreeMap<RelPath, OsString>,
+    /// Its mtime shim's pairs (§7.3), shared with a running scan as they
+    /// were when it started.
+    pub shims: Arc<BTreeMap<RelPath, Shim>>,
     pub disk: Arc<DiskState>,
     /// Its stability check, with the first looks it keeps (§7.3).
     pub stability: Arc<Stability>,
@@ -163,6 +168,7 @@ impl Kept {
             folder: &*self.folder,
             records: &*self.records,
             names: &self.names,
+            shims: &*self.shims,
             journal,
             clock,
             stability: &self.stability,
@@ -404,6 +410,7 @@ impl Executor {
             id,
             folder: Arc::clone(&kept.folder),
             records: Arc::clone(&kept.records),
+            shims: Arc::clone(&kept.shims),
             disk: Arc::clone(&kept.disk),
             stability: Arc::clone(&kept.stability),
             clock: Arc::clone(&self.clock),
@@ -470,6 +477,8 @@ struct Scanner {
     /// The live records as the scan starts: what its fast path compares
     /// against.
     records: Arc<BTreeMap<RelPath, Entry>>,
+    /// The shim's pairs as the scan starts (§7.3).
+    shims: Arc<BTreeMap<RelPath, Shim>>,
     disk: Arc<DiskState>,
     stability: Arc<Stability>,
     clock: Arc<Clock>,
@@ -484,6 +493,7 @@ impl Scanner {
             folder: &*self.folder,
             records: &*self.records,
             open: &*self.disk,
+            shims: &*self.shims,
             clock: &*self.clock,
             stability: &self.stability,
             hashers: self.hashers,
@@ -615,6 +625,7 @@ mod tests {
                     folder: Arc::new(RealFolder::new(&root)),
                     records: Arc::new(BTreeMap::from([(p(nfc), file.clone())])),
                     names: BTreeMap::from([(p(nfc), OsString::from(nfd))]),
+                    shims: Arc::new(BTreeMap::new()),
                     disk: Arc::new(DiskState::new()),
                     stability: Arc::new(Stability::real()),
                 },

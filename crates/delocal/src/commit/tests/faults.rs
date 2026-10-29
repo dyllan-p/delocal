@@ -1061,6 +1061,7 @@ fn kill_child() {
         folder: &spy,
         records: &records,
         names: &names,
+        shims: &BTreeMap::<RelPath, crate::store::Shim>::new(),
         journal: &journal,
         clock: &clock,
         stability: &settled(),

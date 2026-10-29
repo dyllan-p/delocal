@@ -18,7 +18,8 @@
 //!    the engine task starts as soon as it runs.
 //!
 //! It also reads each known peer's Tailscale node from `machines` (§5), for
-//! the engine task's tiers (§6.4).
+//! the engine task's tiers (§6.4), and each folder's mtime shim pairs
+//! (§7.3), which the restart keeps.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -39,7 +40,7 @@ use crate::fs::{FileKind, Folder, Fs};
 use crate::reach;
 use crate::scan::MARKER;
 use crate::scan::stability::Stability;
-use crate::store::{Group, Store, Writer};
+use crate::store::{Group, Shim, Store, Writer};
 use crate::tailscale::StableId;
 use crate::tmp;
 use crate::trash::Policy;
@@ -52,6 +53,8 @@ pub(crate) struct Opened {
     pub folder: Arc<dyn Folder>,
     pub records: BTreeMap<RelPath, Entry>,
     pub names: BTreeMap<RelPath, OsString>,
+    /// Its mtime shim's pairs (§7.3).
+    pub shims: BTreeMap<RelPath, Shim>,
     pub disk: Arc<DiskState>,
     pub stability: Arc<Stability>,
 }
@@ -91,6 +94,11 @@ pub(crate) fn start(
             .disk_names(row.id)?
             .into_iter()
             .map(|n| (n.path, n.name))
+            .collect();
+        let shims: BTreeMap<RelPath, Shim> = store
+            .shims(row.id)?
+            .into_iter()
+            .map(|shim| (shim.path.clone(), shim))
             .collect();
         let journal = store.journal(row.id)?;
         let trash = store.trash(row.id)?;
@@ -165,6 +173,7 @@ pub(crate) fn start(
             folder,
             records: BTreeMap::new(),
             names,
+            shims,
             disk,
             stability: Arc::new(Stability::new(Arc::clone(&setup.realtime))),
         });
