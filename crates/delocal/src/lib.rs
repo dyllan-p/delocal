@@ -11,6 +11,8 @@
 //!   the executor, the timers and the watcher (§10, §11, §7.8, §7.3)
 //! - [`fs`]: the filesystem layer, every operation on a folder (§14.2)
 //! - [`names`]: names on disk and the index paths they map to (§7.1, §7.3)
+//! - [`net`]: the transport: connections to this user's other machines and
+//!   the protocol's messages (§6.3, §12, §5)
 //! - [`reach`]: an index path on disk: its names, the walk to it that never
 //!   crosses a mount point, and what a filesystem that folds names answers
 //!   (§7.3, §7.5)
@@ -32,6 +34,7 @@ pub mod commit;
 pub mod daemon;
 pub mod fs;
 pub mod names;
+pub mod net;
 pub mod reach;
 pub mod scan;
 pub mod shim;
