@@ -63,6 +63,17 @@
 //! fast path, the report is relative to a record that is gone, and is
 //! passed on as `Skipped { Unstable }` instead (seen, and nothing more) and
 //! the path observed again 2 s later.
+//!
+//! **A shim pair that changed under a scan** (§7.3). A scan reports file
+//! mtimes through a copy of the folder's mtime shim pairs taken when it
+//! started. A commit that lands while it runs changes its path's pair at
+//! once, and a scan that reaches the path after the commit would report the
+//! mtime the filesystem stored, untranslated, which reads as a touch. So
+//! while a scan runs this task notes every path whose pair a commit's
+//! writes change, and the scan's report of such a path is passed on as
+//! `Skipped { Unstable }` and the path observed again 2 s later, through the
+//! pairs as they are. A report that arrives before the commit's is no
+//! danger: the path is in flight then, and the engine ignores it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -200,6 +211,9 @@ pub(crate) struct Watch {
     /// scan may have walked past them before, so what it found there is
     /// not taken.
     pub touched: BTreeSet<RelPath>,
+    /// Paths whose mtime shim pair a commit changed while the scan ran
+    /// (§7.3): the scan's reports of them are not taken.
+    pub reshimmed: BTreeSet<RelPath>,
     /// `IndexChanged`s the running scan's events produced.
     pub changes: usize,
     /// Where the folder is on disk, for its watch.
@@ -381,6 +395,11 @@ impl Core {
         if let Some((folder, path)) = relative(&self.engine, &mut event, compared.as_ref()) {
             debug!(folder = %folder.short(), %path, "unchanged against a record that moved");
         }
+        if source == Source::Scan
+            && let Some((folder, path)) = reshimmed(&self.folders, &mut event)
+        {
+            debug!(folder = %folder.short(), %path, "scanned against a shim pair since changed");
+        }
         let unstable = unstable(&event);
         if source != Source::Scan
             && let Some(folder) = folder_of(&event)
@@ -394,6 +413,12 @@ impl Core {
                     }
                     HostWrite::RemoveDiskName { path, .. } => {
                         watch.touched.insert(path.clone());
+                    }
+                    HostWrite::PutShim { shim, .. } => {
+                        watch.reshimmed.insert(shim.path.clone());
+                    }
+                    HostWrite::RemoveShim { path, .. } => {
+                        watch.reshimmed.insert(path.clone());
                     }
                     _ => {}
                 }
@@ -691,6 +716,7 @@ impl Core {
         watch.next_scan = None;
         watch.skipped.clear();
         watch.touched.clear();
+        watch.reshimmed.clear();
         watch.changes = 0;
         self.direct(Job::Scan { folder: id })
     }
@@ -839,6 +865,35 @@ fn names_written(id: FolderId, watch: &Watch, report: &ScanReport) -> Vec<HostWr
         }
     }
     writes
+}
+
+/// A scan's report of a path whose shim pair a commit changed while the
+/// scan ran (see the module docs) becomes `Skipped { Unstable }`; the path,
+/// if so. A skip stays as it is.
+fn reshimmed(
+    folders: &BTreeMap<FolderId, Watch>,
+    event: &mut Event,
+) -> Option<(FolderId, RelPath)> {
+    let Event::Scanned {
+        folder,
+        path,
+        state,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    if matches!(state, ScanState::Skipped { .. }) {
+        return None;
+    }
+    let watch = folders.get(folder)?;
+    if !watch.scanning || !watch.reshimmed.contains(path) {
+        return None;
+    }
+    *state = ScanState::Skipped {
+        reason: SkipReason::Unstable,
+    };
+    Some((*folder, path.clone()))
 }
 
 /// An `Unchanged` compared against a record the engine no longer holds
