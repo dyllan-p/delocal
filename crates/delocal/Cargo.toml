@@ -23,6 +23,8 @@ blake3.workspace = true
 clap.workspace = true
 ignore.workspace = true
 notify.workspace = true
+# The wire format of the transport's messages (§6.3, §12).
+postcard.workspace = true
 # Fresh node and batch ids (§4, §7.4), which the engine takes as inputs:
 # `thread_rng` is a CSPRNG seeded from the operating system.
 rand = { workspace = true, features = ["thread_rng"] }
