@@ -7,16 +7,16 @@ test: delocal-sim regressions::a_revert_moves_only_an_empty_directory_to_the_tra
 test: delocal-sim sim::tests::the_host_moves_only_an_empty_directory_to_the_trash
 
 diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
-index ddaa102..fcf1c1a 100644
+index 73ba389..9c63b6b 100644
 --- a/crates/sim/src/sim.rs
 +++ b/crates/sim/src/sim.rs
-@@ -3288,9 +3288,6 @@ impl Sim {
+@@ -3312,9 +3312,6 @@ impl Sim {
              // directory delete (§7.5, draft 61). Its children's own moves
              // ran first, so anything still inside is something the revert
              // did not know of, and it stays.
 -            if has_children(node, path) {
 -                return (changed(node), Vec::new());
 -            }
-             if let Some(error) = fail {
-                 return (failed(node, error), Vec::new());
-             }
+             // Nor one holding a file a user rule ignores, and the host says
+             // so (§7.3, draft 64).
+             if holds_ignored(node, path) {
