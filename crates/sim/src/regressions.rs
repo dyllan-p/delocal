@@ -48,8 +48,9 @@ fn skipping() -> Knobs {
 /// `knobs` without draft 34's simulator models (§14.1): no crash between a
 /// commit's two renames, no group-commit lag, a displaced directory leaves
 /// its children, and no scan skips a path (§7.3). Nor the later ones: no
-/// fetch or commit fails on its machine (§7.5), and no node ignores case
-/// (§7.6). Every pin before them was found this way.
+/// fetch or commit fails on its machine (§7.5), no node ignores case
+/// (§7.6), and no user keeps ignored files in the folder (§7.3). Every pin
+/// before them was found this way.
 fn before_draft_34(knobs: &Knobs) -> Knobs {
     Knobs {
         crash_between_renames: 0.0,
@@ -59,6 +60,7 @@ fn before_draft_34(knobs: &Knobs) -> Knobs {
         io_failure: 0.0,
         disk_fill: 0.0,
         case_variants: 0.0,
+        ignored_files: 0.0,
         ..knobs.clone()
     }
 }

@@ -76,6 +76,14 @@ pub struct Knobs {
     /// The final phase's scans take no time. Up to 10 s by default, the
     /// time a large folder's hashing takes.
     pub scan_delay_ms: (u64, u64),
+    /// Probability, after each step, that one node's user puts a file a
+    /// rule of their own ignores into a directory of the folder there, or,
+    /// half the time when that disk has one, takes one away (§7.3, draft
+    /// 64). Such a file is never reported or synced, but it is on disk: a
+    /// directory holding one is not removed, its received deletion waits,
+    /// and a revert's move of it gives up. Files left at the end keep their
+    /// directories, which I1 and I3 exempt.
+    pub ignored_files: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,
     /// Check I9, what revert discards stays discarded (§14.1), and fail a
@@ -101,6 +109,7 @@ impl Default for Knobs {
             disk_fill: 0.002,
             case_variants: 0.02,
             scan_delay_ms: (0, 10_000),
+            ignored_files: 0.02,
             nodes: None,
             check_i9: true,
         }
@@ -111,7 +120,7 @@ impl fmt::Display for Knobs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {} --scan-delay-ms {}..{} --check-i9 {}",
+            "--corruption {} --drop-watcher {} --delay-ms {}..{} --crash-after-rename {} --crash-between-renames {} --group-commit-lag {} --displace-subtrees {} --skip {} --io-failure {} --disk-fill {} --case-variants {} --scan-delay-ms {}..{} --ignored-files {} --check-i9 {}",
             self.corruption,
             self.drop_watcher,
             self.delay_ms.0,
@@ -126,6 +135,7 @@ impl fmt::Display for Knobs {
             self.case_variants,
             self.scan_delay_ms.0,
             self.scan_delay_ms.1,
+            self.ignored_files,
             self.check_i9
         )?;
         if let Some(n) = self.nodes {

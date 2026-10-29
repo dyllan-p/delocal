@@ -64,6 +64,9 @@ const CASE_STREAM: u64 = 5;
 /// The PRNG stream a full scan's delay between its read and its reports
 /// is drawn from (§14.1, draft 58).
 const SCAN_STREAM: u64 = 6;
+/// The PRNG stream the users' ignored files are drawn from (§7.3, draft
+/// 64): when one is put into a directory or taken away, where, and by whom.
+const IGNORED_STREAM: u64 = 7;
 /// How often a host whose folder's inbound is paused checks for free
 /// space (§7.5).
 const SPACE_CHECK_NANOS: i64 = 30 * NANOS;
@@ -141,6 +144,13 @@ pub struct Stats {
     /// for: a delayed scan's report that arrived after the watcher's.
     pub out_of_order: u64,
     pub out_of_order_acted: u64,
+    /// Files a user rule ignores, put into a directory by a node's user and
+    /// taken away again (§7.3, draft 64).
+    pub ignored_put: u64,
+    pub ignored_taken: u64,
+    /// Removals and moves to the trash a host refused because the
+    /// directory held one of them.
+    pub holds_ignored: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -344,6 +354,12 @@ struct Node {
     /// them, and how many more of this node's full scans the rule lasts
     /// (§7.3). On disk, so a restart keeps them.
     ignored: BTreeMap<RelPath, u32>,
+    /// Files a rule of the user's own ignores, each in a directory of the
+    /// folder (§7.3, draft 64): on disk but never tracked, so no scan or
+    /// watcher reports them and nothing syncs them. They are not in `fs`,
+    /// which holds what sync can see, but they go wherever their directory
+    /// goes, and a directory holding one is not removed.
+    ignored_files: BTreeSet<RelPath>,
     /// The disk has no free space until then (§7.5).
     full_until: Option<Timestamp>,
     /// When the host next checks for free space, while the folder's inbound
@@ -487,6 +503,9 @@ struct JournalRow {
     moved: Vec<(RelPath, File)>,
     /// Where in the node's trash the moved files start, for `Displace::Trash`.
     trash_at: usize,
+    /// The files a user rule ignores that went along, at the paths they had
+    /// (§7.3, draft 64).
+    ignored: Vec<RelPath>,
 }
 
 /// What one full scan reports under the skip model (§7.3).
@@ -793,6 +812,8 @@ pub struct Sim {
     case_rng: ChaCha8Rng,
     /// Draws for the scan delay, on `SCAN_STREAM`.
     scan_rng: ChaCha8Rng,
+    /// Draws for the users' ignored files, on `IGNORED_STREAM`.
+    ignored_rng: ChaCha8Rng,
     /// While a node is fed an event: which node, what kind of event, and
     /// its index's `seq` as the event began, for the disk-full checker.
     feeding: Option<Feeding>,
@@ -902,6 +923,7 @@ impl Sim {
                 temp: BTreeMap::new(),
                 journal: Vec::new(),
                 ignored: BTreeMap::new(),
+                ignored_files: BTreeSet::new(),
                 full_until: None,
                 space_check_at: None,
                 observe: BTreeSet::new(),
@@ -944,6 +966,8 @@ impl Sim {
         case_rng.set_stream(CASE_STREAM);
         let mut scan_rng = ChaCha8Rng::seed_from_u64(seed);
         scan_rng.set_stream(SCAN_STREAM);
+        let mut ignored_rng = ChaCha8Rng::seed_from_u64(seed);
+        ignored_rng.set_stream(IGNORED_STREAM);
         let watch = knobs.check_i9.then(i9::Watch::default);
         let mut sim = Self {
             seed,
@@ -955,6 +979,7 @@ impl Sim {
             fail_rng,
             case_rng,
             scan_rng,
+            ignored_rng,
             feeding: None,
             checking: None,
             committing: BTreeMap::new(),
@@ -1071,6 +1096,7 @@ impl Sim {
         self.steps = steps.to_vec();
         for step in steps {
             self.apply(step)?;
+            self.tend_ignored_files();
             self.steps_applied += 1;
             let settle = self.rng.random_range(NANOS..30 * NANOS);
             let end = self.clock.plus_nanos(settle);
@@ -1159,6 +1185,9 @@ impl Sim {
             let Some(f) = engine.folder(self.folder) else {
                 return false;
             };
+            // A deletion held by ignored files waits until the user takes
+            // them away, which the final phase never does (§7.3, draft 64).
+            let held = invariants::held_by_ignored(self, n.id);
             n.online
                 && n.restart_at.is_none()
                 && n.observe.is_empty()
@@ -1170,9 +1199,10 @@ impl Sim {
                 && f.quarantine().is_empty()
                 && f.paused().is_none()
                 && f.deferred().next().is_none()
-                && f.wants()
-                    .iter()
-                    .all(|w| matches!(w.state, WantState::GaveUp | WantState::NoSource))
+                && f.wants().iter().all(|w| {
+                    matches!(w.state, WantState::GaveUp | WantState::NoSource)
+                        || held.contains(w.path())
+                })
         })
     }
 
@@ -1191,10 +1221,12 @@ impl Sim {
             let Some(f) = engine.folder(self.folder) else {
                 continue;
             };
+            let held = invariants::held_by_ignored(self, n.id);
             let wants: Vec<String> = f
                 .wants()
                 .iter()
                 .filter(|w| !matches!(w.state, WantState::GaveUp | WantState::NoSource))
+                .filter(|w| !held.contains(w.path()))
                 .map(|w| format!("{}={:?}", w.path(), w.state))
                 .collect();
             if !wants.is_empty()
@@ -1535,16 +1567,7 @@ impl Sim {
                 &cause,
                 group_open,
                 |p| node.and_then(|n| content_at(n, p)),
-                |p| {
-                    folder.is_some_and(|f| {
-                        f.index()
-                            .live_records()
-                            .any(|r| p.is_ancestor_of(&r.entry.path))
-                            || f.wants()
-                                .iter()
-                                .any(|w| !w.is_delete() && p.is_ancestor_of(w.path()))
-                    }) || node.is_some_and(|n| n.fs.keys().any(|q| p.is_ancestor_of(q)))
-                },
+                |p| something_beneath(node, folder, p),
             );
         }
         let outer = std::mem::replace(&mut self.observing, observing);
@@ -2913,11 +2936,12 @@ impl Sim {
                 let fail = self.local_failure(node, matches!(*action, Action::Write { .. }));
                 // What the disk held, for the check that a failed commit left
                 // it so; only a commit that can fail needs it: one drawn to,
-                // and one on a filesystem that ignores case.
+                // one on a filesystem that ignores case, and one on a disk
+                // holding ignored files.
                 let before = self
                     .nodes
                     .get(&node)
-                    .filter(|n| fail.is_some() || n.case_insensitive)
+                    .filter(|n| fail.is_some() || n.case_insensitive || !n.ignored_files.is_empty())
                     .map(|n| (n.fs.clone(), n.trash.clone()));
                 // I9: where a commit's displacement to a conflict copy would
                 // move what is at the path, and everything a rename of it
@@ -3291,6 +3315,12 @@ impl Sim {
             if has_children(node, path) {
                 return (changed(node), Vec::new());
             }
+            // Nor one holding a file a user rule ignores, and the host says
+            // so (§7.3, draft 64).
+            if holds_ignored(node, path) {
+                self.stats.holds_ignored += 1;
+                return (failed(node, LocalError::HoldsIgnored), Vec::new());
+            }
             if let Some(error) = fail {
                 return (failed(node, error), Vec::new());
             }
@@ -3411,6 +3441,18 @@ impl Sim {
                 if !renamed && has_children(node, path) {
                     return (changed(node), created); // not empty
                 }
+                // Nor while it holds a file a user rule ignores (§7.3, draft
+                // 64), which the host reports when the directory is to go to
+                // the trash. Without subtrees a non-empty directory cannot
+                // be displaced at all (see the knob), so a conflict copy is
+                // refused as for a tracked child.
+                if !renamed && holds_ignored(node, path) {
+                    if *displace == Displace::Trash {
+                        self.stats.holds_ignored += 1;
+                        return (failed(node, LocalError::HoldsIgnored), created);
+                    }
+                    return (changed(node), created);
+                }
                 if let Displace::ConflictCopy(target) = displace
                     && node.fs.contains_key(target)
                 {
@@ -3420,6 +3462,9 @@ impl Sim {
                     self.stats.subtrees_displaced += 1;
                 }
                 let moved = displace_path(node, path, displace, subtrees);
+                if subtrees {
+                    displace_ignored(node, path, displace);
+                }
                 if let Displace::ConflictCopy(target) = displace {
                     follow_moved(node, path, target, &moved, now);
                 }
@@ -3987,6 +4032,47 @@ impl Sim {
         }
     }
 
+    /// A node's user keeps files out of sync with a rule of their own
+    /// (§7.3, draft 64): with the knob's probability after each step, the
+    /// user of a node drawn at random takes one of its ignored files away,
+    /// half the time when its disk has one, and otherwise puts `local.env`
+    /// into one of its directories. Nothing is reported, since a host never
+    /// reports a path a user rule ignores that it does not track, and the
+    /// user's own edits (I2) are of tracked paths only. Every draw is on
+    /// `IGNORED_STREAM`, and none is made with the knob at 0.
+    fn tend_ignored_files(&mut self) {
+        let p = self.knobs.ignored_files;
+        if p <= 0.0 || self.ignored_rng.random::<f64>() >= p {
+            return;
+        }
+        let id = self.order[self.ignored_rng.random_range(0..self.order.len())];
+        let Some(n) = self.nodes.get_mut(&id) else {
+            return;
+        };
+        if !n.ignored_files.is_empty() && self.ignored_rng.random::<bool>() {
+            let i = self.ignored_rng.random_range(0..n.ignored_files.len());
+            if let Some(file) = n.ignored_files.iter().nth(i).cloned() {
+                n.ignored_files.remove(&file);
+                self.stats.ignored_taken += 1;
+            }
+            return;
+        }
+        let dirs: Vec<&RelPath> =
+            n.fs.iter()
+                .filter(|(_, f)| f.kind == Kind::Dir)
+                .map(|(p, _)| p)
+                .collect();
+        if dirs.is_empty() {
+            return;
+        }
+        let dir = dirs[self.ignored_rng.random_range(0..dirs.len())];
+        if let Ok(file) = RelPath::new(format!("{dir}/local.env"))
+            && n.ignored_files.insert(file)
+        {
+            self.stats.ignored_put += 1;
+        }
+    }
+
     /// A file path a step names, as the step spells it (§7.6): with the
     /// knob's probability its file name is in upper case, `F3` for `f3`.
     /// Only file names vary, never directories, so the paths of a pair
@@ -4151,7 +4237,8 @@ impl Sim {
         self.ensure_parent(id, path)?;
         let now = self.now_for(id).as_unix_nanos();
         if let Some(n) = self.nodes.get_mut(&id) {
-            // A directory in the way is removed with its children first.
+            // A directory in the way is removed with its children first,
+            // ignored files included.
             if n.fs.get(path).is_some_and(|f| f.kind == Kind::Dir) {
                 let under: Vec<RelPath> =
                     n.fs.keys()
@@ -4161,6 +4248,7 @@ impl Sim {
                 for p in under {
                     n.fs.remove(&p);
                 }
+                n.ignored_files.retain(|f| !path.is_ancestor_of(f));
             }
             let exec = exec.unwrap_or_else(|| n.fs.get(path).is_some_and(|f| f.exec));
             n.fs.insert(
@@ -4189,6 +4277,9 @@ impl Sim {
                 for p in &gone {
                     n.fs.remove(p);
                 }
+                // The user's `rm -r` takes the ignored files too, which no
+                // watcher reports (see `tend_ignored_files`).
+                n.ignored_files.retain(|f| !path.is_ancestor_of(f));
                 gone
             }
             None => Vec::new(),
@@ -4285,6 +4376,11 @@ impl Sim {
         self.nodes.get(&id).map(|n| &n.fs)
     }
 
+    /// The files a user rule ignores on `id`'s disk (§7.3, draft 64).
+    pub(crate) fn ignored_files(&self, id: NodeId) -> Option<&BTreeSet<RelPath>> {
+        self.nodes.get(&id).map(|n| &n.ignored_files)
+    }
+
     pub(crate) fn trash(&self, id: NodeId) -> &[ContentHash] {
         self.nodes.get(&id).map_or(&[], |n| n.trash.as_slice())
     }
@@ -4356,6 +4452,13 @@ impl Sim {
                     h.update(&bytes);
                 }
                 if let Ok(bytes) = postcard::to_stdvec(&n.trash) {
+                    h.update(&bytes);
+                }
+                // Only when there are any, so a run without them keeps the
+                // fingerprint it had before they were modelled.
+                if !n.ignored_files.is_empty()
+                    && let Ok(bytes) = postcard::to_stdvec(&n.ignored_files)
+                {
                     h.update(&bytes);
                 }
             }
@@ -4550,6 +4653,50 @@ fn has_children(node: &Node, path: &RelPath) -> bool {
     node.fs.keys().any(|p| path.is_ancestor_of(p))
 }
 
+/// True if a file a user rule ignores lies under `path` (§7.3, draft 64).
+fn holds_ignored(node: &Node, path: &RelPath) -> bool {
+    node.ignored_files.iter().any(|f| path.is_ancestor_of(f))
+}
+
+/// For I9's live directory record (§8.3 step 2): whether something is
+/// beneath `path` on a node once an event is over. A live record or a
+/// wanted live entry of its engine's, or anything on its disk, a file a
+/// user rule ignores included (§7.3, draft 64), since a revert's move gives
+/// up a directory holding one as it does one found not empty.
+fn something_beneath(node: Option<&Node>, folder: Option<&FolderState>, path: &RelPath) -> bool {
+    folder.is_some_and(|f| {
+        f.index()
+            .live_records()
+            .any(|r| path.is_ancestor_of(&r.entry.path))
+            || f.wants()
+                .iter()
+                .any(|w| !w.is_delete() && path.is_ancestor_of(w.path()))
+    }) || node
+        .is_some_and(|n| n.fs.keys().any(|q| path.is_ancestor_of(q)) || holds_ignored(n, path))
+}
+
+/// The files a user rule ignores under `path` go where a rename of it to
+/// `to` takes them: beneath the conflict-copy path, or into the trash,
+/// where nothing sync answers for is kept of them (§7.6, §8.4). Returns the
+/// paths they had.
+fn displace_ignored(node: &mut Node, path: &RelPath, to: &Displace) -> Vec<RelPath> {
+    let moving: Vec<RelPath> = node
+        .ignored_files
+        .iter()
+        .filter(|f| path.is_ancestor_of(f))
+        .cloned()
+        .collect();
+    for from in &moving {
+        node.ignored_files.remove(from);
+        if let Displace::ConflictCopy(target) = to
+            && let Some(at) = rebase(from, path, target)
+        {
+            node.ignored_files.insert(at);
+        }
+    }
+    moving
+}
+
 /// §7.5 step 7: move what is at `path` aside, to the trash or to a
 /// conflict-copy path, with one rename. With `subtree`, a directory takes
 /// everything under it, as a real rename does (§7.6); without, only its own
@@ -4610,6 +4757,11 @@ fn displace_journalled(
     }
     let trash_at = node.trash.len();
     let moved = displace_path(node, path, to, subtree);
+    let ignored = if subtree {
+        displace_ignored(node, path, to)
+    } else {
+        Vec::new()
+    };
     if let Displace::ConflictCopy(target) = to {
         follow_moved(node, path, target, &moved, now);
     }
@@ -4619,6 +4771,7 @@ fn displace_journalled(
         at: now,
         moved,
         trash_at,
+        ignored,
     });
     true
 }
@@ -4656,6 +4809,7 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) -> Vec<(RelPath, RelPa
             for (from, file) in row.moved {
                 node.fs.insert(from, file);
             }
+            node.ignored_files.extend(row.ignored);
         }
         Displace::ConflictCopy(target) => {
             let under: Vec<RelPath> = node
@@ -4672,6 +4826,18 @@ fn undo(node: &mut Node, row: JournalRow, now: Timestamp) -> Vec<(RelPath, RelPa
                     follow(node, &at, &back, file.hash(), now);
                     node.fs.insert(back.clone(), file);
                     back_from_copy.push((at, back));
+                }
+            }
+            let ignored: Vec<RelPath> = node
+                .ignored_files
+                .iter()
+                .filter(|p| target.is_ancestor_of(p))
+                .cloned()
+                .collect();
+            for at in ignored {
+                if let Some(back) = rebase(&at, target, &row.path) {
+                    node.ignored_files.remove(&at);
+                    node.ignored_files.insert(back);
                 }
             }
         }
@@ -5804,6 +5970,180 @@ mod tests {
         let (moved, _) = sim.commit(id, &d, &Version::empty(), &mv, None);
         assert!(matches!(moved, Committed::Report(ApplyOutcome::Ok)));
         assert!(!sim.nodes[&id].fs.contains_key(&d), "empty, it goes");
+    }
+
+    /// §7.3, draft 64: the host removes no directory that holds a file a
+    /// user rule ignores, for a received deletion or a revert's move, and
+    /// reports `HoldsIgnored` with the directory as found; nothing moves.
+    /// A tracked child decides first, as on a real disk, where only a
+    /// directory whose every entry is ignored is classified by the rules.
+    /// Once the user takes the file away the directory goes.
+    #[test]
+    fn the_host_removes_no_directory_holding_an_ignored_file() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let folder = sim.folder;
+        let d = rel("d");
+        let remove = Action::Remove {
+            folder,
+            path: d.clone(),
+            expected: Some(dir().observed()),
+            displace: Displace::Trash,
+        };
+        let mv = Action::MoveToTrash {
+            folder,
+            path: d.clone(),
+            version: Version::empty(),
+            expected: dir().observed(),
+        };
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.fs.insert(d.clone(), dir());
+        node.ignored_files.insert(rel("d/local.env"));
+        node.fs.insert(rel("d/u"), file(6, false));
+        for action in [&remove, &mv] {
+            let (tracked, _) = sim.commit(id, &d, &Version::empty(), action, None);
+            assert!(
+                matches!(
+                    tracked,
+                    Committed::Report(ApplyOutcome::ChangedUnderneath { .. })
+                ),
+                "a tracked child first"
+            );
+        }
+        sim.nodes.get_mut(&id).unwrap().fs.remove(&rel("d/u"));
+        for action in [&remove, &mv] {
+            let (held, _) = sim.commit(id, &d, &Version::empty(), action, None);
+            assert!(
+                matches!(&held, Committed::Report(ApplyOutcome::Failed { error: LocalError::HoldsIgnored, found: ScanState::Observed(o) }) if o.kind == Kind::Dir),
+                "{action:?}"
+            );
+            assert!(sim.nodes[&id].fs.contains_key(&d));
+            assert!(sim.nodes[&id].ignored_files.contains(&rel("d/local.env")));
+        }
+        assert_eq!(sim.stats.holds_ignored, 2);
+        sim.nodes.get_mut(&id).unwrap().ignored_files.clear();
+        let (removed, _) = sim.commit(id, &d, &Version::empty(), &remove, None);
+        assert!(matches!(removed, Committed::Report(ApplyOutcome::Ok)));
+        assert!(!sim.nodes[&id].fs.contains_key(&d));
+    }
+
+    /// I9's live directory record (§8.3 step 2): a directory a revert's
+    /// move gave up for a file a user rule ignores inside (§7.3, draft 64)
+    /// has something beneath it, as one found not empty does, so the
+    /// record that keeps it is let through; with nothing inside, nothing is.
+    #[test]
+    fn an_ignored_file_is_something_beneath_its_directory_for_i9() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let d = rel("d");
+        let node = sim.nodes.get_mut(&id).unwrap();
+        node.fs.insert(d.clone(), dir());
+        assert!(!something_beneath(Some(node), None, &d));
+        node.ignored_files.insert(rel("d/local.env"));
+        assert!(something_beneath(Some(node), None, &d));
+        assert!(!something_beneath(Some(node), None, &rel("d/local.env")));
+    }
+
+    /// §7.6, §7.5: a file a user rule ignores goes wherever its directory
+    /// goes. Displaced to a conflict copy it is beneath the copy, displaced
+    /// to the trash it has left the folder, and the journal's undo of either
+    /// displacement brings it back with the directory.
+    #[test]
+    fn ignored_files_go_where_their_directory_goes() {
+        let mut sim = world();
+        let id = sim.order[0];
+        let now = sim.clock;
+        let (d, inside) = (rel("d"), rel("d/local.env"));
+        let copy = rel("d.conflict-19700101-000000-n0");
+        let node = sim.nodes.get_mut(&id).unwrap();
+        for to in [Displace::ConflictCopy(copy.clone()), Displace::Trash] {
+            node.fs.insert(d.clone(), dir());
+            node.ignored_files.insert(inside.clone());
+            assert!(displace_journalled(node, &d, &to, true, now));
+            let moved: Vec<&RelPath> = node.ignored_files.iter().collect();
+            match &to {
+                Displace::ConflictCopy(_) => {
+                    assert_eq!(moved, [&rel("d.conflict-19700101-000000-n0/local.env")]);
+                }
+                Displace::Trash => assert!(moved.is_empty()),
+            }
+            let row = node.journal.pop().unwrap();
+            undo(node, row, now);
+            assert!(node.fs.contains_key(&d), "{to:?}");
+            assert_eq!(node.ignored_files.iter().collect::<Vec<_>>(), [&inside]);
+            node.fs.clear();
+            node.ignored_files.clear();
+        }
+    }
+
+    /// §7.3 (draft 64), I1 and I3: A deletes d1 and d1/e, and B holds d1/e
+    /// with a file a user rule ignores inside. B's host refuses to remove
+    /// d1/e, B's engine defers its deletion, and d1's deletion waits for it.
+    /// So at the end both are live on B and deleted on A: they are what I1
+    /// and I3 leave out on B, and the run is quiescent with B's wants
+    /// waiting. Once B's user takes the file away, the next scan's
+    /// observation lets both deletions through and nothing is held.
+    #[test]
+    fn directories_held_by_an_ignored_file_are_left_out_of_i1_and_i3() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                drop_watcher: 0.0,
+                crash_after_rename: 0.0,
+                crash_between_renames: 0.0,
+                io_failure: 0.0,
+                disk_fill: 0.0,
+                scan_delay_ms: (0, 0),
+                ..Knobs::default()
+            },
+        );
+        let (a, b) = (sim.order[0], sim.order[1]);
+        let (d1, e) = (rel("d1"), rel("d1/e"));
+        let settle = |sim: &mut Sim| {
+            let end = sim.clock.plus_nanos(300 * NANOS);
+            sim.run_until(end).unwrap();
+        };
+        sim.mkdir(a, &d1).unwrap();
+        sim.mkdir(a, &e).unwrap();
+        settle(&mut sim);
+        assert!(sim.nodes[&b].fs.contains_key(&e));
+        sim.nodes
+            .get_mut(&b)
+            .unwrap()
+            .ignored_files
+            .insert(rel("d1/e/local.env"));
+        sim.delete_path(a, &d1).unwrap();
+        settle(&mut sim);
+        sim.final_phase().unwrap();
+        assert!(sim.stats.holds_ignored > 0);
+        let live = |sim: &Sim, id, path: &RelPath| {
+            sim.engine(id)
+                .and_then(|en| en.folder(sim.folder))
+                .is_some_and(|f| f.index().live(path).is_some())
+        };
+        for path in [&d1, &e] {
+            assert!(
+                !live(&sim, a, path) && live(&sim, b, path),
+                "the indexes differ at {path}"
+            );
+            assert!(sim.nodes[&b].fs.contains_key(path));
+        }
+        assert_eq!(
+            invariants::held_by_ignored(&sim, b),
+            BTreeSet::from([d1.clone(), e.clone()])
+        );
+        assert!(invariants::held_by_ignored(&sim, a).is_empty());
+        invariants::check_all(&sim).unwrap();
+
+        sim.nodes.get_mut(&b).unwrap().ignored_files.clear();
+        sim.final_phase().unwrap();
+        for path in [&d1, &e] {
+            assert!(!live(&sim, b, path) && !sim.nodes[&b].fs.contains_key(path));
+        }
+        assert!(invariants::held_by_ignored(&sim, b).is_empty());
+        invariants::check_all(&sim).unwrap();
     }
 
     /// §8.3, draft 55: the host answers `Observe` with the observation a
