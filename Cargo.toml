@@ -31,7 +31,7 @@ unicode-normalization = "0.1.25"
 # musl and needs no system library (DESIGN.md Appendix A, §16). `cache` keeps
 # prepared statements across a transaction's rows. The default features also
 # pull in a WebAssembly build of SQLite, which no target here needs.
-rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
+rusqlite = { version = "0.41.0", default-features = false, features = ["bundled", "cache"] }
 # The daemon's runtime (DESIGN.md Appendix A): one engine task, its timers,
 # the channels between it and the threads that do the I/O, and the signals
 # that stop it. `macros` is for `select!`, not for `#[tokio::main]`.
