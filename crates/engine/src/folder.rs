@@ -445,8 +445,9 @@ pub enum FolderStatus {
     CommitOverdue { path: RelPath },
     /// A commit or fetch at `path` failed on this machine (§7.5 "local
     /// failures"): `Io` is tried again after a backoff, `DiskFull` pauses
-    /// the folder's inbound, and `CaseCollision` names the other path of
-    /// the pair.
+    /// the folder's inbound, `CaseCollision` names the other path of the
+    /// pair, and `HoldsIgnored` waits for the next observation of the
+    /// directory (§7.3).
     LocalFailure { path: RelPath, error: LocalError },
     /// A full disk paused the folder's inbound (§7.5): nothing is fetched
     /// or committed until the host reports space recovered.
@@ -1350,6 +1351,13 @@ impl FolderState {
             Some(old) => self.rederive(now, old),
             None if change.is_some() => self.reclassify_want(now, &path),
             None => {}
+        }
+        // A deletion deferred because the directory held ignored files is
+        // re-evaluated on the next observation of it (§7.3, draft 64). What
+        // a commit's guard found belongs to that commit's report, the one
+        // that deferred it, so only a scan or the watcher counts.
+        if observer == Observer::Scan {
+            self.wants.observed(&path);
         }
         self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
         Scanned {
@@ -2640,7 +2648,7 @@ impl FolderState {
     fn collision_seq(&self, error: &LocalError) -> Option<u64> {
         match error {
             LocalError::CaseCollision { with } => self.index.live(with).map(|r| r.seq),
-            LocalError::Io | LocalError::DiskFull => None,
+            LocalError::Io | LocalError::DiskFull | LocalError::HoldsIgnored => None,
         }
     }
 
@@ -3065,9 +3073,10 @@ impl FolderState {
     /// the mark's carrier is wanted again and anything else deferred at the
     /// path is classified again. The guard finding something else means the
     /// user changed the path after the revert: the move is given up and what
-    /// it found is taken as an observation, a local change like any other. A
-    /// local failure backs off and tries again, as any commit's does (§7.5).
-    /// Returns every record written.
+    /// it found is taken as an observation, a local change like any other,
+    /// and so is a directory that holds files a user rule ignores (§7.3,
+    /// draft 64). A local failure backs off and tries again, as any
+    /// commit's does (§7.5). Returns every record written.
     pub fn trashed(
         &mut self,
         now: Timestamp,
@@ -3104,7 +3113,14 @@ impl FolderState {
                 self.reconsider(now, path, DeferredReason::ChangedUnderneath);
                 Vec::new()
             }
-            ApplyOutcome::ChangedUnderneath { found } => {
+            // A directory holding files a user rule ignores is not empty, and
+            // a revert's move gives it up and keeps it, as for any directory
+            // found not empty (§7.3, draft 64; §8.3 step 2).
+            ApplyOutcome::ChangedUnderneath { found }
+            | ApplyOutcome::Failed {
+                error: LocalError::HoldsIgnored,
+                found,
+            } => {
                 self.wants.remove(path);
                 let records = self.observe_found(now, at, path, &found);
                 self.reconsider(now, path, DeferredReason::ChangedUnderneath);
@@ -8431,6 +8447,183 @@ mod tests {
             matches!(&steps[..], [HostStep::Write { path, entry, .. }] if path == &p("n") && entry.version == v),
             "{steps:?}"
         );
+    }
+
+    fn a_dir() -> ScanState {
+        observed(Kind::Dir, 0, 0, false)
+    }
+
+    /// The paths each step of `steps` removes.
+    fn removes(steps: &[HostStep]) -> Vec<&str> {
+        steps
+            .iter()
+            .filter_map(|s| match s {
+                HostStep::Remove { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A (node 1) and B (node 2) both hold the directories at `dirs`, and A
+    /// deletes them. B removes the deepest first, and its host finds the
+    /// first of them holding a file a user rule ignores (§7.3, draft 64),
+    /// so it removes nothing and reports `HoldsIgnored` at `t(14.0)`, with
+    /// the directory as the guard found it. Returns B and the version of
+    /// the held deletion.
+    fn holding_ignored(dirs: &[&str]) -> (FolderState, Version) {
+        let (mut a, mut b) = a_and_b(1, Rules::default());
+        for dir in dirs {
+            a.scanned(t(7.0), p(dir), a_dir());
+        }
+        let batch = a.form_batches(t(8.0), bid(3)).remove(0);
+        b.receive(t(8.0), &batch);
+        commit_all(&mut b, t(8.5));
+        b.form_batches(t(9.0), bid(4));
+        for dir in dirs {
+            a.scanned(t(10.0), p(dir), ScanState::Absent);
+        }
+        let batch = a.form_batches(t(12.0), bid(5)).remove(0);
+        assert_eq!(b.receive(t(12.0), &batch).decision, Decision::Accepted);
+        let (steps, _) = b.dispatch(t(12.0), &lan(&[1]));
+        let held = removes(&steps)[0];
+        let v = b.wants().get(&p(held)).unwrap().version().clone();
+        b.take_statuses();
+        let outcome = ApplyOutcome::Failed {
+            error: LocalError::HoldsIgnored,
+            found: a_dir(),
+        };
+        let written = b.applied_at(t(14.0), &p(held), &v, t(14.0), outcome);
+        assert!(written.is_empty(), "nothing is written: {written:?}");
+        (b, v)
+    }
+
+    /// §7.3, draft 64: a received deletion of a directory that holds a file
+    /// a user rule ignores is deferred with reason `holds ignored files`,
+    /// observable, and `status` hears of it. The directory keeps its record,
+    /// and nothing tries the deletion again by itself, however long.
+    #[test]
+    fn a_deletion_of_a_directory_holding_ignored_files_is_deferred_observably() {
+        let (mut b, v) = holding_ignored(&["d"]);
+        let want = b.wants().get(&p("d")).unwrap();
+        assert_eq!(want.state, WantState::HoldsIgnored);
+        assert_eq!(want.version(), &v);
+        assert!(want.entry.deleted);
+        assert!(!b.in_flight(&p("d")), "deferred is observable");
+        assert!(b.index().live(&p("d")).is_some(), "the directory stays");
+        assert_eq!(
+            b.take_statuses(),
+            [FolderStatus::LocalFailure {
+                path: p("d"),
+                error: LocalError::HoldsIgnored
+            }]
+        );
+        b.expire(t(10_000.0));
+        assert_eq!(b.dispatch(t(10_000.0), &lan(&[1])).0, []);
+        assert_eq!(
+            b.wants().get(&p("d")).unwrap().state,
+            WantState::HoldsIgnored
+        );
+    }
+
+    /// §7.3, draft 64: the deletion is re-evaluated on the next observation
+    /// of the directory, which tries it again. One read before the report
+    /// is stale (§7.3) and changes nothing; a scan after it does, and once
+    /// the user has taken the ignored file away the deletion lands.
+    #[test]
+    fn a_deletion_held_by_ignored_files_is_tried_again_when_the_directory_is_next_seen() {
+        let (mut b, v) = holding_ignored(&["d"]);
+        b.observed_at(t(15.0), t(13.0), p("d"), ScanState::Unchanged);
+        assert_eq!(
+            b.wants().get(&p("d")).unwrap().state,
+            WantState::HoldsIgnored,
+            "a read from before the report is stale"
+        );
+        b.scan_started();
+        b.observed_at(t(16.0), t(16.0), p("d"), ScanState::Unchanged);
+        assert_eq!(b.wants().get(&p("d")).unwrap().state, WantState::Wanted);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1]));
+        assert_eq!(removes(&steps), ["d"]);
+        let written = b.applied_at(t(17.0), &p("d"), &v, t(17.0), ApplyOutcome::Ok);
+        assert!(matches!(&written[..], [r] if r.entry.deleted && r.entry.version == v));
+        assert!(b.wants().get(&p("d")).is_none());
+    }
+
+    /// §7.5 "local failures", downwards: a directory's deletion waiting on
+    /// a deletion beneath it that holds ignored files is deferred too, with
+    /// reason `waiting for <path>`, observable; it stays so while the one
+    /// beneath is held, and goes ahead once that one lands.
+    #[test]
+    fn a_deletion_above_one_held_by_ignored_files_waits_for_it_observably() {
+        let (mut b, v) = holding_ignored(&["d", "d/e"]);
+        assert_eq!(
+            b.wants().get(&p("d/e")).unwrap().state,
+            WantState::HoldsIgnored
+        );
+        b.dispatch(t(15.0), &lan(&[1]));
+        let d = b.wants().get(&p("d")).unwrap();
+        assert_eq!(d.state, WantState::WaitingFor { path: p("d/e") });
+        assert!(!b.in_flight(&p("d")));
+        b.observed_at(t(16.0), t(16.0), p("d/e"), ScanState::Unchanged);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1]));
+        assert_eq!(removes(&steps), ["d/e"]);
+        b.applied_at(t(17.0), &p("d/e"), &v, t(17.0), ApplyOutcome::Ok);
+        let (steps, _) = b.dispatch(t(17.0), &lan(&[1]));
+        assert_eq!(removes(&steps), ["d"]);
+    }
+
+    /// §7.3, draft 64: an observation re-evaluates only a deletion held by
+    /// ignored files. Every other deferred want keeps waiting for what it
+    /// waits on (§7.5): a local retry for its backoff, a case collision for
+    /// a write at either path.
+    #[test]
+    fn an_observation_ends_no_other_deferral() {
+        let (_, mut b, _, vn) = committing_n_fetching_m();
+        let failed = ApplyOutcome::Failed {
+            error: io(),
+            found: ScanState::Absent,
+        };
+        b.applied(t(14.0), &p("n"), &vn, failed);
+        b.observed_at(t(15.0), t(15.0), p("n"), ScanState::Absent);
+        let retry = WantState::LocalRetry { until: t(74.0) };
+        assert_eq!(b.wants().get(&p("n")).unwrap().state, retry);
+
+        let (_, mut b, _) = colliding();
+        let state = b.wants().get(&p("n")).unwrap().state.clone();
+        assert!(matches!(state, WantState::Collides { .. }));
+        b.observed_at(t(15.0), t(15.0), p("n"), ScanState::Absent);
+        assert_eq!(b.wants().get(&p("n")).unwrap().state, state);
+    }
+
+    /// §7.3 (draft 64), §8.3 step 2: a revert's move of a directory holding
+    /// a file a user rule ignores gives up and keeps the directory, as for
+    /// any directory found not empty: a live record of B's own, announced
+    /// as a local change, and no want left at the path.
+    #[test]
+    fn a_reverts_move_of_a_directory_holding_ignored_files_keeps_it() {
+        let (_, mut b, _) = a_directory_to_revert();
+        b.revert(t(15.0)).unwrap();
+        let trash = |steps: &[HostStep], at: &str| {
+            steps.iter().find_map(|s| match s {
+                HostStep::Trash { path, version, .. } if *path == p(at) => Some(version.clone()),
+                _ => None,
+            })
+        };
+        let (steps, _) = b.dispatch(t(15.0), &lan(&[1]));
+        let vx = trash(&steps, "d/x").unwrap();
+        b.trashed(t(16.0), &p("d/x"), &vx, t(16.0), ApplyOutcome::Ok);
+        let (steps, _) = b.dispatch(t(16.0), &lan(&[1]));
+        let vd = trash(&steps, "d").unwrap();
+        assert!(b.index().get(&p("d")).is_none(), "no peer saw d");
+        let held = ApplyOutcome::Failed {
+            error: LocalError::HoldsIgnored,
+            found: a_dir(),
+        };
+        let written = b.trashed(t(17.0), &p("d"), &vd, t(17.0), held);
+        assert!(b.wants().get(&p("d")).is_none(), "the move is given up");
+        let d = b.index().live(&p("d")).unwrap();
+        assert!(d.entry.kind == Kind::Dir && d.entry.modified_by == b.index().own());
+        assert!(matches!(&written[..], [r] if r.entry.path == p("d")));
+        assert!(d.seq > b.index().announced_seq(), "to be announced");
     }
 
     /// A scripted host for the want-list properties.
