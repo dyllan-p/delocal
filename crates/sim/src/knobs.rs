@@ -81,8 +81,9 @@ pub struct Knobs {
     /// half the time when that disk has one, takes one away (§7.3, draft
     /// 64). Such a file is never reported or synced, but it is on disk: a
     /// directory holding one is not removed, its received deletion waits,
-    /// and a revert's move of it gives up. Files left at the end keep their
-    /// directories, which I1 and I3 exempt.
+    /// and a revert's move of it gives up. The watcher's event for one is
+    /// an observation of its directory (draft 68). Files left at the end
+    /// keep their directories, which I1 and I3 exempt.
     pub ignored_files: f64,
     /// Number of nodes, or `None` to draw 2 to 8 from the seed.
     pub nodes: Option<u8>,

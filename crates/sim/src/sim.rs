@@ -151,6 +151,9 @@ pub struct Stats {
     /// Removals and moves to the trash a host refused because the
     /// directory held one of them.
     pub holds_ignored: u64,
+    /// Observations of a directory, made by an event for an ignored file
+    /// in it, while a deletion of it was held for such files (draft 68).
+    pub holds_observed: u64,
 }
 
 /// Why a run failed, with everything needed to reproduce and read it.
@@ -1096,7 +1099,7 @@ impl Sim {
         self.steps = steps.to_vec();
         for step in steps {
             self.apply(step)?;
-            self.tend_ignored_files();
+            self.tend_ignored_files()?;
             self.steps_applied += 1;
             let settle = self.rng.random_range(NANOS..30 * NANOS);
             let end = self.clock.plus_nanos(settle);
@@ -3496,6 +3499,11 @@ impl Sim {
         if self.rng.random::<f64>() < self.knobs.drop_watcher {
             return Ok(());
         }
+        self.report_watched(id, path)
+    }
+
+    /// What the watcher reports for `path` on `id`, an event having named it.
+    fn report_watched(&mut self, id: NodeId, path: RelPath) -> Result<(), Failure> {
         // The watcher sees a path a rule ignores, and the host reports it
         // `Skipped`, which outside a bracket changes nothing (§7.3).
         if self.nodes.get(&id).is_some_and(|n| ignores(n, &path)) {
@@ -4036,26 +4044,28 @@ impl Sim {
     /// (§7.3, draft 64): with the knob's probability after each step, the
     /// user of a node drawn at random takes one of its ignored files away,
     /// half the time when its disk has one, and otherwise puts `local.env`
-    /// into one of its directories. Nothing is reported, since a host never
-    /// reports a path a user rule ignores that it does not track, and the
-    /// user's own edits (I2) are of tracked paths only. Every draw is on
-    /// `IGNORED_STREAM`, and none is made with the knob at 0.
-    fn tend_ignored_files(&mut self) {
+    /// into one of its directories. The file itself is never reported,
+    /// since a host never reports a path a user rule ignores that it does
+    /// not track, and the user's own edits (I2) are of tracked paths only;
+    /// but its event is an observation of its directory (draft 68). Every
+    /// draw is on `IGNORED_STREAM`, and none is made with the knob at 0.
+    fn tend_ignored_files(&mut self) -> Result<(), Failure> {
         let p = self.knobs.ignored_files;
         if p <= 0.0 || self.ignored_rng.random::<f64>() >= p {
-            return;
+            return Ok(());
         }
         let id = self.order[self.ignored_rng.random_range(0..self.order.len())];
         let Some(n) = self.nodes.get_mut(&id) else {
-            return;
+            return Ok(());
         };
         if !n.ignored_files.is_empty() && self.ignored_rng.random::<bool>() {
             let i = self.ignored_rng.random_range(0..n.ignored_files.len());
             if let Some(file) = n.ignored_files.iter().nth(i).cloned() {
                 n.ignored_files.remove(&file);
                 self.stats.ignored_taken += 1;
+                return self.watch_ignored(id, &file);
             }
-            return;
+            return Ok(());
         }
         let dirs: Vec<&RelPath> =
             n.fs.iter()
@@ -4063,14 +4073,39 @@ impl Sim {
                 .map(|(p, _)| p)
                 .collect();
         if dirs.is_empty() {
-            return;
+            return Ok(());
         }
         let dir = dirs[self.ignored_rng.random_range(0..dirs.len())];
         if let Ok(file) = RelPath::new(format!("{dir}/local.env"))
-            && n.ignored_files.insert(file)
+            && n.ignored_files.insert(file.clone())
         {
             self.stats.ignored_put += 1;
+            return self.watch_ignored(id, &file);
         }
+        Ok(())
+    }
+
+    /// The watcher's event for `file`, which a rule ignores, on `id`, unless
+    /// it drops it: an observation of the directory holding it (§7.3, draft
+    /// 68), so a deletion held for the files in it is tried again at once.
+    /// The drop is drawn on `IGNORED_STREAM`, so the main stream is drawn
+    /// as it was.
+    fn watch_ignored(&mut self, id: NodeId, file: &RelPath) -> Result<(), Failure> {
+        if self.ignored_rng.random::<f64>() < self.knobs.drop_watcher {
+            return Ok(());
+        }
+        let Some(dir) = file.parent() else {
+            return Ok(());
+        };
+        let held = self
+            .engine(id)
+            .and_then(|e| e.folder(self.folder))
+            .and_then(|f| f.wants().get(&dir))
+            .is_some_and(|w| w.state == WantState::HoldsIgnored);
+        if held {
+            self.stats.holds_observed += 1;
+        }
+        self.report_watched(id, dir)
     }
 
     /// A file path a step names, as the step spells it (§7.6): with the
@@ -4277,8 +4312,9 @@ impl Sim {
                 for p in &gone {
                     n.fs.remove(p);
                 }
-                // The user's `rm -r` takes the ignored files too, which no
-                // watcher reports (see `tend_ignored_files`).
+                // The user's `rm -r` takes the ignored files too. Their
+                // events would observe directories this removal takes and
+                // reports anyway (see `watch_ignored`), so none is made.
                 n.ignored_files.retain(|f| !path.is_ancestor_of(f));
                 gone
             }
@@ -6144,6 +6180,78 @@ mod tests {
         }
         assert!(invariants::held_by_ignored(&sim, b).is_empty());
         invariants::check_all(&sim).unwrap();
+    }
+
+    /// §7.3, draft 68: an event for an ignored file is an observation of its
+    /// directory. B holds d1 with two files a user rule ignores in it when A
+    /// deletes d1, so B's deletion is held. With no scan to come, B's user
+    /// takes one file away, and the deletion is tried again and held again;
+    /// then the other, and it goes through.
+    #[test]
+    fn removing_the_last_ignored_file_releases_a_held_deletion_without_a_scan() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                group_commit_lag: 0,
+                drop_watcher: 0.0,
+                crash_after_rename: 0.0,
+                crash_between_renames: 0.0,
+                io_failure: 0.0,
+                disk_fill: 0.0,
+                scan_delay_ms: (0, 0),
+                ignored_files: 0.0,
+                ..Knobs::default()
+            },
+        );
+        let (a, b) = (sim.order[0], sim.order[1]);
+        let d1 = rel("d1");
+        let files = [rel("d1/.env"), rel("d1/local.env")];
+        let settle = |sim: &mut Sim| {
+            let end = sim.clock.plus_nanos(60 * NANOS);
+            sim.run_until(end).unwrap();
+        };
+        sim.mkdir(a, &d1).unwrap();
+        settle(&mut sim);
+        assert!(sim.nodes[&b].fs.contains_key(&d1));
+        let never = Timestamp::from_unix_nanos(i64::MAX);
+        for n in sim.nodes.values_mut() {
+            n.next_scan_at = never;
+        }
+        sim.nodes
+            .get_mut(&b)
+            .unwrap()
+            .ignored_files
+            .extend(files.clone());
+        sim.delete_path(a, &d1).unwrap();
+        settle(&mut sim);
+        let state = |sim: &Sim| {
+            sim.engine(b)
+                .and_then(|e| e.folder(sim.folder))
+                .and_then(|f| f.wants().get(&d1))
+                .map(|w| w.state.clone())
+        };
+        assert_eq!(state(&sim), Some(WantState::HoldsIgnored));
+        assert_eq!(sim.stats.holds_ignored, 1);
+
+        for (taken, file) in files.iter().enumerate() {
+            sim.nodes.get_mut(&b).unwrap().ignored_files.remove(file);
+            sim.watch_ignored(b, file).unwrap();
+            settle(&mut sim);
+            assert_eq!(sim.stats.holds_observed, taken as u64 + 1);
+        }
+        assert_eq!(sim.stats.holds_ignored, 2, "tried again only at once");
+        assert_eq!(state(&sim), None);
+        assert!(!sim.nodes[&b].fs.contains_key(&d1));
+        assert!(
+            sim.engine(b)
+                .and_then(|e| e.folder(sim.folder))
+                .is_some_and(|f| f.index().live(&d1).is_none())
+        );
+        assert!(
+            sim.nodes.values().all(|n| n.next_scan_at == never),
+            "a scan ran"
+        );
     }
 
     /// §8.3, draft 55: the host answers `Observe` with the observation a
