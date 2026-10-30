@@ -4,7 +4,8 @@
 //!
 //! **Formation.** A batch carries every record written since the last one,
 //! local changes and adopted records alike, in the sender's `seq` order. A
-//! run longer than [`MAX_BATCH_ENTRIES`] is split on `seq` boundaries so
+//! run longer than [`MAX_BATCH_ENTRIES`], or whose entries are estimated at
+//! more than [`MAX_BATCH_BYTES`] encoded, is split on `seq` boundaries so
 //! every batch covers a contiguous `seq` range `(seq_low, seq_high]`, and
 //! a sender's batches chain: each `seq_low` is the previous batch's
 //! `seq_high` (0 for the first), so a receiver can tell a batch it never
@@ -37,6 +38,32 @@ use crate::version::Relation;
 
 /// Most entries in one batch (§7.4). Longer runs split on `seq`.
 pub const MAX_BATCH_ENTRIES: usize = 10_000;
+
+/// Most estimated bytes of encoded entries in one batch (§7.4): a run whose
+/// entries would come to more splits on `seq` too. This keeps a batch well
+/// under §6.3's 16 MiB frame whatever its paths, where 10,000 entries alone
+/// would not: paths may be 4,096 bytes long (§7.1).
+pub const MAX_BATCH_BYTES: u64 = 4 * 1024 * 1024;
+
+/// What [`estimated_bytes`] allows for every field of an entry but its
+/// path's bytes (§7.4).
+///
+/// At their widest, postcard encodes those fields in 183 bytes plus 27 for
+/// each node in the version vector: every integer at its longest varint,
+/// `author_host` at its 63-byte limit. A folder's handful of machines, with
+/// small counters and short hostnames, comes to well under this, and
+/// 10,000 entries with paths of up to 163 bytes still fit under
+/// [`MAX_BATCH_BYTES`], so the entry bound is still the one an ordinary
+/// folder meets. An entry wider than the allowance overshoots it by at most
+/// 27 bytes for each node, and a batch with every field at its widest still
+/// fits §6.3's frame for vectors of up to 49 nodes.
+pub const ENTRY_ALLOWANCE: u64 = 256;
+
+/// An entry's estimated encoded size (§7.4): its path's bytes plus a fixed
+/// allowance for everything else.
+pub fn estimated_bytes(entry: &Entry) -> u64 {
+    entry.path.as_str().len() as u64 + ENTRY_ALLOWANCE
+}
 
 /// Counts for a batch (§7.4), classified as in §8.1.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -154,32 +181,49 @@ pub fn form(
     );
     // Chunks chain: the second starts where the first ended.
     let mut low = seq_low;
-    records
-        .chunks(MAX_BATCH_ENTRIES)
-        .enumerate()
-        .map(|(i, chunk)| {
-            let seq_low = low;
-            low = chunk.last().map_or(low, |(r, _)| r.seq);
-            let mut summary = Summary::default();
-            let mut entries = Vec::with_capacity(chunk.len());
-            for (record, kind) in chunk {
-                if let Some(kind) = kind {
-                    summary.count(&record.entry, *kind);
-                }
-                entries.push(record.entry.clone());
+    let mut rest = records;
+    let mut batches = Vec::new();
+    while !rest.is_empty() {
+        let (chunk, after) = rest.split_at(batch_len(rest));
+        rest = after;
+        let seq_low = low;
+        low = chunk.last().map_or(low, |(r, _)| r.seq);
+        let mut summary = Summary::default();
+        let mut entries = Vec::with_capacity(chunk.len());
+        for (record, kind) in chunk {
+            if let Some(kind) = kind {
+                summary.count(&record.entry, *kind);
             }
-            Batch {
-                id: base.successor(i as u128),
-                folder,
-                source,
-                created_at: now,
-                seq_low,
-                seq_high: chunk.last().map_or(seq_low, |(r, _)| r.seq),
-                entries,
-                summary,
-            }
-        })
-        .collect()
+            entries.push(record.entry.clone());
+        }
+        batches.push(Batch {
+            id: base.successor(batches.len() as u128),
+            folder,
+            source,
+            created_at: now,
+            seq_low,
+            seq_high: low,
+            entries,
+            summary,
+        });
+    }
+    batches
+}
+
+/// How many of `records`, from the first, the next batch takes (§7.4): as
+/// many as fit both [`MAX_BATCH_ENTRIES`] and [`MAX_BATCH_BYTES`], and at
+/// least one, so every run splits into batches that each make progress. No
+/// single entry comes near the byte bound, a path being at most 4,096
+/// bytes (§7.1).
+fn batch_len(records: &[(&IndexRecord, Option<ChangeKind>)]) -> usize {
+    let mut bytes = 0;
+    for (i, (record, _)) in records.iter().enumerate() {
+        bytes += estimated_bytes(&record.entry);
+        if i == MAX_BATCH_ENTRIES || (i > 0 && bytes > MAX_BATCH_BYTES) {
+            return i;
+        }
+    }
+    records.len()
 }
 
 /// What applying a dominating entry involves (§7.5).
@@ -625,6 +669,117 @@ mod tests {
         );
         assert_eq!(batches[0].summary.adds, MAX_BATCH_ENTRIES as u64);
         assert_eq!(batches[1].summary.adds, 5);
+    }
+
+    /// §6.3: the largest frame the transport carries.
+    const FRAME: usize = 16 * 1024 * 1024;
+
+    /// A path of exactly `len` bytes, unique by `i`: directories of 200
+    /// bytes, then a leaf ending in `i`, every component within §7.1's 255.
+    fn long_path(len: usize, i: usize) -> String {
+        let mut path = String::new();
+        while len - path.len() > 255 {
+            path.push_str(&"a".repeat(200));
+            path.push('/');
+        }
+        let leaf = format!("{i:05}");
+        path.push_str(&"b".repeat(len - path.len() - leaf.len()));
+        path + &leaf
+    }
+
+    /// 10,000 entries whose paths are `len` bytes, formed into batches:
+    /// the byte bound splits them, every batch's estimate is within it and
+    /// its encoding within the frame, and the batches chain on `seq` and
+    /// carry every entry once, in order. Returns the batches and what all
+    /// the entries would encode to in one.
+    fn form_long_paths(len: usize) -> (Vec<Batch>, usize) {
+        let mut idx = index(1);
+        for i in 0..MAX_BATCH_ENTRIES {
+            let path = long_path(len, i);
+            assert_eq!(path.len(), len);
+            idx.observe(p(&path), file(1, i as i64)).unwrap();
+        }
+        let unannounced = idx.unannounced();
+        let all: Vec<&Entry> = unannounced.iter().map(|(r, _)| &r.entry).collect();
+        let whole = all
+            .iter()
+            .map(|e| postcard::to_stdvec(e).unwrap().len())
+            .sum();
+        let batches = form(batch_id(1), folder(), node(1), now(), &unannounced, 0);
+        assert!(batches.len() > 1, "{len}-byte paths split");
+        let mut next = 0;
+        let mut low = 0;
+        for (i, b) in batches.iter().enumerate() {
+            assert_eq!(b.id, batch_id(1).successor(i as u128));
+            assert_eq!(b.seq_low, low, "batch {i} chains on the one before");
+            let estimate: u64 = b.entries.iter().map(estimated_bytes).sum();
+            assert!(estimate <= MAX_BATCH_BYTES, "batch {i}: {estimate}");
+            let encoded = postcard::to_stdvec(b).unwrap().len();
+            assert!(encoded < FRAME, "batch {i} encodes to {encoded} bytes");
+            let carried: Vec<&Entry> = b.entries.iter().collect();
+            assert_eq!(carried, all[next..next + b.entries.len()]);
+            next += b.entries.len();
+            assert_eq!(b.seq_high, next as u64, "batch {i} ends at its last entry");
+            low = b.seq_high;
+        }
+        assert_eq!(next, MAX_BATCH_ENTRIES, "every entry, once");
+        (batches, whole)
+    }
+
+    /// §7.4 (draft 34): 10,000 entries with 1.5 KB paths split at 4 MiB of
+    /// estimated entries, each batch as full as the estimate allows, and
+    /// every batch's encoding stays under §6.3's 16 MiB frame.
+    #[test]
+    fn splits_long_paths_at_four_mebibytes() {
+        let (batches, _) = form_long_paths(1536);
+        let full = (MAX_BATCH_BYTES / (1536 + ENTRY_ALLOWANCE)) as usize;
+        assert_eq!(batches.len(), MAX_BATCH_ENTRIES.div_ceil(full));
+        for b in &batches[..batches.len() - 1] {
+            assert_eq!(b.entries.len(), full);
+        }
+    }
+
+    /// At §7.1's longest paths, 4,096 bytes, 10,000 entries in one batch
+    /// would not fit a frame, which is what the byte bound is for; split,
+    /// every batch does.
+    #[test]
+    fn the_longest_paths_split_into_batches_that_each_fit_a_frame() {
+        let (_, whole) = form_long_paths(4096);
+        assert!(whole > FRAME, "10,000 entries encode to {whole} bytes");
+    }
+
+    /// The arithmetic behind [`ENTRY_ALLOWANCE`]: with every field at its
+    /// widest, an entry encodes in 183 bytes beyond its path's, plus 27
+    /// for each node of its vector. So a batch the estimate has filled
+    /// overshoots it by at most `27 n - 73` bytes an entry, and 10,000 of
+    /// those fit a frame, a kilobyte left for the batch's own fields and
+    /// the message around it, up to 49 nodes.
+    #[test]
+    fn an_entry_at_its_widest_takes_183_bytes_and_27_a_node_beyond_its_path() {
+        for nodes in [0u8, 1, 2, 3, 8, 49, 127] {
+            let version: Version = (0..nodes).map(|i| (node(i), u64::MAX)).collect();
+            let widest = Entry {
+                path: p(&long_path(4096, 0)),
+                kind: Kind::Symlink,
+                size: u64::MAX,
+                mtime_ns: i64::MIN,
+                stamp: i64::MIN,
+                exec: true,
+                hash: hash(1),
+                prev_hash: hash(2),
+                version,
+                deleted: true,
+                modified_by: node(1),
+                author_host: HostName::new("h".repeat(HostName::MAX_LEN)).unwrap(),
+            };
+            let encoded = postcard::to_stdvec(&widest).unwrap().len() as u64;
+            assert_eq!(encoded, 4096 + 183 + 27 * u64::from(nodes), "{nodes} nodes");
+        }
+        let filled = |nodes: u64| {
+            MAX_BATCH_BYTES + MAX_BATCH_ENTRIES as u64 * (183 + 27 * nodes - ENTRY_ALLOWANCE) + 1024
+        };
+        assert!(filled(49) < FRAME as u64);
+        assert!(filled(50) > FRAME as u64);
     }
 
     // ---- apply set -------------------------------------------------------------

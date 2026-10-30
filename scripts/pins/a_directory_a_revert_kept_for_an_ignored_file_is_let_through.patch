@@ -1,0 +1,22 @@
+Leaves files a user rule ignores out of what the simulator tells I9 is
+beneath a directory (`something_beneath`), so the live record a revert's
+given-up move of a directory holding one leaves (§7.3, draft 64; §8.3
+step 2) is no longer let through as the directory kept for something
+beneath it, and reads as the discarded version coming back.
+
+test: delocal-sim regressions::a_directory_a_revert_kept_for_an_ignored_file_is_let_through
+test: delocal-sim sim::tests::an_ignored_file_is_something_beneath_its_directory_for_i9
+
+diff --git a/crates/sim/src/sim.rs b/crates/sim/src/sim.rs
+index 73ba389..3099a4b 100644
+--- a/crates/sim/src/sim.rs
++++ b/crates/sim/src/sim.rs
+@@ -4672,7 +4672,7 @@ fn something_beneath(node: Option<&Node>, folder: Option<&FolderState>, path: &R
+                 .iter()
+                 .any(|w| !w.is_delete() && path.is_ancestor_of(w.path()))
+     }) || node
+-        .is_some_and(|n| n.fs.keys().any(|q| path.is_ancestor_of(q)) || holds_ignored(n, path))
++        .is_some_and(|n| n.fs.keys().any(|q| path.is_ancestor_of(q)))
+ }
+ 
+ /// The files a user rule ignores under `path` go where a rename of it to

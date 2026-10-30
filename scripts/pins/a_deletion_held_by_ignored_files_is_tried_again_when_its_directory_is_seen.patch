@@ -1,0 +1,29 @@
+Removes the re-evaluation from `FolderState::take_one` (§7.3, draft 64):
+a received deletion deferred because its directory held a file a user
+rule ignores is no longer wanted again when a scan or the watcher next
+observes the directory, so once the user takes the file away nothing
+tries the deletion again, and the directory stays on this machine while
+every other has deleted it. In the simulator a peer re-creating the
+directory nearly always replaces the held want first: no seed in 0 to
+9,999 fails with this patch, and one in 2,000 at ten times the rate, so
+the rule's unit tests stand in.
+
+test: delocal-engine folder::tests::a_deletion_held_by_ignored_files_is_tried_again_when_the_directory_is_next_seen
+test: delocal-engine folder::tests::a_deletion_above_one_held_by_ignored_files_waits_for_it_observably
+test: delocal-sim sim::tests::directories_held_by_an_ignored_file_are_left_out_of_i1_and_i3
+
+diff --git a/crates/engine/src/folder.rs b/crates/engine/src/folder.rs
+index 1062e5e..fb5e47f 100644
+--- a/crates/engine/src/folder.rs
++++ b/crates/engine/src/folder.rs
+@@ -1357,9 +1357,7 @@ impl FolderState {
+         // 68, the watcher's event for an ignored file in it being one). What
+         // a commit's guard found belongs to that commit's report, the one
+         // that deferred it, so only a scan or the watcher counts.
+-        if observer == Observer::Scan {
+-            self.wants.observed(&path);
+-        }
++        let _ = observer;
+         self.reconsider(now, &path, DeferredReason::ChangedUnderneath);
+         Scanned {
+             ancestors: Vec::new(),

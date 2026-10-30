@@ -93,10 +93,10 @@ impl Tier {
 
 /// Where a want is in its life (§7.5).
 ///
-/// `Deferred`, `LocalRetry`, `DiskFull`, `Collides` and `WaitingFor` are
-/// the reasons §7.5 gives for a want to be *deferred*. The last four came
-/// later and are listed last, so that the encoding of every earlier state
-/// is unchanged.
+/// `Deferred`, `LocalRetry`, `DiskFull`, `Collides`, `WaitingFor` and
+/// `HoldsIgnored` are the reasons §7.5 and §7.3 give for a want to be
+/// *deferred*. The last five came later and are listed last, so that the
+/// encoding of every earlier state is unchanged.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WantState {
     /// Ready to fetch (or, with content in hand, to commit) as soon as a
@@ -150,6 +150,15 @@ pub enum WantState {
     /// like every deferred want, rather than held in flight behind it;
     /// wanted again when the want at `path` ends.
     WaitingFor { path: RelPath },
+    /// Deferred with reason `holds ignored files` (§7.3, draft 64): the
+    /// directory this want deletes holds a file a user rule ignores, which
+    /// the user chose to keep out of sync and may need, so the host removed
+    /// nothing. Observable meanwhile, like every deferred want, and wanted
+    /// again at the next observation of the directory, the user having
+    /// perhaps taken the file away: a scan's, or the watcher's, whose event
+    /// for an ignored file is one (draft 68). `status` names the files,
+    /// which only the host knows.
+    HoldsIgnored,
 }
 
 impl WantState {
@@ -802,7 +811,8 @@ impl WantList {
     /// (§7.5 "local failures"). The operation is released and the path
     /// leaves in-flight; the sources are untouched, since no peer is to
     /// blame. `Io` backs off a minute, doubling on each repeat for the want
-    /// up to an hour, as an exclusion does. `with_seq` is the `seq` of the
+    /// up to an hour, as an exclusion does; `HoldsIgnored` waits for the
+    /// next observation of the directory (§7.3). `with_seq` is the `seq` of the
     /// live record a `CaseCollision` names, if there is one: with none, the
     /// index at that path has changed since the host looked, so the
     /// collision is already re-evaluated and the want is wanted again.
@@ -820,11 +830,12 @@ impl WantList {
         if want.version() != version {
             return None;
         }
-        if !matches!(error, LocalError::CaseCollision { .. }) {
+        if matches!(error, LocalError::Io | LocalError::DiskFull) {
             // The failure may have taken the temp file with it, and only the
             // host could tell. The retry fetches again, which resumes from
             // whatever the temp file still holds (§7.5), rather than commit
-            // content that may be gone. A collision attempted nothing.
+            // content that may be gone. A collision, or a directory holding
+            // ignored files, attempted nothing.
             want.fetched = false;
         }
         want.state = match error {
@@ -842,9 +853,24 @@ impl WantList {
                 },
                 None => WantState::Wanted,
             },
+            LocalError::HoldsIgnored => WantState::HoldsIgnored,
         };
         self.note(path);
         self.wants.get(path)
+    }
+
+    /// The directory at `path` was observed (§7.3, draft 64): a deletion
+    /// deferred because it held ignored files is wanted again, and the
+    /// host finds out whether it still does. Nothing else at the path
+    /// changes.
+    pub fn observed(&mut self, path: &RelPath) {
+        if self
+            .wants
+            .get(path)
+            .is_some_and(|w| w.state == WantState::HoldsIgnored)
+        {
+            self.set_state(path, WantState::Wanted);
+        }
     }
 
     /// The folder's inbound paused on a full disk (§7.5 "local failures"):
@@ -1287,6 +1313,11 @@ pub enum LocalError {
     /// the commit was not attempted. Only the host can tell which paths its
     /// filesystem treats as one name, so it says which.
     CaseCollision { with: RelPath },
+    /// The directory to be removed holds a file a user rule ignores (§7.3,
+    /// draft 64), so nothing was removed or moved. A received deletion waits
+    /// for the next observation of the directory; a revert's move gives up
+    /// and keeps it, as for any directory found not empty (§8.3).
+    HoldsIgnored,
 }
 
 /// What [`WantList::expire`] found: fetches that stalled and are wanted
