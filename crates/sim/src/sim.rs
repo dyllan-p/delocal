@@ -682,10 +682,12 @@ fn observed_at(event: &Event) -> Option<Timestamp> {
 }
 
 /// What made an event's new local versions, as I9's classes tell them apart.
-fn cause(event: &Event) -> i9::Cause {
-    if let Some((_, state)) = observation(event) {
+/// `observed_at` is when the disk was read for the observation the event
+/// carries, if it carries one, on the run's clock.
+fn cause(event: &Event, observed_at: Option<Timestamp>) -> i9::Cause {
+    if let (Some((_, state)), Some(at)) = (observation(event), observed_at) {
         match state {
-            ScanState::Observed(_) => return i9::Cause::Observed,
+            ScanState::Observed(_) => return i9::Cause::Observed { at },
             ScanState::Absent => return i9::Cause::Absent,
             ScanState::Unchanged | ScanState::Skipped { .. } => {}
         }
@@ -1066,6 +1068,17 @@ impl Sim {
         let at = now.max(n.last_stamp.plus_nanos(1));
         n.last_stamp = at;
         at
+    }
+
+    /// Where `id` is in its own order of events, on the run's clock: just
+    /// after the last stamp it took. Stamps never repeat, so an observation
+    /// stamped before this moment was read before it, and one stamped at or
+    /// after it, at the same instant included, was read after. It takes no
+    /// stamp itself, so asking for it leaves the run's history as it is.
+    fn moment(&self, id: NodeId) -> Timestamp {
+        self.nodes
+            .get(&id)
+            .map_or(self.clock, |n| n.last_stamp.plus_nanos(1 - n.skew_ns))
     }
 
     fn now_for(&self, id: NodeId) -> Timestamp {
@@ -1452,13 +1465,20 @@ impl Sim {
     fn feed(&mut self, id: NodeId, event: Event) -> Result<(), Failure> {
         let now = self.now_for(id);
         let what = event_name(&event);
+        // I9 measures what the engine knew of a path from when the disk was
+        // read, on the run's clock: the observation's own time, less the
+        // node's skew.
+        let observed_at = observed_at(&event).map(|at| {
+            let skew = self.nodes.get(&id).map_or(0, |n| n.skew_ns);
+            at.plus_nanos(-skew)
+        });
         // I9: what made the event's versions, and the path it observes, if
         // it does (a skip observes nothing), noted once the engine has it.
         let cause = self.i9.as_ref().map(|_| {
             let observed = observation(&event)
                 .filter(|(_, state)| !matches!(state, ScanState::Skipped { .. }))
                 .map(|(path, _)| path.clone());
-            (cause(&event), observed)
+            (cause(&event, observed_at), observed)
         });
         let observing = match &event {
             Event::Scanned { path, .. } => Some((id, path.clone())),
@@ -1503,13 +1523,6 @@ impl Sim {
         {
             self.stats.stale_dropped += 1;
         }
-        // I9 measures what the engine knew of a path from when the disk was
-        // read, on the run's clock: the observation's own time, less the
-        // node's skew.
-        let observed_at = observed_at(&event).map(|at| {
-            let skew = self.nodes.get(&id).map_or(0, |n| n.skew_ns);
-            at.plus_nanos(-skew)
-        });
         let folder = self.folder;
         let may_adopt = matches!(event, Event::Applied { .. } | Event::Scanned { .. });
         let (actions, seq) = {
@@ -2973,13 +2986,16 @@ impl Sim {
                     _ => Vec::new(),
                 };
                 let (committed, created) = self.commit(node, &path, &version, &action, fail);
+                // Dated in the node's order of events, so a read at the same
+                // instant is before or after the moves as it ran.
+                let moment = self.moment(node);
                 if let Some(watch) = self.i9.as_mut() {
                     let n = self.nodes.get(&node);
                     // A `Write` fills the path again, so a move shows at its
                     // target: empty before, full after.
                     for (from, to, was) in &moves {
                         if !was && n.is_some_and(|n| n.fs.contains_key(to)) {
-                            watch.displaced(node, from, to, from != &path, self.clock);
+                            watch.displaced(node, from, to, from != &path, moment);
                         }
                     }
                 }
