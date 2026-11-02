@@ -9,10 +9,10 @@
 //!
 //! **Addresses carry a port.** A machine's addresses, its own and its
 //! peers', are socket addresses. The real implementation will pair each
-//! Tailscale IP with delocal's port (§6.3); the fake may give every machine
-//! a port of its own on 127.0.0.1, which is how two daemons share one host
-//! without `sudo` (§14.2). `whois` takes the socket address a connection
-//! came from.
+//! Tailscale IP with delocal's port (§6.3); the fake gives every machine its
+//! own loopback address on one port, as Tailscale gives every machine its
+//! own IP, which is how two daemons share one host (§14.2). `whois` takes
+//! the socket address a connection came from; the fake resolves it by IP.
 //!
 //! So far:
 //!
