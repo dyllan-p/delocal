@@ -410,6 +410,10 @@ struct Node {
     moves: Vec<(ContentHash, RelPath, RelPath, Timestamp)>,
     /// When this node's own user last edited or deleted each path (I2).
     local_edit_at: BTreeMap<RelPath, Timestamp>,
+    /// The same edits, each dated by the node's order of events (I9): the
+    /// [`Sim::moment`] it was made at, which a read at the same instant is
+    /// before or after as it ran.
+    edit_moments: BTreeMap<RelPath, Timestamp>,
     /// The highest `seq` this node's index has written. Every write takes a
     /// new one except `revert`'s, which puts records back with theirs
     /// (§8.3), so an `IndexChanged` at or below it is a revert's.
@@ -422,16 +426,17 @@ impl Node {
         self.engine.is_some() && self.online
     }
 
-    /// When this node's user last changed `path`, as I9 reads it. On a
-    /// filesystem that ignores case, a write or deletion under one spelling
-    /// changes every path that folds to the same name (§7.6): writing `F2`
-    /// while `f2` is away, in the trash for a journalled displacement say,
-    /// takes the name `f2` too. Compared as [`fold`] compares names.
+    /// The moment this node's user last changed `path`, as I9 reads it (see
+    /// `edit_moments`). On a filesystem that ignores case, a write or
+    /// deletion under one spelling changes every path that folds to the
+    /// same name (§7.6): writing `F2` while `f2` is away, in the trash for
+    /// a journalled displacement say, takes the name `f2` too. Compared as
+    /// [`fold`] compares names.
     fn edited(&self, path: &RelPath) -> Option<Timestamp> {
         if !self.case_insensitive {
-            return self.local_edit_at.get(path).copied();
+            return self.edit_moments.get(path).copied();
         }
-        self.local_edit_at
+        self.edit_moments
             .iter()
             .filter(|(p, _)| p.as_str().eq_ignore_ascii_case(path.as_str()))
             .map(|(_, at)| *at)
@@ -958,6 +963,7 @@ impl Sim {
                 synced: Vec::new(),
                 moves: Vec::new(),
                 local_edit_at: BTreeMap::new(),
+                edit_moments: BTreeMap::new(),
                 max_seq: 0,
                 paused: false,
             };
@@ -3525,8 +3531,10 @@ impl Sim {
     /// where the user's edits are remembered for I2.
     fn watch(&mut self, id: NodeId, path: RelPath) -> Result<(), Failure> {
         let now = self.clock;
+        let moment = self.moment(id);
         if let Some(n) = self.nodes.get_mut(&id) {
             n.local_edit_at.insert(path.clone(), now);
+            n.edit_moments.insert(path.clone(), moment);
         }
         if self.rng.random::<f64>() < self.knobs.drop_watcher {
             return Ok(());
@@ -5220,8 +5228,8 @@ mod tests {
         let written = sim.clock;
         for n in [id, other] {
             let node = sim.nodes.get_mut(&n).unwrap();
-            node.local_edit_at.insert(rel("d1/F2"), written);
-            node.local_edit_at
+            node.edit_moments.insert(rel("d1/F2"), written);
+            node.edit_moments
                 .insert(rel("d1/f2"), written.plus_nanos(-NANOS));
         }
         sim.nodes.get_mut(&id).unwrap().case_insensitive = true;
@@ -5232,6 +5240,34 @@ mod tests {
         let node = &sim.nodes[&other];
         assert_eq!(node.edited(&rel("d1/f2")), Some(written.plus_nanos(-NANOS)));
         assert_eq!(node.edited(&rel("D1/f2")), None);
+    }
+
+    /// I9, seed 29231003: the user's change and a read at one instant are
+    /// ordered as they ran. A read stamped just before the change is
+    /// earlier than it, and the watcher's read of the change, at the same
+    /// instant, is not, though all three share the run's clock, which I2
+    /// still dates the change by.
+    #[test]
+    fn a_users_change_is_ordered_against_reads_at_its_instant() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                drop_watcher: 0.0,
+                check_i9: true,
+                ..Knobs::default()
+            },
+        );
+        let id = sim.order[0];
+        let f = rel("f1");
+        let skew = sim.nodes[&id].skew_ns;
+        let read = sim.stamp(id).plus_nanos(-skew);
+        sim.watch(id, f.clone()).unwrap();
+        let edited = sim.nodes[&id].edited(&f).unwrap();
+        let seen = sim.i9.as_ref().unwrap().last_observed(id, &f).unwrap();
+        assert!(edited > read, "a read before the change");
+        assert!(edited <= seen, "the watcher's read of the change");
+        assert_eq!(sim.nodes[&id].local_edit_at[&f], sim.clock);
     }
 
     /// An adoption joins `synced` once its write is durable (§11), which
