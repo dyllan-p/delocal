@@ -129,7 +129,8 @@ struct Mark {
     own: u64,
     /// What was at the path as the revert ran.
     found: Content,
-    /// What the node's record at the path says, as last written.
+    /// What the node's record at the path says, as last written. A crash
+    /// before the write's group is durable puts it back (§11).
     current: Content,
     trashed: Trashed,
     /// A commit displaced a directory above the path to a conflict copy,
@@ -154,6 +155,17 @@ struct Mark {
     lost: Option<Content>,
 }
 
+/// A change to a mark that an event made while its node's group of writes
+/// was open (§11), with what it replaced, so that a crash before the group
+/// is durable can put it back.
+#[derive(Clone, Debug)]
+enum MarkChange {
+    /// A revert marked the path, replacing this mark, if there was one.
+    Marked(Option<Mark>),
+    /// An index write at the marked path replaced this record content.
+    Current(Content),
+}
+
 /// An observation fed while its node's group of writes is open: its path,
 /// the time it replaced in `Watch::last_observed`, and the path's entry it
 /// cleared from `Watch::moved`.
@@ -163,10 +175,12 @@ type Undurable = (RelPath, Option<Timestamp>, Option<Timestamp>);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Watch {
     marks: BTreeMap<(NodeId, RelPath), Mark>,
-    /// Marks made while their node's group of writes is open (§11), with
-    /// the mark each replaced: a crash before the group is durable takes
-    /// the revert with it, so its marks go too.
-    undurable_marks: BTreeMap<NodeId, Vec<(RelPath, Option<Mark>)>>,
+    /// Changes to marks made while their node's group of writes is open
+    /// (§11), in order: a crash before the group is durable takes a revert
+    /// with it, so its marks go too, and takes every record the group
+    /// wrote, so a mark's `current` goes back to the record the index
+    /// still holds.
+    undurable_marks: BTreeMap<NodeId, Vec<(RelPath, MarkChange)>>,
     /// When the latest observation of each path that each node's engine
     /// was fed was taken.
     last_observed: BTreeMap<(NodeId, RelPath), Timestamp>,
@@ -310,6 +324,12 @@ impl Watch {
                     };
                     let made = content(&record.entry);
                     let replaced = std::mem::replace(&mut m.current, made);
+                    if group_open {
+                        self.undurable_marks
+                            .entry(id)
+                            .or_default()
+                            .push((path.clone(), MarkChange::Current(replaced)));
+                    }
                     if own <= m.own {
                         continue;
                     }
@@ -407,7 +427,7 @@ impl Watch {
             self.undurable_marks
                 .entry(id)
                 .or_default()
-                .push((path.clone(), replaced));
+                .push((path.clone(), MarkChange::Marked(replaced)));
         }
     }
 
@@ -420,8 +440,9 @@ impl Watch {
     }
 
     /// `id` crashed with a group of writes open (§11): a revert the group
-    /// held never happened, the landings it recorded are lost, and the
-    /// engine never saw the observations it took in.
+    /// held never happened, the records it wrote are gone, so the landings
+    /// among them are lost, and the engine never saw the observations it
+    /// took in.
     pub(crate) fn crashed(&mut self, id: NodeId, disk: impl Fn(&RelPath) -> Content) {
         let observed = self.undurable_observed.remove(&id).unwrap_or_default();
         for (path, replaced, moved) in observed.into_iter().rev() {
@@ -434,11 +455,20 @@ impl Watch {
             }
         }
         let marks = self.undurable_marks.remove(&id).unwrap_or_default();
-        for (path, replaced) in marks.into_iter().rev() {
-            match replaced {
-                Some(mark) => self.marks.insert((id, path), mark),
-                None => self.marks.remove(&(id, path)),
-            };
+        for (path, change) in marks.into_iter().rev() {
+            match change {
+                MarkChange::Marked(Some(mark)) => {
+                    self.marks.insert((id, path), mark);
+                }
+                MarkChange::Marked(None) => {
+                    self.marks.remove(&(id, path));
+                }
+                MarkChange::Current(content) => {
+                    if let Some(m) = self.marks.get_mut(&(id, path)) {
+                        m.current = content;
+                    }
+                }
+            }
         }
         for (path, found) in self.undurable_found.remove(&id).unwrap_or_default() {
             if let Some(m) = self.marks.get_mut(&(id, path)) {
@@ -917,6 +947,55 @@ mod tests {
             |_| false,
         );
         assert_eq!(watch.revives(A, &again, None).map(|(class, _)| class), None);
+    }
+
+    /// Class B of the nightly triage, seed 29495449: a peer's version lands
+    /// at a path a revert removed, and a crash takes the group of writes
+    /// its record was in, so the index has no record there again. A deny's
+    /// bump of the path is then a tombstone, keeping the content of the
+    /// record it replaces, which is none. Had the landing's group been
+    /// durable, the same tombstone would have replaced a live record, and
+    /// that is no bump.
+    #[test]
+    fn a_bump_of_a_record_a_crash_rolled_back_is_let_through() {
+        let class = |crash: bool| {
+            let mut watch = Watch::default();
+            watch.observed(A, &rel("f"), at(10), false);
+            let removed = Action::IndexRemoved {
+                folder: FOLDER,
+                path: rel("f"),
+            };
+            let cause = Cause::Other("Revert".to_owned());
+            let actions = [removed, reverted(), trash("f")];
+            watch.note(A, &actions, 5, &cause, false, x_on_disk, |_| false);
+            let landed = Entry {
+                modified_by: B,
+                ..entry("f", &[(B, 1)], X, ContentHash::EMPTY)
+            };
+            let applied = Cause::Applied { path: rel("f") };
+            let actions = [changed(&landed, 6)];
+            watch.note(A, &actions, 5, &applied, true, x_on_disk, |_| false);
+            if crash {
+                watch.crashed(A, x_on_disk);
+            } else {
+                watch.durable(A);
+            }
+            let empty = ContentHash::EMPTY;
+            let bump = entry("f", &[(A, 1), (B, 2)], empty, empty);
+            let denied = Action::StatusChanged {
+                folder: FOLDER,
+                status: FolderStatus::Denied {
+                    batch: BatchId::from_bytes([6; 16]),
+                    paths: 1,
+                },
+            };
+            let deny = Cause::Other("Deny".to_owned());
+            let actions = [changed(&bump, 7), denied];
+            watch.note(A, &actions, 6, &deny, false, x_on_disk, |_| false);
+            watch.revives(A, &bump, None).map(|(class, _)| class)
+        };
+        assert_eq!(class(true), None);
+        assert_eq!(class(false), Some(Class::Other("Deny".to_owned())));
     }
 
     /// Class 2: a later revert's trash move of a directory takes a file an
