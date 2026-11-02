@@ -68,14 +68,14 @@ fn direct() -> Option<PathInfo> {
 fn tailscale(path: Option<PathInfo>) -> Arc<FakeTailscale> {
     Arc::new(FakeTailscale::new(Config {
         self_info: SelfInfo {
-            addrs: vec![addr("127.0.0.1:41831")],
+            addrs: vec![addr("127.0.0.2:41831")],
             stable_id: StableId("nHereCNTRL".to_owned()),
             user: "me@example.com".to_owned(),
             hostname: "here".to_owned(),
         },
         peers: vec![Peer {
             hostname: "peer".to_owned(),
-            addrs: vec![addr("127.0.0.1:41832")],
+            addrs: vec![addr("127.0.0.3:41831")],
             stable_id: stable(),
             user: "me@example.com".to_owned(),
             online: true,
