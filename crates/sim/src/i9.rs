@@ -31,8 +31,9 @@ fn content(entry: &Entry) -> Content {
 /// What made a new local version, as far as the classes need to know.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Cause {
-    /// A scan or the watcher reported a file at the path.
-    Observed,
+    /// A scan or the watcher reported a file at the path, read at `at` on
+    /// the run's clock.
+    Observed { at: Timestamp },
     /// A scan or the watcher reported the path `Absent`.
     Absent,
     /// The end of a full scan's bracket, whose deletion pass tombstones the
@@ -81,7 +82,10 @@ pub(crate) enum Class {
     /// child that went along as an add (§7.6). A conflict copy's name
     /// repeats for the same loser, and a removed path's counters start
     /// again. Let through as it is made, as [`Class::MovedWithDirectory`]
-    /// is.
+    /// is. A copy made again of the loser the revert trashed holds the very
+    /// file the revert found, so the class is told from
+    /// [`Class::SawTrashedFile`] by when the scan read it: at or after the
+    /// displacement, it read the copy.
     ConflictCopy,
     /// Anything else, by the event that made the first new local version.
     Other(String),
@@ -132,9 +136,10 @@ struct Mark {
     /// and the path's file with it, and the engine has not observed the
     /// path since: before the revert, or after it.
     moved_with_directory: bool,
-    /// A commit since the revert displaced a file to the path, as a
-    /// conflict copy or beneath one (§7.6).
-    copied_here: bool,
+    /// When a commit since the revert first displaced a file to the path,
+    /// as a conflict copy or beneath one (§7.6): the moment in its node's
+    /// order of events that [`Watch::displaced`] was given.
+    copied_at: Option<Timestamp>,
     /// Each new local version since the revert, by the node's counter in
     /// it: what made it, and what it says is at the path.
     made: BTreeMap<u64, (Cause, Content)>,
@@ -282,7 +287,7 @@ impl Watch {
             },
             current: restored,
             moved_with_directory: watch.moved.contains_key(&(id, path.clone())),
-            copied_here: false,
+            copied_at: None,
             made: BTreeMap::new(),
             let_through: BTreeSet::new(),
             lost: None,
@@ -315,8 +320,10 @@ impl Watch {
                     // replaces, a tombstone's included (§8.2).
                     let bumped = denied && record.entry.modified_by == id && made == replaced;
                     // Only a scan finds what a lost landing left (§13).
-                    let scanned =
-                        matches!(cause, Cause::Observed | Cause::Absent | Cause::ScanFinished);
+                    let scanned = matches!(
+                        cause,
+                        Cause::Observed { .. } | Cause::Absent | Cause::ScanFinished
+                    );
                     let landed = scanned && m.lost == Some(made);
                     if landed {
                         m.lost = None;
@@ -378,6 +385,9 @@ impl Watch {
                     let mut m = m.clone();
                     m.found = disk(p);
                     m.trashed = Trashed::WithDirectory;
+                    // A copy displaced here before this revert is what the
+                    // revert found and meant to trash (seed 30604788).
+                    m.copied_at = None;
                     (p.clone(), m)
                 })
                 .collect();
@@ -491,7 +501,9 @@ impl Watch {
 
     /// A commit on `id` displaced what was at `from` to `to`, as a conflict
     /// copy (§7.6), at `at`; `beneath` if it went along with a directory
-    /// above it.
+    /// above it. `at` is a moment in the node's order of events, on the
+    /// run's clock, such that an observation read before the displacement
+    /// was taken before it, and one read after, at or after it.
     pub(crate) fn displaced(
         &mut self,
         id: NodeId,
@@ -507,7 +519,7 @@ impl Watch {
             }
         }
         if let Some(m) = self.marks.get_mut(&(id, to.clone())) {
-            m.copied_here = true;
+            m.copied_at.get_or_insert(at);
         }
     }
 
@@ -565,9 +577,13 @@ impl Watch {
 /// made, saying `made` is there.
 fn classify(mark: &Mark, path: &RelPath, cause: &Cause, made: &Content) -> Class {
     let found = made.is_some() && *made == mark.found;
+    let copied = mark.copied_at.is_some();
     match cause {
-        Cause::Observed if found && mark.trashed != Trashed::No => Class::SawTrashedFile,
-        Cause::Observed if found => Class::KeptUnknownFile,
+        // Read at or after a displacement made a copy here, which is what
+        // the scan saw, whatever the revert found (seed 29112528).
+        Cause::Observed { at } if mark.copied_at.is_some_and(|c| *at >= c) => Class::ConflictCopy,
+        Cause::Observed { .. } if found && mark.trashed != Trashed::No => Class::SawTrashedFile,
+        Cause::Observed { .. } if found => Class::KeptUnknownFile,
         // A displacement of a directory above the path took a file that was
         // there to take, before the revert or after something landed there
         // since: it, not the revert's trash, is why the path is empty.
@@ -577,10 +593,10 @@ fn classify(mark: &Mark, path: &RelPath, cause: &Cause, made: &Content) -> Class
         Cause::Absent | Cause::ScanFinished if mark.trashed == Trashed::WithDirectory => {
             Class::TrashedWithDirectory
         }
-        Cause::Applied { path: at } if at != path && mark.copied_here => Class::ConflictCopy,
-        Cause::Observed if mark.copied_here => Class::ConflictCopy,
+        Cause::Applied { path: at } if at != path && copied => Class::ConflictCopy,
+        Cause::Observed { .. } if copied => Class::ConflictCopy,
         Cause::Applied { .. } => Class::Other("applied".to_owned()),
-        Cause::Observed => Class::Other("observed".to_owned()),
+        Cause::Observed { .. } => Class::Other("observed".to_owned()),
         Cause::Absent | Cause::ScanFinished => Class::Other("found empty".to_owned()),
         Cause::Other(what) => Class::Other(what.clone()),
     }
@@ -663,6 +679,11 @@ mod tests {
         }
     }
 
+    /// A scan's report of a file, read at 30 s.
+    fn observed() -> Cause {
+        Cause::Observed { at: at(30) }
+    }
+
     /// X at every path, as a disk that has not changed.
     fn x_on_disk(_: &RelPath) -> Content {
         Some((Kind::File, X, false))
@@ -716,7 +737,7 @@ mod tests {
     fn an_edit_of_a_copy_that_comes_back_is_an_edit_of_the_path() {
         let mut watch = reverted_watch("f", "f");
         watch.edited_elsewhere(A, &rel("f"), at(12));
-        assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
+        assert_eq!(made(&mut watch, "f", X, observed(), None), None);
     }
 
     /// I9's row lets through the live directory record a revert writes for
@@ -791,7 +812,7 @@ mod tests {
     #[test]
     fn a_scan_that_reports_the_file_a_revert_trashed_fails() {
         let mut watch = reverted_watch("f", "f");
-        let class = made(&mut watch, "f", X, Cause::Observed, Some(at(5)));
+        let class = made(&mut watch, "f", X, observed(), Some(at(5)));
         assert_eq!(class, Some(Class::SawTrashedFile));
     }
 
@@ -800,10 +821,7 @@ mod tests {
     #[test]
     fn a_user_change_since_the_last_observation_is_not_a_failure() {
         let mut watch = reverted_watch("f", "f");
-        assert_eq!(
-            made(&mut watch, "f", X, Cause::Observed, Some(at(11))),
-            None
-        );
+        assert_eq!(made(&mut watch, "f", X, observed(), Some(at(11))), None);
     }
 
     /// §11: a crash before the revert's group of writes is durable takes the
@@ -823,7 +841,7 @@ mod tests {
             |_| false,
         );
         watch.crashed(A, x_on_disk);
-        assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
+        assert_eq!(made(&mut watch, "f", X, observed(), None), None);
     }
 
     /// §11: a crash before the group of writes an observation was fed into
@@ -837,10 +855,7 @@ mod tests {
         watch.observed(A, &rel("f"), at(20), true);
         watch.crashed(A, x_on_disk);
         revert(&mut watch, "f", "f");
-        assert_eq!(
-            made(&mut watch, "f", X, Cause::Observed, Some(at(15))),
-            None
-        );
+        assert_eq!(made(&mut watch, "f", X, observed(), Some(at(15))), None);
         // Once its group is durable, the observation stays.
         let mut watch = Watch::default();
         watch.observed(A, &rel("f"), at(10), false);
@@ -848,7 +863,7 @@ mod tests {
         watch.durable(A);
         watch.crashed(A, x_on_disk);
         revert(&mut watch, "f", "f");
-        let class = made(&mut watch, "f", X, Cause::Observed, Some(at(15)));
+        let class = made(&mut watch, "f", X, observed(), Some(at(15)));
         assert_eq!(class, Some(Class::SawTrashedFile));
     }
 
@@ -868,7 +883,7 @@ mod tests {
         watch.lost(A, &rel("f"), &lost, x_on_disk);
         let tick = Cause::Other("Tick".to_owned());
         assert!(made(&mut watch.clone(), "f", X, tick, None).is_some());
-        assert_eq!(made(&mut watch, "f", X, Cause::Observed, None), None);
+        assert_eq!(made(&mut watch, "f", X, observed(), None), None);
     }
 
     /// §11, §13, seed 96083: a scan, or a commit report carrying what the
@@ -888,7 +903,7 @@ mod tests {
         watch.lost(A, &rel("f"), &lost, x_on_disk);
         let first = entry("f", &[(A, 2), (B, 1)], X, Y);
         let actions = [changed(&first, 7)];
-        let observed = Cause::Observed;
+        let observed = observed();
         watch.note(A, &actions, 6, &observed, true, x_on_disk, |_| false);
         watch.crashed(A, x_on_disk);
         let again = entry("f", &[(A, 3), (B, 1)], X, Y);
@@ -1000,6 +1015,40 @@ mod tests {
         let empty = ContentHash::EMPTY;
         let class = made(&mut watch, "d/f", empty, Cause::ScanFinished, None);
         assert_eq!(class, None);
+    }
+
+    /// Class 5 again, seed 29112528: the conflict that displaced a losing
+    /// file to f.conflict, which a revert trashed, displaces the same loser
+    /// there again, so the copy holds the very file the revert found. A
+    /// scan's read at or after that displacement saw the copy, let through;
+    /// one read before it saw the trashed file.
+    #[test]
+    fn a_copy_made_again_is_let_through_when_read_after_its_displacement() {
+        let class = |read: i64| {
+            let mut watch = reverted_watch("f.conflict", "f.conflict");
+            watch.displaced(A, &rel("f"), &rel("f.conflict"), false, at(20));
+            let observed = Cause::Observed { at: at(read) };
+            made(&mut watch, "f.conflict", X, observed, None)
+        };
+        assert_eq!(class(20), None);
+        assert_eq!(class(25), None);
+        assert_eq!(class(19), Some(Class::SawTrashedFile));
+    }
+
+    /// Seed 30604788: a displacement put a copy at d.conflict/f, which an
+    /// earlier revert had marked, and a later revert's trash move of
+    /// d.conflict takes the path, the copy in it. That copy is what the
+    /// later revert found, not one made since, so a scan that reports it
+    /// again saw the trashed file.
+    #[test]
+    fn a_copy_displaced_before_a_later_revert_is_what_it_trashed() {
+        let mut watch = reverted_watch("d.conflict/f", "");
+        watch.displaced(A, &rel("d/f"), &rel("d.conflict/f"), true, at(20));
+        let cause = Cause::Other("Revert".to_owned());
+        let actions = [reverted(), trash("d.conflict")];
+        watch.note(A, &actions, 6, &cause, false, x_on_disk, |_| false);
+        let class = made(&mut watch, "d.conflict/f", X, observed(), None);
+        assert_eq!(class, Some(Class::SawTrashedFile));
     }
 
     /// Class 5, let through by I9's row: a commit of another path displaces
