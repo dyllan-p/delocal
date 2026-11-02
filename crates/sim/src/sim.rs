@@ -421,6 +421,22 @@ impl Node {
     fn alive(&self) -> bool {
         self.engine.is_some() && self.online
     }
+
+    /// When this node's user last changed `path`, as I9 reads it. On a
+    /// filesystem that ignores case, a write or deletion under one spelling
+    /// changes every path that folds to the same name (§7.6): writing `F2`
+    /// while `f2` is away, in the trash for a journalled displacement say,
+    /// takes the name `f2` too. Compared as [`fold`] compares names.
+    fn edited(&self, path: &RelPath) -> Option<Timestamp> {
+        if !self.case_insensitive {
+            return self.local_edit_at.get(path).copied();
+        }
+        self.local_edit_at
+            .iter()
+            .filter(|(p, _)| p.as_str().eq_ignore_ascii_case(path.as_str()))
+            .map(|(_, at)| *at)
+            .max()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -2090,7 +2106,7 @@ impl Sim {
                                 });
                         if let Some((class, detail)) = self.i9.as_ref().and_then(|watch| {
                             let node = self.nodes.get(&id);
-                            let edited = node.and_then(|n| n.local_edit_at.get(&e.path).copied());
+                            let edited = node.and_then(|n| n.edited(&e.path));
                             watch.revives(id, e, edited)
                         }) {
                             return Err(self.fail(&class.invariant(), detail));
@@ -5186,6 +5202,36 @@ mod tests {
         sim.restart(id).unwrap();
         let watch = sim.i9.as_ref().unwrap();
         assert_eq!(watch.edited_elsewhere_at(id, &at), Some(deleted));
+    }
+
+    /// I9, seed 28916886: on a filesystem that ignores case, the user's
+    /// write of `F2` is a change of `f2`, which shares its name, and of
+    /// every other spelling; elsewhere it is a change of `F2` alone.
+    #[test]
+    fn a_users_write_changes_every_spelling_where_case_is_ignored() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                ..Knobs::default()
+            },
+        );
+        let (id, other) = (sim.order[0], sim.order[1]);
+        let written = sim.clock;
+        for n in [id, other] {
+            let node = sim.nodes.get_mut(&n).unwrap();
+            node.local_edit_at.insert(rel("d1/F2"), written);
+            node.local_edit_at
+                .insert(rel("d1/f2"), written.plus_nanos(-NANOS));
+        }
+        sim.nodes.get_mut(&id).unwrap().case_insensitive = true;
+        let node = &sim.nodes[&id];
+        assert_eq!(node.edited(&rel("d1/f2")), Some(written));
+        assert_eq!(node.edited(&rel("D1/f2")), Some(written));
+        assert_eq!(node.edited(&rel("d1/f3")), None);
+        let node = &sim.nodes[&other];
+        assert_eq!(node.edited(&rel("d1/f2")), Some(written.plus_nanos(-NANOS)));
+        assert_eq!(node.edited(&rel("D1/f2")), None);
     }
 
     /// An adoption joins `synced` once its write is durable (§11), which
