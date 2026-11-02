@@ -129,6 +129,11 @@ jobs:
       # runs every seed in every part, so one failure cannot hide another.
       # The log starts with the shard's number and ends with "shard done"
       # only if every part ran to the end.
+      # GitHub runs a step's script under `bash -e`, and `set -uo pipefail`
+      # leaves that on, so a failing pipeline ends the step where it stands
+      # unless it is the test of an `if`. Until it was one here, a failing
+      # seed ended its shard: the later parts never ran, and the log never
+      # said "shard done".
       - name: Simulate
         env:
           SHARD: ${{ strategy.job-index }}
@@ -157,8 +162,9 @@ jobs:
             local lo=$(( from > $1 ? from : $1 )) hi=$(( to < $2 ? to : $2 ))
             shift 2
             [ "$lo" -lt "$hi" ] || return 0
-            ./target/release/delocal-sim --seeds "$(( hi - lo ))" --start "$(( START + lo ))" "$@" --keep-going 2>&1 | tee -a sim.log
-            [ "${PIPESTATUS[0]}" -eq 0 ] || status=1
+            if ! ./target/release/delocal-sim --seeds "$(( hi - lo ))" --start "$(( START + lo ))" "$@" --keep-going 2>&1 | tee -a sim.log; then
+              status=1
+            fi
           }
           slice 0 "$ignored_from"
           slice "$ignored_from" "$corrupt_from" --ignored-files 0.2
@@ -336,11 +342,13 @@ jobs:
       # Two workers of two threads each: a patched build spends most of its
       # time compiling the simulator's test binary, which uses few threads,
       # so two builds at once finish sooner than one on all four.
+      # Under `bash -e`, as in the Simulate step: the pipeline's status is
+      # taken on the right of `||`, where a failure does not end the step.
       - name: Check every pin both ways
         run: |
           set -uo pipefail
-          scripts/pins.sh --jobs 2 --out "$RUNNER_TEMP/pins" 2>&1 | tee pins.log
-          status=${PIPESTATUS[0]}
+          status=0
+          scripts/pins.sh --jobs 2 --out "$RUNNER_TEMP/pins" 2>&1 | tee pins.log || status=${PIPESTATUS[0]}
           cp "$RUNNER_TEMP/pins/summary.md" . 2> /dev/null || true
           # 0: every pin is valid; 1: some are not. Either way the check ran
           # to the end. 3: it wrote its table, but some pins were not checked
