@@ -622,8 +622,9 @@ struct InFlight {
     released: bool,
 }
 
-/// What the disk-full checker needs of the event a node is being fed
-/// (§7.5): see [`Sim::starts_inbound_while_paused`].
+/// What the checkers need of the event a node is being fed: the disk-full
+/// checker (§7.5, see [`Sim::starts_inbound_while_paused`]), and I2's
+/// dating of what the event adopts (see [`Sim::written_at`]).
 struct Feeding {
     node: NodeId,
     /// A commit's report or a scan's observation, the two events that may
@@ -633,6 +634,9 @@ struct Feeding {
     may_adopt: bool,
     /// The index's `seq` as the event began; a write above it is new.
     seq: u64,
+    /// The path the event observes, if it carries an observation, and
+    /// when the disk was read for it, on the run's clock.
+    observed: Option<(RelPath, Timestamp)>,
 }
 
 /// `path` as the host finds it after a failed commit, for the report
@@ -840,8 +844,9 @@ pub struct Sim {
     scan_rng: ChaCha8Rng,
     /// Draws for the users' ignored files, on `IGNORED_STREAM`.
     ignored_rng: ChaCha8Rng,
-    /// While a node is fed an event: which node, what kind of event, and
-    /// its index's `seq` as the event began, for the disk-full checker.
+    /// While a node is fed an event: which node, what kind of event, its
+    /// index's `seq` as the event began, and what it observes, for the
+    /// disk-full checker and I2.
     feeding: Option<Feeding>,
     /// While a node is fed a `Skipped` report or the end of a bracket that
     /// had one, what the skip checker holds its index writes against.
@@ -1547,6 +1552,9 @@ impl Sim {
         }
         let folder = self.folder;
         let may_adopt = matches!(event, Event::Applied { .. } | Event::Scanned { .. });
+        let observed = observation(&event)
+            .map(|(path, _)| path.clone())
+            .zip(observed_at);
         let (actions, seq) = {
             let Some(node) = self.nodes.get_mut(&id) else {
                 return Ok(());
@@ -1613,6 +1621,7 @@ impl Sim {
             node: id,
             may_adopt,
             seq,
+            observed,
         });
         let acted = actions
             .into_iter()
@@ -1981,6 +1990,26 @@ impl Sim {
         }
     }
 
+    /// When a table write that `id`'s engine makes in the event it is being
+    /// fed is dated, for the invariants that follow index writes: the run's
+    /// clock, except for a record at the path the event observes, which is
+    /// dated when the disk was read for it. A scan's report can arrive
+    /// seconds after its read (draft 58), and what it shows was on disk at
+    /// the read. So when it finds a landing whose report a crash took and
+    /// the engine adopts the landing (§8.3, §13), sync had put the content
+    /// there by the read, and a user's deletion of it after the read is the
+    /// user's own change (I2, seed 29587859).
+    fn written_at(&self, id: NodeId, action: &Action) -> Timestamp {
+        match (action, &self.feeding) {
+            (Action::IndexChanged { record, .. }, Some(f)) if f.node == id => f
+                .observed
+                .as_ref()
+                .filter(|(path, _)| *path == record.entry.path)
+                .map_or(self.clock, |(_, at)| *at),
+            _ => self.clock,
+        }
+    }
+
     fn act(&mut self, id: NodeId, action: Action) -> Result<(), Failure> {
         if let Some(detail) = self.tombstones_a_skip(id, &action) {
             return Err(self.fail("Skipped", detail));
@@ -2160,8 +2189,8 @@ impl Sim {
             | Action::DeferredChanged { .. }
             | Action::RestChanged { .. } => {
                 let staged = Staged {
+                    at: self.written_at(id, &action),
                     write: TableWrite::Hook(Box::new(action)),
-                    at: self.clock,
                     event: self.stats.events,
                     moves: self.nodes.get(&id).map_or(0, |n| n.moves.len()),
                 };
@@ -5663,6 +5692,7 @@ mod tests {
             node: id,
             may_adopt,
             seq: 4,
+            observed: None,
         };
         sim.feeding = Some(feeding(false));
         assert!(sim.starts_inbound_while_paused(id, &adopt).is_some());
@@ -5676,6 +5706,41 @@ mod tests {
         sim.feeding = Some(feeding(true));
         assert_eq!(sim.starts_inbound_while_paused(id, &adopt), None);
         assert_eq!(sim.starts_inbound_while_paused(other, &fetch), None);
+    }
+
+    /// I2, seed 29587859: a delayed scan's report found a landing whose
+    /// report a crash took, and the engine adopts it as the report
+    /// arrives, but the report shows the disk as read. The record written
+    /// at the path it observes is dated by the read, so the user's
+    /// deletion between the read and the report is a change after sync put
+    /// the content there. Every other write keeps the run's clock.
+    #[test]
+    fn a_record_an_observation_writes_is_dated_by_the_read() {
+        let mut sim = Sim::new(
+            0,
+            Knobs {
+                nodes: Some(2),
+                ..Knobs::default()
+            },
+        );
+        let (id, other) = (sim.order[0], sim.order[1]);
+        let folder = sim.folder;
+        let read = sim.clock.plus_nanos(-5 * NANOS);
+        let record = |path: &str| {
+            let version = Version::from_iter([(other, 1)]);
+            changed(folder, written(&rel(path), other, version, 1, 0), 5)
+        };
+        sim.feeding = Some(Feeding {
+            node: id,
+            may_adopt: true,
+            seq: 4,
+            observed: Some((rel("f0"), read)),
+        });
+        assert_eq!(sim.written_at(id, &record("f0")), read);
+        assert_eq!(sim.written_at(id, &record("f1")), sim.clock);
+        assert_eq!(sim.written_at(other, &record("f0")), sim.clock);
+        sim.feeding = None;
+        assert_eq!(sim.written_at(id, &record("f0")), sim.clock);
     }
 
     /// §7.5: a full disk reported by the fetch or commit its want waited
